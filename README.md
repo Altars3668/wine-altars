@@ -43,6 +43,10 @@ multiarch build costs several times as much for nothing.
     scripts/import-office.sh             # copy Office out of a real C: drive
     scripts/export-office-registry.py    # SOFTWARE + SYSTEM + NTUSER + App-V vreg
     scripts/apply-office-registry.sh     # import the .reg into the prefix
+    scripts/merge-case-collisions.py     # REQUIRED after import: fold directories
+                                         # that differ only in case (NTFS source,
+                                         # ext4 prefix) -- see the docs for why
+                                         # OfficeClickToRun.exe went missing
 
 **Status: Word does not start yet.** It gets 186 modules in and stops inside
 Click-to-Run's bootstrap, before any Office code of its own is loaded. What was
