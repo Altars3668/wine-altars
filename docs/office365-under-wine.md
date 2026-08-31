@@ -283,3 +283,37 @@ A subscription SKU wants an identity to validate against, and `sppc` here
 answers with an empty policy set by design. Whether (6) is the licensing check
 or something else is not yet measured — the next step is to find what Word reads
 immediately before it raises it, not to guess.
+
+### What error (6) is not
+
+Each of these was tried and changed nothing — the dialog is identical:
+
+* **add-ins** — `/a` and `/safe` both still fail
+* **`Normal.dotm` and the Roaming user data.** They were genuinely missing:
+  `import-office.sh` never copied `AppData\Roaming\Microsoft\{Templates,Word,Office}`,
+  so Word had no default template at all. Copying them (40 + 13 + 37 files) is
+  right and is now in the script — but (6) is unchanged.
+* **`HKCU\...\Word\Data`**, the binary blob of machine-specific state
+* **the whole `HKCU\...\Office\16.0\Word` tree**, deleted so Word rebuilds from
+  nothing
+* **`osppc.dll`.** Word walks the loaded-module list looking for it — and
+  CodeWeavers carry `CX HACK 18329`, "Office 365: Always install osppc.dll", so
+  it looked promising. It is **absent from the source Windows too**, and their
+  hack is in the MSI install path, not the C2R one.
+* **`isolatedwindowsenvironmentutils.dll`**, the one module that still fails to
+  load, is **not present on the real Windows either**.
+
+Across a whole run Wine reports zero unimplemented functions, zero failed delay
+imports and zero missing imports, for both Word and Excel.
+
+### Excel gets a different error, and it is a number
+
+Excel reaches a small dialog reading **"IOPL not enabled."** — the message text
+for Win32 error **197, `ERROR_IOPL_NOT_ENABLED`**. Nothing in Wine's tree ever
+returns 197, so it is a code Office obtained somewhere and rendered through
+`FormatMessage`. Word's (6) and Excel's 197 are different symptoms, which is
+itself informative: whatever fails is upstream of both, and each app reports it
+in its own way.
+
+That number is the most concrete thing left to pull on: find which call leaves
+197 in the thread's last-error, rather than guessing at licensing.
