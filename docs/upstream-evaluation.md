@@ -62,6 +62,45 @@ per-title HACKs. Two areas looked relevant and one was:
   arrived at it from an unrelated direction, which is the usual sign that a
   gap is load-bearing for somebody.
 
+## CrossOver 26.3.0 — taken as the new base, but it does not fix this
+
+CodeWeavers ships Microsoft 365 support commercially and publishes their Wine
+under the LGPL. Their 26.3.0 sources are on **the same wine-11.0 base as ours**,
+which makes the comparison exact: **221 files, +15717/-662** against pristine.
+
+All 13 mstsc patches apply to it cleanly. (The Valve `FindNextFileNameW` patch
+conflicts because CrossOver already has it — same author, CodeWeavers maintains
+Valve's Wine too.) `altars-cx` is that tree plus our series.
+
+They do have Click-to-Run specific work, and one comment names our exact
+problem — `CXHACK 14391` in `rpcrt4/rpc_transport.c`:
+
+> ClickToRun hooks NtReadFile and many other APIs. Some of hooked functions do
+> RPC calls. When we call NtReadFile in such RPC call, it locks a critical
+> section inside its NtReadFile hook, which causes dead locks. It most likely
+> works on Windows because **RPC calls use LPC ports, so they don't call
+> NtReadFile**.
+
+Also `CX HACK 10834` (msoffice sets FILE_EXECUTE on saved files) and
+`CX HACK 18329` (Office 365: always install osppc.dll).
+
+**It changes nothing here.** Measured on the CrossOver base with the same
+prefix: Word still never loads `wwlib.dll`, still ends on the same
+`RPC_S_SERVER_UNAVAILABLE`, `ClickToRunSvc` still fails to start with 1077, and
+`OfficeClickToRun.exe /service` reports the *same* missing pieces
+(`Windows.System.dll`, `twinapi.appcore`, `PrivIsDllSynchronizationHeld`).
+A module count that rose 186 -> 357 is an artifact: the extra entries are
+`iexplore.exe`, `msi.dll`, `mshtml.dll` — other processes in the same log, not
+Word getting further.
+
+The likely reason is visible in the log: every CrossOver process tries to load
+**`cxcompatdb.so` and fails**, because it is proprietary and not in the LGPL
+source drop. CodeWeavers' Office support lives partly in that compatibility
+database and in their bottle configuration, neither of which is published.
+
+Keeping the base anyway: it is the same wine-11.0, it carries CXHACK 14391 for
+when the deadlock does become reachable, and it costs nothing.
+
 ## wine-tkg
 
 An integration project — it composes staging, Proton and kernel patches rather

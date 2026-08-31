@@ -145,3 +145,44 @@ Order of work, cheapest first:
    to answer.
 2. Get `OfficeClickToRun.exe /service` far enough to register with the SCM.
 3. Only then decide whether the WinRT facades are needed or were incidental.
+
+## The Windows-side comparison (2026-08-31)
+
+A real Windows with **the same product** (`O365HomePremRetail` x64,
+16.0.20425.20000 vs our 16.0.20208.20000) was used as a reference. There Word
+starts normally and loads **244 modules**. PowerShell's `Process.Modules` is in
+load order, so the two sequences can be lined up directly.
+
+Windows, in order: `WINWORD.EXE`, `ntdll`, `KERNEL32`, `KERNELBASE`, `apphelp`,
+`ucrtbase`, `VCRUNTIME140_1`, `VCRUNTIME140`, **`AppVIsvSubsystems64`** (9th),
+`MSVCP140`, **`c2r64`** (11th), `ADVAPI32`, `msvcrt`, `sechost`, **`RPCRT4`**
+(15th), `Comctl32`, `GDI32`, `win32u`, `gdi32full`, `msvcp_win`, `etw`,
+`USER32`, `ole32`, `combase`, `oleaut32`, **`wwlib.dll`**, `oart`,
+`mso20win32client` ...
+
+We reach the same first eleven. Then the paths diverge, and the divergence is
+sharper than "we stop":
+
+| module | Windows | Wine |
+|---|---|---|
+| `Kerberos.dll` | **not loaded** | loaded |
+| `MSV1_0.dll` | **not loaded** | loaded |
+| `netapi32.dll` | **not loaded** | loaded |
+
+`Kerberos` and `MSV1_0` are SSPI authentication packages; they are loaded only
+when something authenticates. **On Windows, Click-to-Run's `ncalrpc` never
+authenticates** — it is an ALPC port, local and unauthenticated. Wine implements
+`ncalrpc` over **named pipes**, and the named-pipe connection drags in the full
+NTLM/Kerberos negotiation, a path that does not exist on Windows at all.
+
+That is the same difference CodeWeavers describes in CXHACK 14391 from the other
+side ("RPC calls use LPC ports, so they don't call NtReadFile"). It is now a
+measurement rather than a quotation.
+
+The RPC target itself is fully identified without a debugger:
+
+* interface UUID **`469d3a0e-e164-422e-a662-9cbe0621407e` v1.0**, extracted
+  from `C2R64.dll`, `ApiClient.dll` and `OfficeClickToRun.exe` by anchoring on
+  the NDR transfer-syntax GUID and reading the 20 bytes before it
+* protocol **`ncalrpc`**, endpoint **`ClickToRun_Pipeline16`** — which is also
+  `PipelineServerName` in the registry we already import
