@@ -259,3 +259,27 @@ and Wine used to say nothing, so `0xC06D007F` in a log named no import at all.
 
 **Where it stops now:** Word's own dialog, in Chinese —
 *"很抱歉，出现错误，Word 不能启动。(6)"*. That is Word's error code, not Wine's.
+
+### Error (6)
+
+With everything above supplied, Word gets through its loader, paints the
+Microsoft 365 splash, and stops on a dialog of its own:
+*"很抱歉，出现错误，Word 不能启动。(6)"*. Reproducible, and unchanged by
+`/a` (no add-ins) or `/safe`.
+
+At that point Wine reports **zero** unimplemented functions, **zero** failed
+delay imports and **zero** missing imports over a whole run, so this is Word's
+own refusal rather than another gap in Wine.
+
+Licensing state, for the next session to start from:
+
+* the vNext token is in place under `%LOCALAPPDATA%\Microsoft\Office\Licenses\5\`
+* `HKCU\...\Common\Licensing\LicensingNext` has `O365HomePremRetail = 2`
+* `HKCU\...\Common\Identity\Identities` is **empty** — but it is *also* empty in
+  the source `NTUSER.DAT`, so nothing was lost in the import; that machine keeps
+  its sign-in elsewhere (OneAuth) or was not signed in.
+
+A subscription SKU wants an identity to validate against, and `sppc` here
+answers with an empty policy set by design. Whether (6) is the licensing check
+or something else is not yet measured — the next step is to find what Word reads
+immediately before it raises it, not to guess.
