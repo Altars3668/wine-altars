@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Subject: [PATCH] secur32: Answer SECPKG_ATTR_PACKAGE_INFO and SECPKG_ATTR_SESSION_KEY for Schannel contexts.
+
+Each of these made a caller abandon a working TLS connection.
+
+SECPKG_ATTR_PACKAGE_INFO describes the package that secured the context;
+Wine returned SEC_E_UNSUPPORTED_FUNCTION, which callers surface as an
+authentication failure.
+
+SECPKG_ATTR_SESSION_KEY is answered with keying material exported from the
+session under RFC 5705, since GnuTLS does not hand out the master secret. It
+is stable per session and different between sessions, which is what callers
+binding their own state to a connection need. It is not the literal session
+key Windows returns, so anything that must agree with a peer about this
+value byte for byte will not.
+
+Signed-off-by: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+---
+--- a/dlls/secur32/schannel.c
++++ b/dlls/secur32/schannel.c
+@@ -1295,6 +1295,67 @@
+         params.buffer = p;
+         return GNUTLS_CALL( get_unique_channel_binding, &params );
+     }
++    case SECPKG_ATTR_PACKAGE_INFO:
++    {
++        /*
++         * Which security package this context belongs to. Callers use it to
++         * report what secured a connection, and to decide what a package is
++         * capable of before asking it for more.
++         *
++         * The buffer holds a pointer the caller frees with FreeContextBuffer,
++         * so the strings have to live in the same allocation as the struct
++         * rather than beside it.
++         */
++        static const WCHAR name[] = L"Schannel";
++        static const WCHAR comment[] = L"Schannel Security Package";
++        SecPkgContext_PackageInfoW *out = buffer;
++        SecPkgInfoW *info;
++        char *p;
++
++        if (!(info = RtlAllocateHeap( GetProcessHeap(), 0,
++                                      sizeof(*info) + sizeof(name) + sizeof(comment) )))
++            return SEC_E_INSUFFICIENT_MEMORY;
++
++        p = (char *)(info + 1);
++        memcpy( p, name, sizeof(name) );
++        info->Name = (SEC_WCHAR *)p;
++        p += sizeof(name);
++        memcpy( p, comment, sizeof(comment) );
++        info->Comment = (SEC_WCHAR *)p;
++
++        info->fCapabilities = SECPKG_FLAG_INTEGRITY | SECPKG_FLAG_PRIVACY |
++                              SECPKG_FLAG_CONNECTION | SECPKG_FLAG_MULTI_REQUIRED |
++                              SECPKG_FLAG_EXTENDED_ERROR | SECPKG_FLAG_IMPERSONATION |
++                              SECPKG_FLAG_ACCEPT_WIN32_NAME | SECPKG_FLAG_STREAM;
++        info->wVersion = 1;
++        info->wRPCID = UNISP_RPC_ID;
++        info->cbMaxToken = 16384;
++
++        out->PackageInfo = info;
++        return SEC_E_OK;
++    }
++    case SECPKG_ATTR_SESSION_KEY:
++    {
++        SecPkgContext_SessionKey *key = buffer;
++        ULONG size = 0;
++        struct get_session_key_params params = { ctx->session, NULL, &size };
++        SECURITY_STATUS status = GNUTLS_CALL( get_session_key, &params );
++
++        if (status != SEC_E_BUFFER_TOO_SMALL && status != SEC_E_OK) return status;
++        if (!(params.buffer = RtlAllocateHeap( GetProcessHeap(), 0, size )))
++            return SEC_E_INSUFFICIENT_MEMORY;
++
++        status = GNUTLS_CALL( get_session_key, &params );
++        if (status != SEC_E_OK)
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, params.buffer );
++            return status;
++        }
++        /* Freed by the caller with FreeContextBuffer. */
++        key->SessionKeyLength = size;
++        key->SessionKey = params.buffer;
++        return SEC_E_OK;
++    }
+     case SECPKG_ATTR_APPLICATION_PROTOCOL:
+     {
+         SecPkgContext_ApplicationProtocol *protocol = buffer;
+--- a/dlls/secur32/schannel_gnutls.c
++++ b/dlls/secur32/schannel_gnutls.c
+@@ -90,6 +90,7 @@
+ MAKE_FUNCPTR(gnutls_certificate_get_peers);
+ MAKE_FUNCPTR(gnutls_certificate_set_x509_key);
+ MAKE_FUNCPTR(gnutls_cipher_get);
++MAKE_FUNCPTR(gnutls_prf_rfc5705);
+ MAKE_FUNCPTR(gnutls_cipher_get_key_size);
+ MAKE_FUNCPTR(gnutls_credentials_set);
+ MAKE_FUNCPTR(gnutls_deinit);
+@@ -1038,6 +1039,45 @@
+     return SEC_E_OK;
+ }
+ 
++/*
++ * The session key, as far as one can be produced here.
++ *
++ * Callers ask for this to bind something of their own to the session -- an
++ * auto-reconnect token, a log correlator. GnuTLS does not hand out the master
++ * secret, so this exports keying material derived from it (RFC 5705) under a
++ * label of our own. That is stable for the life of the session and different
++ * for every session, which is what such callers rely on.
++ *
++ * It is not the literal session key Windows would return. Anything that has to
++ * agree with a peer about this value byte for byte will not, and there is no
++ * way to give it one without the master secret.
++ */
++static NTSTATUS schan_get_session_key( void *args )
++{
++    static const char label[] = "EXPORTER-Wine-Schannel-SessionKey";
++    const struct get_session_key_params *params = args;
++    gnutls_session_t s = session_from_handle(params->session);
++    unsigned char key[32];
++    int rc;
++
++    rc = pgnutls_prf_rfc5705(s, sizeof(label) - 1, label, 0, NULL, sizeof(key), (char *)key);
++    if (rc)
++    {
++        pgnutls_perror(rc);
++        return SEC_E_INTERNAL_ERROR;
++    }
++
++    if (!params->buffer || *params->bufsize < sizeof(key))
++    {
++        *params->bufsize = sizeof(key);
++        return SEC_E_BUFFER_TOO_SMALL;
++    }
++
++    memcpy( params->buffer, key, sizeof(key) );
++    *params->bufsize = sizeof(key);
++    return SEC_E_OK;
++}
++
+ static NTSTATUS schan_get_unique_channel_binding( void *args )
+ {
+     const struct get_unique_channel_binding_params *params = args;
+@@ -1498,6 +1538,7 @@
+     LOAD_FUNCPTR(gnutls_certificate_get_peers)
+     LOAD_FUNCPTR(gnutls_certificate_set_x509_key)
+     LOAD_FUNCPTR(gnutls_cipher_get)
++    LOAD_FUNCPTR(gnutls_prf_rfc5705)
+     LOAD_FUNCPTR(gnutls_cipher_get_key_size)
+     LOAD_FUNCPTR(gnutls_credentials_set)
+     LOAD_FUNCPTR(gnutls_deinit)
+@@ -1626,6 +1667,7 @@
+     schan_get_key_signature_algorithm,
+     schan_get_max_message_size,
+     schan_get_session_cipher_block_size,
++    schan_get_session_key,
+     schan_get_session_peer_certificate,
+     schan_get_unique_channel_binding,
+     schan_handshake,
+@@ -1772,6 +1814,22 @@
+     return schan_get_session_peer_certificate(&params);
+ }
+ 
++static NTSTATUS wow64_schan_get_session_key( void *args )
++{
++    struct
++    {
++        schan_session session;
++        PTR32 buffer;
++        PTR32 bufsize;
++    } const *params32 = args;
++    struct get_session_key_params params =
++    {
++        params32->session,
++        ULongToPtr(params32->buffer),
++        ULongToPtr(params32->bufsize),
++    };
++    return schan_get_session_key(&params);
++}
+ static NTSTATUS wow64_schan_get_unique_channel_binding( void *args )
+ {
+     struct
+@@ -1961,6 +2019,7 @@
+     schan_get_key_signature_algorithm,
+     schan_get_max_message_size,
+     schan_get_session_cipher_block_size,
++    wow64_schan_get_session_key,
+     wow64_schan_get_session_peer_certificate,
+     wow64_schan_get_unique_channel_binding,
+     wow64_schan_handshake,
+--- a/dlls/secur32/secur32_priv.h
++++ b/dlls/secur32/secur32_priv.h
+@@ -142,6 +142,13 @@
+     ULONG *retcount;
+ };
+ 
++struct get_session_key_params
++{
++    schan_session session;
++    void *buffer;
++    ULONG *bufsize;
++};
++
+ struct get_unique_channel_binding_params
+ {
+     schan_session session;
+@@ -230,6 +237,7 @@
+     unix_get_key_signature_algorithm,
+     unix_get_max_message_size,
+     unix_get_session_cipher_block_size,
++    unix_get_session_key,
+     unix_get_session_peer_certificate,
+     unix_get_unique_channel_binding,
+     unix_handshake,

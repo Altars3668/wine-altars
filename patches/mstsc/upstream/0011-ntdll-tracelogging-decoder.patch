@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Subject: [PATCH] ntdll: Decode TraceLogging events.
+
+TraceLogging events carry their own schema -- provider name, event name, and
+every field name and type travel with the event -- so they can be decoded
+without the manifest a classic ETW consumer needs. They were discarded at a
+FIXME.
+
+A provider stays silent until a session enables it, and TraceLogging checks
+a flag set by the enable callback rather than testing per event, so
+EtwEventRegister has to invoke that callback or nothing is ever written.
+
+All of it is behind WINEDEBUG=+tracelog; off, providers stay as silent as
+before.
+
+Signed-off-by: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+---
+--- a/dlls/ntdll/misc.c
++++ b/dlls/ntdll/misc.c
+@@ -30,6 +30,7 @@
+ #include "evntprov.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
++WINE_DECLARE_DEBUG_CHANNEL(tracelog);
+ 
+ LPCSTR debugstr_us( const UNICODE_STRING *us )
+ {
+@@ -297,6 +298,8 @@
+  */
+ BOOLEAN WINAPI EtwEventProviderEnabled( REGHANDLE handle, UCHAR level, ULONGLONG keyword )
+ {
++    if (TRACE_ON(tracelog)) return TRUE;
++
+     WARN("%s, %u, %s: stub\n", wine_dbgstr_longlong(handle), level, wine_dbgstr_longlong(keyword));
+     return FALSE;
+ }
+@@ -307,11 +310,26 @@
+ ULONG WINAPI EtwEventRegister( LPCGUID provider, PENABLECALLBACK callback, PVOID context,
+                 PREGHANDLE handle )
+ {
+-    WARN("(%s, %p, %p, %p) stub.\n", debugstr_guid(provider), callback, context, handle);
+-
+     if (!handle) return ERROR_INVALID_PARAMETER;
+ 
+     *handle = 0xdeadbeef;
++
++    /*
++     * A TraceLogging provider does not test anything per event: it keeps a flag
++     * that this callback sets, and skips the call to EventWriteTransfer
++     * entirely while the flag is clear. Reporting the provider as enabled
++     * afterwards is therefore too late -- without this, nothing is ever
++     * written and the decoder never sees an event.
++     */
++    if (TRACE_ON(tracelog) && callback)
++    {
++        TRACE_(tracelog)( "enabling provider %s\n", debugstr_guid(provider) );
++        callback( provider, 1 /* EVENT_CONTROL_CODE_ENABLE_PROVIDER */, TRACE_LEVEL_VERBOSE,
++                  ~(ULONGLONG)0, ~(ULONGLONG)0, NULL, context );
++        return ERROR_SUCCESS;
++    }
++
++    WARN("(%s, %p, %p, %p) stub.\n", debugstr_guid(provider), callback, context, handle);
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -345,11 +363,191 @@
+ }
+ 
+ /******************************************************************************
++ * TraceLogging
++ *
++ * Most of what a modern Windows component reports about itself goes through
++ * ETW rather than any interface it exposes, and TraceLogging events carry
++ * their own schema -- the provider name, the event name and every field name
++ * and type travel with the event. That makes them decodable without the
++ * manifest a classic ETW consumer would need, and printing them is the only
++ * way to hear what a closed-source component is saying about itself.
++ *
++ * A provider only emits when a session has enabled it, so EtwEventEnabled has
++ * to agree before any of this happens. The +tracelog channel is that consent:
++ * off, nothing changes and providers stay silent as before.
++ */
++
++#define TLG_IN_NULL           0
++#define TLG_IN_UNICODESTRING  1
++#define TLG_IN_ANSISTRING     2
++#define TLG_IN_INT8           3
++#define TLG_IN_UINT8          4
++#define TLG_IN_INT16          5
++#define TLG_IN_UINT16         6
++#define TLG_IN_INT32          7
++#define TLG_IN_UINT32         8
++#define TLG_IN_INT64          9
++#define TLG_IN_UINT64        10
++#define TLG_IN_FLOAT         11
++#define TLG_IN_DOUBLE        12
++#define TLG_IN_BOOL32        13
++#define TLG_IN_BINARY        14
++#define TLG_IN_GUID          15
++#define TLG_IN_POINTER       17
++#define TLG_IN_FILETIME      18
++#define TLG_IN_SYSTEMTIME    19
++#define TLG_IN_SID           20
++#define TLG_IN_HEXINT32      21
++#define TLG_IN_HEXINT64      22
++#define TLG_IN_COUNTEDSTRING 23
++#define TLG_IN_COUNTEDANSISTRING 24
++
++#define TLG_IN_TYPE_MASK   0x1f
++#define TLG_IN_CUSTOM_MASK 0x20
++#define TLG_IN_ARRAY_MASK  0x40
++#define TLG_IN_OUT_MASK    0x80
++
++static void tracelog_print_value( UCHAR in_type, const BYTE **payload, const BYTE *end )
++{
++    const BYTE *p = *payload;
++    UCHAR type = in_type & TLG_IN_TYPE_MASK;
++    ULONG len;
++
++    switch (type)
++    {
++    case TLG_IN_UNICODESTRING:
++    {
++        const WCHAR *str = (const WCHAR *)p;
++        len = 0;
++        while ((const BYTE *)(str + len + 1) <= end && str[len]) len++;
++        TRACE_(tracelog)( "%s", debugstr_wn( str, len ));
++        p = (const BYTE *)(str + len + 1);
++        break;
++    }
++    case TLG_IN_ANSISTRING:
++    {
++        const char *str = (const char *)p;
++        len = 0;
++        while (p + len < end && str[len]) len++;
++        TRACE_(tracelog)( "%s", debugstr_an( str, len ));
++        p += len + 1;
++        break;
++    }
++    case TLG_IN_INT8:   if (p + 1 > end) break; TRACE_(tracelog)( "%d", *(const signed char *)p ); p += 1; break;
++    case TLG_IN_UINT8:  if (p + 1 > end) break; TRACE_(tracelog)( "%u", *p ); p += 1; break;
++    case TLG_IN_INT16:  if (p + 2 > end) break; TRACE_(tracelog)( "%d", *(const short *)p ); p += 2; break;
++    case TLG_IN_UINT16: if (p + 2 > end) break; TRACE_(tracelog)( "%u", *(const USHORT *)p ); p += 2; break;
++    case TLG_IN_INT32:  if (p + 4 > end) break; TRACE_(tracelog)( "%d", *(const int *)p ); p += 4; break;
++    case TLG_IN_BOOL32: if (p + 4 > end) break; TRACE_(tracelog)( "%s", *(const int *)p ? "true" : "false" ); p += 4; break;
++    case TLG_IN_UINT32: if (p + 4 > end) break; TRACE_(tracelog)( "%u", *(const ULONG *)p ); p += 4; break;
++    case TLG_IN_HEXINT32: if (p + 4 > end) break; TRACE_(tracelog)( "%#lx", *(const ULONG *)p ); p += 4; break;
++    case TLG_IN_INT64:  if (p + 8 > end) break; TRACE_(tracelog)( "%s", wine_dbgstr_longlong( *(const LONG64 *)p )); p += 8; break;
++    case TLG_IN_UINT64:
++    case TLG_IN_FILETIME: if (p + 8 > end) break; TRACE_(tracelog)( "%s", wine_dbgstr_longlong( *(const ULONG64 *)p )); p += 8; break;
++    case TLG_IN_HEXINT64:
++    case TLG_IN_POINTER: if (p + 8 > end) break; TRACE_(tracelog)( "%#I64x", *(const ULONG64 *)p ); p += 8; break;
++    case TLG_IN_DOUBLE: if (p + 8 > end) break; TRACE_(tracelog)( "%f", *(const double *)p ); p += 8; break;
++    case TLG_IN_FLOAT:  if (p + 4 > end) break; TRACE_(tracelog)( "%f", *(const float *)p ); p += 4; break;
++    case TLG_IN_GUID:   if (p + 16 > end) break; TRACE_(tracelog)( "%s", debugstr_guid( (const GUID *)p )); p += 16; break;
++    case TLG_IN_COUNTEDSTRING:
++        if (p + 2 > end) break;
++        len = *(const USHORT *)p;
++        p += 2;
++        if (p + len > end) { p = end; break; }
++        TRACE_(tracelog)( "%s", debugstr_wn( (const WCHAR *)p, len / sizeof(WCHAR) ));
++        p += len;
++        break;
++    case TLG_IN_COUNTEDANSISTRING:
++    case TLG_IN_BINARY:
++        if (p + 2 > end) break;
++        len = *(const USHORT *)p;
++        p += 2;
++        if (p + len > end) { p = end; break; }
++        TRACE_(tracelog)( "%s", debugstr_an( (const char *)p, len ));
++        p += len;
++        break;
++    default:
++        /* An unrecognised type has an unknown length, so nothing after it in
++         * this event can be located; say so rather than print rubbish. */
++        TRACE_(tracelog)( "<type %u, rest of event skipped>", type );
++        p = end;
++        break;
++    }
++    *payload = p;
++}
++
++static void tracelog_dump( const EVENT_DATA_DESCRIPTOR *data, ULONG count )
++{
++    const BYTE *provider_meta, *event_meta, *payload, *payload_end;
++    ULONG provider_size, event_size, pos;
++    const char *provider_name, *event_name;
++
++    TRACE_(tracelog)( "event: %lu descriptor(s)\n", count );
++    if (count < 3) return;
++
++    provider_meta = (const BYTE *)(ULONG_PTR)data[0].Ptr;
++    event_meta = (const BYTE *)(ULONG_PTR)data[1].Ptr;
++    if (!provider_meta || !event_meta) return;
++
++    provider_size = data[0].Size;
++    event_size = data[1].Size;
++    if (provider_size < 3 || event_size < 4) return;
++
++    /* Provider metadata: size, then the name. */
++    provider_name = (const char *)provider_meta + 2;
++    if (!memchr( provider_name, 0, provider_size - 2 )) return;
++
++    /* Event metadata: size, tag bytes (top bit continues), then the name. */
++    pos = 2;
++    while (pos < event_size && (event_meta[pos] & 0x80)) pos++;
++    if (pos >= event_size) return;
++    pos++;
++    event_name = (const char *)event_meta + pos;
++    if (!memchr( event_name, 0, event_size - pos )) return;
++    pos += strlen( event_name ) + 1;
++
++    payload = (const BYTE *)(ULONG_PTR)data[2].Ptr;
++    payload_end = payload ? payload + data[2].Size : NULL;
++
++    TRACE_(tracelog)( "%s: %s", provider_name, event_name );
++
++    /* Field descriptors run to the end of the metadata blob; each is a name
++     * and a type, and the types say how to walk the payload alongside. */
++    while (pos < event_size && payload && payload < payload_end)
++    {
++        const char *field = (const char *)event_meta + pos;
++        UCHAR in_type;
++
++        if (!memchr( field, 0, event_size - pos )) break;
++        pos += strlen( field ) + 1;
++        if (pos >= event_size) break;
++
++        in_type = event_meta[pos++];
++        if ((in_type & TLG_IN_OUT_MASK) && pos < event_size) pos++;  /* out type */
++
++        TRACE_(tracelog)( " %s=", field );
++        if (in_type & TLG_IN_ARRAY_MASK)
++        {
++            TRACE_(tracelog)( "<array>" );
++            break;
++        }
++        tracelog_print_value( in_type, &payload, payload_end );
++    }
++    TRACE_(tracelog)( "\n" );
++}
++
++/******************************************************************************
+  *                  EtwEventWriteTransfer   (NTDLL.@)
+  */
+ ULONG WINAPI EtwEventWriteTransfer( REGHANDLE handle, PCEVENT_DESCRIPTOR descriptor, LPCGUID activity,
+                                     LPCGUID related, ULONG count, PEVENT_DATA_DESCRIPTOR data )
+ {
++    if (TRACE_ON(tracelog))
++    {
++        tracelog_dump( data, count );
++        return ERROR_SUCCESS;
++    }
++
+     FIXME("%s, %p, %s, %s, %lu, %p: stub\n", wine_dbgstr_longlong(handle), descriptor,
+           debugstr_guid(activity), debugstr_guid(related), count, data);
+     return ERROR_SUCCESS;
+@@ -428,6 +626,8 @@
+  */
+ BOOLEAN WINAPI EtwEventEnabled( REGHANDLE handle, const EVENT_DESCRIPTOR *descriptor )
+ {
++    if (TRACE_ON(tracelog)) return TRUE;
++
+     WARN("(%s, %p): stub\n", wine_dbgstr_longlong(handle), descriptor);
+     return FALSE;
+ }
