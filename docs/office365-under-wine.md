@@ -221,3 +221,41 @@ both the pristine and the CrossOver base:
 The Kerberos/MSV1_0 divergence from Windows is real but is a property of Wine's
 named-pipe `ncalrpc`, and on this path it is `\pipe\svcctl` that drags them in —
 so it is a second finding, not the blocker.
+
+## Word starts (2026-08-31, later the same day)
+
+`WINWORD.EXE` now reaches its own splash screen — the Microsoft 365 branding,
+the logo, "正在启动 Microsoft Word…" — with Chinese text rendering correctly,
+and reports an error of its own rather than dying in a loader. That is the whole
+of Word's UI framework, resource loading (the MUI patch) and font stack working.
+
+The chain that got there, each link found by running it and reading what it said:
+
+1. **Two directories differing only in case.** `import-office.sh` unfolded
+   `root/vfs/ProgramFilesCommonX64` into `Common Files/Microsoft Shared` while
+   also copying the drive's own `Common Files/microsoft shared`. NTFS is
+   case-insensitive and ext4 is not, so both existed, each holding half the
+   content, and Wine's case-insensitive lookup picked whichever it found first.
+   `OfficeClickToRun.exe` was in the half nobody looked in, which is why the
+   service failed with `ERROR_FILE_NOT_FOUND` while sitting on disk. Merging
+   them is what first got `ClickToRunSvc` to **RUNNING**.
+2. **`IAnalyticsInfoStatics2` missing from twinapi.appcore** — the service
+   activated `AnalyticsInfo`, QueryInterfaced for it, got `E_NOINTERFACE`, and
+   C++/WinRT turned that into a thrown exception that killed the service.
+3. **The AppV runtime virtualisation layer.** `AppvIsvSubsystems64.dll`'s
+   `DllMain` fails here, and a failed `DLL_PROCESS_ATTACH` aborts the whole
+   process. It is Click-to-Run's API-hooking layer, whose entire job is to
+   project `root\vfs` and `root\vreg` over the real system — **which this prefix
+   has already done for real**. `tools/appv-stub/` is a stand-in that reports
+   "not virtualised"; `APIExportForDetours` returns 1 because that is literally
+   what the shipped one does (`mov eax,1; ret`, read from the binary).
+4. **Three absent kernel32/kernelbase exports**, then
+   **`ole32.CoRegisterActivationFilter`**, then **`sppc.SLLoadApplicationPolicies`**
+   — each surfaced only after the previous was supplied.
+
+The delay-load diagnostic added to `ntdll` is what made step 4 tractable: the
+MSVC helper raises `VcppException(ERROR_PROC_NOT_FOUND)` with a `DelayLoadInfo`
+and Wine used to say nothing, so `0xC06D007F` in a log named no import at all.
+
+**Where it stops now:** Word's own dialog, in Chinese —
+*"很抱歉，出现错误，Word 不能启动。(6)"*. That is Word's error code, not Wine's.
