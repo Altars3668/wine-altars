@@ -186,3 +186,38 @@ The RPC target itself is fully identified without a debugger:
   the NDR transfer-syntax GUID and reading the 20 bytes before it
 * protocol **`ncalrpc`**, endpoint **`ClickToRun_Pipeline16`** — which is also
   `PipelineServerName` in the registry we already import
+
+## Correction: Word never talks to Click-to-Run's RPC interface
+
+`WINEDEBUG=+rpc` over a full Word start, 22525 lines. Two counts settle it:
+
+* occurrences of `ClickToRun_Pipeline16`: **0**
+* occurrences of the interface UUID `469d3a0e`: **0**
+
+Word does **not** contact the Click-to-Run pipeline at all. What it actually
+does, repeatedly, from several threads:
+
+    RpcStringBindingComposeW (ncacn_np, "\pipe\svcctl")
+    rpcrt4_conn_open_pipe    connecting to \\.\pipe\svcctl
+
+`svcctl` is the **Service Control Manager**. Word is asking the SCM about a
+service — and `ClickToRunSvc` is stopped, because it fails to start with 1077.
+
+This supersedes the earlier reading on this page, which had `c2r64.dll` calling
+the service and getting no answer. It never places the call. It asks the SCM
+whether the service is there, gets an answer it does not like, and stops. The
+interface UUID and endpoint extracted earlier are correct but not yet reached.
+
+**So the whole problem is now one goal: make `OfficeClickToRun.exe /service`
+start and register with the SCM.** What it says it is missing, unchanged across
+both the pristine and the CrossOver base:
+
+| missing | kind |
+|---|---|
+| `Windows.System.dll`, `Windows.System.Profile.dll`, `Windows.dll` | WinRT API-contract facade DLLs |
+| `kernelbase.PrivIsDllSynchronizationHeld` | not in the spec |
+| `wevtsvc.SvchostPushServiceGlobals` | not exported |
+
+The Kerberos/MSV1_0 divergence from Windows is real but is a property of Wine's
+named-pipe `ncalrpc`, and on this path it is `\pipe\svcctl` that drags them in —
+so it is a second finding, not the blocker.
