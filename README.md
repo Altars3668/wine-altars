@@ -12,7 +12,9 @@ Base: **Wine 11.0** + a 13-patch series carried over from the
     patches/mstsc/      the inherited 13-patch series (CredSSP, MUI redirection,
                         TraceLogging, srpapi, ...) — see patches/mstsc/README.md
     patches/office/     patches written for Microsoft 365 (empty until earned)
-    patches/ported/     work ported from wine-staging / Proton / wine-tkg
+    patches/ported/     work ported from wine-staging / Valve / wine-tkg
+                        (see docs/upstream-evaluation.md for what was rejected
+                         and why — that list is the useful half)
     scripts/            build, and the Office import pipeline
     docs/               what was measured, and where it currently stops
     wine-src/           the Wine tree (own git repo, gitignored here)
@@ -47,6 +49,16 @@ Click-to-Run's bootstrap, before any Office code of its own is loaded. What was
 measured, and what has been ruled out, is in
 [`docs/office365-under-wine.md`](docs/office365-under-wine.md) — read that
 before repeating any of it.
+
+## Docs
+
+* [`docs/office365-under-wine.md`](docs/office365-under-wine.md) — the Office
+  work: what was measured, what it rules out, where it stops.
+* [`docs/upstream-evaluation.md`](docs/upstream-evaluation.md) — wine-staging,
+  Valve and wine-tkg surveyed against this project's actual blocker. 131 + 400
+  commits looked at, one taken.
+* [`docs/method.md`](docs/method.md) — the instruments, and the traps already
+  hit.
 
 ## Method
 
