@@ -443,3 +443,31 @@ and never hits PDB addresses, in the same run.
 **So: names yes, addresses no.** Anything that needs an address has to recover
 it from the binary — export table, or by finding the function some other way —
 rather than trusting the PDB.
+
+### The dialog comes from mso.dll, not wwlib
+
+The `Boot::Ifr*` breakpoints never fired because they were in the wrong module.
+Wine's relay log carries a `ret=` for every call, which is the caller's address,
+so the question needed no symbols at all:
+
+    user32.MessageBoxW(0, L"很抱歉，出现错误，Word 不能启动。(6)",
+                       L"Microsoft Word 16.0", 0x1040)   ret=6fffec7960f7
+
+Resolving that against the module table **from the same run** (ASLR makes a
+table from another run useless, and Wine prints the bases in upper-case hex,
+which cost two wrong answers before it cost a right one):
+
+    0x6fffeb750000  mso.dll        <- ret lands here
+    RVA 0x10460f7, inside the function starting at RVA 0x10460b0 (+0x47)
+
+So the dialog is raised by **`mso.dll`, Office's shared layer**, not by Word's
+own `wwlib`. The format string living in `WWINTL.DLL` is only a resource; the
+code that formats and shows it is in mso.
+
+Worth noting from the same log: the line immediately before creates Word's real
+main window — `CreateWindowExW(..., L"OpusApp", L"Microsoft Word", ...)`. Word
+gets all the way to having a main window before this fires.
+
+`MSO.pdb` has the same address problem as `wwlib.pdb` (`DllGetLCID` differs from
+the export table by 0x9BE0), so the function at `0x10460b0` has no name yet. It
+does have an address, which is what a breakpoint needs.
