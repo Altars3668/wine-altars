@@ -37,3 +37,34 @@ in this project so far were confident inferences.
   that only ever goes up is worth printing.
 - **`pgrep -f` / `pkill -f` match the shell that ran them.** Resolve the PID
   another way.
+
+## Office symbols are published — I was wrong about this
+
+An earlier session of this project asserted that Office has no public symbols,
+by analogy with it not being a Windows component. That was an inference, and it
+was wrong. Measured:
+
+    scripts/pe-pdb-id.py <binary>     # read the CodeView RSDS record
+    https://msdl.microsoft.com/download/symbols/<pdb>/<GUID><age>/<pdb>
+
+| pdb | result |
+|---|---|
+| `wwlib.pdb` (Word's core) | **200**, 92.7 MB |
+| `MSO.pdb` (Office shared layer) | **200**, 87 MB |
+| `c2r64.pdb` | **200**, 6 MB |
+| `winword.pdb` | **200**, 118 KB |
+
+`kernel32.pdb` and `mstscax.pdb` were fetched in the same run as a control, so
+a 200 here means the request shape and the network are both right rather than
+the server answering everything.
+
+`wwlib.pdb` yields **264,870 public symbols** — `BootDialog`, `EndBootDialog`,
+`HrFatalError`, the whole `FInit*` family. Anything in this project that was
+deferred because "Office has no symbols" should be reconsidered.
+
+**llvm-pdbutil cannot read these.** Office builds with a 1024-byte MSF block, so
+a large PDB needs more directory block numbers than one block holds (wwlib: 352
+needed, 256 per block) and the block map spills across consecutive blocks;
+llvm-pdbutil reads only the first and fails with "Too many directory blocks".
+`scripts/pdb-symbols.py` handles it — it does the MSF directory, stream 3 for
+the symbol-record stream index, and S_PUB32, and nothing else.
