@@ -1,0 +1,135 @@
+From 919f102cb10f0ddea78770b1d3b20abbf06ef530 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 09:35:23 -0400
+Subject: [PATCH] sppc: answer "unlicensed" instead of failing, and stop faking
+ a policy handle.
+
+Two calls measured against Windows 11, on a machine where Office runs:
+
+  SLLoadApplicationPolicies(office app id, ...)
+      -> SL_E_APPLICATION_POLICIES_MISSING (0xc004f072), handle NULL
+  SLGetLicensingStatusInformation(all)
+      -> S_OK, 33 entries; the sku Word asks about is eStatus 3 with
+         hrReason 0xc004f009, the other 32 are eStatus 0 with
+         SL_E_PKEY_NOT_INSTALLED
+
+So even where Office is licensed and working, the software protection
+platform's answer here is "no product key". That matters, because
+failing the call and answering "unlicensed" are not the same thing to
+the caller: Office treats a failure as a broken licensing stack and
+stops with "cannot verify the license for this product", and treats an
+unlicensed answer as something to act on. Wine has no protection
+platform, so "no product key" is exactly what it can say honestly, in
+the shape the caller expects. The returned array is LocalAlloc'd; the
+caller frees it with LocalFree.
+
+SLLoadApplicationPolicies previously handed back a fake handle on the
+reasoning that "no policies" reads better than "cannot open the policy
+set". That was reasoning, not measurement, and the measurement
+disagrees. A fake handle only invites SLGetApplicationPolicy calls
+Windows would never have allowed.
+
+Measured effect: Word's "cannot verify the license" text is gone, and it
+starts asking for the sign-in broker instead.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ dlls/sppc/sppc.c  | 54 +++++++++++++++++++++++++++++++++++++----------
+ include/slerror.h |  2 ++
+ 2 files changed, 45 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/sppc/sppc.c b/dlls/sppc/sppc.c
+index 01397b9..ec7d4f1 100644
+--- a/dlls/sppc/sppc.c
++++ b/dlls/sppc/sppc.c
+@@ -34,9 +34,40 @@ WINE_DEFAULT_DEBUG_CHANNEL(slc);
+ HRESULT WINAPI SLGetLicensingStatusInformation(HSLC handle, const SLID *app, const SLID *product,
+                                                LPCWSTR name, UINT *count, SL_LICENSING_STATUS **status)
+ {
+-    FIXME("(%p %p %p %s %p %p) stub\n", handle, app, product, debugstr_w(name), count, status );
++    SL_LICENSING_STATUS *ret;
++
++    /* Failing this call and answering "unlicensed" are not the same thing to a
++     * caller. Office treats a failure as "the licensing platform is broken" and
++     * stops with "cannot verify the license for this product"; it treats an
++     * unlicensed *answer* as something to act on, which is the path that leads
++     * to its activation and sign-in flow.
++     *
++     * Measured on Windows 11 against a machine with a Microsoft 365
++     * subscription: this succeeds and returns 33 entries, and the entry Word
++     * asks about is not licensed either -- eStatus 3 with hrReason 0xc004f009,
++     * the other 32 being eStatus 0 with SL_E_PKEY_NOT_INSTALLED. So even where
++     * Office works, the answer here is "no product key". Wine has no software
++     * protection platform, so that is exactly what it can say honestly, in the
++     * shape the caller expects.
++     *
++     * The caller frees the array with LocalFree. */
++    FIXME("(%p %p %p %s %p %p) reporting one unlicensed sku\n", handle, app, product,
++          debugstr_w(name), count, status );
++
++    if (!count || !status)
++        return E_INVALIDARG;
++
++    if (!(ret = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, sizeof(*ret) )))
++        return E_OUTOFMEMORY;
++
++    if (product) ret->SkuId = *product;
++    else if (app) ret->SkuId = *app;
++    ret->eStatus = SL_LICENSING_STATUS_UNLICENSED;
++    ret->hrReason = SL_E_PKEY_NOT_INSTALLED;
+ 
+-    return SL_E_RIGHT_NOT_CONSUMED;
++    *status = ret;
++    *count = 1;
++    return S_OK;
+ }
+ 
+ HRESULT WINAPI SLOpen(HSLC *handle)
+@@ -69,21 +100,22 @@ HRESULT WINAPI SLPersistApplicationPolicies(const SLID *app, const SLID *product
+ }
+ 
+ /*
+- * The application-policy calls. Wine has no Software Protection Platform, so
+- * there are no policies to load -- but refusing outright is not the same as
+- * having none: a caller that cannot even open the policy set treats it as a
+- * broken licensing stack, while one that opens it and finds every value absent
+- * falls back on its own defaults. Office takes the second path and carries on,
+- * so hand it an empty policy set rather than a failure.
++ * The application-policy calls. An earlier version of this handed back a fake
++ * handle on the reasoning that "no policies" reads better to a caller than
++ * "cannot open the policy set". That was reasoning, not measurement, and the
++ * measurement disagrees: on Windows 11, with Office running fine, this call
++ * for Office's application id returns SL_E_APPLICATION_POLICIES_MISSING and
++ * leaves the handle NULL. A fake handle only invites SLGetApplicationPolicy
++ * calls Windows would never have allowed.
+  */
+ HRESULT WINAPI SLLoadApplicationPolicies(const SLID *app, const SLID *product, DWORD flags, HSLP *policy)
+ {
+-    FIXME("(%s,%s,%#lx,%p) stub, returning an empty policy set\n",
++    FIXME("(%s,%s,%#lx,%p) reporting no application policies\n",
+           wine_dbgstr_guid(app), wine_dbgstr_guid(product), flags, policy);
+ 
+     if (!policy) return E_INVALIDARG;
+-    *policy = (HSLP)0xdeadbeef;
+-    return S_OK;
++    *policy = NULL;
++    return SL_E_APPLICATION_POLICIES_MISSING;
+ }
+ 
+ HRESULT WINAPI SLGetApplicationPolicy(HSLP policy, LPCWSTR name, SLDATATYPE *type, UINT *size, LPBYTE *value)
+diff --git a/include/slerror.h b/include/slerror.h
+index 4980a96..b297441 100644
+--- a/include/slerror.h
++++ b/include/slerror.h
+@@ -22,6 +22,8 @@
+ #define SL_E_RIGHT_NOT_CONSUMED       0xC004F002
+ #define SL_E_VALUE_NOT_FOUND          0xC004F012
+ #define SL_E_RIGHT_NOT_GRANTED        0xC004F013
++#define SL_E_PKEY_NOT_INSTALLED       0xC004F014
+ #define SL_E_DATATYPE_MISMATCHED      0xC004F01E
++#define SL_E_APPLICATION_POLICIES_MISSING 0xC004F072
+ 
+ #endif /* __WINE_SLERROR_H */
+-- 
+2.53.0
+
