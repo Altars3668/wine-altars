@@ -349,3 +349,33 @@ Ruled out this round, each measured:
   we do not, are both present in the prefix. Word simply never gets to them.
 * **Word never touches the network.** No winhttp/wininet/DNS activity in a whole
   run, so this is not an online activation check timing out.
+
+### Word's startup chain, by name
+
+The published PDBs are **public-only**: `wwlib.pdb`'s TPI stream is 56 bytes
+with zero type records, so there are function names but no enum members, no
+locals, no line numbers. `scripts/pdb-enums.py` exists and works, but it has
+nothing to read here — worth knowing before planning around type information.
+
+The function names alone are enough to see the shape of the problem. `wwlib`
+has a **`Boot` class with 188 methods returning `InitFailureReason`**, one per
+startup step:
+
+    Boot::IfrFirstBoot          Boot::IfrOleRegister      Boot::IfrInitAppDocs
+    Boot::IfrFirstBoot2         Boot::IfrInitScreenRT     Boot::IfrInitDigSig
+    Boot::IfrEnsureTHRCLS       Boot::IfrInitTaskManager  Boot::IfrInitLD
+    Boot::IfrProcStartupPostIntl                          ... 188 in total
+
+The dialog's format string lives in Word's own resource dll — `WWINTL.DLL`
+carries `出现错误，<a> 不能启动。(<d>)`, where `<d>` is the number. So **error
+(6) is one of these `Ifr*` methods returning `InitFailureReason` 6**, and the
+question is now which one rather than what area.
+
+Each has an RVA from the PDB, so the next step is mechanical: break on their
+entry points, record the order they are called in, and read `rax` at the return
+of the last one. No guessing about licensing required.
+
+Tried and not useful here: the inherited `ntdll-tracelogging-decoder` patch does
+enable Word's ETW providers (`EtwEventRegister enabling provider ...` for a
+dozen of them), but Word writes essentially nothing before it fails — one event,
+no payload. Its `EvtWordCoreBootStart`/`Stop` never fire.
