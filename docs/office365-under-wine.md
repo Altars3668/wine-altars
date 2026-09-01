@@ -414,11 +414,31 @@ Not a constant offset. Reading the bytes settles which is right: every export
 address holds a real prologue (`mov [rsp+8],rbx; push rdi`, `sub rsp,28h`,
 `push rbx`), every PDB address holds mid-function bytes.
 
-This is not a parsing bug — the S_PUB32 record was dumped and checked field by
-field (`reclen=30 kind=0x110e flags=2 off=0178ced0 seg=1`), the PDB's own
-section table matches the PE's exactly, and the PDB's GUID/age
-(`E529CCD6-…-2`) is what the DLL asks for. The symbols are for a build that is
-not quite this binary.
+This is not a parsing bug, and that was checked properly rather than assumed:
+
+* The S_PUB32 record was dumped and read field by field
+  (`reclen=30 kind=0x110e flags=2 off=0178ced0 seg=1`).
+* Walking the symbol-record stream lands exactly on its end — 264,870 records,
+  29,908,348 of 29,908,348 bytes, every one S_PUB32, none misaligned.
+* **`pdb-symbols.py` agrees with `llvm-pdbutil` symbol for symbol.** On
+  `c2r64.pdb`, which llvm *can* read, llvm reports `_GUID_0000000a_…` at
+  `0002:407592` (decimal) and this reads `0002:00063828` — the same address.
+* The PDB's own section table matches the PE's exactly, all eight sections.
+* The PE has exactly one CODEVIEW debug entry, GUID/age `E529CCD6-…-2`, which
+  is what was fetched.
+* There are two `WWLIB.DLL` on disk with *different* symbol GUIDs — the one
+  under `Updates\Apply\FilesInUse` is a different build — but `+loaddll`
+  confirms Word loads `root\Office16\wwlib.dll`, the one this PDB belongs to.
+* No constant offset explains it: a histogram of (nearest `.pdata` start −
+  symbol offset) over 20,000 symbols is flat noise, top bucket 2.5%, and every
+  one of the eight section VAs as a base gives under 2%.
+
+One earlier check here was itself faulty and is worth flagging: comparing
+symbol addresses against `.pdata` entries. x64 `.pdata` holds only non-leaf
+functions and S_PUB32 holds plenty of data symbols, so a low hit rate proves
+nothing — the control (`c2r64`, whose PDB llvm can read) scored just as low.
+What actually decides it is the runtime: `bootrace` hits export-table addresses
+and never hits PDB addresses, in the same run.
 
 **So: names yes, addresses no.** Anything that needs an address has to recover
 it from the binary — export table, or by finding the function some other way —
