@@ -317,3 +317,35 @@ in its own way.
 
 That number is the most concrete thing left to pull on: find which call leaves
 197 in the thread's last-error, rather than guessing at licensing.
+
+### How far Word actually gets, and four more things ruled out
+
+With `WINEDEBUG=+loaddll`, Word now loads **657 modules**, and the list is close
+to complete: `wwlib`, `oart`, all five `mso*win32client`, `mso.dll`, and the
+typesetting stack — `msls70` (Microsoft Line Services), `mspts70`,
+`msptls70shared`, `pagelayout`, `MsoAria`, `riched20`. The last thing in the log
+is Direct2D/DXGI work:
+
+    dxgi:DXGID3D10CreateDevice Ignoring flags 0x20
+    d2d:d2d_d3d_create_render_target Ignoring render target usage 0x2
+    dxgi:dxgi_surface_GetDC ... semi-stub!
+
+So Word initialises nearly everything it has and then refuses.
+
+Ruled out this round, each measured:
+
+* **The 197 in Excel's dialog is not a Win32 error at all.** Tracing
+  `RtlNtStatusToDosError` and `SetLastError` over a whole Excel run finds no 197
+  anywhere. It is an Office-internal code that Office rendered through
+  `FormatMessage`, which picked an unrelated system string. Chasing it is a dead
+  end — a good reminder that a plausible-looking number can be a coincidence.
+* **The licensing registry is complete.** All eight subkeys under
+  `HKCU\...\Common\Licensing` (`CachedLicenseData`, `LicensingExperience`,
+  `ServicePlanFeatures`, the SKU GUID, …) match the source hive exactly.
+* **Hardware graphics acceleration.** `DisableHardwareAcceleration`,
+  `DisableAnimations` and `Avalon.Graphics\DisableHWAcceleration` all set — the
+  dialog is unchanged, despite `dxgi_surface_GetDC` being a semi-stub.
+* **`gfx.dll` and `aitrx.dll`**, the only two Office modules Windows loads that
+  we do not, are both present in the prefix. Word simply never gets to them.
+* **Word never touches the network.** No winhttp/wininet/DNS activity in a whole
+  run, so this is not an online activation check timing out.
