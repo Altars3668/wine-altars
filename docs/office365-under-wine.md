@@ -379,3 +379,47 @@ Tried and not useful here: the inherited `ntdll-tracelogging-decoder` patch does
 enable Word's ETW providers (`EtwEventRegister enabling provider ...` for a
 dozen of them), but Word writes essentially nothing before it fails — one event,
 no payload. Its `EvtWordCoreBootStart`/`Stop` never fire.
+
+### The startup structure, and why the PDB's addresses cannot be used
+
+`wwlib` turns out to have a `Boot` class with a readable shape:
+
+    Boot::FRun               Boot::ShowBootErrorEid    Boot::FAnyTaskFailed
+    Boot::PrepareRun         Boot::LogBootTaskTelemetry
+    Boot::FShowSplashScreenBasicChecks
+    Boot::Ifr* x180          (each returning InitFailureReason)
+
+`ShowBootErrorEid` is the dialog, and `FAnyTaskFailed` says startup is a task
+list rather than a straight call chain. That is the map of the problem.
+
+`tools/bootrace/` was written to walk it: a debugger (not an injected dll) that
+arms `int3` at a list of RVAs, prints each as it is reached, restores the byte
+and steps `rip` back. **It works** — armed on the export table's `FMain` and
+`DllMain` it prints both, in order.
+
+**But the published PDB's symbol addresses do not match this binary.** All 180
+`Boot::Ifr*` breakpoints, and all 15 non-`Ifr` `Boot` methods, were armed
+successfully and *never hit* — while `bootrace` proved itself on the same run
+using export-table addresses. Cross-checking the three symbols that appear in
+both places:
+
+| symbol | export table | PDB (seg 1 + 0x1000) | difference |
+|---|---|---|---|
+| `DllMain` | `00176460` | `003ae2d0` | — |
+| `DllGetClassObject` | `00f32e60` | `00e99a10` | `0x99450` |
+| `DllCanUnloadNow` | `017b4bf0` | `0178ded0` | `0x26D20` |
+| `FMain` | `01362cd0` | `01322510` | `0x407C0` |
+
+Not a constant offset. Reading the bytes settles which is right: every export
+address holds a real prologue (`mov [rsp+8],rbx; push rdi`, `sub rsp,28h`,
+`push rbx`), every PDB address holds mid-function bytes.
+
+This is not a parsing bug — the S_PUB32 record was dumped and checked field by
+field (`reclen=30 kind=0x110e flags=2 off=0178ced0 seg=1`), the PDB's own
+section table matches the PE's exactly, and the PDB's GUID/age
+(`E529CCD6-…-2`) is what the DLL asks for. The symbols are for a build that is
+not quite this binary.
+
+**So: names yes, addresses no.** Anything that needs an address has to recover
+it from the binary — export table, or by finding the function some other way —
+rather than trusting the PDB.
