@@ -471,3 +471,170 @@ gets all the way to having a main window before this fires.
 `MSO.pdb` has the same address problem as `wwlib.pdb` (`DllGetLCID` differs from
 the export table by 0x9BE0), so the function at `0x10460b0` has no name yet. It
 does have an address, which is what a breakpoint needs.
+
+## Error (6), named: the App-V registry tokens were never expanded (2026-09-01)
+
+The winedbg backtrace of the thread sitting on the dialog is short enough to
+read end to end:
+
+    user32.MessageBoxW
+    mso            +0x10460f7
+    mso30win32client +0x683833
+    wwlib          +0x1421b3d
+    wwlib          +0x616eb9
+    wwlib          +0x1004abc     <- the caller that decides the number
+    wwlib          +0xbf1079
+    winword        +0x1368
+
+Disassembling the frame that decides the number, `wwlib+0x1004a00`, gives the
+whole answer in twenty instructions:
+
+    call  [mso!#36903]        ; a process-wide singleton
+    xor   ebx, ebx
+    test  rax, rax
+    jne   done                ; non-NULL -> return 0
+    ...
+    lea   edx, [rbx+0x42]
+    lea   ebx, [rdx-0x3c]     ; ebx = 0 + 0x42 - 0x3c = 6
+    call  wwlib+0x616e10      ; "Word cannot start (6)"
+
+So "(6)" is not a stage index. It is a constant added at one call site, and
+that call site is reached by exactly one condition: `MSO.dll` ordinal 36903
+returned NULL. That ordinal is a magic-static that calls
+`Mso30Win32Client!#24676(0x4d, ...)` once and caches the result, which
+dispatches to `Mso98win32client+0xae788` — a function that names itself in its
+own trace string:
+
+    L"[T%d]%s: called on token %#x (%s)"   with   L"LoadLocalizedLibraryCore"
+
+Breaking there with `bootrace -wstr rbp+0x3c0` (the buffer the function fills
+with the library's name) says which library token `0x4d` is, and what path was
+composed for it:
+
+      3 after_path
+          rbp+960  = "MSPTLS.DLL"
+          rbp-96   = ""
+
+An empty path. `MSPTLS.DLL` is present -- twice -- in the copied installation,
+so nothing was missing; the path composer produced nothing. It composes from
+`HKLM\Software\Microsoft\Office\16.0\Common\InstallRoot\Path`, and that value
+in the prefix read:
+
+    "Path" = "[{AppVPackageRoot}]\Office16\"
+
+That is an App-V token. The virtual registry stores every path that way, and on
+Windows the tokens never reach the application: `AppvIsvSubsystems64.dll` hooks
+the registry APIs and substitutes them on the way out. This fork replaces that
+dll with a stub that returns 1, so nothing substituted them.
+
+2623 `[{AppVPackageRoot}]` plus ten other tokens, all in the vreg dumps and
+none in the real hives -- which also explains why applying the real HKLM tree
+after the vreg did not fix it: the real hive has no `InstallRoot\Path` at all,
+only a `Virtual` subkey. The token *is* the value.
+
+`export-office-registry.py` now substitutes them at export time, in value data,
+value names and key paths -- Office keys its ChangeNotify and compatibility
+tables by path, so data alone would not have been enough. Two things to know if
+this is ever revisited: the test for a token has to be done on UTF-16 bytes
+(`b"[\x00{\x00"`), because as ASCII it never matches; and `user.reg` has its own
+`[{` strings that are JSON, not tokens.
+
+## Then it crashed, and Windows said why (2026-09-01)
+
+With the paths expanded, Word got past (6) and died instead:
+
+    Unhandled page fault on read access at vcruntime140+0xf0e0 (wcsstr)
+    mso +0x2d75f7 ... mso +0x9d5ba ... wwlib +0x1b3096d ... winword+0x1368
+
+`mso+0x2d75e3` is `mov r15,[rbx+0x30]` followed by
+`wcsstr(r15, L"\\?\Volume{")`, and `[rbx+0x30]` held garbage. Reading back up
+the function gives what fills it:
+
+    GetVolumePathNameW(path, buf, 0x104)
+    GetVolumeNameForVolumeMountPointW(buf, guid, 0x104)
+    CreateFileW(guid, 0, 0, NULL, OPEN_EXISTING, 0, NULL)
+    if (handle != INVALID_HANDLE_VALUE) {
+        info->Version = 2;
+        r = VirtDisk.GetStorageDependencyInformation(handle, 1, 0x400, info, &size);
+        if (r == ERROR_INSUFFICIENT_BUFFER) retry;
+        if (r == 0) use info->Version2Entries[0].HostVolumeName;   <- here
+    }
+
+Office reads entry 0 whenever the call succeeds and never looks at
+`NumberEntries`. Wine's stub returned `ERROR_SUCCESS` with `NumberEntries = 0`
+and left the rest of the buffer untouched, so Office read whatever was there.
+
+Rather than guess what Windows does, the same sequence was compiled with mingw
+and run on both sides. On Windows 11:
+
+    volume guid: '\\?\Volume{69a2ea4e-...}\'
+    CreateFileW(guid with trailing backslash) -> INVALID_HANDLE_VALUE (err 3)
+    CreateFileW(guid without it)              -> ok
+    GetStorageDependencyInformation(flags=1)  -> 0xc03a0015, used=0
+    small buffer (8)                          -> 87 (ERROR_INVALID_PARAMETER)
+
+and under this fork's Wine, before the fix:
+
+    CreateFileW(guid with trailing backslash) -> handle 0x34 (err 0)
+    GetStorageDependencyInformation(flags=1)  -> 0 (success), entry = poison
+    small buffer (8)                          -> 0
+
+Two divergences, either of which is enough on its own. The one fixed here is
+virtdisk: `ERROR_VIRTDISK_NOT_VIRTUAL_DISK` is both what Windows answers and
+the honest answer for a Wine that has no virtual disk stack at all. The other
+-- Wine opening `\\?\Volume{...}\` where Windows returns ERROR_PATH_NOT_FOUND
+-- is left alone for now; it is in path handling, it is riskier to touch, and
+with virtdisk correct Office reaches the same branch it reaches on Windows.
+
+## Where it stops now: the licence (2026-09-01)
+
+Word now builds its entire UI. `winedbg`'s `info window` shows the real thing,
+not a splash screen:
+
+    OpusApp                     "Word"        <- Word's main frame
+      FullpageUIHost / NetUIHWND
+      _WwF                                    <- the document frame
+      MsoCommandBarDock             x4        <- the docks
+      MsoWorkPane / NUIPane / NetUIHWND
+    NUIDialog                   "Microsoft Word"
+
+and the main thread sits in `DispatchMessageW` inside `mso40uiwin32client` --
+a modal dialog's message pump, not a hang.
+
+The dialog paints as an empty rectangle, which made it unreadable by
+screenshot. Office draws its own dialogs: a `NUIDialog` has one `NetUIHWND`
+child and no controls, so there is nothing for a screenshot to fall back on
+when the drawing is the broken part. MSAA asks the application for the text
+instead, which works whether or not a pixel reached the screen --
+`tools/uidump` does that:
+
+    NUIDialog "Microsoft Word" 375x177
+      NetUIHWND
+        [graphic]      name="错误图标"
+        [static text]  name="Microsoft Office 无法验证此产品的许可证。
+                             应使用控制面板修复 Office 程序。"
+        [push button]  name="确定"
+        [push button]  name="帮助"
+
+So the remaining gate is Office licensing, not Wine. Word is otherwise up.
+Immediately before the dialog, Office activates
+`Windows.Security.Authentication.OnlineId.OnlineIdSystemAuthenticator` and then
+launches `winebrowser.exe` -- it is trying to sign in. The supported way past
+this is to sign in to the Microsoft 365 account inside the prefix, which needs
+the account holder's credentials.
+
+Certificate work is not the problem: with `+crypt` on, every
+`CertGetCertificateChain` returns 1 and `CertVerifyCertificateChainPolicy`
+returns no error.
+
+Still open, all measured, none of them the licence gate:
+
+  - `Windows.Security.EnterpriseData.ProtectionPolicyManager` (6 activations)
+  - `Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager` (2)
+  - `Windows.System.Profile.SharedModeSettings` (1)
+  - msxml3 rejects Office's Ribbon extensibility schema: libxml2 calls an
+    attribute that appears both directly and through an attributeGroup a
+    "Duplicate attribute use", MSXML accepts it
+  - `{99d651d7-5f7c-470e-8a3b-774d5d9536ac}` (VSTOAddinLoader) is not
+    registered, because the VSTO runtime lives outside the Office package and
+    was never copied
