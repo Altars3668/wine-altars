@@ -735,3 +735,68 @@ Two traps found on the way, both cheap to repeat by accident:
     -0x25740, `FileIO` ones -0x1EEE0), all inside `.text` and all in segment 1.
     An earlier session recorded this for one symbol; it holds generally.
     Names yes, addresses no -- confirmed, not merely inherited.
+
+## The broker had to answer, not fail — and then Office went further (2026-09-02)
+
+`Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager` is the
+sign-in broker, and Office asks it about the account its own cache names
+(`0003BFFD6D5A3345`, the same id the licence's `RenewalToken` carries). In the
+in-tree WAM shim, `FindAccountAsync` was one of the `STUB_ASYNC` macros:
+
+    #define STUB_ASYNC(name, sig, args) \
+    static HRESULT WINAPI name sig \
+    { FIXME args; if (result) *result = NULL; return E_NOTIMPL; }
+
+which is the sppc mistake again in a different dll. "There is no account with
+that id" and "this API does not exist" are not the same answer: on `E_NOTIMPL`
+Office concludes the broker is broken and stops asking, where a **completed
+operation carrying no account** is something it acts on — and it is what
+Windows answers for an id the broker does not hold. Its neighbour
+`GetTokenSilentlyAsync` already had this right, returning
+`create_token_result_operation(3, NULL, ...)` — status 3, *interaction
+required* — instead of failing.
+
+The operation object could not express "completed, carrying nothing" — three
+places `AddRef`/`Release`d the payload unconditionally — so those were made
+NULL-tolerant, `FindAccountAsync` now returns `create_object_operation(NULL,
+result)`, and `FindAllAccountsAsync` was pointed at `create_findall_operation`
+like the `WithClientId` sibling right below it that already answered.
+
+**Measured effect, same prefix, one variable changed:**
+
+| `WINEDEBUG=+webauth` | before | after |
+|---|---|---|
+| `FindAccountAsync` | 19, all `E_NOTIMPL` | answered |
+| `GetTokenSilentlyAsync` | — | 20 |
+| `FindAllAccountsWithClientIdAsync` | — | 40 |
+| `request_get_Properties` / `string_map_Insert` | — | 203 |
+| `response_get_Token` | — | 20 |
+
+So Office stops treating the broker as broken and walks the whole token
+acquisition path: it builds token requests, resolves the provider
+(`https://login.microsoft.com`, authority `consumers` — the consumer MSA
+provider), and reads tokens back out.
+
+The dialog is unchanged, and that is the honest result: this removed a gap,
+it did not remove the last one.
+
+### Where it stops now, and it is one file
+
+The shim already has the injection point: `GetTokenSilentlyAsync` reads
+`Z:\tmp\office-wam-token.txt` and, if it can, hands the contents back as a
+successful token response. That file exists, and the log proves it is being
+used — across 20 calls there is **not one** `no authorized token available`
+line, and `response_get_Token` fires 20 times. Office is being handed a token,
+is reading it, and is still refusing.
+
+The token was written at 18:44 the previous day and read back after 04:00, so
+it is roughly nine hours old against an MSA access-token lifetime of about one
+hour. **The next thing to try is simply a fresh token in that file** — no DPAPI
+work, no identity-cache transplant, no credentials leaving any machine. If a
+fresh token still leaves the dialog up, then the token's audience is wrong
+rather than its age, and the request properties Office fills in (203
+`string_map_Insert` calls on each request) name what it is actually asking for.
+
+Worth keeping in view: the licence still carries another machine's
+`HardwareId`, so even a successful sign-in has to result in Office obtaining a
+licence for *this* device rather than validating the transplanted one.
