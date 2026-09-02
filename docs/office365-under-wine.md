@@ -638,3 +638,100 @@ Still open, all measured, none of them the licence gate:
   - `{99d651d7-5f7c-470e-8a3b-774d5d9536ac}` (VSTOAddinLoader) is not
     registered, because the VSTO runtime lives outside the Office package and
     was never copied
+
+## The per-user half was in a profile Office never opens (2026-09-02)
+
+The licence dialog had been read as a licensing problem. It was, but not the
+one it looked like: **none of the per-user import was where Office looks for
+it.** `WINEDEBUG=+file`, one run, says it in a line:
+
+    GetFileAttributesExW L"C:\users\crossover\AppData\Local\Microsoft\Office\Licenses\5" 0 ...
+    NtQueryFullAttributesFile L"\??\C:\users\crossover\...\Licenses\5" not found (c000003a)
+
+`import-office.sh` copied the licence, the identity caches and the Roaming
+templates into `C:\users\$USER` — `user`. The CrossOver base this fork
+builds on names its Windows user **`crossover`**, always, whatever `$USER` is:
+
+    dist/bin/wine     -> USERNAME=user    USERPROFILE=C:\users\user
+    dist-cx/bin/wine  -> USERNAME=crossover   USERPROFILE=C:\users\crossover
+
+and `run-word.sh` defaults to `dist-cx`. Counted over the same run: 744 + 332
+path references under `crossover`, and the only `user` ones are `%TEMP%`.
+So Office was reading an empty profile one directory away from the whole
+subscription, and reporting itself unlicensed — which is the honest answer to
+the question it was actually asking.
+
+`import-office.sh` now asks the runtime instead of assuming:
+
+    WIN_PROFILE="$("$WINE" cmd /c 'echo %USERNAME%')"
+
+The failure mode is worth remembering because nothing about it looks like a
+bug: every copy succeeds, every file is present, and the application is right.
+
+### What that did not fix, measured
+
+Putting the licence in the right profile changed nothing observable — the same
+`NUIDialog`, the same window set. Two further things were ruled out and one
+was named:
+
+  - **Expiry is not the gate.** The imported token had `NotAfter
+    2026-08-02`, already past. A valid one taken from another machine of the
+    same subscription (`NotAfter 2026-11-14`, same `UserId`) produces an
+    **identical** dialog. `HardwareId` is per-machine and differs between the
+    two, so a token issued elsewhere is not expected to satisfy this device
+    either -- but expiry, at least, is not what is being complained about.
+  - **The dialog cannot be read the usual two ways.** It paints nothing (a
+    1920x1080 screenshot holds 12 colours), and MSAA returns empty names for
+    every static in it, so `tools/uidump` gets the shape -- error icon, a link,
+    a check button, six buttons, one of them `确定` -- and no text.
+  - **Office's own identity cache does not decrypt.** 259
+    `CryptUnprotectData` calls fail, every one of them with
+    `unrecognized CryptProtectData block` / `info0 magic value not matched`.
+    Attributing each failure to the file its thread opened last puts all 259
+    in one place:
+
+        C:\users\crossover\AppData\Local\Microsoft\IdentityCache\1\UD\
+            u_*\e_C2GK9UTC67FSUCG3\{Accounts,AT,ID}\*.bin
+
+    These are Windows-sealed DPAPI blobs. Wine's `CryptProtectData` derives its
+    key from the user name, a fixed in-tree secret and a salt carried in the
+    blob -- there is no machine master key -- so it can only open what Wine
+    itself wrote, and it says so rather than guessing. Office reads the cache,
+    gets nothing back, and concludes it is not signed in.
+
+  - `webauth.FindAccountAsync` is a stub, and Office calls it with the exact
+    account the licence names (`0003BFFD6D5A3345`, matching the token's
+    `RenewalToken` identity). So a fresh in-prefix sign-in has a second gap
+    waiting behind the first.
+
+  - Office never calls `CryptProtectData` in these runs, so the cache cannot
+    heal itself even once something else is fixed.
+
+### Bridging DPAPI, and the precondition that makes it possible
+
+The one measurement that decides whether the cache can be transplanted at all:
+**Office reads these records with `pOptionalEntropy = NULL`.** Wine's `report()`
+dumps the entropy blob whenever it is non-NULL, and across all 259 calls it
+dumped none. Since Wine's key is (user name + fixed secret + stored salt +
+entropy), a record re-sealed with NULL entropy **as the user Office runs as**
+is a record Office can open.
+
+That gives a bridge with no guessing in it: recover the plaintext on the
+Windows machine that owns the master key, and re-seal it with this Wine's own
+`CryptProtectData` from inside the prefix, as `crossover`. The plaintext never
+needs to touch disk on this side -- it can stream from ssh straight into the
+re-sealing tool.
+
+Two traps found on the way, both cheap to repeat by accident:
+
+  - **Opening a live Office telemetry `.db` read-write destroys its WAL.**
+    `OTele\winword.exe.db` had a 1.2 MB `-wal`; a single `sqlite3 .tables`
+    against the file checkpointed and deleted it, and the events it held were
+    already drained. Copy `db` + `-wal` first, query the copy.
+  - **The PDB address skew is not a constant**, so it cannot be corrected for.
+    `MSO.pdb`'s GUID/age match the shipped `MSO.DLL` exactly, and yet across
+    the 62 exported names that appear in both, the PDB-to-binary delta takes
+    **36 distinct values** (`DllGetLCID` -0x9BE0, a block of `IMsoNotebook*`
+    -0x25740, `FileIO` ones -0x1EEE0), all inside `.text` and all in segment 1.
+    An earlier session recorded this for one symbol; it holds generally.
+    Names yes, addresses no -- confirmed, not merely inherited.

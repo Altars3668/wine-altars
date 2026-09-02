@@ -48,11 +48,19 @@ multiarch build costs several times as much for nothing.
                                          # ext4 prefix) -- see the docs for why
                                          # OfficeClickToRun.exe went missing
 
-**Status: Word does not start yet.** It gets 186 modules in and stops inside
-Click-to-Run's bootstrap, before any Office code of its own is loaded. What was
-measured, and what has been ruled out, is in
+**Status: Word builds its whole UI and stops on licensing.** It reaches its
+Start screen and a modal dialog; the remaining gate is that Office cannot read
+its own identity cache, because those records are DPAPI blobs sealed on real
+Windows and Wine can only open what Wine sealed. What was measured, and what
+has been ruled out, is in
 [`docs/office365-under-wine.md`](docs/office365-under-wine.md) — read that
 before repeating any of it.
+
+One trap that cost a whole investigation, in case it bites again: the per-user
+half of the import must go into the profile **the runtime** uses. `dist-cx`
+(the CrossOver base) runs Office as `crossover`, not `$USER`, so a licence
+copied to `C:\users\$USER` is invisible and Office correctly reports itself
+unlicensed. `import-office.sh` now asks `wine` rather than assuming.
 
 ## Docs
 
