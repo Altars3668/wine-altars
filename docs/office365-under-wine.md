@@ -800,3 +800,70 @@ rather than its age, and the request properties Office fills in (203
 Worth keeping in view: the licence still carries another machine's
 `HardwareId`, so even a successful sign-in has to result in Office obtaining a
 licence for *this* device rather than validating the transplanted one.
+
+## The gate is local, and it is the HardwareId (2026-09-02)
+
+Three measurements, in this order, moved the answer a long way from where it
+looked like it was.
+
+**1. Office never asks a licensing service.** `WINEDEBUG=+winhttp,+wininet`
+over a whole run reaches exactly four hosts:
+
+    mobile.events.data.microsoft.com      telemetry, 8x /OneCollector/1.0/
+    support.content.office.net            word_whatsnew.xml
+    relcomms-prod-...b02.azurefd.net      content
+    wus-000.odc.officeapps.live.com       /restore
+
+No `ols.officeapps.live.com`, no `licensing.mp.microsoft.com`, nothing. So
+whatever decides "unlicensed" decides it **offline**, and no amount of token
+freshness reaches that decision -- a token Office never spends cannot be the
+thing stopping it.
+
+**2. Office does read the licence.** With the token finally in the profile the
+runtime uses, `+file` shows the whole sequence on it: `FindNextFileW` enumerates
+`Licenses\5\*`, then `CreateFileW`/`NtCreateFile` open the token itself. It also
+looks for `Licenses\5\Grace\0` and `ProgramData\...\Licenses\5\Perpetual` and
+finds neither. So the file is found, opened, parsed -- and rejected.
+
+**3. A working machine has none of the identity state we were chasing.** The
+same Office, licensed and working, on the machine the fresh token came from:
+
+    HKCU\...\Common\Identity\Identities            0 subkeys
+    HKCU\...\Common\Identity\ConnectedAccountCID   (empty)
+
+This prefix has `ConnectedAccountCID` **set**, inherited from the imported hive,
+and the working machine does not. So the empty `Identities` key here was never
+the problem, and the identity registry is not what separates licensed from not.
+
+Put together: what makes the reference machine licensed is a signed licence
+whose `HardwareId` matches the device it is on, validated entirely offline. The
+token here is signed, in date and for the right subscription, and the one field
+left that can disqualify it is the `HardwareId`, which belongs to the other
+machine.
+
+**This is not something to work around.** Making this prefix compute the other
+device's `HardwareId` would be defeating the device binding, and the allowance
+the subscription grants is counted in exactly those ids. The legitimate route is
+the one the subscription already provides: a one-time online activation issuing
+a licence for *this* device, after which it validates offline the way the
+reference machine's does. That is gated on sign-in working, which is the WAM
+shim, which is where the remaining work is.
+
+### Two things ruled out along the way, cheaply
+
+  - **Office was chasing the wrong account, and that was self-inflicted.**
+    Migrating the identity caches into the right profile also brought in
+    OneAuth's five account records -- three for work/school tenants, two
+    consumer. Office picked a work account with no relationship to the
+    `O365HomePremRetail` subscription installed here, and put a `LoginHint` for
+    it on every request. Narrowing `OneAuth/accounts/` to the one CID the
+    licence itself names removed the hint and a stray `claims` property. It did
+    not change the dialog, which is consistent with measurement 3.
+  - **`get_UserName` is not read.** The shim returned an empty user name while
+    `get_Id` answered properly from `ConnectedAccountCID`; that asymmetry looked
+    like a candidate. Counted over a run, Office calls `account2_get_Id` 16
+    times and `get_UserName` **zero**. Making the name resolve is still the more
+    honest answer, and it is not the gap.
+
+Account identifiers are deliberately not written down here; they are in the
+prefix's own hive and OneAuth records for anyone who needs them.
