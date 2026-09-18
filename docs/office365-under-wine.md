@@ -6339,3 +6339,51 @@ MathType 自己的 `Setup.exe` 能跑起来并认出已有安装，但**跑不�
 用原始安装程序在 prefix 里重装一遍。要真正打通工具栏集成，缺的就是这个安装包。
 
 在此之前该模板不安装；公式通过 `插入 > 对象` 走 OLE 注册，MathType 主程序照常用。
+
+### 验一遍：公式到底能不能插进去、功能区到底有没有
+
+上面这些结论此前都是"注册表看着对"推出来的，没有一条是量出来的。补测之后有两条
+需要写进来。
+
+**一、两个公式对象在 64 位客户端里都真的能创建。** `tools/oleprobe` 把
+"插入 > 对象"的三步拆开报 HRESULT：
+
+```
+=== Equation.DSMT4 ===            === Equation.AxMath ===
+  ProgID 解析      {0002CE03-…}     ProgID 解析      {B18C2BCC-…}
+  创建(进程内   ) 失败 0x80040154   创建(进程内   ) 失败 0x80040154
+  创建(本地服务器) 成功 0x00000000   创建(本地服务器) 成功 0x00000000
+    IOleObject       有 0x00000000     IOleObject       有 0x00000000
+                                       对象名           Equation.AxMath
+```
+
+`进程内` 那行的 `0x80040154` 不是毛病：两个产品都注册成 `LocalServer32`，
+跨进程激活本来就是它们该走的路，而 64 位客户端驱动 32 位的进程外服务器是正常的。
+
+**二、AxMath 的 Word 功能区加载项是完整工作的。** 这一条推翻了"32 位产品的模板
+进不了 64 位 Word"的想当然。`AxMath.dotm` 就在 Word 的 `STARTUP` 目录里，Word
+启动后用 MSAA 读功能区（`tools/uidump`，不依赖截图）：
+
+```
+name="功能区选项卡" value="Ribbon Tabs List" [page tab list]
+  … name="视图" [page tab] rect=(374,49,44,31)
+    name="AxMath" [page tab] rect=(419,49,70,31)
+    name="Zotero" [page tab] rect=(490,49,63,31)
+```
+
+点开之后里面的命令也都排好了版：行内公式、行间公式、左/右编号公式、插入引用、
+插入编号、更新编号、Browse Equations…… 都带实际的布局矩形。也就是说**Word 里
+有一个完全可用的公式编辑器**，只不过是 AxMath 而不是 MathType。
+
+这同时给 MathType 模板的崩溃划掉了一整类解释：AxMath 同样是 32 位安装程序装的
+32 位产品，它的模板在同一个 64 位 Word 里加载得好好的。所以那个崩溃不是位数问题。
+
+**顺带证伪一个看着很像的猜想。** AxMath 的 CLSID 只写在
+`HKLM\SOFTWARE\Classes\WOW6432Node\CLSID` 下，而它的 ProgID 在 64 位视图——按
+Windows 的规矩，64 位 Word 顺着 ProgID 找过去应该找不到类。于是我把 CLSID 镜像
+进 64 位视图。做对照实验（有镜像 / 删掉镜像 / 再镜像回去，各跑一轮）的结果是
+**三轮全部成功**：Wine 的 `HKLM\Software\Classes` 根本不按位数分视图。镜像是多余
+的，会让 prefix 偏离源安装，已经撤销。
+
+教训和本文档前面那次 `oVft` 一样：改 Wine 或改 prefix 之前，先做一次会失败的对照
+实验，否则分不清是修好了还是本来就没坏。
