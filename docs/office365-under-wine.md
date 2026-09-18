@@ -6116,21 +6116,53 @@ trace:amsi:probe scanner ready at "/var/run/clamav/clamd.ctl"
 `CoCreateInstance` 返回 `REGDB_E_CLASSNOTREG`；`scripts/register-amsi.sh` 负责这件事，
 已接入 `import-office.sh`。
 
-### 宏仍然跑不起来，但阻塞点在别处
+### 宏的真正阻塞点：MathType 塞进 Office 目录的 MathPage.wll
 
-AMSI 通了之后，宏依然没能运行，原因是另一个独立缺陷：把宏安全设置临时放开后，
-Word 加载 VBA 工程时 **VBE7.DLL 直接崩溃**：
+AMSI 通了之后宏依然跑不起来。把宏安全设置临时放开，Word 加载 VBA 工程时
+**直接崩在 VBE7.DLL**：
 
 ```
 Unhandled page fault on execute access to 0000000000004000
   VBE7.DLL +0xebd3e / +0x3fdb40 / +0xec2a2 ...
 ```
 
-跳到 `0x4000` 执行，是典型的"拿到一个没被正确填写的值当函数指针用"。用
-`WINEDLLOVERRIDES=amsi=d` 完全禁掉 amsi 再试，崩溃与调用栈**一模一样**——
-确认与本次 AMSI 改动无关，是既有问题。崩溃前刷了大量
-`fixme:ole:ITypeInfo_fnGetMops`，但那个 stub 已经正确设置 `*pBstrMops = NULL`
-并返回 `S_OK`，不是崩溃源，还需要继续定位。
+跳到 `0x4000` 执行，典型的"拿到一个没被正确填写的值当函数指针用"。
 
-默认宏安全设置（禁用并通知）下 Word 压根不加载 VBA，所以不会碰到这个崩溃——
-这也是为什么平时只表现为"宏没启用"。
+逐项二分，每步都实测：
+
+| 条件 | 结果 |
+|---|---|
+| `WINEDLLOVERRIDES=amsi=d` 完全禁掉 amsi | 崩溃，调用栈一模一样 |
+| `/a`（禁用加载项与全局模板） | **不崩** |
+| 清空 STARTUP（AxMath、Zotero） | 仍崩 |
+| 注册表 7 个加载项全部 `LoadBehavior=0` | 仍崩 |
+| 移开 Normal.dotm | 仍崩 |
+| 换成完全没有宏的文档 | 仍崩 |
+| **移开 `Office16\MathPage.wll`** | **不崩** |
+
+所以与 AMSI 无关，与被打开的文档无关，也不是 STARTUP 模板或注册表加载项——
+只要 `VBAWarnings=1` 让 VBA 引擎真正加载，`MathPage.wll` 就会把它带崩。
+
+这个 `MathPage.wll` **不是 Office 自带的那个**。Office 原版只导出 `MP*`
+（另存为网页时处理公式），而这一份还导出大量 `MT*`（`MTAPIVersion`、
+`MTCloseOleObject`、`MTCopyButtonFace`…），版本资源写着
+`CompanyName: WIRIS`、`WIRIS America (Design Science, Inc.)`——是 **MathType
+安装时替换进 Office 目录的第三方组件**，文件日期 2024-02-21，而同目录的
+Office 组件是 2026-06-15。目录里没有原版备份。
+
+移开它之后 VBA 引擎工作正常：能加载、能运行、能正常报运行时错误
+（测试文档借用的是 AxMath 的 VBA 工程，找不到 AxMath 环境时报错误 76，
+那是测试构造的问题，不是引擎的问题）。
+
+已排除的方向：它的 TLS 回调数组是空的；导出地址都在 `0x1xxxx` 段，
+`0x4000` 处是数据不是函数入口，所以不是"RVA 当 VA 用"；它导入的 190 个
+函数（advapi32/comdlg32/gdi32/kernel32/ole32/shell32/user32）在 Wine 里
+**全部有实现，没有一个 stub**。`ITypeInfo::AddressOfMember` 走的是
+`GetProcAddress`，返回的是真地址，也不是它。
+
+再往下需要反汇编级调试才能定位 `0x4000` 的来源。当前可用的处置是把
+`MathPage.wll` 移开——代价只是 MathType 的"另存为网页"公式转换，
+MathType 的公式编辑本身走 COM，不受影响。
+
+注意：默认宏安全设置（禁用并通知）下 Word 压根不加载 VBA，所以平时碰不到
+这个崩溃，只表现为"宏没启用"。
