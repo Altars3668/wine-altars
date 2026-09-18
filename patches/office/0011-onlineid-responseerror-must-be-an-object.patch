@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 4 Sep 2026 05:15:00 -0400
+Subject: [PATCH] windows.security.authentication.onlineid: implement
+ WebProviderError, all three properties.
+
+Excel and PowerPoint both fault on a null read, every run, on the WAM path:
+
+    wine: Unhandled page fault on read access to 0000000000000000
+      at address ...  (mso30win32client.dll +0x5775f4)
+
+The containing function came from .pdata, not the PDB -- measured on this
+binary, only 3.1% of Mso30Win32Client.pdb's 59,585 .text publics land on a
+.pdata function start and the delta histogram has no mode, so its addresses
+are unusable even though its GUID/age match the PE (see the docs). The
+function stages a {line, tag, file, function} context on the stack three
+instructions before it needs it, and reading what those two pointers point at
+names the caller outright:
+
+    "...\winrt\Windows.Security.Authentication.Web.Core.h"
+    "auto __cdecl winrt::impl::consume_Windows_Security_Authentication_Web_
+     Core_IWebProviderError<...>"
+
+C++/WinRT's generated property getter is
+
+    WebProviderError ResponseError() const
+    {
+        void* value{};
+        check_hresult(...->get_ResponseError(&value));
+        return WebProviderError{ value, take_ownership_from_abi };
+    }
+
+-- it checks the HRESULT and then wraps whatever pointer came back without
+testing it. So the old `*error = NULL; return S_OK;` was a promise the caller
+took literally, and its next line was a virtual call through nothing. Same
+shape as the E_NOINTERFACE-on-a-map gap already recorded in webtoken.c.
+
+The IID is not in this prefix's metadata (Windows.Security.winmd is absent),
+so it came from the name/guid table C++/WinRT leaves in WebView2Host.dll -- a
+UTF-16 interface name followed by its IID at the next 16-byte boundary. The
+rule was checked against IWebTokenRequestResult, whose IID this file already
+carried, before its answer for IWebProviderError was used.
+
+**Implementing two of the three properties was not enough, and the way it
+failed is the point.** With ErrorCode and ErrorMessage only, the null read
+was gone and replaced by an access violation at Office's CFG dispatch thunk
+(`jmp rax`) with a garbage target. A stack scan at the fault (the kernelbase
+diagnostic in the companion patch) gave the caller, whose own staged context
+read `consume_..._IWebProviderError<...>::Properties(void) const`, and whose
+call site is `mov rax,[rax+0x40]` -- vtable slot 8, one past the end of an
+eight-entry vtable. A WinRT interface implemented with most of its methods is
+not partially working; it is a live jump into whatever .rdata follows the
+table. Count the methods against the metadata, not against what the caller
+has been seen to use.
+
+With all three, Excel reaches its Start screen and creates a workbook.
+
+Also adds TRACEs to the provider getters, which had none, and records in a
+comment the FindAccountProviderAsync change that was tried and reverted: two
+byte-for-byte different answers to that call produced one identical fault, so
+whatever remains there is not on this side of the boundary.
+--- a/dlls/windows.security.authentication.onlineid/webauth.c
++++ b/dlls/windows.security.authentication.onlineid/webauth.c
+@@ -284,6 +284,8 @@
+     else if (IsEqualGUID(iid, &IID_IWebAccountProvider4)) *out = &obj->iface4;
+     if (!*out) { FIXME("provider interface %s not implemented.\n", debugstr_guid(iid)); return E_NOINTERFACE; }
+     InterlockedIncrement(&obj->ref);
++    TRACE("provider %p QI %s -> %p (iface %p iface2 %p iface3 %p iface4 %p).\n",
++          obj, debugstr_guid(iid), *out, &obj->iface, &obj->iface2, &obj->iface3, &obj->iface4);
+     return S_OK;
+ }
+ static ULONG provider_addref(struct provider *obj) { return InterlockedIncrement(&obj->ref); }
+@@ -308,25 +310,32 @@
+ PROVIDER_BASE(struct provider_iface4, provider4, provider_from_iface4)
+ 
+ static HRESULT WINAPI provider_get_Id(struct provider_iface *iface, HSTRING *value)
+-{ return WindowsDuplicateString(provider_from_iface(iface)->id, value); }
++{ TRACE("provider %p get_Id %p.\n", provider_from_iface(iface), value);
++  return WindowsDuplicateString(provider_from_iface(iface)->id, value); }
+ static HRESULT WINAPI provider_get_DisplayName(struct provider_iface *iface, HSTRING *value)
+ {
+     static const WCHAR name[] = L"Microsoft account";
+     return WindowsCreateString(name, ARRAY_SIZE(name)-1, value);
+ }
+ static HRESULT WINAPI provider_get_IconUri(struct provider_iface *iface, void **value)
+-{ if (!value) return E_POINTER; *value = NULL; return S_OK; }
++{ TRACE("provider %p get_IconUri %p.\n", provider_from_iface(iface), value);
++  if (!value) return E_POINTER; *value = NULL; return S_OK; }
+ static HRESULT WINAPI provider2_get_DisplayPurpose(struct provider_iface2 *iface, HSTRING *value)
+ {
+     static const WCHAR purpose[] = L"Sign in to Microsoft 365";
++    TRACE("provider %p get_DisplayPurpose %p.\n", provider_from_iface2(iface), value);
+     return WindowsCreateString(purpose, ARRAY_SIZE(purpose)-1, value);
+ }
+ static HRESULT WINAPI provider2_get_Authority(struct provider_iface2 *iface, HSTRING *value)
+-{ return WindowsDuplicateString(provider_from_iface2(iface)->authority, value); }
++{ TRACE("provider %p get_Authority %p (authority %s).\n", provider_from_iface2(iface), value,
++        debugstr_hstring(provider_from_iface2(iface)->authority));
++  return WindowsDuplicateString(provider_from_iface2(iface)->authority, value); }
+ static HRESULT WINAPI provider3_get_User(struct provider_iface3 *iface, void **value)
+-{ if (!value) return E_POINTER; *value = NULL; return S_OK; }
++{ TRACE("provider %p get_User %p.\n", provider_from_iface3(iface), value);
++  if (!value) return E_POINTER; *value = NULL; return S_OK; }
+ static HRESULT WINAPI provider4_get_IsSystemProvider(struct provider_iface4 *iface, boolean *value)
+-{ if (!value) return E_POINTER; *value = TRUE; return S_OK; }
++{ TRACE("provider %p get_IsSystemProvider %p.\n", provider_from_iface4(iface), value);
++  if (!value) return E_POINTER; *value = TRUE; return S_OK; }
+ 
+ static const struct provider_vtbl provider_vtbl =
+ {
+@@ -825,6 +834,127 @@
+     if(FAILED(WindowsDuplicateString(token,&r->token))){response_Release(&r->iface);return E_OUTOFMEMORY;}*out=r;return S_OK;
+ }
+ 
++/* Windows.Security.Authentication.Web.Core.WebProviderError.
++ *
++ * A WebTokenRequestResult must answer ResponseError with an *object*, never
++ * with a null pointer, and that is not a style preference. C++/WinRT's
++ * generated property getter is
++ *
++ *     WebProviderError ResponseError() const
++ *     {
++ *         void* value{};
++ *         check_hresult(...->get_ResponseError(&value));
++ *         return WebProviderError{ value, take_ownership_from_abi };
++ *     }
++ *
++ * -- it checks the HRESULT and then wraps whatever pointer came back without
++ * ever testing it, so "S_OK, and here is NULL" is a promise the caller takes
++ * literally. Its next line is a virtual call on that pointer.
++ *
++ * Measured, in Excel, answering the Safe Mode prompt: an unhandled page fault
++ * reading address 0 at mso30win32client.dll +0x5775f4, which disassembles to
++ *
++ *     5775cc  mov  rcx,[rcx]          ; the interface out of the wrapper
++ *     5775f4  mov  rax,[rcx]          ; <-- rcx is 0: read of the vtable
++ *     577607  mov  rax,[rax+0x30]     ; slot 6
++ *     57760b  call [rip+...]
++ *
++ * and whose own error-reporting context, two pointers it stages on the stack
++ * three instructions earlier, names itself:
++ * "...\winrt\Windows.Security.Authentication.Web.Core.h" and
++ * "auto __cdecl winrt::impl::consume_Windows_Security_Authentication_Web_Core_
++ * IWebProviderError<...>". Slot 6 is get_ErrorCode.
++ *
++ * The IID was read out of the name/IID table C++/WinRT leaves in
++ * WebView2Host.dll, using a rule verified against IWebTokenRequestResult's
++ * already-known IID before it was trusted for this one.
++ *
++ * What the object *says* is deliberately minimal: this broker never contacted
++ * an identity provider, so there is no provider error code to report, and
++ * inventing one would be the "wrong error code" mistake this project has
++ * already paid for elsewhere. ErrorCode is 0 and ErrorMessage says plainly
++ * where the answer came from. If Office turns out to act on a specific code
++ * here, that is a measurement to take and not a value to guess at now. */
++static const GUID IID_IWebProviderError =
++    {0xdb191bb1,0x50c5,0x4809,{0x8d,0xca,0x09,0xc9,0x94,0x10,0x24,0x5c}};
++struct provider_error_iface;
++struct provider_error_vtbl
++{
++    INSPECTABLE_VTBL(struct provider_error_iface);
++    HRESULT (WINAPI *get_ErrorCode)(struct provider_error_iface *, UINT32 *);
++    HRESULT (WINAPI *get_ErrorMessage)(struct provider_error_iface *, HSTRING *);
++    HRESULT (WINAPI *get_Properties)(struct provider_error_iface *, void **);
++};
++struct provider_error_iface { const struct provider_error_vtbl *lpVtbl; };
++struct provider_error { struct provider_error_iface iface; LONG ref; UINT32 code; IMap_HSTRING_HSTRING *properties; };
++static struct provider_error *provider_error_from_iface(struct provider_error_iface *iface)
++{ return CONTAINING_RECORD(iface,struct provider_error,iface); }
++static HRESULT WINAPI provider_error_QueryInterface(struct provider_error_iface *iface,REFIID iid,void **out)
++{
++    struct provider_error *obj=provider_error_from_iface(iface);TRACE("provider error %p QI %s.\n",obj,debugstr_guid(iid));
++    if(!out)return E_POINTER;if(!IsEqualGUID(iid,&IID_IUnknown)&&!IsEqualGUID(iid,&IID_IInspectable)&&
++       !IsEqualGUID(iid,&IID_IAgileObject)&&!IsEqualGUID(iid,&IID_IWebProviderError)){*out=NULL;return E_NOINTERFACE;}
++    *out=iface;InterlockedIncrement(&obj->ref);return S_OK;
++}
++static ULONG WINAPI provider_error_AddRef(struct provider_error_iface *iface)
++{return InterlockedIncrement(&provider_error_from_iface(iface)->ref);}
++static ULONG WINAPI provider_error_Release(struct provider_error_iface *iface)
++{struct provider_error *obj=provider_error_from_iface(iface);ULONG ref=InterlockedDecrement(&obj->ref);
++ if(!ref){if(obj->properties)IMap_HSTRING_HSTRING_Release(obj->properties);free(obj);}return ref;}
++static HRESULT WINAPI provider_error_GetIids(struct provider_error_iface *iface,ULONG *c,IID **i){return E_NOTIMPL;}
++static HRESULT WINAPI provider_error_GetRuntimeClassName(struct provider_error_iface *iface,HSTRING *name)
++{static const WCHAR n[]=L"Windows.Security.Authentication.Web.Core.WebProviderError";return WindowsCreateString(n,ARRAY_SIZE(n)-1,name);}
++static HRESULT WINAPI provider_error_GetTrustLevel(struct provider_error_iface *iface,TrustLevel *level){*level=BaseTrust;return S_OK;}
++static HRESULT WINAPI provider_error_get_ErrorCode(struct provider_error_iface *iface,UINT32 *code)
++{struct provider_error *obj=provider_error_from_iface(iface);TRACE("provider error %p code %u.\n",obj,obj->code);if(!code)return E_POINTER;*code=obj->code;return S_OK;}
++static HRESULT WINAPI provider_error_get_ErrorMessage(struct provider_error_iface *iface,HSTRING *message)
++{
++    static const WCHAR m[]=L"No identity provider was contacted: this broker answers from the tokens present in the profile.";
++    TRACE("provider error %p message %p.\n",provider_error_from_iface(iface),message);
++    if(!message)return E_POINTER;
++    return WindowsCreateString(m,ARRAY_SIZE(m)-1,message);
++}
++/* The third property, and the reason this whole object exists twice over.
++ *
++ * Implementing IWebProviderError with only ErrorCode and ErrorMessage fixed
++ * the null-pointer fault it was written for and immediately produced another
++ * one, at mso30win32client.dll's CFG dispatch thunk with a garbage target.
++ * A stack scan at the fault (see the kernelbase diagnostic) gave the caller,
++ * whose staged error context names itself:
++ *
++ *     consume_..._IWebProviderError<...>::Properties(void) const
++ *
++ * and whose call site reads `mov rax,[rax+0x40]` -- vtable slot 8, one past
++ * the end of an eight-entry vtable. So the second fault was not the "next
++ * gap" it looked like; it was this object being one method short, and the
++ * indirect call landing on whatever .rdata followed the table.
++ *
++ * The lesson is narrow and worth stating: a WinRT interface implemented with
++ * *most* of its methods is not partially working, it is a live jump into
++ * unrelated data the moment the caller reaches the missing one. Count the
++ * methods against the metadata, not against what the caller has been seen to
++ * use so far. */
++static HRESULT WINAPI provider_error_get_Properties(struct provider_error_iface *iface,void **p)
++{
++    struct provider_error *obj=provider_error_from_iface(iface);HRESULT hr;
++    TRACE("provider error %p get Properties %p.\n",obj,p);
++    if(!p)return E_POINTER;
++    if(!obj->properties&&FAILED(hr=webauth_string_map_create(&obj->properties))){*p=NULL;return hr;}
++    *p=obj->properties;IMap_HSTRING_HSTRING_AddRef(obj->properties);return S_OK;
++}
++static const struct provider_error_vtbl provider_error_vtbl=
++{
++    provider_error_QueryInterface,provider_error_AddRef,provider_error_Release,
++    provider_error_GetIids,provider_error_GetRuntimeClassName,provider_error_GetTrustLevel,
++    provider_error_get_ErrorCode,provider_error_get_ErrorMessage,provider_error_get_Properties,
++};
++static HRESULT create_provider_error(UINT32 code,struct provider_error **out)
++{
++    struct provider_error *e;
++    if(!(e=calloc(1,sizeof(*e))))return E_OUTOFMEMORY;
++    e->iface.lpVtbl=&provider_error_vtbl;e->ref=1;e->code=code;*out=e;return S_OK;
++}
++
+ static const GUID IID_IWebTokenRequestResult =
+     {0xc12a8305,0xd1f8,0x4483,{0x8d,0x54,0x38,0xfe,0x29,0x27,0x84,0xff}};
+ struct token_result_iface;
+@@ -837,7 +967,7 @@
+     HRESULT (WINAPI *InvalidateCacheAsync)(struct token_result_iface *, void **);
+ };
+ struct token_result_iface { const struct token_result_vtbl *lpVtbl; };
+-struct token_result { struct token_result_iface iface; LONG ref; INT status; struct empty_vector *responses; };
++struct token_result { struct token_result_iface iface; LONG ref; INT status; struct empty_vector *responses; struct provider_error *error; };
+ static struct token_result *token_result_from_iface(struct token_result_iface *iface)
+ { return CONTAINING_RECORD(iface,struct token_result,iface); }
+ static HRESULT WINAPI token_result_QueryInterface(struct token_result_iface *iface,REFIID iid,void **out)
+@@ -850,7 +980,7 @@
+ static ULONG WINAPI token_result_AddRef(struct token_result_iface *iface)
+ {return InterlockedIncrement(&token_result_from_iface(iface)->ref);}
+ static ULONG WINAPI token_result_Release(struct token_result_iface *iface)
+-{struct token_result *obj=token_result_from_iface(iface);ULONG ref=InterlockedDecrement(&obj->ref);if(!ref){vector_Release(obj->responses);free(obj);}return ref;}
++{struct token_result *obj=token_result_from_iface(iface);ULONG ref=InterlockedDecrement(&obj->ref);if(!ref){vector_Release(obj->responses);if(obj->error)provider_error_Release(&obj->error->iface);free(obj);}return ref;}
+ static HRESULT WINAPI token_result_GetIids(struct token_result_iface *iface,ULONG *c,IID **i){return E_NOTIMPL;}
+ static HRESULT WINAPI token_result_GetRuntimeClassName(struct token_result_iface *iface,HSTRING *name)
+ {static const WCHAR n[]=L"Windows.Security.Authentication.Web.Core.WebTokenRequestResult";return WindowsCreateString(n,ARRAY_SIZE(n)-1,name);}
+@@ -860,7 +990,14 @@
+ static HRESULT WINAPI token_result_get_ResponseStatus(struct token_result_iface *iface,INT *status)
+ {struct token_result *obj=token_result_from_iface(iface);TRACE("token result %p status %d.\n",obj,obj->status);if(!status)return E_POINTER;*status=obj->status;return S_OK;}
+ static HRESULT WINAPI token_result_get_ResponseError(struct token_result_iface *iface,void **error)
+-{if(!error)return E_POINTER;*error=NULL;return S_OK;}
++{
++    struct token_result *obj=token_result_from_iface(iface);
++    TRACE("token result %p get error %p (status %d).\n",obj,error,obj->status);
++    if(!error)return E_POINTER;
++    /* take_ownership_from_abi on the caller's side: hand back a reference it
++     * owns, exactly as get_ResponseData next to this one does. */
++    *error=&obj->error->iface;provider_error_AddRef(&obj->error->iface);return S_OK;
++}
+ static HRESULT WINAPI token_result_InvalidateCacheAsync(struct token_result_iface *iface,void **operation)
+ {
+     /* Nothing is cached in here -- the tokens are read off disk on every call,
+@@ -882,6 +1019,7 @@
+     if(!(vector=calloc(1,sizeof(*vector))))return E_OUTOFMEMORY;vector->lpVtbl=&empty_vector_vtbl;vector->ref=1;vector->item=item;if(item)IUnknown_AddRef(item);
+     if(!(payload=calloc(1,sizeof(*payload)))){vector_Release(vector);return E_OUTOFMEMORY;}
+     payload->iface.lpVtbl=&token_result_vtbl;payload->ref=1;payload->status=status;payload->responses=vector;
++    if(FAILED(hr=create_provider_error(0,&payload->error))){token_result_Release(&payload->iface);return hr;}
+     hr=create_object_operation((IUnknown *)&payload->iface,result);token_result_Release(&payload->iface);return hr;
+ }
+ 
+@@ -972,6 +1110,31 @@
+           debugstr_hstring(account_id), debugstr_w(cid));
+     return create_object_operation(NULL, result);
+ }
++/* Answering FindAccountProvider for every id, including ones this broker has
++ * no business claiming, was tried and reverted -- the note is worth more than
++ * the change was.
++ *
++ * Office asks this for "https://login.windows.local", which on Windows is the
++ * *local or domain* identity the OS itself holds and which nothing here backs.
++ * Returning a WebAccountProvider for it anyway means handing back one whose
++ * Authority is empty, and on the face of it that is the same mistake as
++ * returning S_OK with a null interface (see the WebProviderError comment
++ * above): the caller believes the answer and proceeds.
++ *
++ * So a version of this function that answered null for any id outside
++ * {login.microsoft.com, login.windows.net, login.microsoftonline.com} was
++ * built and measured. It worked -- "not a provider this broker has; answering
++ * null" is the last line in the log -- and Excel then faulted at *exactly* the
++ * same instruction as before, mso30win32client.dll +0x18d410 (`jmp rax`, this
++ * binary's CFG dispatch thunk), with the same access violation. Two different
++ * answers to this call, byte for byte the same crash.
++ *
++ * That is the useful measurement: whatever Excel dies on here does not depend
++ * on what this function returns, so the fault is not on this side of the
++ * boundary and changing this behaviour cannot reach it. Reverted rather than
++ * kept, because it changes what Word's sign-in path is told for no measured
++ * benefit, and an unverified behaviour change in a broker two applications
++ * share is a regression risk with nothing on the other side of the scale. */
+ static HRESULT WINAPI statics_FindAccountProviderAsync(struct webauth_statics *iface,HSTRING provider_id,void **result)
+ {
+     TRACE("FindAccountProviderAsync iface %p, provider_id %s, result %p.\n",iface,debugstr_hstring(provider_id),result);

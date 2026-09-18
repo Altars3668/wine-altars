@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 4 Sep 2026 06:10:00 -0400
+Subject: [PATCH] diagnostics: a real stack walk at a C++ throw, and who raised
+ a message box.
+
+Two read-only diagnostics, plus the correction of a third that did not work.
+
+**ntdll: the call chain at a C++ throw (+cxxthrow).** An MSVC throw carries
+its ThrowInfo in ExceptionInformation, which names the *type*
+(scripts/pe-throwtype.py) but never the throw site, because every C++
+exception in the process is raised from the same two instructions. This walks
+the stack at dispatch_exception, where the context is still the thrower's,
+using RtlLookupFunctionEntry + RtlVirtualUnwind, and falling back to "pop the
+return address" for leaf functions and for thunks with no unwind info (Office's
+CFG dispatch stubs are three bytes and have none). Its own channel, because
+Office raises and catches C++ exceptions as ordinary control flow.
+
+Two things about where and how it is done are the point, both learned by
+getting them wrong first:
+
+  - **Not in RaiseException.** On x86_64 that is hand-written assembly
+    (`__ASM_GLOBAL_FUNC`, "some DRMs depend on RaiseException not altering
+    non-volatile registers"); a hook added to the portable C version beside it
+    compiles into a build that never runs it, and the resulting silence looks
+    exactly like "nothing threw". Disassembling the built dll is what caught
+    it. The +seh addresses that seemed to contradict the hook being called at
+    all (throws at kernelbase +0xD907, RaiseException entry at +0xD898) were
+    never a contradiction: +0xD907 is the return address of
+    `call RtlRaiseException`, because +seh prints context->Rip.
+
+  - **Not a stack scan.** A scan cannot tell a live frame from a stale one.
+    Against PowerPoint's failing start-up the scan version reported
+    oart.dll +0x44ae0 -- the *success* path of a buffer allocator, sitting on
+    the stack from an earlier call -- as if it were on the chain. The unwind
+    version produced the real chain, from the throw helper through oart and
+    ppcore to POWERPNT.EXE's main, and that chain is what located the
+    GetProcAddress("MathBuildUp") that fails.
+
+**user32: the caller of a MessageBox (+msgbox).** Every MessageBox funnels
+through MessageBoxIndirectW, so it is the one place that can answer "who put
+that box up?" -- a question Office makes expensive because its dialogs name
+symptoms ("not enough memory or system resources") and not the code path that
+gave up. Note the delay-load thunks above the real caller: the "USER32.dll"
+and "MessageBoxW" strings that appear are that mechanism, not data.
+
+**kernelbase: a stack scan at an unhandled fault.** Kept as a scan, because
+the faults it is for land in a three-byte CFG thunk with no unwind info *and*
+arrive after the crashing context is already partly gone; winedbg produces no
+backtrace for them at all. It found the caller that identified the missing
+IWebProviderError::Properties. Read its first entries and distrust the rest.
+
+All three are TRACE/MESSAGE only and change no behaviour.
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -37,6 +37,7 @@
+ #include "ntdll_misc.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(seh);
++WINE_DECLARE_DEBUG_CHANNEL(cxxthrow);
+ WINE_DECLARE_DEBUG_CHANNEL(threadname);
+ 
+ typedef struct
+@@ -190,11 +191,81 @@
+ /*******************************************************************
+  *		dispatch_exception
+  */
++/* Diagnostic, off unless WINEDEBUG has +cxxthrow.
++ *
++ * An MSVC C++ throw arrives here with its ThrowInfo in ExceptionInformation[2]
++ * and the throwing module's base in [3], which names the *type* (feed the
++ * difference to scripts/pe-throwtype.py). What it never gives is where the
++ * throw came from: every C++ exception in the process is raised from the same
++ * couple of instructions inside RaiseException.
++ *
++ * This is the right place for that, and RaiseException is not: on x86_64 that
++ * function is hand-written assembly (`__ASM_GLOBAL_FUNC`, because "some DRMs
++ * depend on RaiseException not altering non-volatile registers"), so a C hook
++ * added to the portable version next to it compiles into a build that never
++ * runs it -- which is exactly the mistake this replaces. Here the stack is
++ * still the thrower's, untouched by any unwinding.
++ *
++ * Its own channel because Office raises and catches C++ exceptions as ordinary
++ * control flow, dozens per second; this is for one question at a time.
++ */
++static void trace_cxx_throw_stack( const EXCEPTION_RECORD *rec, const CONTEXT *context )
++{
++#ifdef __x86_64__
++    CONTEXT ctx = *context;
++    int frame;
++
++    if (rec->ExceptionCode != 0xe06d7363 || rec->NumberParameters < 4) return;
++    if (!TRACE_ON(cxxthrow)) return;
++
++    TRACE_(cxxthrow)( "C++ throw: ThrowInfo %p, module base %p, rva %#Ix\n",
++                      (void *)rec->ExceptionInformation[2],
++                      (void *)rec->ExceptionInformation[3],
++                      rec->ExceptionInformation[2] > rec->ExceptionInformation[3] ?
++                          rec->ExceptionInformation[2] - rec->ExceptionInformation[3] : 0 );
++
++    /* A real unwind, not a stack scan. The scan this replaces could not tell a
++     * live frame from a stale one -- it reported an allocator's *success* path
++     * as if it were on the call chain -- and the distinction is the whole
++     * question here. At the moment an exception is dispatched the context is
++     * still the thrower's and every module involved carries .pdata, so
++     * RtlVirtualUnwind gives the actual chain. */
++    for (frame = 0; frame < 24 && ctx.Rip; frame++)
++    {
++        RUNTIME_FUNCTION *func;
++        LDR_DATA_TABLE_ENTRY *mod = NULL;
++        ULONG64 base = 0, frame_base = 0;
++        void *handler_data;
++
++        if (LdrFindEntryForAddress( (void *)ctx.Rip, &mod ))
++            TRACE_(cxxthrow)( "  #%-2d %p\n", frame, (void *)ctx.Rip );
++        else
++            TRACE_(cxxthrow)( "  #%-2d %p  %s +%#Ix\n", frame, (void *)ctx.Rip,
++                              debugstr_w(mod->BaseDllName.Buffer),
++                              (ULONG_PTR)ctx.Rip - (ULONG_PTR)mod->DllBase );
++
++        if (!(func = RtlLookupFunctionEntry( ctx.Rip, &base, NULL )))
++        {
++            /* A leaf function, or a thunk with no unwind info (Office's CFG
++             * dispatch stubs are three bytes and have none). The x64 ABI says
++             * such a frame pushed nothing but its return address. */
++            ctx.Rip = *(ULONG64 *)ctx.Rsp;
++            ctx.Rsp += sizeof(ULONG64);
++            continue;
++        }
++        RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, ctx.Rip, func,
++                          &ctx, &handler_data, &frame_base, NULL );
++    }
++#endif
++}
++
+ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
+ {
+     NTSTATUS status;
+     DWORD i;
+ 
++    trace_cxx_throw_stack( rec, context );
++
+     switch (rec->ExceptionCode)
+     {
+     case EXCEPTION_WINE_STUB:
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -41,6 +41,7 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(seh);
+ WINE_DECLARE_DEBUG_CHANNEL(winedbg);
++WINE_DECLARE_DEBUG_CHANNEL(cxxthrow);
+ 
+ typedef INT (WINAPI *MessageBoxA_funcptr)(HWND,LPCSTR,LPCSTR,UINT);
+ typedef INT (WINAPI *MessageBoxW_funcptr)(HWND,LPCWSTR,LPCWSTR,UINT);
+@@ -391,6 +392,24 @@
+ {
+     EXCEPTION_RECORD record;
+ 
++    /* Diagnostic, off unless WINEDEBUG has +cxxthrow. An MSVC C++ throw comes
++     * through here, and its ExceptionInformation carries the ThrowInfo (args[2])
++     * and the throwing module's base (args[3]) -- enough to name the *type*
++     * with scripts/pe-throwtype.py, but not to say where it was thrown from,
++     * because this function is the throw site for every C++ exception in the
++     * process. Scanning the stack here supplies the missing half.
++     *
++     * Deliberately its own channel: Office raises and catches C++ exceptions
++     * as ordinary control flow, dozens per second, so this is unusable as part
++     * of +seh and is meant to be turned on for one question at a time. */
++    if (code == 0xe06d7363 && count >= 4 && args && TRACE_ON(cxxthrow))
++    {
++        MESSAGE( "wine: C++ throw, ThrowInfo %p base %p (rva %#Ix):\n",
++                 (void *)args[2], (void *)args[3],
++                 args[2] > args[3] ? args[2] - args[3] : 0 );
++        stack_scan_from( (const ULONG_PTR *)&record, "the throw" );
++    }
++
+     record.ExceptionCode    = code;
+     record.ExceptionFlags   = flags & EXCEPTION_NONCONTINUABLE;
+     record.ExceptionRecord  = NULL;
+@@ -527,6 +546,63 @@
+ 
+ 
+ /******************************************************************
++ *		dump_stack_scan
++ *
++ * Diagnostic only. Print the qwords near RSP that point into a loaded
++ * module's code, with the module they belong to and their offset in it.
++ *
++ * Written because winedbg's own backtrace does not appear for these faults
++ * (it starts, prints two dbghelp fixmes, and stops), and because the faults
++ * this is aimed at land inside a *CFG dispatch thunk* -- three bytes,
++ * `jmp rax` -- which has no useful unwind info, so a proper RtlVirtualUnwind
++ * from there cannot walk out either. A raw scan needs neither: the `call`
++ * that entered the thunk pushed its return address and it is still sitting
++ * at the top of the stack, and the frames above it are still there too.
++ *
++ * It is a scan, so it prints stale addresses as well as live ones. Read it
++ * as "these functions are somewhere in this thread's recent history", not as
++ * an exact call chain -- the first one or two entries are the ones that
++ * matter, and they are the ones a thunk-shaped fault otherwise hides.
++ */
++static void stack_scan_from( const ULONG_PTR *sp, const char *what )
++{
++#ifdef __x86_64__
++    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
++    const ULONG_PTR *limit;
++    int shown = 0, i;
++
++    limit = (const ULONG_PTR *)tib->StackBase;
++    if (sp < (const ULONG_PTR *)tib->StackLimit || sp >= limit) return;
++
++    MESSAGE( "wine: stack scan for %s from %p:\n", what, sp );
++    for (i = 0; sp + i < limit && i < 256 && shown < 20; i++)
++    {
++        ULONG_PTR v = sp[i];
++        void *base = NULL;
++        WCHAR path[MAX_PATH];
++        const WCHAR *name;
++
++        if (v < 0x10000) continue;
++        if (!RtlPcToFileHeader( (void *)v, &base ) || !base) continue;
++        if (!GetModuleFileNameW( base, path, ARRAY_SIZE(path) )) continue;
++        name = wcsrchr( path, '\\' );
++        name = name ? name + 1 : path;
++        MESSAGE( "wine:   %p  %s +0x%Ix\n", (void *)v,
++                 debugstr_w(name), (ULONG_PTR)v - (ULONG_PTR)base );
++        shown++;
++    }
++#endif
++}
++
++static void dump_stack_scan( const EXCEPTION_POINTERS *ptr )
++{
++#ifdef __x86_64__
++    if (!ptr->ContextRecord) return;
++    stack_scan_from( (const ULONG_PTR *)ptr->ContextRecord->Rsp, "the fault" );
++#endif
++}
++
++/******************************************************************
+  *		start_debugger
+  *
+  * Does the effective debugger startup according to 'format'
+@@ -545,6 +621,7 @@
+ 
+     format_exception_msg( epointers, buffer, sizeof(buffer) );
+     MESSAGE( "wine: %s (thread %04lx), starting debugger...\n", buffer, GetCurrentThreadId() );
++    dump_stack_scan( epointers );
+ 
+     InitializeObjectAttributes( &attr, &nameW, 0, 0, NULL );
+     if (!NtOpenKey( &dbg_key, KEY_READ, &attr ))
+--- a/dlls/user32/msgbox.c
++++ b/dlls/user32/msgbox.c
+@@ -458,6 +458,52 @@
+ /**************************************************************************
+  *      MessageBoxTimeoutW (USER32.@)
+  */
++/* Diagnostic. Every MessageBox in this tree funnels through here, so this is
++ * the one place that can answer "who put that box on the screen?" -- a
++ * question Office makes expensive to answer any other way, because its
++ * dialogs say things like "not enough memory or system resources" that name a
++ * symptom and not the code path that gave up.
++ *
++ * Same technique as the one in kernelbase's start_debugger: scan the stack for
++ * qwords that point into a loaded module and print them module-relative. It is
++ * a scan, so it shows stale frames too; the first few entries are the ones
++ * that matter. Off unless WINEDEBUG has +msgbox.
++ */
++/* Declared in winnt.h behind a guard this file does not trip. */
++PVOID WINAPI RtlPcToFileHeader(PVOID,PVOID*);
++
++static void trace_msgbox_caller( LPCWSTR text )
++{
++#ifdef __x86_64__
++    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
++    const ULONG_PTR *sp, *limit;
++    int shown = 0, i;
++
++    if (!TRACE_ON(msgbox)) return;
++    sp = (const ULONG_PTR *)&text;
++    limit = (const ULONG_PTR *)tib->StackBase;
++    if (sp < (const ULONG_PTR *)tib->StackLimit || sp >= limit) return;
++
++    TRACE_(msgbox)( "message box %s raised by:\n", debugstr_w(text) );
++    for (i = 0; sp + i < limit && i < 400 && shown < 16; i++)
++    {
++        ULONG_PTR v = sp[i];
++        void *base = NULL;
++        WCHAR path[MAX_PATH];
++        const WCHAR *name;
++
++        if (v < 0x10000) continue;
++        if (!RtlPcToFileHeader( (void *)v, &base ) || !base) continue;
++        if (!GetModuleFileNameW( base, path, ARRAY_SIZE(path) )) continue;
++        name = wcsrchr( path, '\\' );
++        name = name ? name + 1 : path;
++        TRACE_(msgbox)( "  %p  %s +0x%Ix\n", (void *)v, debugstr_w(name),
++                        (ULONG_PTR)v - (ULONG_PTR)base );
++        shown++;
++    }
++#endif
++}
++
+ INT WINAPI MessageBoxTimeoutW( HWND hWnd, LPCWSTR text, LPCWSTR title,
+                                UINT type, WORD langid, DWORD timeout )
+ {
+@@ -523,6 +569,8 @@
+     UINT i;
+     struct ThreadWindows threadWindows;
+ 
++    trace_msgbox_caller( msgbox->lpszText );
++
+     if (!(hRes = FindResourceExW(user32_module, (LPWSTR)RT_DIALOG, L"MSGBOX", msgbox->dwLanguageId)))
+     {
+         if (!msgbox->dwLanguageId ||

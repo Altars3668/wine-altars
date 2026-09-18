@@ -1,0 +1,139 @@
+d3d11: give a shared surface's creator a moment before handing it to somebody
+ who would find it empty
+
+What 0018 leaves: one start in sixteen still comes up with Word's navigation
+rail at two colours, its title bar at one, and the full black band -- all three
+together, which is what says they are one fault.  The shape of it is in 0018's
+own evidence: the participant that did not create the surface can acquire it,
+on key 0, before its creator has released anything into it at all.  On Windows
+that participant sees the creator's live pixels, because the storage really is
+shared and nothing has to be carried.  Here there is nothing to give it, so it
+composites a whole frame from a texture that has never held anything, and
+Office does not draw that content again.
+
+This waits for the creator, and the two things that make it safe are the two
+things it does not do:
+
+  - **It does not take the surface while it waits.**  The creator can acquire
+    it and get on with drawing, which is the whole point.
+  - **It never extends the caller's own timeout,** and it gives up after 250 ms
+    regardless.  The creator may itself be blocked on a key only this
+    participant can release, and waiting for content in that position is a
+    deadlock; giving up and taking the empty surface is exactly what happens
+    today.  So the worst case this can produce is a late frame, and a caller
+    that passed timeout 0 is unaffected -- for those the wait is zero-length by
+    construction.
+
+Two WARNs come with it, because both states they report are anomalies worth
+seeing: `altars-content-wait` when the wait engages and again if it succeeds,
+and `altars-empty-acquire` when it expires and a participant takes an unwritten
+surface anyway -- the case that loses a frame.  In an ordinary start-up none of
+them fires, and that is the point: the wait is inert until the ordering
+inverts.  What is *not* yet measured is the thing it exists for -- catching the
+inversion takes a run in which it happens, and at one start in sixteen that is
+a long wait.  So this is a change argued from a mechanism 0018's evidence
+names, with an instrument attached that will say plainly whether it ever
+engages and whether it helps when it does.  Read the WARNs before believing it
+works.
+
+--- a/dlls/d3d11/shared.c
++++ b/dlls/d3d11/shared.c
+@@ -55,6 +55,7 @@
+      * halves of the handoff can run on the right thread. */
+     void *bits;
+     UINT pitch, rows, generation;
++    struct d3d_texture2d *owner;
+ 
+     struct list textures;
+ };
+@@ -424,7 +425,8 @@
+ {
+     struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+     struct d3d_shared_surface *shared = texture->shared;
+-    DWORD start = GetTickCount(), remaining = timeout;
++    DWORD start = GetTickCount(), remaining = timeout, content_deadline;
++    BOOL waited_for_content = FALSE;
+     UINT generation = 0;
+     BOOL stale = FALSE;
+     HRESULT hr = S_OK;
+@@ -436,20 +438,67 @@
+         return E_FAIL;
+ 
+     EnterCriticalSection(&shared->cs);
+-    while (shared->acquired || shared->key != key)
+-    {
++    /* A participant that did not create this surface, taking it before anything
++     * has ever been carried into it, composites from a texture that has never
++     * held pixels -- on Windows it would have seen the creator's live pixels,
++     * because there the storage really is shared and there is nothing to carry.
++     * So give the creator a short chance to get there first.
++     *
++     * Bounded on purpose, and it never extends the caller's own timeout.  The
++     * creator may itself be waiting for a key only this participant can
++     * release, and waiting for content in that position is a deadlock; waiting
++     * for a quarter of a second is a late frame.  The surface is deliberately
++     * not taken while this waits, so the creator can acquire it. */
++    content_deadline = GetTickCount() + (timeout ? 250 : 0);
++    for (;;)
++    {
++        BOOL blocked = shared->acquired || shared->key != key;
++        BOOL want_content = !shared->bits && texture != shared->owner
++                && (int)(content_deadline - GetTickCount()) > 0;
++        DWORD slice;
++
++        if (!blocked && !want_content)
++            break;
++
++        if (want_content && !waited_for_content)
++        {
++            waited_for_content = TRUE;
++            WARN("altars-content-wait texture %p waiting for surface %p to be written by its owner %p.\n",
++                    texture, shared, shared->owner);
++        }
++
+         if (timeout != INFINITE)
+         {
+             DWORD elapsed = GetTickCount() - start;
++
+             remaining = elapsed >= timeout ? 0 : timeout - elapsed;
+         }
+-        if (!SleepConditionVariableCS(&shared->cv, &shared->cs, remaining))
++        slice = remaining;
++        if (want_content)
+         {
+-            LeaveCriticalSection(&shared->cs);
+-            return WAIT_TIMEOUT;
++            DWORD content_left = content_deadline - GetTickCount();
++
++            if (slice == INFINITE || content_left < slice)
++                slice = content_left;
++        }
++
++        if (!SleepConditionVariableCS(&shared->cv, &shared->cs, slice))
++        {
++            /* Only the caller's own timeout ends this; a content slice running
++             * out just means we stop waiting for content and take the surface. */
++            if (timeout != INFINITE && GetTickCount() - start >= timeout)
++            {
++                LeaveCriticalSection(&shared->cs);
++                return WAIT_TIMEOUT;
++            }
+         }
+     }
+     shared->acquired = TRUE;
++    if (waited_for_content && shared->bits)
++        WARN("altars-content-wait texture %p got surface %p after waiting.\n", texture, shared);
++    if (!shared->bits && texture != shared->owner)
++        WARN("altars-empty-acquire texture %p took surface %p with nothing in it after waiting; "
++                "its owner %p never released.\n", texture, shared, shared->owner);
+     generation = shared->generation;
+     /* Not if this texture has been drawn into since: uploading over it would
+      * throw that away, and there is no way to merge the two. */
+@@ -556,6 +605,7 @@
+ 
+     texture->shared = shared;
+     texture->IDXGIKeyedMutex_iface.lpVtbl = &d3d_keyed_mutex_vtbl;
++    shared->owner = texture;
+     list_add_tail(&shared->textures, &texture->shared_entry);
+ 
+     /* No pixels yet.  They arrive at the first ReleaseSync, which is also the

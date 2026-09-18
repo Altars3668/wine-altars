@@ -1,0 +1,147 @@
+Subject: [PATCH] sppc: answer ActivePlugins with the provider Wine actually has
+
+接在 0027 和 0028 之后。Office 在权利评估返回 F013 后查询服务属性 ActivePlugins，
+这是通往许可枚举的闸门，不是可选诊断。
+
+Mso30win32client 的实际控制流（RVA 仅适用于此精确二进制）：+0x5ab331 比较评估结果
+是否为 F013，是则进入 +0x5ab35f 的查询分支；+0x5ab3eb 调用五参数 API 之后只验证
+三件事——HRESULT 成功、+0x5ab415 的长度非零、+0x5ab41f 的数据指针非空——随即在
++0x5ab424 调用 0x5e21a0 释放缓冲区。0x5e21a0 经反汇编确认只是 RAII deleter：取
+[rcx+8] 的指针，非空则调用导入的释放函数，再置哨兵 0x4de1。失败路径的 0x5ab440 是
+jmp 到同一个释放导入。**没有任何路径解析返回的字符串或加载那些 DLL。**
+任一检查不过就在 +0x5ab400 改报 F076 并直接返回，连 +0x5ab339 的许可枚举都不执行。
+
+原生对照（Windows 10.0.29648.1000，tools/sppcprobe/service-info.c，自测 14/14）：
+查询返回 hr=0、type=7 即 SL_DATA_MULTI_SZ、bytes=132，内容是 sppwinob.dll 与
+sppobjs.dll 的完全限定路径，双 NUL 结尾，长度以字节计，缓冲区由调用方 LocalFree。
+132 字节正好是那两条路径的 66 个 WCHAR。slc 的查询入口解析到 SPPC.DLL，证实转发。
+失败契约同批采集：未知属性名 0xC004F012，参数为空 0x80070057，无效或已关闭句柄
+0xC0030005，且每条失败路径都不改写调用方的输出，类型指针可以省略。
+
+那两个插件是 Windows SPP 服务的模块，Wine 里并不存在，报告它们的路径就是虚构不
+存在的文件。Wine 的许可对象由 sppc 自身提供——上下文、安装目录和权利评估都实现在
+本模块内，没有独立插件模块——所以如实返回本模块自己的路径。它确实存在，也确实是
+这里唯一活动的提供者。虽然调用方并不读取内容，仍返回真实路径而不是任意非空值，
+以免把碰巧够用的占位固化成契约。
+
+**这不授予任何许可。** 权利评估照常返回未授权，本函数不参与许可判断。实测部署后
+真实 Word 的 FullValidationHr 由 0xC004F076 变为 0xC004F015：闸门确实打开，Office
+开始枚举全部 33 个已注册 SKU 并逐个查询 ApplicationBitmap，但 SLGetProductSkuInformation
+仍是 stub，所以枚举仍然得不到匹配的 SKU。许可证没有签发，Office 没有激活。
+
+验证：全新隔离 prefix 的 34 项 Python 回归通过（含 115 条 Win32 断言、14 个解析用例、
+3 个命令行防误用用例和 18 次两 DLL 转发查询），失败与跳过均为零。
+
+依据：
+- https://learn.microsoft.com/en-us/windows/win32/api/slpublic/nf-slpublic-slgetserviceinformation
+- https://raw.githubusercontent.com/microsoft/win32metadata/main/generation/WinSDK/RecompiledIdlHeaders/um/slpublic.h
+
+---
+--- a/dlls/sppc/sppc.c
++++ b/dlls/sppc/sppc.c
+@@ -18,6 +18,8 @@
+  */
+ 
+ #include <stdarg.h>
++#include <string.h>
++#include <wchar.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -28,6 +30,7 @@
+ 
+ #include "slpublic.h"
+ #include "slerror.h"
++#include "sppc_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(slc);
+ 
+@@ -356,12 +359,55 @@
+     return SL_E_VALUE_NOT_FOUND;
+ }
+ 
++/* ActivePlugins 报告当前活动的许可对象提供者，供调用方确认许可平台可用。
++ *
++ * 原生 Windows 由 SPP 服务加载 sppwinob.dll 和 sppobjs.dll，返回这两个模块的完全
++ * 限定路径（实测 type=SL_DATA_MULTI_SZ，双 NUL 结尾，长度以字节计，缓冲区由调用方
++ * LocalFree）。Wine 里没有这两个模块，报告它们的路径就是虚构不存在的文件。
++ *
++ * Wine 的许可对象由本模块自身提供：上下文、安装目录和权利评估都实现在 sppc 内，
++ * 没有独立的插件模块。所以如实返回本模块自己的路径——它确实存在，也确实是这里唯一
++ * 活动的提供者。这不授予任何权利：权利评估照常返回未授权，本函数不参与许可判断。
++ *
++ * Mso30win32client 实测只验证 HRESULT、长度和指针非空就释放缓冲区，从不读取内容；
++ * 这里仍返回真实路径，不拿任意非空值凑数，以免把碰巧够用的占位固化成契约。
++ */
++static HRESULT active_plugins(UINT *size, BYTE **value)
++{
++    WCHAR path[MAX_PATH], *list;
++    HMODULE module;
++    DWORD length;
++
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const WCHAR *)(void *)active_plugins, &module))
++        return HRESULT_FROM_WIN32(GetLastError());
++    length = GetModuleFileNameW(module, path, ARRAY_SIZE(path));
++    if (!length || length >= ARRAY_SIZE(path)) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++
++    /* 一项自己的 NUL，再加列表结尾的 NUL。 */
++    if (!(list = LocalAlloc(LMEM_FIXED, (length + 2) * sizeof(WCHAR)))) return E_OUTOFMEMORY;
++    memcpy(list, path, (length + 1) * sizeof(WCHAR));
++    list[length + 1] = 0;
++    *value = (BYTE *)list;
++    *size = (length + 2) * sizeof(WCHAR);
++    return S_OK;
++}
++
+ HRESULT WINAPI SLGetServiceInformation(HSLC handle, LPCWSTR name, SLDATATYPE *type,
+                                       UINT *size, BYTE **value)
+ {
+-    FIXME("(%p,%s,%p,%p,%p) stub\n", handle, debugstr_w(name), type, size, value);
+-    /* ActivePlugins 需要真正活动的插件路径；修正 ABI 不意味着已有插件后端。 */
+-    return SL_E_VALUE_NOT_FOUND;
++    HRESULT hr;
++
++    TRACE("handle %p name %s type %p size %p value %p.\n", handle, debugstr_w(name), type, size, value);
++
++    /* 原生在每条失败路径上都不改写调用方的输出，并允许省略类型指针。 */
++    if (!handle || !name || !size || !value) return E_INVALIDARG;
++    if (FAILED(hr = sppc_context_validate(handle))) return hr;
++    /* 其余属性尚未实现。大小写敏感性没有原生实测，按 Windows 属性名惯例不区分。 */
++    if (wcsicmp(name, L"ActivePlugins")) return SL_E_VALUE_NOT_FOUND;
++    if (FAILED(hr = active_plugins(size, value))) return hr;
++    if (type) *type = SL_DATA_MULTI_SZ;
++    return S_OK;
+ }
+ 
+ HRESULT WINAPI SLIsGenuineLocalEx(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5)
+--- a/dlls/sppc/context.c
++++ b/dlls/sppc/context.c
+@@ -94,6 +94,17 @@
+     return S_OK;
+ }
+ 
++/* 服务信息查询只需要知道句柄是否还在，不碰它的评估历史，所以共享锁即可。 */
++HRESULT sppc_context_validate(HSLC handle)
++{
++    HRESULT hr;
++
++    AcquireSRWLockShared(&context_lock);
++    hr = find_context(handle) ? S_OK : RPC_NT_SS_CONTEXT_MISMATCH;
++    ReleaseSRWLockShared(&context_lock);
++    return hr;
++}
++
+ HRESULT WINAPI SLGetLicensingStatusInformation(HSLC handle, const SLID *app, const SLID *product,
+         LPCWSTR right, UINT *count, SL_LICENSING_STATUS **status)
+ {
+--- a/dlls/sppc/sppc_private.h
++++ b/dlls/sppc/sppc_private.h
+@@ -9,4 +9,7 @@
+ /* 成功时返回 malloc 分配的未授权状态数组，由调用方 free。 */
+ HRESULT sppc_catalog_status(const SLID *app, const SLID *sku, UINT *count, SL_LICENSING_STATUS **status);
+ 
++/* 句柄有效返回 S_OK，否则返回原生对照的上下文错误。不向外暴露上下文内部结构。 */
++HRESULT sppc_context_validate(HSLC handle);
++
+ #endif

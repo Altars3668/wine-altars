@@ -1,0 +1,118 @@
+Subject: [PATCH] onlineid: match scoped captures without legacy fallback
+
+在0023的固定样本仪器上增加显式WINE_WAM_CAPTURE_ROOT。
+目录名按scope清洗，但必须再核对原始scope、client、office-silent采集配置
+和主账户ID。仅读取原始响应，不拼造或改写凭据；没有在线获取/刷新功能。
+
+显式采集模式中的拒绝与未启用模式必须分开：S_FALSE仅用于后者。
+否则默认请求、缺少主账户目录、单样本模式的其他scope会回退旧存储，
+错误返回Success。隔离回归用合成控制字符串和私有Z:映射复现这些分支。
+
+依赖0023；不依赖HTTP诊断补丁0024，不修改Office的许可判断。
+---
+--- a/dlls/windows.security.authentication.onlineid/webauth.c
++++ b/dlls/windows.security.authentication.onlineid/webauth.c
+@@ -865,6 +865,25 @@
+     return match;
+ }
+ 
++static HRESULT read_scoped_capture(HSTRING scope,const WCHAR *name,HSTRING *value)
++{
++    WCHAR path[MAX_PATH],folder[128];
++    DWORD len=GetEnvironmentVariableW(L"WINE_WAM_CAPTURE_ROOT",path,ARRAY_SIZE(path));
++
++    *value=NULL;
++    if(!len)return S_FALSE;
++    if(len>=ARRAY_SIZE(path) || WindowsGetStringLen(scope)>=ARRAY_SIZE(folder))
++        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
++    scope_file_name(scope,folder,ARRAY_SIZE(folder));
++    if(len+2+wcslen(folder)+wcslen(name)>=ARRAY_SIZE(path))
++        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
++    if(path[len-1]!='\\')path[len++]='\\';
++    wcscpy(path+len,folder);
++    wcscat(path,L"\\");
++    wcscat(path,name);
++    return read_token_file(path,value);
++}
++
+ /* 这是固定样本的 A/B 仪器，不是在线 broker。仅允许与该次原生采集
+  * 相同的 provider/client/scope/API 契约，不能把完整封装当作裸 ticket
+  * 返回给旧式调用者；也不生成或改写 token 内的任何字段。 */
+@@ -873,33 +892,68 @@
+     struct provider_iface *provider=NULL;
+     struct provider_iface2 *provider2=NULL;
+     IMap_HSTRING_HSTRING *properties=NULL;
+-    HSTRING client=NULL,id=NULL,authority=NULL;
++    HSTRING client=NULL,id=NULL,authority=NULL,captured=NULL,primary=NULL;
+     WCHAR path[MAX_PATH];
++    INT32 order;
+     HRESULT hr;
+ 
+     *token=NULL;
+-    if((hr=capture_file_path(L"response-0-token",path,ARRAY_SIZE(path)))!=S_OK)return hr;
+-    if(!request || !hstring_matches(scope,L"service::ssl.live.com::MBI_SSL_SHORT openid profile"))
+-        return S_FALSE;
++    /* S_FALSE 只表示未启用采集模式。显式模式中的拒绝不得回退旧存储，
++     * 否则旧存储非空时，不匹配的请求也会被错误地报告为成功。 */
++    if(!GetEnvironmentVariableW(L"WINE_WAM_CAPTURE_DIR",NULL,0) &&
++       !GetEnvironmentVariableW(L"WINE_WAM_CAPTURE_ROOT",NULL,0))return S_FALSE;
++    if((hr=capture_file_path(L"response-0-account-id",path,ARRAY_SIZE(path)))!=S_OK)
++        return hr==S_FALSE ? E_INVALIDARG : hr;
++    if(!request)return E_INVALIDARG;
+     if(FAILED(hr=request->lpVtbl->get_ClientId(request,&client)))goto done;
+-    if(!hstring_matches(client,L"00000000480728C5")){hr=S_FALSE;goto done;}
++    if(!hstring_matches(client,L"00000000480728C5")){hr=E_INVALIDARG;goto done;}
+     if(FAILED(hr=request->lpVtbl->get_WebAccountProvider(request,(void **)&provider)))goto done;
+     if(!provider){hr=E_UNEXPECTED;goto done;}
+     if(FAILED(hr=provider->lpVtbl->get_Id(provider,&id)))goto done;
+-    if(!hstring_matches(id,L"https://login.microsoft.com")){hr=S_FALSE;goto done;}
++    if(!hstring_matches(id,L"https://login.microsoft.com")){hr=E_INVALIDARG;goto done;}
+     if(FAILED(hr=provider->lpVtbl->QueryInterface(provider,&IID_IWebAccountProvider2,(void **)&provider2)))goto done;
+     if(FAILED(hr=provider2->lpVtbl->get_Authority(provider2,&authority)))goto done;
+-    if(!hstring_matches(authority,L"consumers")){hr=S_FALSE;goto done;}
++    if(!hstring_matches(authority,L"consumers")){hr=E_INVALIDARG;goto done;}
+     if(FAILED(hr=request->lpVtbl->get_Properties(request,&properties)))goto done;
+     if(!properties){hr=E_UNEXPECTED;goto done;}
+     if(!request_property_matches(properties,L"api-version",L"2.0") ||
+        !request_property_matches(properties,L"oauth2_batch",L"1") ||
+        !request_property_matches(properties,L"x-client-info",L"1"))
+-    {hr=S_FALSE;goto done;}
+-    hr=read_token_file(path,token);
++    {hr=E_INVALIDARG;goto done;}
++    hr=read_scoped_capture(scope,L"request-scope",&captured);
++    if(hr==S_FALSE)
++    {
++        if(!hstring_matches(scope,L"service::ssl.live.com::MBI_SSL_SHORT openid profile"))
++        {hr=E_INVALIDARG;goto done;}
++        if((hr=capture_file_path(L"response-0-token",path,ARRAY_SIZE(path)))!=S_OK)goto done;
++        hr=read_token_file(path,token);
++    }
++    else
++    {
++        if(hr!=S_OK)goto done;
++        if(FAILED(hr=WindowsCompareStringOrdinal(scope,captured,&order)))goto done;
++        if(order){hr=E_INVALIDARG;goto done;}
++        WindowsDeleteString(captured);captured=NULL;
++        if((hr=read_scoped_capture(scope,L"request-client-id",&captured))!=S_OK)goto done;
++        if(FAILED(hr=WindowsCompareStringOrdinal(client,captured,&order)))goto done;
++        if(order){hr=E_INVALIDARG;goto done;}
++        WindowsDeleteString(captured);captured=NULL;
++        if((hr=read_scoped_capture(scope,L"request-profile",&captured))!=S_OK)goto done;
++        if(!hstring_matches(captured,L"office-silent")){hr=E_INVALIDARG;goto done;}
++        WindowsDeleteString(captured);captured=NULL;
++        /* 目录名可能碰撞；还要检查原始 scope、client 和账户，不能错配。 */
++        if((hr=read_scoped_capture(scope,L"response-0-account-id",&captured))!=S_OK)goto done;
++        if((hr=capture_file_path(L"response-0-account-id",path,ARRAY_SIZE(path)))!=S_OK)goto done;
++        if(FAILED(hr=read_token_file(path,&primary)))goto done;
++        if(FAILED(hr=WindowsCompareStringOrdinal(primary,captured,&order)))goto done;
++        if(order){hr=E_INVALIDARG;goto done;}
++        hr=read_scoped_capture(scope,L"response-0-token",token);
++    }
+     TRACE("matched native capture request, hr %#lx, token length %u.\n",hr,WindowsGetStringLen(*token));
+ 
+ done:
++    WindowsDeleteString(captured);
++    WindowsDeleteString(primary);
+     if(properties)IMap_HSTRING_HSTRING_Release(properties);
+     if(provider2)provider2->lpVtbl->Release(provider2);
+     if(provider)provider->lpVtbl->Release(provider);

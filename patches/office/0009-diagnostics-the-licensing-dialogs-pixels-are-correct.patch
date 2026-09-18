@@ -1,0 +1,206 @@
+Diagnostics: the licensing dialog's pixels are correct all the way to X11
+
+Measurement-only TRACEs, applied on top of 0008.  None of them changes
+behaviour.  They exist because the licensing dialog (NUIDialog, class
+NetUIHWND, 373x148) renders as a solid black rectangle on screen, and this
+answers where in the pipeline that happens -- with the answer being: nowhere
+in this tree.
+
+  d3d11/texture.c   every CreateTexture2D desc.  The dialog's two swapchain
+                    buffers are misc 0 -- not MISC_SHARED_KEYEDMUTEX -- so this
+                    window never goes through 0008's shared-surface code at
+                    all.  A different mechanism was suspected and ruled out in
+                    one line of log.
+
+  d3d11/shared.c    texture dimensions on every AcquireSync/ReleaseSync and on
+                    first attach, so a shared surface's participants can be
+                    told apart by size in a mixed trace.
+
+  d3d11/view.c      resource dimensions on every CreateRenderTargetView, to
+                    find which RTV belongs to the dialog's 373x148 buffer.
+
+  dxgi/swapchain.c  the presenting window and the running present count.  The
+                    dialog's swapchain presents exactly once, ever -- compare
+                    dozens for the main frame.
+
+  winex11.drv/init.c three things, in order down the present path:
+
+    - altars-redirect: state at the moment client_surface_update_offscreen
+      first redirects the window (map_state, size).  IsViewable, correct
+      size -- the redirect itself is not late or wrong.
+    - altars-srcpixel: an XGetImage read of the *source* window
+      (surface->window, the GL-rendered child) at the instant of blit.  White
+      -- Office's own D3D11 draw calls (a background clear plus a 56-instance
+      glyph batch, seen with +d3d11) really did land there.
+    - altars-dstpixel: the same read on the *destination* -- the toplevel's own
+      X window -- immediately after NtGdiStretchBlt + XFlush.  Also white.
+
+So the content is correct at every layer this tree owns: the render target,
+the source drawable, and the destination drawable, confirmed by reading actual
+X11 pixels with no Wine bookkeeping involved.  A plain, Wine-independent Xlib
+client (XGetImage on the same window ID) confirms the same thing outside any
+Wine code path at all.  And `xwd -root` at that exact screen rectangle, at that
+exact moment, reads solid black.
+
+That is where this stops.  It rules out d3d11, dxgi, wined3d and winex11.drv's
+own present logic, all the way down to the X11 protocol.  What is left is
+whatever composites X windows onto the actual display under this test's
+Xwayland (:77) -- outside this tree entirely.  A plain two-line Xlib program
+that creates a window, draws into it once and maps it shows up correctly, so
+the display server is not broadly broken; something specific to a window that
+has been associated with GL/DRI3 rendering and is then presented by a single
+plain XCopyArea appears not to reach the compositor.  Repeating the same present
+up to nine times, an external XCopyArea with XSync, a resize round-trip, an
+unmap/remap cycle and forcing override-redirect were all tried against a live
+run and none of them changed the outcome -- see the writeup in
+docs/office365-under-wine.md for the numbers.
+
+Apply with `git apply` inside wine-src, on top of 0008, when this question
+comes back.
+
+diff --git a/dlls/d3d11/texture.c b/dlls/d3d11/texture.c
+index 9564168..195cd6f 100644
+--- a/dlls/d3d11/texture.c
++++ b/dlls/d3d11/texture.c
+@@ -997,6 +997,10 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
+     wined3d_mutex_lock();
+     texture->desc = *desc;
+ 
++    if (TRACE_ON(d3d11))
++        TRACE("altars-tex %ux%u fmt %u misc %#x texture %p device %p.\n",
++                desc->Width, desc->Height, desc->Format, desc->MiscFlags, texture, device);
++
+     if (wined3d_texture)
+     {
+         wined3d_resource_set_parent(wined3d_texture_get_resource(wined3d_texture),
+diff --git a/dlls/d3d11/shared.c b/dlls/d3d11/shared.c
+index a417ef2..c4aaa5e 100644
+--- a/dlls/d3d11/shared.c
++++ b/dlls/d3d11/shared.c
+@@ -238,7 +238,8 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_AcquireSync(IDXGIKeyedMutex *if
+     struct d3d_texture2d *content = NULL;
+     HRESULT hr = S_OK;
+ 
+-    TRACE("iface %p, key %s, timeout %lu.\n", iface, wine_dbgstr_longlong(key), timeout);
++    TRACE("iface %p, key %s, timeout %lu, texture %p %ux%u.\n", iface, wine_dbgstr_longlong(key), timeout,
++            texture, texture->desc.Width, texture->desc.Height);
+ 
+     if (!shared)
+         return E_FAIL;
+@@ -276,7 +277,8 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_ReleaseSync(IDXGIKeyedMutex *if
+     struct d3d_shared_surface *shared = texture->shared;
+     HRESULT hr = S_OK;
+ 
+-    TRACE("iface %p, key %s.\n", iface, wine_dbgstr_longlong(key));
++    TRACE("iface %p, key %s, texture %p %ux%u.\n", iface, wine_dbgstr_longlong(key),
++            texture, texture->desc.Width, texture->desc.Height);
+ 
+     if (!shared)
+         return E_FAIL;
+@@ -342,7 +344,8 @@ static struct d3d_shared_surface *texture_get_shared(struct d3d_texture2d *textu
+      * gets a black rectangle. */
+     shared->content = texture;
+ 
+-    TRACE("Created shared state %p for texture %p.\n", shared, texture);
++    TRACE("Created shared state %p for texture %p %ux%u.\n", shared, texture,
++            texture->desc.Width, texture->desc.Height);
+ 
+     return shared;
+ }
+@@ -362,7 +365,8 @@ HRESULT d3d_shared_surface_attach(struct d3d_texture2d *owner, struct d3d_textur
+     list_add_tail(&shared->textures, &texture->shared_entry);
+     LeaveCriticalSection(&shared->cs);
+ 
+-    TRACE("Attached texture %p to shared state %p (owner %p).\n", texture, shared, owner);
++    TRACE("Attached texture %p %ux%u to shared state %p (owner %p).\n", texture,
++            texture->desc.Width, texture->desc.Height, shared, owner);
+ 
+     return S_OK;
+ }
+diff --git a/dlls/d3d11/view.c b/dlls/d3d11/view.c
+index 862560a..7c2286b 100644
+--- a/dlls/d3d11/view.c
++++ b/dlls/d3d11/view.c
+@@ -1736,6 +1736,13 @@ static HRESULT d3d_rendertarget_view_init(struct d3d_rendertarget_view *view, st
+         return E_FAIL;
+     }
+ 
++    if (TRACE_ON(d3d11))
++    {
++        struct wined3d_resource_desc rdesc;
++        wined3d_resource_get_desc(wined3d_resource, &rdesc);
++        TRACE("altars-rtv resource %p %ux%u view %p.\n", resource, rdesc.width, rdesc.height, view);
++    }
++
+     wined3d_rendertarget_view_desc_from_d3d11(&wined3d_desc, &view->desc);
+     if (FAILED(hr = wined3d_rendertarget_view_create(&wined3d_desc, wined3d_resource,
+             view, &d3d_render_target_view_wined3d_parent_ops, &view->wined3d_view)))
+diff --git a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
+index 5c49c7f..aa0c956 100644
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -323,6 +323,9 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+         return S_OK;
+     }
+ 
++    if (TRACE_ON(dxgi))
++        TRACE("altars-present hwnd %p count %ld.\n", d3d11_swapchain_get_hwnd(swapchain), swapchain->present_count + 1);
++
+     if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0)))
+         InterlockedIncrement(&swapchain->present_count);
+     return hr;
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 09ef2bf..3610e47 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -394,6 +394,15 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+ #ifdef SONAME_LIBXCOMPOSITE
+         if (usexcomposite) pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+ #endif
++        if (TRACE_ON(x11drv))
++        {
++            /* altars: measurement only -- when does this window actually become
++             * redirected, relative to when it is first presented? */
++            XWindowAttributes attr = {0};
++            XGetWindowAttributes( gdi_display, surface->window, &attr );
++            TRACE( "altars-redirect hwnd %p window %lx map_state %d w %d h %d.\n",
++                    hwnd, surface->window, attr.map_state, attr.width, attr.height );
++        }
+     }
+ 
+     if ((data = get_win_data( hwnd )))
+@@ -456,10 +465,34 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+ 
++    if (TRACE_ON(x11drv))
++    {
++        /* altars: measurement only -- does the redirected source window already
++         * hold real pixels at the moment this present blits from it? */
++        XImage *img = XGetImage( gdi_display, surface->window, 0, 0, 1, 1, AllPlanes, ZPixmap );
++        XWindowAttributes attr = {0};
++        unsigned long px = img ? XGetPixel( img, 0, 0 ) : 0xdeadbeef;
++        XGetWindowAttributes( gdi_display, surface->window, &attr );
++        if (img) XDestroyImage( img );
++        TRACE( "altars-srcpixel hwnd %p window %lx pixel %08lx map_state %d dst_rect %s src_rect %s.\n",
++                hwnd, surface->window, px, attr.map_state, wine_dbgstr_rect( &rect_dst ), wine_dbgstr_rect( &surface->rect ) );
++    }
++
+     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
+     XFlush( gdi_display );
+ 
++    if (TRACE_ON(x11drv))
++    {
++        /* altars: measurement only -- did the blit actually land in the
++         * destination window's own drawable, at the position we told it to? */
++        XImage *img = XGetImage( gdi_display, window, rect_dst.left, rect_dst.top, 1, 1, AllPlanes, ZPixmap );
++        unsigned long px = img ? XGetPixel( img, 0, 0 ) : 0xdeadbeef;
++        if (img) XDestroyImage( img );
++        TRACE( "altars-dstpixel hwnd %p window %lx pixel %08lx at (%d,%d).\n",
++                hwnd, window, px, (int)rect_dst.left, (int)rect_dst.top );
++    }
++
+ done:
+     if (region) NtGdiDeleteObjectApp( region );
+ }

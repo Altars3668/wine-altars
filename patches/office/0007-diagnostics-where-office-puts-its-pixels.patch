@@ -1,0 +1,231 @@
+Diagnostics: where Office puts its pixels
+
+Measurement-only TRACEs.  None of them changes behaviour; every one exists
+because a question about Office's rendering could not be answered by reading
+Wine's source, and each answered its question in one run.
+
+  dxgi/device.c      the swapchain's window and terms.  Office puts its whole
+                     UI in a DXGI_SWAP_EFFECT_FLIP_DISCARD swapchain on a
+                     *child* NetUIHWND (1438x808 for Word's frame, 373x148 for
+                     the licensing dialog, 848x654 for SETLANG), not on the
+                     top-level window.  Reading the source will not tell you
+                     that; the app decides it.
+
+  d3d11/texture.c    every CreateTexture2D desc, and a pixel summary of what a
+                     D3D10 Map hands back.  Proved that Office's rendering
+                     produces real content -- a mapped 16x16 came back with 52
+                     non-zero premultiplied pixels.  It is also how the shared
+                     surfaces were found: misc 0x100 is
+                     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, not GDI_COMPATIBLE
+                     (that is 0x200), and misreading it once cost an hour.
+
+  winex11.drv/init.c what X11DRV_client_surface_present was actually asked to
+                     do, and whether the blit said yes.  A child window always
+                     takes the offscreen path (needs_offscreen_rendering
+                     returns TRUE for anything parented below the desktop), so
+                     the client X window is XComposite-redirected, reparented
+                     onto a 1x1 dummy, and StretchBlt'd onto the top-level.
+                     19 presents, dst (1,1)-(1439,809), full region, blt 1.
+
+  d2d1/device.c      which branch each glyph run takes, and the alpha texture
+                     dwrite produced for it.  Office shapes 260 glyph runs per
+                     SETLANG startup and rasterises four of them.
+
+  dwrite/font.c      the alpha coverage glyphrunanalysis_CreateAlphaTexture
+                     actually hands back.  This is what took Wine's rasteriser
+                     off the suspect list: all 78 textures Office asks for come
+                     back full (nonzero 437 of 845, peak 255), so a missing
+                     glyph is never a missing glyph.
+
+Not included, because it is six lines and only useful once: printing
+`resource->device` from dxgi_resource_GetSharedHandle and the device from
+d3d11_device_OpenSharedResource.  That pair is what proved Office's creating and
+opening devices are genuinely different objects on different threads, so the
+shared-surface gap cannot be closed by handing back the same texture.
+
+Apply with `git apply` inside wine-src when a rendering question comes back.
+Do not carry it in a build you are measuring timings with: the d3d11 Map
+summary walks every pixel.
+
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 3969046..4ce8f29 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1520,6 +1520,26 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
+         goto done;
+     }
+ 
++    if (TRACE_ON(d2d))
++    {
++        /* altars: measurement only -- Word draws 156 glyph runs and no text
++         * appears, so read the alpha texture dwrite produced and the rect it
++         * is about to be filled into. */
++        const unsigned char *o = opacity_values;
++        unsigned int i, nonzero = 0, peak = 0;
++        for (i = 0; i < opacity_values_size; ++i)
++        {
++            if (o[i]) ++nonzero;
++            if (o[i] > peak) peak = o[i];
++        }
++        TRACE("altars-glyph target %p type %u bounds %s bitmap %ux%u alpha nonzero %u/%u peak %u "
++                "run_rect %s transform (%.2f %.2f %.2f %.2f %.2f %.2f).\n",
++                context->target.object, texture_type, wine_dbgstr_rect(&bounds),
++                bitmap_size.width, bitmap_size.height, nonzero, (unsigned int)opacity_values_size,
++                peak, debug_d2d_rect_f(&run_rect), transform->_11, transform->_12,
++                transform->_21, transform->_22, transform->_31, transform->_32);
++    }
++
+     m = *transform;
+     *transform = identity;
+     d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
+@@ -1557,6 +1577,7 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
++        TRACE("altars-glyphrun-cmdlist target %p glyphs %u.\n", context->target.object, glyph_run->glyphCount);
+         d2d_command_list_draw_glyph_run(context->target.command_list, context, baseline_origin, glyph_run,
+                 glyph_run_desc, brush, measuring_mode);
+         return;
+@@ -1626,6 +1647,11 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
+         }
+     }
+ 
++    /* altars: measurement only -- which branch each glyph run takes, and into what. */
++    TRACE("altars-glyphrun target %p type %u mode %u aa %u glyphs %u em %.1f origin (%.1f,%.1f) brush %p.\n",
++            context->target.object, context->target.type, rendering_mode, antialias_mode,
++            glyph_run->glyphCount, glyph_run->fontEmSize, baseline_origin.x, baseline_origin.y, brush);
++
+     if (rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
+         d2d_device_context_draw_glyph_run_outline(context, baseline_origin, glyph_run, brush);
+     else
+diff --git a/dlls/d3d11/texture.c b/dlls/d3d11/texture.c
+index b2ef96d..69a9d05 100644
+--- a/dlls/d3d11/texture.c
++++ b/dlls/d3d11/texture.c
+@@ -848,6 +848,35 @@ static HRESULT STDMETHODCALLTYPE d3d10_texture2d_Map(ID3D10Texture2D *iface, UIN
+     {
+         mapped_texture->pData = wined3d_map_desc.data;
+         mapped_texture->RowPitch = wined3d_map_desc.row_pitch;
++
++        /* altars: measurement only -- is there anything in the pixels Office reads back? */
++        if (TRACE_ON(d3d11) && map_type != D3D10_MAP_WRITE_DISCARD && wined3d_map_desc.data)
++        {
++            const unsigned int *px = wined3d_map_desc.data;
++            unsigned int stride = wined3d_map_desc.row_pitch / 4, first, distinct = 0, nonzero = 0;
++            unsigned int seen[8], y, x, i, n = 0;
++
++            first = px[0];
++            for (y = 0; y < texture->desc.Height; ++y)
++            {
++                for (x = 0; x < texture->desc.Width; ++x)
++                {
++                    unsigned int v = px[y * stride + x];
++                    if (v) ++nonzero;
++                    if (v != first)
++                    {
++                        for (i = 0; i < n; ++i) if (seen[i] == v) break;
++                        if (i == n && n < ARRAY_SIZE(seen)) seen[n++] = v;
++                        ++distinct;
++                    }
++                }
++            }
++            TRACE("altars-map %ux%u first %08x differing %u nonzero %u of %u; samples:",
++                    texture->desc.Width, texture->desc.Height, first, distinct, nonzero,
++                    texture->desc.Width * texture->desc.Height);
++            for (i = 0; i < n; ++i) TRACE(" %08x", seen[i]);
++            TRACE("\n");
++        }
+     }
+ 
+     return hr;
+@@ -981,6 +1010,12 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
+     texture->ID3D11Texture2D_iface.lpVtbl = &d3d11_texture2d_vtbl;
+     texture->ID3D10Texture2D_iface.lpVtbl = &d3d10_texture2d_vtbl;
+     texture->refcount = 1;
++
++    /* altars: measurement only -- what shape are the surfaces Office renders into? */
++    TRACE("altars-tex2d %ux%u fmt %u mip %u arr %u usage %u bind %#x cpu %#x misc %#x samples %u.\n",
++            desc->Width, desc->Height, desc->Format, desc->MipLevels, desc->ArraySize,
++            desc->Usage, desc->BindFlags, desc->CPUAccessFlags, desc->MiscFlags,
++            desc->SampleDesc.Count);
+     wined3d_mutex_lock();
+     texture->desc = *desc;
+ 
+diff --git a/dlls/dxgi/device.c b/dlls/dxgi/device.c
+index 46d252f..35a43b5 100644
+--- a/dlls/dxgi/device.c
++++ b/dlls/dxgi/device.c
+@@ -438,6 +438,21 @@ static HRESULT STDMETHODCALLTYPE dxgi_swapchain_factory_create_swapchain(IWineDX
+     TRACE("iface %p, factory %p, window %p, desc %p, fullscreen_desc %p, output %p, swapchain %p.\n",
+             iface, factory, window, desc, fullscreen_desc, output, swapchain);
+ 
++    if (TRACE_ON(dxgi) && desc)
++    {
++        /* altars: measurement only -- which window, and on what terms? */
++        WCHAR cls[64] = {0};
++        RECT r = {0};
++        GetClassNameW(window, cls, ARRAY_SIZE(cls));
++        GetWindowRect(window, &r);
++        TRACE("altars-swapchain hwnd %p class %s rect %s visible %d -- %ux%u fmt %u stereo %d "
++                "samples %u/%u usage %#x buffers %u scaling %u effect %u alpha %u flags %#x.\n",
++                window, debugstr_w(cls), wine_dbgstr_rect(&r), IsWindowVisible(window),
++                desc->Width, desc->Height, desc->Format, desc->Stereo,
++                desc->SampleDesc.Count, desc->SampleDesc.Quality, desc->BufferUsage,
++                desc->BufferCount, desc->Scaling, desc->SwapEffect, desc->AlphaMode, desc->Flags);
++    }
++
+     if (!(dxgi_factory = unsafe_impl_from_IDXGIFactory(factory)))
+     {
+         WARN("Factory %p is not a valid dxgi factory.\n", factory);
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 09ef2bf..f7563b2 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -456,8 +456,20 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+ 
+-    NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+-                     surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
++    {
++        /* altars: measurement only -- 19 presents reach here for Word's main
++         * NetUIHWND and nothing appears, so read what the blit was actually
++         * asked to do and whether it said yes. */
++        RECT rgn_box = {0};
++        BOOL ok;
++        int rgn_type = region ? NtGdiGetRgnBox( region, &rgn_box ) : -1;
++        ok = NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left,
++                              rect_dst.bottom - rect_dst.top, surface->hdc_src, 0, 0,
++                              surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
++        TRACE( "altars-present hwnd %p toplevel %p window %lx dst %s src %s rgn_type %d rgn %s blt %d\n",
++               hwnd, toplevel, window, wine_dbgstr_rect( &rect_dst ),
++               wine_dbgstr_rect( &surface->rect ), rgn_type, wine_dbgstr_rect( &rgn_box ), ok );
++    }
+     XFlush( gdi_display );
+ 
+ done:
+diff --git a/dlls/dwrite/font.c b/dlls/dwrite/font.c
+index ac2e2b8..913188b 100644
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -6080,6 +6080,20 @@ static HRESULT WINAPI glyphrunanalysis_CreateAlphaTexture(IDWriteGlyphRunAnalysi
+         }
+     }
+ 
++    if (TRACE_ON(dwrite))
++    {
++        /* altars: measurement only -- Office rasterises glyph runs and no text
++         * appears, so read the alpha it was actually handed. */
++        UINT32 i, nonzero = 0, peak = 0;
++        for (i = 0; i < size; ++i)
++        {
++            if (bitmap[i]) ++nonzero;
++            if (bitmap[i] > peak) peak = bitmap[i];
++        }
++        TRACE("altars-alpha bounds %s size %u nonzero %u peak %u.\n",
++                wine_dbgstr_rect(bounds), size, nonzero, peak);
++    }
++
+     return S_OK;
+ }
+ 

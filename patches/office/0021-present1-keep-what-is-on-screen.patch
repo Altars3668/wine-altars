@@ -1,0 +1,306 @@
+dxgi: keep what is on screen, so Present1's dirty rectangles mean something
+
+Reported: moving the pointer onto the licensing dialog's 帮助 button turns the
+dialog black.  Measured on the dialog's own X window, one pointer move apart:
+
+    at rest            545 distinct colours,     0 black pixels
+    pointer on 帮助     90 distinct colours,  53488 black (80%)
+
+and exactly one thing in the log between the two reads:
+
+    fixme:dxgi:d3d11_swapchain_Present1 Ignored present parameters ...
+
+Office redraws the one button that changed and calls `Present1` with a
+`DXGI_PRESENT_PARAMETERS` naming that rectangle -- measured as
+`(283,101)-(349,127)`, the 帮助 button's 64x24 plus a pixel of border, at
+exactly its place in the dialog's client area.  DXGI's contract is that
+everything outside it is already correct on screen.  Wine discarded the
+parameters and presented the whole back buffer, and with a flip-model swapchain
+that buffer is not the one the untouched pixels were drawn into, so every pixel
+Office did not redraw came from whatever that buffer last held -- on its first
+trip round the rotation, nothing.  Hence 80% black, all of it except the button
+under the pointer.
+
+That one FIXME accounts for the symptom in both its directions:
+`patches/office/0014-*` recorded two sessions ago that the dialog had gone from
+"black at rest, legible under the pointer" to "correct at rest, black under the
+pointer", and said plainly that a second fault remained.  This is it, with the
+buffers the other way round.
+
+**The obvious fix is wrong here, and it is worth saying why.**  Passing the
+dirty rectangle down to `wined3d_swapchain_present` as its source and
+destination -- a partial blit, leave the rest alone -- is what DXGI does, and it
+fixed the dialog exactly.  It also broke the main window: over eight starts,
+five came up with most of Word's navigation rail black (230 or 97 distinct
+colours against 287) where the eight before had none.  The reason is one line of
+GL semantics: the drawable is double buffered and `wglSwapBuffers` exchanges the
+whole of it, so a present that blits only the dirty region does not leave the
+rest of the window alone -- it shows the drawable's *other* buffer there.  On
+this present path "the window keeps what it had" is not true.
+
+So the composite is kept on this side instead.  A texture the size of the back
+buffer holds the last thing presented; a partial present copies its dirty region
+into that texture and the whole texture back into the back buffer, which is then
+presented entire, as before.  What the back buffer holds after a present is the
+application's to lose -- with a flip model DXGI tells it so -- and every pixel
+outside the dirty region is, by the application's own account, already what it
+wants on screen.  One full-size GPU copy per partial present.
+
+Three fallbacks to taking the whole buffer: a scroll rectangle (`pScrollRect` /
+`pScrollOffset` ask for a region of the *front* buffer to be moved, a different
+operation), a back buffer that is not the size of the window (the rectangles are
+in back-buffer space), and the first present on a swapchain and the first after
+`ResizeBuffers` -- until one whole buffer has been taken there is nothing behind
+the untouched region to keep.
+
+Worth knowing for anything else in this area: Office presents **exactly one
+complete frame per swapchain** and every frame after that is partial -- 43
+presents on the main window's swapchain, 1 full and 42 with dirty rectangles;
+7 on the dialog's, 1 and 6.
+
+Measured after, same start:
+
+    dialog at rest        545 colours,   0 black
+    pointer on 帮助        544 colours,   0 black   (the hover highlight drawn)
+    navigation rail       287 colours,   0 black, unchanged throughout
+
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -183,6 +183,8 @@
+     IDXGIOutput *target;
+     LONG present_count;
+     LONG in_set_fullscreen_state;
++    BOOL presented_full;
++    struct wined3d_texture *front_copy;
+ };
+ 
+ HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -240,6 +240,8 @@
+             IDXGIOutput_Release(swapchain->target);
+         }
+         IWineDXGIFactory_Release(swapchain->factory);
++        if (swapchain->front_copy)
++            wined3d_texture_decref(swapchain->front_copy);
+         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
+         IWineDXGIDevice_Release(device);
+     }
+@@ -301,9 +303,160 @@
+ 
+ /* IDXGISwapChain1 methods */
+ 
++/* The union of the rectangles an application says it changed, in back buffer
++ * coordinates, or NULL for "present the lot".
++ *
++ * DXGI's contract for Present1 is that everything outside the dirty region is
++ * already correct on screen -- the application redrew only what changed and is
++ * relying on the rest of the window keeping what it had.  Discarding that and
++ * presenting the whole back buffer is not a harmless over-copy: with a flip
++ * model the buffer being presented is not the one the untouched pixels were
++ * drawn into, so the parts the application did not redraw are whatever that
++ * buffer last held, and on its first trip round that is nothing at all.
++ *
++ * Measured, Word's licensing dialog, pointer moved onto its 帮助 button: one
++ * Present1, and the dialog's own X window goes from 545 distinct colours and
++ * no black to 90 colours and 80% black, everything except the button Office
++ * had redrawn.
++ *
++ * Only the union is honoured, which copies at most a little more than asked
++ * and never less.  A scroll rectangle asks for something else again -- move a
++ * region of the *front* buffer -- and there is no partial handling of it here,
++ * so its presence falls back to presenting everything, which is what this code
++ * did for every case until now. */
++static const RECT *d3d11_swapchain_dirty_rect(struct d3d11_swapchain *swapchain,
++        const DXGI_PRESENT_PARAMETERS *params, RECT *rect)
++{
++    struct wined3d_swapchain_desc desc;
++    RECT client_rect;
++    unsigned int i;
++
++    if (!params || !params->DirtyRectsCount || !params->pDirtyRects)
++        return NULL;
++    /* Everything outside a dirty rectangle is only correct if an earlier
++     * present put it there.  Until this swapchain has presented a whole buffer
++     * once -- and again after a resize, which throws the buffers away -- there
++     * is nothing behind the untouched region but whatever the drawable happened
++     * to hold, so take the whole buffer and let the next one be partial. */
++    if (!swapchain->presented_full)
++        return NULL;
++    if (params->pScrollRect || params->pScrollOffset)
++    {
++        FIXME("Ignoring scroll rect %p, scroll offset %p.\n", params->pScrollRect, params->pScrollOffset);
++        return NULL;
++    }
++
++    /* The rectangles are in back buffer space and wined3d wants them in the
++     * window's, so only take this path while the two are the same. */
++    wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &desc);
++    if (!GetClientRect(d3d11_swapchain_get_hwnd(swapchain), &client_rect))
++        return NULL;
++    if (client_rect.right - client_rect.left != desc.backbuffer_width
++            || client_rect.bottom - client_rect.top != desc.backbuffer_height)
++        return NULL;
++
++    *rect = params->pDirtyRects[0];
++    for (i = 1; i < params->DirtyRectsCount; ++i)
++        UnionRect(rect, rect, &params->pDirtyRects[i]);
++
++    if (rect->left < 0) rect->left = 0;
++    if (rect->top < 0) rect->top = 0;
++    if (rect->right > (LONG)desc.backbuffer_width) rect->right = desc.backbuffer_width;
++    if (rect->bottom > (LONG)desc.backbuffer_height) rect->bottom = desc.backbuffer_height;
++    if (rect->right <= rect->left || rect->bottom <= rect->top)
++        return NULL;
++
++    return rect;
++}
++
++/* Keep, here, a copy of what is on screen, and make every present a whole one.
++ *
++ * Presenting only the region an application says it changed is what DXGI does,
++ * and 0021 does it -- but it depends on the window's composited content
++ * persisting between frames, and on this present path it does not.  The
++ * drawable is double buffered and wglSwapBuffers exchanges the whole of it, so
++ * a present that blits only the dirty region shows the drawable's *other*
++ * buffer everywhere else.  Measured: with 0021 alone, five starts in eight came
++ * up with most of Word's navigation rail black, against none in the eight
++ * before it.
++ *
++ * So the composite is kept on this side.  A texture the size of the back buffer
++ * holds the last thing presented; a partial present writes its dirty region
++ * into that and copies the whole thing back into the back buffer, which is then
++ * presented entire.  What the back buffer holds after a present is the
++ * application's to lose -- with a flip model DXGI tells it so -- and every
++ * pixel outside the dirty region is, by the application's own account, already
++ * what it wants on screen.
++ *
++ * One full-size copy per partial present, GPU-side, in exchange for the two
++ * faults this closes. */
++static void STDMETHODCALLTYPE d3d11_swapchain_copy_wined3d_object_destroyed(void *parent) {}
++
++static const struct wined3d_parent_ops d3d11_swapchain_copy_parent_ops =
++{
++    d3d11_swapchain_copy_wined3d_object_destroyed,
++};
++
++static void d3d11_swapchain_composite(struct d3d11_swapchain *swapchain, const RECT *dirty)
++{
++    struct wined3d_texture *back_buffer;
++    struct wined3d_device_context *context;
++    struct wined3d_resource *bb_res, *copy_res;
++    struct wined3d_resource_desc desc;
++    struct wined3d_box box;
++    HRESULT hr;
++
++    if (!(back_buffer = wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, 0)))
++        return;
++    bb_res = wined3d_texture_get_resource(back_buffer);
++    wined3d_resource_get_desc(bb_res, &desc);
++    context = wined3d_device_get_immediate_context(wined3d_swapchain_get_device(swapchain->wined3d_swapchain));
++
++    if (!swapchain->front_copy)
++    {
++        struct wined3d_resource_desc copy_desc = desc;
++
++        copy_desc.usage = 0;
++        if (FAILED(hr = wined3d_texture_create(wined3d_swapchain_get_device(swapchain->wined3d_swapchain),
++                &copy_desc, 1, 1, 0, NULL, NULL, &d3d11_swapchain_copy_parent_ops, &swapchain->front_copy)))
++        {
++            WARN("Failed to create the presented-content copy, hr %#lx.\n", hr);
++            return;
++        }
++    }
++    copy_res = wined3d_texture_get_resource(swapchain->front_copy);
++
++    box.front = 0;
++    box.back = 1;
++    if (dirty)
++    {
++        box.left = dirty->left;
++        box.top = dirty->top;
++        box.right = dirty->right;
++        box.bottom = dirty->bottom;
++        wined3d_device_context_copy_sub_resource_region(context, copy_res, 0,
++                box.left, box.top, 0, bb_res, 0, &box, 0);
++
++        box.left = box.top = 0;
++        box.right = desc.width;
++        box.bottom = desc.height;
++        wined3d_device_context_copy_sub_resource_region(context, bb_res, 0, 0, 0, 0, copy_res, 0, &box, 0);
++    }
++    else
++    {
++        box.left = box.top = 0;
++        box.right = desc.width;
++        box.bottom = desc.height;
++        wined3d_device_context_copy_sub_resource_region(context, copy_res, 0, 0, 0, 0, bb_res, 0, &box, 0);
++    }
++}
++
+ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+-        unsigned int sync_interval, unsigned int flags)
++        unsigned int sync_interval, unsigned int flags,
++        const DXGI_PRESENT_PARAMETERS *present_parameters)
+ {
++    const RECT *dirty;
++    RECT dirty_rect;
+     HRESULT hr;
+ 
+     if (sync_interval > 4)
+@@ -326,8 +479,18 @@
+     if (TRACE_ON(dxgi))
+         TRACE("altars-present hwnd %p count %ld.\n", d3d11_swapchain_get_hwnd(swapchain), swapchain->present_count + 1);
+ 
+-    if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0)))
++    dirty = d3d11_swapchain_dirty_rect(swapchain, present_parameters, &dirty_rect);
++    if (dirty)
++        TRACE("altars-present dirty %s.\n", wine_dbgstr_rect(dirty));
++
++    d3d11_swapchain_composite(swapchain, dirty);
++
++    if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain,
++            NULL, NULL, NULL, sync_interval, 0)))
++    {
+         InterlockedIncrement(&swapchain->present_count);
++        swapchain->presented_full = TRUE;
++    }
+     return hr;
+ }
+ 
+@@ -337,7 +500,7 @@
+ 
+     TRACE("iface %p, sync_interval %u, flags %#x.\n", iface, sync_interval, flags);
+ 
+-    return d3d11_swapchain_present(swapchain, sync_interval, flags);
++    return d3d11_swapchain_present(swapchain, sync_interval, flags, NULL);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetBuffer(IDXGISwapChain4 *iface,
+@@ -529,6 +692,14 @@
+     TRACE("iface %p, buffer_count %u, width %u, height %u, format %s, flags %#x.\n",
+             iface, buffer_count, width, height, debug_dxgi_format(format), flags);
+ 
++    /* New buffers: nothing an earlier present put on screen can be relied on. */
++    swapchain->presented_full = FALSE;
++    if (swapchain->front_copy)
++    {
++        wined3d_texture_decref(swapchain->front_copy);
++        swapchain->front_copy = NULL;
++    }
++
+     if (flags)
+         FIXME("Ignoring flags %#x.\n", flags);
+ 
+@@ -711,10 +882,7 @@
+     TRACE("iface %p, sync_interval %u, flags %#x, present_parameters %p.\n",
+             iface, sync_interval, flags, present_parameters);
+ 
+-    if (present_parameters)
+-        FIXME("Ignored present parameters %p.\n", present_parameters);
+-
+-    return d3d11_swapchain_present(swapchain, sync_interval, flags);
++    return d3d11_swapchain_present(swapchain, sync_interval, flags, present_parameters);
+ }
+ 
+ static BOOL STDMETHODCALLTYPE d3d11_swapchain_IsTemporaryMonoSupported(IDXGISwapChain4 *iface)

@@ -1,0 +1,332 @@
+Diagnostic: what each draw was aimed at, and what was in the texture it read
+
+Measurement-only.  The traces are on the d3d11 channel; the two dumps are off
+unless their environment variable is set.
+
+  device.c   `altars-draw`, `altars-rt`, `altars-viewport`, `altars-scissor`,
+             `altars-srv` -- every draw, and the render target, viewport,
+             scissor and shader resources in force when it was issued.
+             `scripts/d3d-draw-map.py` replays a log and puts them back
+             together.  `altars-copy` prints CopySubresourceRegion's source
+             box, which is what let a glyph tile's fill be matched to the copy
+             that carries it.
+
+  view.c     `altars-srvres` -- the size of the resource behind a shader
+             resource view, the counterpart of 0009's `altars-rtv`, so a draw's
+             textures can be identified by what they are rather than by
+             pointer.
+
+  shared.c   `d3d_texture2d_dump` writes any texture out through a staging copy
+             on its own device's context.  0016 can only dump a surface that is
+             shared, because that is the only one this file already has in
+             system memory; the texture Office composites from is not shared
+             and has no render target view, so it needed its own way out.
+
+  device.c   `WINE_ALTARS_DUMP_CACHE=N` dumps the destination of every Nth
+             CopySubresourceRegion; `WINE_ALTARS_DUMP_BOX="l,t,r,b"` dumps both
+             sides of the copy whose source box is exactly that, with the
+             source texture's size, misc flags, device, shared state,
+             generation and dirty flag.
+
+What they found, in the order they found it, is the reason to keep them:
+
+  * Office composites the window out of a **2048x2048 texture that has no
+    render target view** -- 320 draws into the 1438x808 swapchain, all with the
+    full-window viewport, 62 of them with a scissor overlapping the navigation
+    rail, all sampling that one texture.  So the rail was not a region Office
+    declines to draw; it was a region drawn from an empty part of a cache.
+  * That cache is filled by **2006 CopySubresourceRegion calls per start-up**,
+    all of them while the calling thread holds the shared surface, sourcing
+    from the three 2048x1280 keyed-mutex atlases.
+  * Matching each glyph fill's rectangle against those copies' source boxes
+    showed Office **does** copy the rail's tiles -- 开始 is filled at
+    (130,3)-(154,14) and copied from (129,0)-(155,16).
+  * And dumping both sides of that copy showed the source texture empty with
+    `gen 0`, which named the bug in 0018 exactly.
+
+The dumps write PPM and PGM -- colour and the alpha plane separately -- for the
+reason 0016 records: these surfaces are premultiplied BGRA, so black text at
+full coverage is (0,0,0,255) and a colour-only dump cannot tell it from
+"nothing was drawn here".
+
+--- a/dlls/d3d11/d3d11_private.h
++++ b/dlls/d3d11/d3d11_private.h
+@@ -172,6 +172,7 @@
+ HRESULT d3d_texture2d_get_keyed_mutex(struct d3d_texture2d *texture, void **out);
+ HRESULT d3d_shared_surface_attach(struct d3d_texture2d *owner, struct d3d_texture2d *texture);
+ void d3d_texture2d_cleanup_shared(struct d3d_texture2d *texture);
++void d3d_texture2d_dump(struct d3d_texture2d *texture, const char *tag, unsigned int seq);
+ void d3d_shared_resource_mark_dirty(ID3D11Resource *resource);
+ struct d3d_texture2d *unsafe_impl_from_ID3D11Texture2D(ID3D11Texture2D *iface);
+ struct d3d_texture2d *unsafe_impl_from_ID3D10Texture2D(ID3D10Texture2D *iface);
+--- a/dlls/d3d11/shared.c
++++ b/dlls/d3d11/shared.c
+@@ -281,6 +281,63 @@
+     return S_OK;
+ }
+ 
++/* altars diagnostic: write any texture out, through a staging copy on its own
++ * device's context.  0016 can only dump a surface that is shared, because that
++ * is the only one whose pixels this file already has in system memory; Office's
++ * composite samples a 2048x2048 cache texture that is not shared with anybody
++ * and never has a render target view, so it needed its own way out. */
++void d3d_texture2d_dump(struct d3d_texture2d *texture, const char *tag, unsigned int seq)
++{
++    ID3D11DeviceContext *context;
++    D3D11_MAPPED_SUBRESOURCE map;
++    ID3D11Texture2D *staging;
++    unsigned int y, px;
++    char path[256];
++    FILE *f;
++
++    if (FAILED(texture_get_staging(texture, D3D11_CPU_ACCESS_READ, &staging)))
++        return;
++    if (!(context = texture_context(texture)))
++        return;
++
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging,
++            (ID3D11Resource *)&texture->ID3D11Texture2D_iface);
++    if (FAILED(ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map)))
++    {
++        ID3D11DeviceContext_Release(context);
++        return;
++    }
++
++    sprintf(path, "/tmp/altars-%s-%p-%03u.ppm", tag, texture, seq);
++    if ((f = fopen(path, "wb")))
++    {
++        fprintf(f, "P6\n%u %u\n255\n", texture->desc.Width, texture->desc.Height);
++        for (y = 0; y < texture->desc.Height; ++y)
++        {
++            const unsigned char *line = (const unsigned char *)map.pData + (size_t)y * map.RowPitch;
++            for (px = 0; px < texture->desc.Width; ++px)
++                fwrite((const char[]){ line[px * 4 + 2], line[px * 4 + 1], line[px * 4] }, 1, 3, f);
++        }
++        fclose(f);
++    }
++    sprintf(path, "/tmp/altars-%s-%p-%03u.pgm", tag, texture, seq);
++    if ((f = fopen(path, "wb")))
++    {
++        fprintf(f, "P5\n%u %u\n255\n", texture->desc.Width, texture->desc.Height);
++        for (y = 0; y < texture->desc.Height; ++y)
++        {
++            const unsigned char *line = (const unsigned char *)map.pData + (size_t)y * map.RowPitch;
++            for (px = 0; px < texture->desc.Width; ++px)
++                fputc(line[px * 4 + 3], f);
++        }
++        fclose(f);
++    }
++    TRACE("altars-dump wrote %s.\n", path);
++
++    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
++    ID3D11DeviceContext_Release(context);
++}
++
+ /* A participant that only reads a shared surface must not make the other side's
+  * copy look stale: if it did, the next acquire on that side would upload this
+  * one's copy over whatever it had drawn in the meantime and destroy it.  So the
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -19,6 +19,9 @@
+ 
+ #define NONAMELESSUNION
+ #define WINE_NO_NAMELESS_EXTENSION
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include "d3d11_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d11);
+@@ -725,6 +728,15 @@
+     TRACE("iface %p, start_slot %u, view_count %u, views %p.\n",
+             iface, start_slot, view_count, views);
+ 
++    if (TRACE_ON(d3d11))
++    {
++        unsigned int j;
++
++        for (j = 0; j < view_count; ++j)
++            TRACE("altars-srv ctx %p slot %u view %p.\n", iface, start_slot + j,
++                    views ? (void *)views[j] : NULL);
++    }
++
+     d3d11_device_context_set_shader_resource_views(iface, WINED3D_SHADER_TYPE_PIXEL, start_slot, view_count, views);
+ }
+ 
+@@ -776,6 +788,7 @@
+ 
+     TRACE("iface %p, index_count %u, start_index_location %u, base_vertex_location %d.\n",
+             iface, index_count, start_index_location, base_vertex_location);
++    if (TRACE_ON(d3d11)) TRACE("altars-draw ctx %p kind indexed count %u.\n", iface, index_count);
+ 
+     wined3d_device_context_draw_indexed(context->wined3d_context,
+             base_vertex_location, start_index_location, index_count, 0, 0);
+@@ -788,6 +801,7 @@
+ 
+     TRACE("iface %p, vertex_count %u, start_vertex_location %u.\n",
+             iface, vertex_count, start_vertex_location);
++    if (TRACE_ON(d3d11)) TRACE("altars-draw ctx %p kind plain count %u.\n", iface, vertex_count);
+ 
+     wined3d_device_context_draw(context->wined3d_context, start_vertex_location, vertex_count, 0, 0);
+ }
+@@ -915,6 +929,8 @@
+             "base_vertex_location %d, start_instance_location %u.\n",
+             iface, instance_index_count, instance_count, start_index_location,
+             base_vertex_location, start_instance_location);
++    if (TRACE_ON(d3d11)) TRACE("altars-draw ctx %p kind indexed-instanced count %u instances %u.\n",
++            iface, instance_index_count, instance_count);
+ 
+     wined3d_device_context_draw_indexed(context->wined3d_context, base_vertex_location,
+             start_index_location, instance_index_count, start_instance_location, instance_count);
+@@ -929,6 +945,8 @@
+             "start_instance_location %u.\n",
+             iface, instance_vertex_count, instance_count, start_vertex_location,
+             start_instance_location);
++    if (TRACE_ON(d3d11)) TRACE("altars-draw ctx %p kind instanced count %u instances %u.\n",
++            iface, instance_vertex_count, instance_count);
+ 
+     wined3d_device_context_draw(context->wined3d_context, start_vertex_location,
+             instance_vertex_count, start_instance_location, instance_count);
+@@ -1088,6 +1106,16 @@
+     unsigned int i;
+ 
+     TRACE("iface %p, rtv_count %u, rtvs %p, depth_stencil_view %p.\n", iface, rtv_count, rtvs, depth_stencil_view);
++    if (TRACE_ON(d3d11))
++    {
++        unsigned int j;
++
++        for (j = 0; j < rtv_count && j < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++j)
++            TRACE("altars-rt ctx %p slot %u view %p.\n", iface, j,
++                    rtvs ? (void *)rtvs[j] : NULL);
++        if (!rtv_count)
++            TRACE("altars-rt ctx %p slot 0 view (none).\n", iface);
++    }
+ 
+     if (rtv_count > ARRAY_SIZE(wined3d_rtvs))
+     {
+@@ -1312,6 +1340,14 @@
+     unsigned int i;
+ 
+     TRACE("iface %p, viewport_count %u, viewports %p.\n", iface, viewport_count, viewports);
++    if (TRACE_ON(d3d11))
++    {
++        unsigned int j;
++
++        for (j = 0; j < viewport_count; ++j)
++            TRACE("altars-viewport ctx %p %.0f,%.0f %.0fx%.0f.\n", iface, viewports[j].TopLeftX,
++                    viewports[j].TopLeftY, viewports[j].Width, viewports[j].Height);
++    }
+ 
+     if (viewport_count > ARRAY_SIZE(wined3d_vp))
+         return;
+@@ -1335,6 +1371,16 @@
+     struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
+ 
+     TRACE("iface %p, rect_count %u, rects %p.\n", iface, rect_count, rects);
++    if (TRACE_ON(d3d11))
++    {
++        unsigned int j;
++
++        for (j = 0; j < rect_count; ++j)
++            TRACE("altars-scissor ctx %p (%ld,%ld)-(%ld,%ld).\n", iface, (long)rects[j].left,
++                    (long)rects[j].top, (long)rects[j].right, (long)rects[j].bottom);
++        if (!rect_count)
++            TRACE("altars-scissor ctx %p (none).\n", iface);
++    }
+ 
+     if (rect_count > WINED3D_MAX_VIEWPORTS)
+         return;
+@@ -1356,6 +1402,77 @@
+             src_resource, src_subresource_idx, src_box);
+     d3d_shared_resource_mark_dirty(dst_resource);
+ 
++    if (TRACE_ON(d3d11))
++        TRACE("altars-copy dst %p at %u,%u src %p box %s.\n", dst_resource, dst_x, dst_y, src_resource,
++                src_box ? wine_dbg_sprintf("(%u,%u)-(%u,%u)", src_box->left, src_box->top,
++                        src_box->right, src_box->bottom) : "(whole)");
++
++    /* altars diagnostic: WINE_ALTARS_DUMP_BOX="l,t,r,b" dumps both sides of the
++     * copy whose source box is exactly that -- Office copies each glyph tile
++     * out of its atlas into the cache it composites from, and this is what says
++     * whether the tile was in the atlas when the copy read it. */
++    if (src_box && getenv("WINE_ALTARS_DUMP_BOX"))
++    {
++        unsigned int l, t, r, b;
++
++        if (sscanf(getenv("WINE_ALTARS_DUMP_BOX"), "%u,%u,%u,%u", &l, &t, &r, &b) == 4
++                && src_box->left == l && src_box->top == t
++                && src_box->right == r && src_box->bottom == b)
++        {
++            static LONG hits;
++            LONG n = InterlockedIncrement(&hits);
++            ID3D11Texture2D *tex;
++
++            if (n <= 4)
++            {
++                if (SUCCEEDED(ID3D11Resource_QueryInterface(src_resource, &IID_ID3D11Texture2D, (void **)&tex)))
++                {
++                    d3d_texture2d_dump(unsafe_impl_from_ID3D11Texture2D(tex), "boxsrc", n);
++                    ID3D11Texture2D_Release(tex);
++                }
++                if (SUCCEEDED(ID3D11Resource_QueryInterface(dst_resource, &IID_ID3D11Texture2D, (void **)&tex)))
++                {
++                    d3d_texture2d_dump(unsafe_impl_from_ID3D11Texture2D(tex), "boxdst", n);
++                    ID3D11Texture2D_Release(tex);
++                }
++                if (SUCCEEDED(ID3D11Resource_QueryInterface(src_resource, &IID_ID3D11Texture2D, (void **)&tex)))
++                {
++                    struct d3d_texture2d *t = unsafe_impl_from_ID3D11Texture2D(tex);
++
++                    ERR("altars-box copy #%ld: src %p %ux%u misc %#x device %p shared %p gen %u dirty %d.\n",
++                            (long)n, src_resource, t->desc.Width, t->desc.Height, t->desc.MiscFlags,
++                            t->device, t->shared, t->shared_generation, t->shared_dirty);
++                    ID3D11Texture2D_Release(tex);
++                }
++                ERR("altars-box copy #%ld: -> dst %p at %u,%u, this context %p.\n", (long)n,
++                        dst_resource, dst_x, dst_y, iface);
++            }
++        }
++    }
++
++    /* altars diagnostic: Office fills a big cache texture with 2000+ of these
++     * per start-up and composites the window out of it.  With
++     * WINE_ALTARS_DUMP_CACHE set, write that texture out every so often, which
++     * is the only way to ask whether a label that never appears on screen was
++     * in the texture the compositor sampled. */
++    if (getenv("WINE_ALTARS_DUMP_CACHE"))
++    {
++        static LONG copies;
++        LONG n = InterlockedIncrement(&copies);
++        unsigned int every = atoi(getenv("WINE_ALTARS_DUMP_CACHE"));
++        ID3D11Texture2D *tex2d;
++
++        if (every && !(n % every) && n / every <= 8
++                && SUCCEEDED(ID3D11Resource_QueryInterface(dst_resource, &IID_ID3D11Texture2D, (void **)&tex2d)))
++        {
++            struct d3d_texture2d *t = unsafe_impl_from_ID3D11Texture2D(tex2d);
++
++            if (t && t->desc.Width >= 1024 && t->desc.Height >= 1024)
++                d3d_texture2d_dump(t, "cache", n / every);
++            ID3D11Texture2D_Release(tex2d);
++        }
++    }
++
+ 
+     if (!dst_resource || !src_resource)
+         return;
+--- a/dlls/d3d11/view.c
++++ b/dlls/d3d11/view.c
+@@ -2238,6 +2238,13 @@
+         return E_FAIL;
+     }
+ 
++    if (TRACE_ON(d3d11))
++    {
++        struct wined3d_resource_desc rdesc;
++        wined3d_resource_get_desc(wined3d_resource, &rdesc);
++        TRACE("altars-srvres resource %p %ux%u view %p.\n", resource, rdesc.width, rdesc.height, view);
++    }
++
+     if (FAILED(hr = wined3d_shader_resource_view_create(&wined3d_desc, wined3d_resource,
+             view, &d3d_shader_resource_view_wined3d_parent_ops, &view->wined3d_view)))
+     {

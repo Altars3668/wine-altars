@@ -1,0 +1,225 @@
+d3d11: carry a shared surface's pixels whenever a participant wrote them
+
+0015 moved the copy that carries a MISC_SHARED_KEYEDMUTEX surface between two
+devices onto the thread that owns each side.  It kept one thing from the
+original: the carry only runs when the surface has more than one participant.
+"Nobody to carry to yet" reads as an obvious optimisation and it is a bug --
+**the second participant opens the surface after the first has already drawn
+into it**, and with that first release dropped, the opener acquires a texture
+that has never been given anything and composites from it.
+
+Word's Backstage navigation rail is what that looks like.  Its labels and
+icons are rasterised (`+d2d` shows every one, with coverage), filled into the
+shared atlas, and then Office copies each tile out of that atlas into the
+2048x2048 texture it composites the window from.  Caught in the act:
+
+    altars-box copy #1: src 00007B79A78D1020 2048x1280 misc 0x100
+        device 00007FFFFF8816E0 shared 00007B79A7591620 gen 0 dirty 0
+
+`gen 0` is the whole story -- the compositing device's copy of the atlas has
+never been uploaded, because the renderer's release happened while it was the
+only participant.  A dump of that texture at that moment is empty, 2048x1280
+pixels of nothing, and so are the tiles copied out of it.
+
+The second half is the same mistake from the other side.  Once the carry runs
+on every release, a participant that only *read* the surface bumps the
+generation too, which makes the other side look stale, and its next acquire
+uploads over whatever it had drawn since -- losing it.  So the carry is driven
+by whether this participant actually wrote: `shared_dirty`, set where a shared
+texture can be written (bound as a render target, the destination of a copy or
+an UpdateSubresource, a Clear, a Map for anything but reading) and cleared when
+its content and the shared buffer agree.  Over-marking is harmless; it costs a
+readback.
+
+Measured, Word's start screen, distinct colours in each region, hardware GL:
+
+                        before                after (16 starts)
+    navigation rail     2, every start        287-288 in 15
+    title bar           1 .. 111              111-221 in the same 15
+    black bands         5 of 25 starts        1 of 16
+
+Before this, the rail was two colours -- its background and a separator line --
+in every start measured, in Excel as well as Word, under software GL as well as
+hardware, with the Office UI theme forced either way, and with 0015 reverted.
+After it the rail carries its six items and their icons, and the "新建"
+heading, the 最近/收藏夹/与我共享 tabs, the search box and 更多模板 come back
+with them.
+
+**One start in sixteen still fails, and it fails completely** -- rail back to 2
+colours, title bar to 1, the full `rows 0..46` / `cols 0..64` black band -- and
+that is itself the useful part: the band and the rail go together, so they are
+one fault rather than two, which nothing before this could tell.  What is left
+is the case bookkeeping cannot close.  The opener can acquire the surface on
+key 0 before the owner has released anything at all; on Windows it would then
+see the owner's live pixels through genuinely shared storage, and here there is
+nothing to give it.  Making a non-owner's first acquire wait for the owner's
+first release is the obvious next move, and it is not made here: it changes
+blocking behaviour on a path where a wrong guess deadlocks.
+
+--- a/dlls/d3d11/d3d11_private.h
++++ b/dlls/d3d11/d3d11_private.h
+@@ -158,6 +158,7 @@
+     ID3D11Texture2D *staging_read;
+     ID3D11Texture2D *staging_write;
+     UINT shared_generation;
++    BOOL shared_dirty;
+ };
+ 
+ static inline struct d3d_texture2d *impl_from_ID3D11Texture2D(ID3D11Texture2D *iface)
+@@ -171,6 +172,7 @@
+ HRESULT d3d_texture2d_get_keyed_mutex(struct d3d_texture2d *texture, void **out);
+ HRESULT d3d_shared_surface_attach(struct d3d_texture2d *owner, struct d3d_texture2d *texture);
+ void d3d_texture2d_cleanup_shared(struct d3d_texture2d *texture);
++void d3d_shared_resource_mark_dirty(ID3D11Resource *resource);
+ struct d3d_texture2d *unsafe_impl_from_ID3D11Texture2D(ID3D11Texture2D *iface);
+ struct d3d_texture2d *unsafe_impl_from_ID3D10Texture2D(ID3D10Texture2D *iface);
+ 
+--- a/dlls/d3d11/shared.c
++++ b/dlls/d3d11/shared.c
+@@ -281,6 +281,26 @@
+     return S_OK;
+ }
+ 
++/* A participant that only reads a shared surface must not make the other side's
++ * copy look stale: if it did, the next acquire on that side would upload this
++ * one's copy over whatever it had drawn in the meantime and destroy it.  So the
++ * carry is driven by "was this texture written to", which is what this marks.
++ * Over-marking is harmless -- it costs one readback -- so binding as a render
++ * target counts, without waiting to see whether a draw followed. */
++void d3d_shared_resource_mark_dirty(ID3D11Resource *resource)
++{
++    struct d3d_texture2d *texture;
++    ID3D11Texture2D *tex2d;
++
++    if (!resource)
++        return;
++    if (FAILED(ID3D11Resource_QueryInterface(resource, &IID_ID3D11Texture2D, (void **)&tex2d)))
++        return;
++    if ((texture = unsafe_impl_from_ID3D11Texture2D(tex2d)) && texture->shared)
++        texture->shared_dirty = TRUE;
++    ID3D11Texture2D_Release(tex2d);
++}
++
+ /* IDXGIKeyedMutex, one per participating texture, all over the same state. */
+ 
+ static inline struct d3d_texture2d *impl_from_IDXGIKeyedMutex(IDXGIKeyedMutex *iface)
+@@ -374,13 +394,18 @@
+     }
+     shared->acquired = TRUE;
+     generation = shared->generation;
+-    stale = shared->bits && texture->shared_generation != generation;
++    /* Not if this texture has been drawn into since: uploading over it would
++     * throw that away, and there is no way to merge the two. */
++    stale = shared->bits && texture->shared_generation != generation && !texture->shared_dirty;
+     LeaveCriticalSection(&shared->cs);
+ 
+     /* Outside the lock: this touches only our own device's context, and no
+      * other participant can acquire the surface while we hold it. */
+     if (stale && SUCCEEDED(hr = shared_surface_upload(shared, texture)))
++    {
+         texture->shared_generation = generation;
++        texture->shared_dirty = FALSE;
++    }
+ 
+     return hr;
+ }
+@@ -405,8 +430,17 @@
+         WARN("Released without being acquired.\n");
+         return E_FAIL;
+     }
+-    /* Nothing to carry anywhere while this surface has one participant. */
+-    others = shared->textures.next != shared->textures.prev;
++    /* Carry whenever this participant actually wrote.  It is tempting to skip
++     * that while the surface has only one participant -- nobody to carry to
++     * yet -- and that is wrong: the second participant opens the surface after
++     * the first has already drawn into it, and with the content dropped it
++     * acquires an empty texture and composites from it.  Measured under Word:
++     * the glyph tiles for the Backstage rail are copied out of the shared
++     * atlas by the compositing device on a texture with generation 0, i.e.
++     * one that had never been given anything, while the renderer had drawn
++     * and released before the opener existed.  A participant that only read
++     * the surface is still skipped -- that is what shared_dirty is for. */
++    others = texture->shared_dirty;
+     LeaveCriticalSection(&shared->cs);
+ 
+     /* Whoever held it may have drawn, so its pixels are the ones that matter
+@@ -419,7 +453,10 @@
+     EnterCriticalSection(&shared->cs);
+     {
+         if (SUCCEEDED(hr) && others)
++        {
+             texture->shared_generation = ++shared->generation;
++            texture->shared_dirty = FALSE;
++        }
+         shared->acquired = FALSE;
+         shared->key = key;
+         WakeAllConditionVariable(&shared->cv);
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -802,6 +802,8 @@
+ 
+     TRACE("iface %p, resource %p, subresource_idx %u, map_type %u, map_flags %#x, mapped_subresource %p.\n",
+             iface, resource, subresource_idx, map_type, map_flags, mapped_subresource);
++    if (map_type != D3D11_MAP_READ)
++        d3d_shared_resource_mark_dirty(resource);
+ 
+     if (map_flags)
+         FIXME("Ignoring map_flags %#x.\n", map_flags);
+@@ -1098,6 +1100,8 @@
+         struct d3d_rendertarget_view *rtv = unsafe_impl_from_ID3D11RenderTargetView(rtvs[i]);
+ 
+         wined3d_rtvs[i] = rtv ? rtv->wined3d_view : NULL;
++        if (rtv)
++            d3d_shared_resource_mark_dirty(rtv->resource);
+     }
+ 
+     dsv = unsafe_impl_from_ID3D11DepthStencilView(depth_stencil_view);
+@@ -1138,6 +1142,8 @@
+             struct d3d_rendertarget_view *rtv = unsafe_impl_from_ID3D11RenderTargetView(render_target_views[i]);
+ 
+             wined3d_rtvs[i] = rtv ? rtv->wined3d_view : NULL;
++            if (rtv)
++                d3d_shared_resource_mark_dirty(rtv->resource);
+         }
+     }
+ 
+@@ -1348,6 +1354,7 @@
+             "src_resource %p, src_subresource_idx %u, src_box %p.\n",
+             iface, dst_resource, dst_subresource_idx, dst_x, dst_y, dst_z,
+             src_resource, src_subresource_idx, src_box);
++    d3d_shared_resource_mark_dirty(dst_resource);
+ 
+ 
+     if (!dst_resource || !src_resource)
+@@ -1370,6 +1377,7 @@
+     struct wined3d_resource *wined3d_dst_resource, *wined3d_src_resource;
+ 
+     TRACE("iface %p, dst_resource %p, src_resource %p.\n", iface, dst_resource, src_resource);
++    d3d_shared_resource_mark_dirty(dst_resource);
+ 
+     wined3d_dst_resource = wined3d_resource_from_d3d11_resource(dst_resource);
+     wined3d_src_resource = wined3d_resource_from_d3d11_resource(src_resource);
+@@ -1386,6 +1394,7 @@
+ 
+     TRACE("iface %p, resource %p, subresource_idx %u, box %p, data %p, row_pitch %u, depth_pitch %u.\n",
+             iface, resource, subresource_idx, box, data, row_pitch, depth_pitch);
++    d3d_shared_resource_mark_dirty(resource);
+ 
+     if (box)
+         wined3d_box_set(&wined3d_box, box->left, box->top, box->right, box->bottom, box->front, box->back);
+@@ -1422,6 +1431,7 @@
+ 
+     TRACE("iface %p, render_target_view %p, color_rgba %s.\n",
+             iface, render_target_view, debug_float4(color_rgba));
++    d3d_shared_resource_mark_dirty(view ? view->resource : NULL);
+ 
+     if (!view)
+         return;
+@@ -1518,6 +1528,7 @@
+             "src_resource %p, src_subresource_idx %u, format %s.\n",
+             iface, dst_resource, dst_subresource_idx,
+             src_resource, src_subresource_idx, debug_dxgi_format(format));
++    d3d_shared_resource_mark_dirty(dst_resource);
+ 
+     wined3d_dst_resource = wined3d_resource_from_d3d11_resource(dst_resource);
+     wined3d_src_resource = wined3d_resource_from_d3d11_resource(src_resource);

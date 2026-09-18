@@ -1,0 +1,85 @@
+winex11.drv: glFinish() before reading back an offscreen swap with no OML wait
+
+Word's licensing dialog (and, per docs/office365-under-wine.md, at least one
+other window) presents through client_surface_present -- redirect the
+GL-rendered content offscreen, XGetImage its pixels, NtGdiStretchBlt them into
+the real toplevel -- from a different thread than the one that just rendered
+it. x11drv_surface_swap already knows this needs synchronization: when
+GLX_OML_sync_control is available it calls glXSwapBuffersMscOML then
+glXWaitForSbcOML, which genuinely waits for the swap. When it is not -- true
+on both an Xvfb test display and a real Mutter/Xwayland desktop, measured on
+this tree -- the fallback was a bare XFlush(), which flushes the X11 protocol
+queue and nothing else. It does not wait for the GPU or software renderer to
+finish the draw commands the swap just submitted, and client_surface_present
+runs immediately after regardless.
+
+Measured with patch 0009's diagnostics: the same dialog, redrawn fresh before
+every single present (a real ClearRenderTargetView plus two
+DrawIndexedInstanced calls each time, not a skipped frame), read back
+alternating between the correct content and solid black, present to present,
+purely depending on which side of the race won that time. A one-line addition
+to wined3d/swapchain.c first measured swapchain->device->context_count == 1
+for this dialog's device, which explains why swapchain_gl_present's own
+glFinish() guard (gated on context_count > 1, there for a different reason --
+AirSpace's cross-device compositing, patch 0008) never covers it either; that
+measurement is kept as a diagnostic even though the swap for this present
+turned out to go through x11drv_surface_swap rather than that function.
+
+The fix is the same one the sibling .flush callbacks two screens down in the
+same file already use for the same reason (x11drv_surface_flush,
+x11drv_egl_surface_flush): glFinish() before the fallback XFlush(), so the
+CPU-side call actually blocks until the GPU is done, not just until the X11
+request reached the server.
+
+Confirmed on the exact same dialog, exact same xwd -id read that returned
+solid black every time before this: 60546 white pixels, Word's blue, and
+every line of the dialog's text, legible. Not re-confirmed on the real
+desktop this session -- the safe-mode dialog gating that specific run landed
+off-window and neither a coordinate click nor a keyboard accelerator reached
+it, unrelated to this fix -- see docs/office365-under-wine.md for what was
+and was not re-measured there.
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index a70832c..38c48c3 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -647,6 +647,11 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+ 
+         swapchain_blit(swapchain, context, src_rect, dst_rect);
+ 
++        /* altars: measurement only -- is context_count == 1 really why this
++         * swapchain's present never forces the glFinish() below? */
++        TRACE("altars-context-count hwnd %p context_count %u.\n",
++                swapchain->state.device_window, swapchain->device->context_count);
++
+         if (swapchain->device->context_count > 1)
+         {
+             WARN_(d3d_perf)("Multiple contexts, calling glFinish() to enforce ordering.\n");
+diff --git a/dlls/winex11.drv/opengl.c b/dlls/winex11.drv/opengl.c
+index 01eb3b9..97d2213 100644
+--- a/dlls/winex11.drv/opengl.c
++++ b/dlls/winex11.drv/opengl.c
+@@ -1478,7 +1478,22 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
+         if (pglXWaitForSbcOML) pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc );
+     }
+ 
+-    if (offscreen && !pglXWaitForSbcOML) XFlush( gdi_display );
++    if (offscreen && !pglXWaitForSbcOML)
++    {
++        /* altars: no GLX_OML_sync_control support (common on a software or
++         * virtual GL renderer) means nothing above actually waited for this
++         * swap's rendering to complete -- XFlush alone only flushes the X11
++         * protocol stream, not the GPU/renderer, and client_surface_present
++         * reads this drawable's pixels from a different thread right after
++         * this returns. Measured as a real race (patches/office/0009,
++         * "the missing measurement, taken" in docs/office365-under-wine.md):
++         * the same content is drawn every time and read back as black on
++         * roughly half of presents. glFinish() is the actual wait; XFlush
++         * stays for the X-side request itself, same order as the sibling
++         * .flush callbacks below already use for the same reason. */
++        funcs->p_glFinish();
++        XFlush( gdi_display );
++    }
+ 
+     client_surface_present( base->client );
+     return TRUE;

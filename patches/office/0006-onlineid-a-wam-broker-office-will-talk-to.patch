@@ -1,0 +1,1760 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 2 Sep 2026 08:20:00 -0400
+Subject: [PATCH] windows.security.authentication.onlineid: a WAM broker Office
+ will talk to.
+
+Office 365 signs in through WebAuthenticationCoreManager. Wine has the
+runtime class registered to nothing, so every call failed and Office
+concluded the broker was broken. This adds the two statics interfaces it
+asks for, the objects they hand back, and the WebTokenRequest class, and
+routes both runtime classes to this dll from combase until classes.idl
+carries the registration.
+
+The rule the whole file follows is the one sppc already cost a day to
+learn: refusing a call and answering it are not the same thing to the
+caller. Every method here answers. Measured over one Word start-up, with
+each change made only after the log said Office was asking:
+
+  FindAccountAsync            E_NOTIMPL -> a completed operation. On
+      E_NOTIMPL Office stopped after 19 calls; answering moved it onto
+      the whole token path (GetTokenSilently 0 -> 20, request
+      properties 0 -> 203).
+  FindAccountAsync            "no such account" -> the account, when the
+      id asked for is the CID this prefix holds. Office asks 15 times
+      per start-up about the id it wrote when it last licensed, and a
+      broker that mints tokens for an account it says it does not have
+      is not consistent enough to be believed.
+  FindAllAccounts*            empty list -> that same account, for the
+      same reason: 35 calls were told there were no accounts in a run
+      that took 16 tokens for one.
+  FindSystemAccountProvider*  E_NOTIMPL -> the provider its non-system
+      siblings already return, which reports IsSystemProvider TRUE.
+  RequestToken*               E_NOTIMPL -> the held token, or UserCancel.
+      This broker cannot put a sign-in window on the screen, and
+      UserInteractionRequired would ask the caller to do the thing it
+      just asked us to do.
+  InvalidateCacheAsync        E_NOTIMPL -> a completed IAsyncAction.
+  WebTokenResponse.Properties NULL -> an empty map. NULL is not "no
+      properties", it is a pointer the caller has to guess is absent.
+
+Two things had to be right that were not obvious:
+
+IAsyncAction and IAsyncOperation<T> share every vtable slot but the
+last, where GetResults takes no out parameter. Returning an action
+through the operation vtable makes GetResults write through whatever is
+in the second argument register, so the operation object carries a flag
+and returns early.
+
+A WinRT map is iterable, and that is not an optional extra. Office asks
+the property bag for IIterable<IKeyValuePair<String,String>> the moment
+it is handed one; answering E_NOINTERFACE there took Word down with an
+unhandled 0xe0000002. IIterable, IIterator and IKeyValuePair are
+implemented over the existing entries.
+
+Tokens are looked up per scope, under Z:\tmp\office-wam-tokens, because
+Office does not ask for "a token": one start-up makes 16 requests, ten
+of them for service::officeapps.live.com::MBI_SSL_SHORT and the rest for
+graph, the consent service, ads and ssl.live.com. Handing one string
+back for all of them is a fixed answer shaped like a token. The
+single-file form is still read when that directory is absent.
+
+After this the whole WAM surface Office touches answers: no FIXME is
+reached in a full start-up and nothing crashes. It does not license
+Office -- see docs/office365-under-wine.md for what that measurement
+then ruled out -- but it is the sign-in stack behaving, which every
+later attempt needs underneath it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ dlls/combase/roapi.c                                      |   11 +
+ dlls/windows.security.authentication.onlineid/Makefile.in |    6 +-
+ dlls/windows.security.authentication.onlineid/main.c      |    4 +
+ dlls/windows.security.authentication.onlineid/private.h   |    4 +
+ dlls/windows.security.authentication.onlineid/webauth.c   | 1070 +++++++++++++++
+ dlls/windows.security.authentication.onlineid/webtoken.c  |  523 ++++++++
+ 6 files changed, 1616 insertions(+), 2 deletions(-)
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index a88181a..e64f25c 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -61,6 +61,17 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
+         return S_OK;
+     }
+ 
++    /* Diagnostic bridge for the WebAuthenticationCoreManager implementation
++     * under construction. Once its classes.idl carries the registration this
++     * disappears; keeping the mapping here for the first run lets the factory
++     * tell us which method Office actually calls without mutating the prefix. */
++    if (!wcscmp(classid, L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager") ||
++        !wcscmp(classid, L"Windows.Security.Authentication.Web.Core.WebTokenRequest"))
++    {
++        *out = wcsdup(L"windows.security.authentication.onlineid.dll");
++        return *out ? S_OK : E_OUTOFMEMORY;
++    }
++
+     /* load class registry key */
+     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId",
+                       0, KEY_READ, &hkey_root))
+diff --git a/dlls/windows.security.authentication.onlineid/Makefile.in b/dlls/windows.security.authentication.onlineid/Makefile.in
+index ee3a15b..18c8edd 100644
+--- a/dlls/windows.security.authentication.onlineid/Makefile.in
++++ b/dlls/windows.security.authentication.onlineid/Makefile.in
+@@ -1,8 +1,10 @@
+ MODULE  = windows.security.authentication.onlineid.dll
+-IMPORTS = combase
++IMPORTS = advapi32 combase
+ 
+ SOURCES = \
+ 	authenticator.c \
+ 	classes.idl \
+ 	main.c \
+-	ticket.c
++	ticket.c \
++	webauth.c \
++	webtoken.c
+diff --git a/dlls/windows.security.authentication.onlineid/main.c b/dlls/windows.security.authentication.onlineid/main.c
+index 4e310d8..8597b7c 100644
+--- a/dlls/windows.security.authentication.onlineid/main.c
++++ b/dlls/windows.security.authentication.onlineid/main.c
+@@ -42,6 +42,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( authenticator_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_Security_Authentication_OnlineId_OnlineIdServiceTicketRequest ))
+         IActivationFactory_QueryInterface( ticket_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager" ))
++        IActivationFactory_QueryInterface( webauth_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, L"Windows.Security.Authentication.Web.Core.WebTokenRequest" ))
++        IActivationFactory_QueryInterface( webtoken_request_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.security.authentication.onlineid/private.h b/dlls/windows.security.authentication.onlineid/private.h
+index 96df5d9..abdc1c8 100644
+--- a/dlls/windows.security.authentication.onlineid/private.h
++++ b/dlls/windows.security.authentication.onlineid/private.h
+@@ -28,6 +28,7 @@
+ #include "winstring.h"
+ 
+ #include "activation.h"
++#include "roapi.h"
+ 
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Collections
+@@ -39,6 +40,9 @@
+ 
+ extern IActivationFactory *authenticator_factory;
+ extern IActivationFactory *ticket_factory;
++extern IActivationFactory *webauth_factory;
++extern IActivationFactory *webtoken_request_factory;
++extern HRESULT webauth_string_map_create(IMap_HSTRING_HSTRING **out);
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/windows.security.authentication.onlineid/webauth.c b/dlls/windows.security.authentication.onlineid/webauth.c
+new file mode 100644
+index 0000000..609a165
+--- /dev/null
++++ b/dlls/windows.security.authentication.onlineid/webauth.c
+@@ -0,0 +1,1070 @@
++/* WinRT Windows.Security.Authentication.Web.Core instrumentation
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(webauth);
++
++/* These two statics interfaces are the ones Office asks for. They are declared
++ * locally for now so this diagnostic can tell us which method Office calls
++ * before a full Windows.Security.Authentication.Web.Core IDL is introduced. */
++static const GUID IID_IWebAuthenticationCoreManagerStatics =
++    {0x6aca7c92,0xa581,0x4479,{0x9c,0x10,0x75,0x2e,0xff,0x44,0xfd,0x34}};
++static const GUID IID_IWebAuthenticationCoreManagerStatics4 =
++    {0x54e633fe,0x96e0,0x41e8,{0x98,0x32,0x12,0x98,0x89,0x7c,0x2a,0xaf}};
++
++struct webauth_statics;
++struct webauth_statics4;
++
++struct webauth_statics_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)(struct webauth_statics *, REFIID, void **);
++    ULONG (WINAPI *AddRef)(struct webauth_statics *);
++    ULONG (WINAPI *Release)(struct webauth_statics *);
++    HRESULT (WINAPI *GetIids)(struct webauth_statics *, ULONG *, IID **);
++    HRESULT (WINAPI *GetRuntimeClassName)(struct webauth_statics *, HSTRING *);
++    HRESULT (WINAPI *GetTrustLevel)(struct webauth_statics *, TrustLevel *);
++    HRESULT (WINAPI *GetTokenSilentlyAsync)(struct webauth_statics *, void *, void **);
++    HRESULT (WINAPI *GetTokenSilentlyWithWebAccountAsync)(struct webauth_statics *, void *, void *, void **);
++    HRESULT (WINAPI *RequestTokenAsync)(struct webauth_statics *, void *, void **);
++    HRESULT (WINAPI *RequestTokenWithWebAccountAsync)(struct webauth_statics *, void *, void *, void **);
++    HRESULT (WINAPI *FindAccountAsync)(struct webauth_statics *, void *, HSTRING, void **);
++    HRESULT (WINAPI *FindAccountProviderAsync)(struct webauth_statics *, HSTRING, void **);
++    HRESULT (WINAPI *FindAccountProviderWithAuthorityAsync)(struct webauth_statics *, HSTRING, HSTRING, void **);
++};
++struct webauth_statics { const struct webauth_statics_vtbl *lpVtbl; };
++
++struct webauth_statics4_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)(struct webauth_statics4 *, REFIID, void **);
++    ULONG (WINAPI *AddRef)(struct webauth_statics4 *);
++    ULONG (WINAPI *Release)(struct webauth_statics4 *);
++    HRESULT (WINAPI *GetIids)(struct webauth_statics4 *, ULONG *, IID **);
++    HRESULT (WINAPI *GetRuntimeClassName)(struct webauth_statics4 *, HSTRING *);
++    HRESULT (WINAPI *GetTrustLevel)(struct webauth_statics4 *, TrustLevel *);
++    HRESULT (WINAPI *FindAllAccountsAsync)(struct webauth_statics4 *, void *, void **);
++    HRESULT (WINAPI *FindAllAccountsWithClientIdAsync)(struct webauth_statics4 *, void *, HSTRING, void **);
++    HRESULT (WINAPI *FindSystemAccountProviderAsync)(struct webauth_statics4 *, HSTRING, void **);
++    HRESULT (WINAPI *FindSystemAccountProviderWithAuthorityAsync)(struct webauth_statics4 *, HSTRING, HSTRING, void **);
++    HRESULT (WINAPI *FindSystemAccountProviderWithAuthorityForUserAsync)(struct webauth_statics4 *, HSTRING, HSTRING, void *, void **);
++};
++struct webauth_statics4 { const struct webauth_statics4_vtbl *lpVtbl; };
++
++struct webauth_factory_impl
++{
++    IActivationFactory IActivationFactory_iface;
++    struct webauth_statics statics_iface;
++    struct webauth_statics4 statics4_iface;
++    LONG ref;
++};
++
++static struct webauth_factory_impl impl;
++
++static inline struct webauth_factory_impl *impl_from_factory(IActivationFactory *iface)
++{
++    return CONTAINING_RECORD(iface, struct webauth_factory_impl, IActivationFactory_iface);
++}
++
++static HRESULT WINAPI factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++{
++    struct webauth_factory_impl *obj = impl_from_factory(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++    if (!out) return E_POINTER;
++    *out = NULL;
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IActivationFactory))
++        *out = &obj->IActivationFactory_iface;
++    else if (IsEqualGUID(iid, &IID_IWebAuthenticationCoreManagerStatics))
++        *out = &obj->statics_iface;
++    else if (IsEqualGUID(iid, &IID_IWebAuthenticationCoreManagerStatics4))
++        *out = &obj->statics4_iface;
++
++    if (!*out)
++    {
++        FIXME("interface %s not implemented.\n", debugstr_guid(iid));
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef((IInspectable *)*out);
++    return S_OK;
++}
++static ULONG WINAPI factory_AddRef(IActivationFactory *iface)
++{
++    return InterlockedIncrement(&impl_from_factory(iface)->ref);
++}
++static ULONG WINAPI factory_Release(IActivationFactory *iface)
++{
++    return InterlockedDecrement(&impl_from_factory(iface)->ref);
++}
++static HRESULT WINAPI factory_GetIids(IActivationFactory *iface, ULONG *count, IID **iids)
++{
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *name)
++{
++    static const WCHAR class_name[] = L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager";
++    return WindowsCreateString(class_name, ARRAY_SIZE(class_name) - 1, name);
++}
++static HRESULT WINAPI factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *level)
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance)
++{
++    if (instance) *instance = NULL;
++    return E_NOTIMPL;
++}
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++#define BASE_METHODS(type, prefix, member) \
++static HRESULT WINAPI prefix##_QueryInterface(type *iface, REFIID iid, void **out) \
++{ return factory_QueryInterface(&impl.IActivationFactory_iface, iid, out); } \
++static ULONG WINAPI prefix##_AddRef(type *iface) \
++{ return factory_AddRef(&impl.IActivationFactory_iface); } \
++static ULONG WINAPI prefix##_Release(type *iface) \
++{ return factory_Release(&impl.IActivationFactory_iface); } \
++static HRESULT WINAPI prefix##_GetIids(type *iface, ULONG *count, IID **iids) \
++{ return E_NOTIMPL; } \
++static HRESULT WINAPI prefix##_GetRuntimeClassName(type *iface, HSTRING *name) \
++{ return factory_GetRuntimeClassName(&impl.IActivationFactory_iface, name); } \
++static HRESULT WINAPI prefix##_GetTrustLevel(type *iface, TrustLevel *level) \
++{ return factory_GetTrustLevel(&impl.IActivationFactory_iface, level); }
++
++BASE_METHODS(struct webauth_statics, statics, statics_iface)
++
++/* Minimal WebAccountProvider and an already-completed IAsyncOperation around
++ * it. This is still instrumentation: the operation accepts the parameterized
++ * IID Office asks for and logs it, which tells us the next ABI boundary without
++ * guessing that IID. The vtable itself is the ABI shared by every
++ * IAsyncOperation<T>. */
++static const GUID IID_IWebAccountProvider =
++    {0x29dcc8c3,0x7ab9,0x4a7c,{0xa3,0x36,0xb9,0x42,0xf9,0xdb,0xf7,0xc7}};
++static const GUID IID_IWebAccountProvider2 =
++    {0x4a01eb05,0x4e42,0x41d4,{0xb5,0x18,0xe0,0x08,0xa5,0x16,0x36,0x14}};
++static const GUID IID_IWebAccountProvider3 =
++    {0xda1c518b,0x970d,0x4d49,{0x82,0x5c,0xf2,0x70,0x6f,0x8c,0xa7,0xfe}};
++static const GUID IID_IWebAccountProvider4 =
++    {0x718fd8db,0xe796,0x4210,{0xb7,0x4e,0x84,0xd2,0x98,0x94,0xb0,0x80}};
++
++struct provider_iface;
++struct provider_iface2;
++struct provider_iface3;
++struct provider_iface4;
++struct async_operation;
++struct async_info;
++struct completed_handler;
++
++#define INSPECTABLE_VTBL(type) \
++    HRESULT (WINAPI *QueryInterface)(type *, REFIID, void **); \
++    ULONG (WINAPI *AddRef)(type *); \
++    ULONG (WINAPI *Release)(type *); \
++    HRESULT (WINAPI *GetIids)(type *, ULONG *, IID **); \
++    HRESULT (WINAPI *GetRuntimeClassName)(type *, HSTRING *); \
++    HRESULT (WINAPI *GetTrustLevel)(type *, TrustLevel *)
++
++struct provider_vtbl
++{
++    INSPECTABLE_VTBL(struct provider_iface);
++    HRESULT (WINAPI *get_Id)(struct provider_iface *, HSTRING *);
++    HRESULT (WINAPI *get_DisplayName)(struct provider_iface *, HSTRING *);
++    HRESULT (WINAPI *get_IconUri)(struct provider_iface *, void **);
++};
++struct provider2_vtbl
++{
++    INSPECTABLE_VTBL(struct provider_iface2);
++    HRESULT (WINAPI *get_DisplayPurpose)(struct provider_iface2 *, HSTRING *);
++    HRESULT (WINAPI *get_Authority)(struct provider_iface2 *, HSTRING *);
++};
++struct provider3_vtbl
++{
++    INSPECTABLE_VTBL(struct provider_iface3);
++    HRESULT (WINAPI *get_User)(struct provider_iface3 *, void **);
++};
++struct provider4_vtbl
++{
++    INSPECTABLE_VTBL(struct provider_iface4);
++    HRESULT (WINAPI *get_IsSystemProvider)(struct provider_iface4 *, boolean *);
++};
++struct provider_iface { const struct provider_vtbl *lpVtbl; };
++struct provider_iface2 { const struct provider2_vtbl *lpVtbl; };
++struct provider_iface3 { const struct provider3_vtbl *lpVtbl; };
++struct provider_iface4 { const struct provider4_vtbl *lpVtbl; };
++
++struct provider
++{
++    struct provider_iface iface;
++    struct provider_iface2 iface2;
++    struct provider_iface3 iface3;
++    struct provider_iface4 iface4;
++    LONG ref;
++    HSTRING id;
++    HSTRING authority;
++};
++
++struct async_operation_vtbl
++{
++    INSPECTABLE_VTBL(struct async_operation);
++    HRESULT (WINAPI *put_Completed)(struct async_operation *, struct completed_handler *);
++    HRESULT (WINAPI *get_Completed)(struct async_operation *, struct completed_handler **);
++    HRESULT (WINAPI *GetResults)(struct async_operation *, void **);
++};
++struct async_info_vtbl
++{
++    INSPECTABLE_VTBL(struct async_info);
++    HRESULT (WINAPI *get_Id)(struct async_info *, UINT *);
++    HRESULT (WINAPI *get_Status)(struct async_info *, AsyncStatus *);
++    HRESULT (WINAPI *get_ErrorCode)(struct async_info *, HRESULT *);
++    HRESULT (WINAPI *Cancel)(struct async_info *);
++    HRESULT (WINAPI *Close)(struct async_info *);
++};
++struct completed_handler_vtbl
++{
++    INSPECTABLE_VTBL(struct completed_handler);
++    HRESULT (WINAPI *Invoke)(struct completed_handler *, struct async_operation *, AsyncStatus);
++};
++struct async_operation { const struct async_operation_vtbl *lpVtbl; };
++struct async_info { const struct async_info_vtbl *lpVtbl; };
++struct completed_handler { const struct completed_handler_vtbl *lpVtbl; };
++
++struct provider_operation
++{
++    struct async_operation operation_iface;
++    struct async_info info_iface;
++    LONG ref;
++    IUnknown *payload;
++    struct completed_handler *handler;
++    /* IAsyncAction and IAsyncOperation<T> share every slot but the last:
++     * GetResults takes no argument for an action. Handing an action back
++     * through the operation vtable would make GetResults write a result
++     * through whatever happened to be in the second argument register. */
++    BOOL is_action;
++};
++
++static const struct provider_vtbl provider_vtbl;
++static const struct provider2_vtbl provider2_vtbl;
++static const struct provider3_vtbl provider3_vtbl;
++static const struct provider4_vtbl provider4_vtbl;
++static const struct async_operation_vtbl async_operation_vtbl;
++static const struct async_info_vtbl async_info_vtbl;
++
++static struct provider *provider_from_iface(struct provider_iface *iface)
++{ return CONTAINING_RECORD(iface, struct provider, iface); }
++static struct provider *provider_from_iface2(struct provider_iface2 *iface)
++{ return CONTAINING_RECORD(iface, struct provider, iface2); }
++static struct provider *provider_from_iface3(struct provider_iface3 *iface)
++{ return CONTAINING_RECORD(iface, struct provider, iface3); }
++static struct provider *provider_from_iface4(struct provider_iface4 *iface)
++{ return CONTAINING_RECORD(iface, struct provider, iface4); }
++
++static HRESULT provider_query(struct provider *obj, REFIID iid, void **out)
++{
++    TRACE("provider %p QI %s.\n", obj, debugstr_guid(iid));
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IWebAccountProvider))
++        *out = &obj->iface;
++    else if (IsEqualGUID(iid, &IID_IWebAccountProvider2)) *out = &obj->iface2;
++    else if (IsEqualGUID(iid, &IID_IWebAccountProvider3)) *out = &obj->iface3;
++    else if (IsEqualGUID(iid, &IID_IWebAccountProvider4)) *out = &obj->iface4;
++    if (!*out) { FIXME("provider interface %s not implemented.\n", debugstr_guid(iid)); return E_NOINTERFACE; }
++    InterlockedIncrement(&obj->ref);
++    return S_OK;
++}
++static ULONG provider_addref(struct provider *obj) { return InterlockedIncrement(&obj->ref); }
++static ULONG provider_release(struct provider *obj)
++{
++    ULONG ref = InterlockedDecrement(&obj->ref);
++    if (!ref) { WindowsDeleteString(obj->id); WindowsDeleteString(obj->authority); free(obj); }
++    return ref;
++}
++#define PROVIDER_BASE(type, prefix, from) \
++static HRESULT WINAPI prefix##_QueryInterface(type *iface, REFIID iid, void **out) { return provider_query(from(iface), iid, out); } \
++static ULONG WINAPI prefix##_AddRef(type *iface) { return provider_addref(from(iface)); } \
++static ULONG WINAPI prefix##_Release(type *iface) { return provider_release(from(iface)); } \
++static HRESULT WINAPI prefix##_GetIids(type *iface, ULONG *count, IID **iids) { return E_NOTIMPL; } \
++static HRESULT WINAPI prefix##_GetRuntimeClassName(type *iface, HSTRING *name) \
++{ static const WCHAR n[] = L"Windows.Security.Credentials.WebAccountProvider"; return WindowsCreateString(n, ARRAY_SIZE(n)-1, name); } \
++static HRESULT WINAPI prefix##_GetTrustLevel(type *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++
++PROVIDER_BASE(struct provider_iface, provider, provider_from_iface)
++PROVIDER_BASE(struct provider_iface2, provider2, provider_from_iface2)
++PROVIDER_BASE(struct provider_iface3, provider3, provider_from_iface3)
++PROVIDER_BASE(struct provider_iface4, provider4, provider_from_iface4)
++
++static HRESULT WINAPI provider_get_Id(struct provider_iface *iface, HSTRING *value)
++{ return WindowsDuplicateString(provider_from_iface(iface)->id, value); }
++static HRESULT WINAPI provider_get_DisplayName(struct provider_iface *iface, HSTRING *value)
++{
++    static const WCHAR name[] = L"Microsoft account";
++    return WindowsCreateString(name, ARRAY_SIZE(name)-1, value);
++}
++static HRESULT WINAPI provider_get_IconUri(struct provider_iface *iface, void **value)
++{ if (!value) return E_POINTER; *value = NULL; return S_OK; }
++static HRESULT WINAPI provider2_get_DisplayPurpose(struct provider_iface2 *iface, HSTRING *value)
++{
++    static const WCHAR purpose[] = L"Sign in to Microsoft 365";
++    return WindowsCreateString(purpose, ARRAY_SIZE(purpose)-1, value);
++}
++static HRESULT WINAPI provider2_get_Authority(struct provider_iface2 *iface, HSTRING *value)
++{ return WindowsDuplicateString(provider_from_iface2(iface)->authority, value); }
++static HRESULT WINAPI provider3_get_User(struct provider_iface3 *iface, void **value)
++{ if (!value) return E_POINTER; *value = NULL; return S_OK; }
++static HRESULT WINAPI provider4_get_IsSystemProvider(struct provider_iface4 *iface, boolean *value)
++{ if (!value) return E_POINTER; *value = TRUE; return S_OK; }
++
++static const struct provider_vtbl provider_vtbl =
++{
++    provider_QueryInterface, provider_AddRef, provider_Release,
++    provider_GetIids, provider_GetRuntimeClassName, provider_GetTrustLevel,
++    provider_get_Id, provider_get_DisplayName, provider_get_IconUri,
++};
++static const struct provider2_vtbl provider2_vtbl =
++{
++    provider2_QueryInterface, provider2_AddRef, provider2_Release,
++    provider2_GetIids, provider2_GetRuntimeClassName, provider2_GetTrustLevel,
++    provider2_get_DisplayPurpose, provider2_get_Authority,
++};
++static const struct provider3_vtbl provider3_vtbl =
++{
++    provider3_QueryInterface, provider3_AddRef, provider3_Release,
++    provider3_GetIids, provider3_GetRuntimeClassName, provider3_GetTrustLevel,
++    provider3_get_User,
++};
++static const struct provider4_vtbl provider4_vtbl =
++{
++    provider4_QueryInterface, provider4_AddRef, provider4_Release,
++    provider4_GetIids, provider4_GetRuntimeClassName, provider4_GetTrustLevel,
++    provider4_get_IsSystemProvider,
++};
++
++static struct provider_operation *operation_from_iface(struct async_operation *iface)
++{ return CONTAINING_RECORD(iface, struct provider_operation, operation_iface); }
++static struct provider_operation *operation_from_info(struct async_info *iface)
++{ return CONTAINING_RECORD(iface, struct provider_operation, info_iface); }
++static ULONG operation_addref(struct provider_operation *obj) { return InterlockedIncrement(&obj->ref); }
++static ULONG operation_release(struct provider_operation *obj)
++{
++    ULONG ref = InterlockedDecrement(&obj->ref);
++    if (!ref)
++    {
++        if (obj->handler) IUnknown_Release((IUnknown *)obj->handler);
++        if (obj->payload) IUnknown_Release(obj->payload);
++        free(obj);
++    }
++    return ref;
++}
++static HRESULT operation_query(struct provider_operation *obj, REFIID iid, void **out)
++{
++    TRACE("operation %p QI %s.\n", obj, debugstr_guid(iid));
++    if (!out) return E_POINTER;
++    if (IsEqualGUID(iid, &IID_IAsyncInfo)) *out = &obj->info_iface;
++    else *out = &obj->operation_iface; /* log the parameterized IID, then accept it */
++    operation_addref(obj);
++    return S_OK;
++}
++#define OP_BASE(type, prefix, from) \
++static HRESULT WINAPI prefix##_QueryInterface(type *iface, REFIID iid, void **out) { return operation_query(from(iface), iid, out); } \
++static ULONG WINAPI prefix##_AddRef(type *iface) { return operation_addref(from(iface)); } \
++static ULONG WINAPI prefix##_Release(type *iface) { return operation_release(from(iface)); } \
++static HRESULT WINAPI prefix##_GetIids(type *iface, ULONG *count, IID **iids) { return E_NOTIMPL; } \
++static HRESULT WINAPI prefix##_GetRuntimeClassName(type *iface, HSTRING *name) { return E_NOTIMPL; } \
++static HRESULT WINAPI prefix##_GetTrustLevel(type *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++OP_BASE(struct async_operation, operation, operation_from_iface)
++OP_BASE(struct async_info, async_info, operation_from_info)
++
++static HRESULT WINAPI operation_put_Completed(struct async_operation *iface, struct completed_handler *handler)
++{
++    struct provider_operation *obj = operation_from_iface(iface);
++    TRACE("operation %p put_Completed handler %p.\n", obj, handler);
++    if (obj->handler) IUnknown_Release((IUnknown *)obj->handler);
++    obj->handler = handler;
++    if (handler)
++    {
++        IUnknown_AddRef((IUnknown *)handler);
++        return handler->lpVtbl->Invoke(handler, iface, Completed);
++    }
++    return S_OK;
++}
++static HRESULT WINAPI operation_get_Completed(struct async_operation *iface, struct completed_handler **handler)
++{
++    struct provider_operation *obj = operation_from_iface(iface);
++    if (!handler) return E_POINTER;
++    *handler = obj->handler;
++    if (*handler) IUnknown_AddRef((IUnknown *)*handler);
++    return S_OK;
++}
++static HRESULT WINAPI operation_GetResults(struct async_operation *iface, void **result)
++{
++    struct provider_operation *obj = operation_from_iface(iface);
++    TRACE("operation %p GetResults result %p payload %p action %d.\n", obj, result, obj->payload, obj->is_action);
++    if (obj->is_action) return S_OK;   /* no out parameter to write through */
++    if (!result) return E_POINTER;
++    *result = obj->payload;
++    if (obj->payload) IUnknown_AddRef(obj->payload);
++    return S_OK;
++}
++static const struct async_operation_vtbl async_operation_vtbl =
++{
++    operation_QueryInterface, operation_AddRef, operation_Release,
++    operation_GetIids, operation_GetRuntimeClassName, operation_GetTrustLevel,
++    operation_put_Completed, operation_get_Completed, operation_GetResults,
++};
++static HRESULT WINAPI async_info_get_Id(struct async_info *iface, UINT *id) { if (!id) return E_POINTER; *id = 1; return S_OK; }
++static HRESULT WINAPI async_info_get_Status(struct async_info *iface, AsyncStatus *status) { if (!status) return E_POINTER; *status = Completed; return S_OK; }
++static HRESULT WINAPI async_info_get_ErrorCode(struct async_info *iface, HRESULT *error) { if (!error) return E_POINTER; *error = S_OK; return S_OK; }
++static HRESULT WINAPI async_info_Cancel(struct async_info *iface) { return S_OK; }
++static HRESULT WINAPI async_info_Close(struct async_info *iface) { return S_OK; }
++static const struct async_info_vtbl async_info_vtbl =
++{
++    async_info_QueryInterface, async_info_AddRef, async_info_Release,
++    async_info_GetIids, async_info_GetRuntimeClassName, async_info_GetTrustLevel,
++    async_info_get_Id, async_info_get_Status, async_info_get_ErrorCode,
++    async_info_Cancel, async_info_Close,
++};
++
++static HRESULT create_action(void **result);
++static HRESULT create_object_operation(IUnknown *payload, void **result)
++{
++    struct provider_operation *op;
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!(op = calloc(1, sizeof(*op)))) return E_OUTOFMEMORY;
++    op->operation_iface.lpVtbl = &async_operation_vtbl;
++    op->info_iface.lpVtbl = &async_info_vtbl;
++    op->ref = 1;
++    op->payload = payload;
++    if (payload) IUnknown_AddRef(payload);
++    *result = &op->operation_iface;
++    TRACE("created completed object operation %p for payload %p.\n", op, payload);
++    return S_OK;
++}
++
++static HRESULT create_action(void **result)
++{
++    HRESULT hr = create_object_operation(NULL, result);
++    if (SUCCEEDED(hr)) operation_from_iface(*result)->is_action = TRUE;
++    return hr;
++}
++
++static HRESULT create_provider_operation(HSTRING id, HSTRING authority, void **result)
++{
++    struct provider *provider;
++    HRESULT hr;
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!(provider = calloc(1, sizeof(*provider)))) return E_OUTOFMEMORY;
++    provider->iface.lpVtbl = &provider_vtbl;
++    provider->iface2.lpVtbl = &provider2_vtbl;
++    provider->iface3.lpVtbl = &provider3_vtbl;
++    provider->iface4.lpVtbl = &provider4_vtbl;
++    provider->ref = 1;
++    if (FAILED(WindowsDuplicateString(id, &provider->id)) ||
++        FAILED(WindowsDuplicateString(authority, &provider->authority)))
++    { provider_release(provider); return E_OUTOFMEMORY; }
++    hr = create_object_operation((IUnknown *)&provider->iface, result);
++    TRACE("created provider result for id %s authority %s, hr %#lx.\n",
++          debugstr_hstring(id), debugstr_hstring(authority), hr);
++    provider_release(provider);
++    return hr;
++}
++
++/* The account enumeration result returned by FindAllAccounts*. */
++static const GUID IID_IFindAllAccountsResult =
++    {0xa5812b5d,0xb72e,0x420c,{0x86,0xab,0xaa,0xc0,0xd7,0xb7,0x26,0x1f}};
++struct empty_vector;
++struct findall_result_iface;
++struct empty_vector_vtbl
++{
++    INSPECTABLE_VTBL(struct empty_vector);
++    HRESULT (WINAPI *GetAt)(struct empty_vector *, UINT, void **);
++    HRESULT (WINAPI *get_Size)(struct empty_vector *, UINT *);
++    HRESULT (WINAPI *IndexOf)(struct empty_vector *, void *, UINT *, boolean *);
++    HRESULT (WINAPI *GetMany)(struct empty_vector *, UINT, UINT, void **, UINT *);
++};
++struct findall_result_vtbl
++{
++    INSPECTABLE_VTBL(struct findall_result_iface);
++    HRESULT (WINAPI *get_Accounts)(struct findall_result_iface *, struct empty_vector **);
++    HRESULT (WINAPI *get_Status)(struct findall_result_iface *, INT *);
++    HRESULT (WINAPI *get_ProviderError)(struct findall_result_iface *, void **);
++};
++struct empty_vector { const struct empty_vector_vtbl *lpVtbl; LONG ref; IUnknown *item; };
++struct findall_result_iface { const struct findall_result_vtbl *lpVtbl; };
++struct findall_result { struct findall_result_iface iface; LONG ref; struct empty_vector *accounts; };
++static const struct empty_vector_vtbl empty_vector_vtbl;
++static const struct findall_result_vtbl findall_result_vtbl;
++
++static HRESULT WINAPI vector_QueryInterface(struct empty_vector *iface, REFIID iid, void **out)
++{
++    TRACE("empty vector %p QI %s.\n", iface, debugstr_guid(iid));
++    if (!out) return E_POINTER;
++    *out = iface; InterlockedIncrement(&iface->ref); return S_OK;
++}
++static ULONG WINAPI vector_AddRef(struct empty_vector *iface) { return InterlockedIncrement(&iface->ref); }
++static ULONG WINAPI vector_Release(struct empty_vector *iface)
++{ ULONG ref = InterlockedDecrement(&iface->ref); if (!ref) { if (iface->item) IUnknown_Release(iface->item); free(iface); } return ref; }
++static HRESULT WINAPI vector_GetIids(struct empty_vector *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI vector_GetRuntimeClassName(struct empty_vector *iface, HSTRING *name) { return E_NOTIMPL; }
++static HRESULT WINAPI vector_GetTrustLevel(struct empty_vector *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI vector_GetAt(struct empty_vector *iface, UINT index, void **value)
++{ TRACE("vector %p GetAt %u item %p out %p.\n",iface,index,iface->item,value); if (!value) return E_POINTER; *value = NULL; if (!iface->item || index) return E_BOUNDS; *value = iface->item; IUnknown_AddRef(iface->item); return S_OK; }
++static HRESULT WINAPI vector_get_Size(struct empty_vector *iface, UINT *size)
++{ TRACE("vector %p get_Size item %p out %p.\n",iface,iface->item,size); if (!size) return E_POINTER; *size = iface->item ? 1 : 0; return S_OK; }
++static HRESULT WINAPI vector_IndexOf(struct empty_vector *iface, void *value, UINT *index, boolean *found)
++{ if (!index || !found) return E_POINTER; *index = 0; *found = iface->item == value; return S_OK; }
++static HRESULT WINAPI vector_GetMany(struct empty_vector *iface, UINT start, UINT capacity, void **items, UINT *actual)
++{ TRACE("vector %p GetMany start %u capacity %u item %p items %p actual %p.\n",iface,start,capacity,iface->item,items,actual); if (!actual) return E_POINTER; *actual = 0; if (iface->item && !start && capacity && items) { items[0]=iface->item; IUnknown_AddRef(iface->item); *actual=1; } return S_OK; }
++static const struct empty_vector_vtbl empty_vector_vtbl =
++{
++    vector_QueryInterface, vector_AddRef, vector_Release,
++    vector_GetIids, vector_GetRuntimeClassName, vector_GetTrustLevel,
++    vector_GetAt, vector_get_Size, vector_IndexOf, vector_GetMany,
++};
++
++static struct findall_result *findall_from_iface(struct findall_result_iface *iface)
++{ return CONTAINING_RECORD(iface, struct findall_result, iface); }
++static HRESULT WINAPI findall_QueryInterface(struct findall_result_iface *iface, REFIID iid, void **out)
++{
++    struct findall_result *obj = findall_from_iface(iface);
++    TRACE("find-all result %p QI %s.\n", obj, debugstr_guid(iid));
++    if (!out) return E_POINTER;
++    if (!IsEqualGUID(iid, &IID_IUnknown) && !IsEqualGUID(iid, &IID_IInspectable) &&
++        !IsEqualGUID(iid, &IID_IAgileObject) && !IsEqualGUID(iid, &IID_IFindAllAccountsResult))
++    { *out = NULL; return E_NOINTERFACE; }
++    *out = iface; InterlockedIncrement(&obj->ref); return S_OK;
++}
++static ULONG WINAPI findall_AddRef(struct findall_result_iface *iface)
++{ return InterlockedIncrement(&findall_from_iface(iface)->ref); }
++static ULONG WINAPI findall_Release(struct findall_result_iface *iface)
++{
++    struct findall_result *obj = findall_from_iface(iface);
++    ULONG ref = InterlockedDecrement(&obj->ref);
++    if (!ref) { vector_Release(obj->accounts); free(obj); }
++    return ref;
++}
++static HRESULT WINAPI findall_GetIids(struct findall_result_iface *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI findall_GetRuntimeClassName(struct findall_result_iface *iface, HSTRING *name)
++{ static const WCHAR n[] = L"Windows.Security.Authentication.Web.Core.FindAllAccountsResult"; return WindowsCreateString(n, ARRAY_SIZE(n)-1, name); }
++static HRESULT WINAPI findall_GetTrustLevel(struct findall_result_iface *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI findall_get_Accounts(struct findall_result_iface *iface, struct empty_vector **accounts)
++{
++    struct findall_result *obj = findall_from_iface(iface);
++    TRACE("find-all result %p get_Accounts %p.\n", obj, accounts);
++    if (!accounts) return E_POINTER; *accounts = obj->accounts; vector_AddRef(*accounts); return S_OK;
++}
++static HRESULT WINAPI findall_get_Status(struct findall_result_iface *iface, INT *status)
++{ if (!status) return E_POINTER; *status = 0; return S_OK; } /* Success */
++static HRESULT WINAPI findall_get_ProviderError(struct findall_result_iface *iface, void **error)
++{ if (!error) return E_POINTER; *error = NULL; return S_OK; }
++static const struct findall_result_vtbl findall_result_vtbl =
++{
++    findall_QueryInterface, findall_AddRef, findall_Release,
++    findall_GetIids, findall_GetRuntimeClassName, findall_GetTrustLevel,
++    findall_get_Accounts, findall_get_Status, findall_get_ProviderError,
++};
++static HRESULT create_findall_operation(IUnknown *item, void **result)
++{
++    struct findall_result *payload;
++    struct empty_vector *vector;
++    HRESULT hr;
++    if (!(vector = calloc(1, sizeof(*vector)))) return E_OUTOFMEMORY;
++    vector->lpVtbl = &empty_vector_vtbl; vector->ref = 1;
++    vector->item = item; if (item) IUnknown_AddRef(item);
++    if (!(payload = calloc(1, sizeof(*payload)))) { vector_Release(vector); return E_OUTOFMEMORY; }
++    payload->iface.lpVtbl = &findall_result_vtbl; payload->ref = 1; payload->accounts = vector;
++    hr = create_object_operation((IUnknown *)&payload->iface, result);
++    findall_Release(&payload->iface);
++    return hr;
++}
++
++static const GUID IID_IWebAccount =
++    {0x69473eb2,0x8031,0x49be,{0x80,0xbb,0x96,0xcb,0x46,0xd9,0x9a,0xba}};
++static const GUID IID_IWebAccount2 =
++    {0x7b56d6f8,0x990b,0x4eb5,{0x94,0xa7,0x56,0x21,0xf3,0xa8,0xb8,0x24}};
++static const GUID IID_IWebTokenResponse =
++    {0x67a7c5ca,0x83f6,0x44c6,{0xa3,0xb1,0x0e,0xb6,0x9e,0x41,0xfa,0x8a}};
++struct account_iface; struct account2_iface; struct response_iface;
++struct account_vtbl
++{
++    INSPECTABLE_VTBL(struct account_iface);
++    HRESULT (WINAPI *get_WebAccountProvider)(struct account_iface *,void **);
++    HRESULT (WINAPI *get_UserName)(struct account_iface *,HSTRING *);
++    HRESULT (WINAPI *get_State)(struct account_iface *,INT *);
++};
++struct account2_vtbl
++{
++    INSPECTABLE_VTBL(struct account2_iface);
++    HRESULT (WINAPI *get_Id)(struct account2_iface *,HSTRING *);
++    HRESULT (WINAPI *get_Properties)(struct account2_iface *,IMap_HSTRING_HSTRING **);
++    HRESULT (WINAPI *GetPictureAsync)(struct account2_iface *,INT,void **);
++    HRESULT (WINAPI *SignOutAsync)(struct account2_iface *,void **);
++    HRESULT (WINAPI *SignOutWithClientIdAsync)(struct account2_iface *,HSTRING,void **);
++};
++struct response_vtbl
++{
++    INSPECTABLE_VTBL(struct response_iface);
++    HRESULT (WINAPI *get_Token)(struct response_iface *,HSTRING *);
++    HRESULT (WINAPI *get_ProviderError)(struct response_iface *,void **);
++    HRESULT (WINAPI *get_WebAccount)(struct response_iface *,struct account_iface **);
++    HRESULT (WINAPI *get_Properties)(struct response_iface *,void **);
++};
++struct account_iface { const struct account_vtbl *lpVtbl; };
++struct account2_iface { const struct account2_vtbl *lpVtbl; };
++struct response_iface { const struct response_vtbl *lpVtbl; };
++struct web_account { struct account_iface iface; struct account2_iface iface2; LONG ref; IUnknown *provider; IMap_HSTRING_HSTRING *properties; };
++struct token_response { struct response_iface iface; LONG ref; HSTRING token; struct web_account *account; IMap_HSTRING_HSTRING *properties; };
++static const struct account_vtbl account_vtbl; static const struct account2_vtbl account2_vtbl; static const struct response_vtbl response_vtbl;
++static struct web_account *account_from_iface(struct account_iface *iface){return CONTAINING_RECORD(iface,struct web_account,iface);}
++static struct web_account *account_from_iface2(struct account2_iface *iface){return CONTAINING_RECORD(iface,struct web_account,iface2);}
++static struct token_response *response_from_iface(struct response_iface *iface){return CONTAINING_RECORD(iface,struct token_response,iface);}
++static HRESULT WINAPI account_QueryInterface(struct account_iface *iface,REFIID iid,void **out)
++{struct web_account *o=account_from_iface(iface);TRACE("web account %p QI %s out %p.\n",o,debugstr_guid(iid),out);if(!out)return E_POINTER;if(!IsEqualGUID(iid,&IID_IUnknown)&&!IsEqualGUID(iid,&IID_IInspectable)&&!IsEqualGUID(iid,&IID_IAgileObject)&&!IsEqualGUID(iid,&IID_IWebAccount)&&!IsEqualGUID(iid,&IID_IWebAccount2)){*out=NULL;return E_NOINTERFACE;}*out=IsEqualGUID(iid,&IID_IWebAccount2)?(void*)&o->iface2:(void*)iface;InterlockedIncrement(&o->ref);return S_OK;}
++static ULONG WINAPI account_AddRef(struct account_iface *iface){return InterlockedIncrement(&account_from_iface(iface)->ref);}
++static ULONG WINAPI account_Release(struct account_iface *iface){struct web_account *o=account_from_iface(iface);ULONG r=InterlockedDecrement(&o->ref);if(!r){if(o->provider)IUnknown_Release(o->provider);if(o->properties)IMap_HSTRING_HSTRING_Release(o->properties);free(o);}return r;}
++static HRESULT WINAPI account_GetIids(struct account_iface *i,ULONG *c,IID **ids){return E_NOTIMPL;}
++static HRESULT WINAPI account_GetRuntimeClassName(struct account_iface *i,HSTRING *n){static const WCHAR s[]=L"Windows.Security.Credentials.WebAccount";return WindowsCreateString(s,ARRAY_SIZE(s)-1,n);}
++static HRESULT WINAPI account_GetTrustLevel(struct account_iface *i,TrustLevel *l){*l=BaseTrust;return S_OK;}
++static HRESULT WINAPI account_get_WebAccountProvider(struct account_iface *iface,void **provider){struct web_account *o=account_from_iface(iface);TRACE("web account %p get provider %p.\n",o,provider);if(!provider)return E_POINTER;*provider=o->provider;if(*provider)IUnknown_AddRef(o->provider);return S_OK;}
++/* Which account this prefix holds, in one place. Office wrote the CID itself
++ * when it last licensed, so this is a reading of its own state rather than an
++ * invention: the account id, the user name and the id FindAccountAsync asks
++ * about are all this one string. */
++static BOOL office_connected_cid(WCHAR *buf, DWORD cb)
++{
++    static const WCHAR key[]=L"Software\\Microsoft\\Office\\16.0\\Common\\Identity";
++    return !RegGetValueW(HKEY_CURRENT_USER,key,L"ConnectedAccountCID",RRF_RT_REG_SZ,NULL,buf,&cb);
++}
++
++/* An account that cannot say who it is is not much of an account: Office reads
++ * this off every token response to learn which identity signed in. get_Id right
++ * below already answers, from ConnectedAccountCID; leaving the name empty made
++ * the pair inconsistent. Office writes the CID-to-address mapping itself when
++ * it licenses, so the honest answer is already in the prefix -- read it the
++ * same way rather than inventing one. */
++static HRESULT WINAPI account_get_UserName(struct account_iface *iface,HSTRING *name)
++{
++    static const WCHAR mapkey[]=L"Software\\Microsoft\\Office\\16.0\\Common\\Licensing\\"
++                                 "LicensingNext\\LicenseIdToEmailMapping";
++    WCHAR cid[256],mail[256];
++    DWORD size;
++
++    TRACE("web account %p get username %p.\n",account_from_iface(iface),name);
++    if(!name)return E_POINTER;
++    if(!office_connected_cid(cid,sizeof(cid)))
++        return WindowsCreateString(NULL,0,name);
++    size=sizeof(mail);
++    if(RegGetValueW(HKEY_CURRENT_USER,mapkey,cid,RRF_RT_REG_SZ,NULL,mail,&size))
++        return WindowsCreateString(NULL,0,name);
++    TRACE("web account %p username resolved for cid %s.\n",account_from_iface(iface),debugstr_w(cid));
++    return WindowsCreateString(mail,lstrlenW(mail),name);
++}
++/* Measured on Windows 11: the WebAccount that comes back with a successful
++ * Office token has State == WebAccountState_None (0), not Connected. */
++static HRESULT WINAPI account_get_State(struct account_iface *iface,INT *state){TRACE("web account %p get state %p.\n",account_from_iface(iface),state);if(!state)return E_POINTER;*state=0;return S_OK;}
++static const struct account_vtbl account_vtbl={account_QueryInterface,account_AddRef,account_Release,account_GetIids,account_GetRuntimeClassName,account_GetTrustLevel,account_get_WebAccountProvider,account_get_UserName,account_get_State};
++static HRESULT WINAPI account2_QueryInterface(struct account2_iface *iface,REFIID iid,void **out){return account_QueryInterface(&account_from_iface2(iface)->iface,iid,out);}
++static ULONG WINAPI account2_AddRef(struct account2_iface *iface){return account_AddRef(&account_from_iface2(iface)->iface);}
++static ULONG WINAPI account2_Release(struct account2_iface *iface){return account_Release(&account_from_iface2(iface)->iface);}
++static HRESULT WINAPI account2_GetIids(struct account2_iface *i,ULONG *c,IID **ids){return E_NOTIMPL;}
++static HRESULT WINAPI account2_GetRuntimeClassName(struct account2_iface *i,HSTRING *n){return account_GetRuntimeClassName(&account_from_iface2(i)->iface,n);}
++static HRESULT WINAPI account2_GetTrustLevel(struct account2_iface *i,TrustLevel *l){*l=BaseTrust;return S_OK;}
++static HRESULT WINAPI account2_get_Id(struct account2_iface *i,HSTRING *id)
++{
++    WCHAR value[256];
++
++    TRACE("web account %p get id %p.\n",account_from_iface2(i),id);
++    if(!id)return E_POINTER;
++    if(!office_connected_cid(value,sizeof(value)))
++        return WindowsCreateString(NULL,0,id);
++    return WindowsCreateString(value,lstrlenW(value),id);
++}
++static HRESULT WINAPI account2_get_Properties(struct account2_iface *i,IMap_HSTRING_HSTRING **p){struct web_account *o=account_from_iface2(i);HRESULT hr;TRACE("web account %p get properties %p.\n",o,p);if(!p)return E_POINTER;if(!o->properties&&FAILED(hr=webauth_string_map_create(&o->properties))){*p=NULL;return hr;}*p=o->properties;IMap_HSTRING_HSTRING_AddRef(*p);return S_OK;}
++static HRESULT WINAPI account2_GetPictureAsync(struct account2_iface *i,INT size,void **op){if(op)*op=NULL;return E_NOTIMPL;}
++static HRESULT WINAPI account2_SignOutAsync(struct account2_iface *i,void **op){if(op)*op=NULL;return E_NOTIMPL;}
++static HRESULT WINAPI account2_SignOutWithClientIdAsync(struct account2_iface *i,HSTRING id,void **op){if(op)*op=NULL;return E_NOTIMPL;}
++static const struct account2_vtbl account2_vtbl={account2_QueryInterface,account2_AddRef,account2_Release,account2_GetIids,account2_GetRuntimeClassName,account2_GetTrustLevel,account2_get_Id,account2_get_Properties,account2_GetPictureAsync,account2_SignOutAsync,account2_SignOutWithClientIdAsync};
++static HRESULT WINAPI response_QueryInterface(struct response_iface *iface,REFIID iid,void **out)
++{struct token_response *o=response_from_iface(iface);TRACE("token response %p QI %s out %p.\n",o,debugstr_guid(iid),out);if(!out)return E_POINTER;if(!IsEqualGUID(iid,&IID_IUnknown)&&!IsEqualGUID(iid,&IID_IInspectable)&&!IsEqualGUID(iid,&IID_IAgileObject)&&!IsEqualGUID(iid,&IID_IWebTokenResponse)){*out=NULL;return E_NOINTERFACE;}*out=iface;InterlockedIncrement(&o->ref);return S_OK;}
++static ULONG WINAPI response_AddRef(struct response_iface *iface){return InterlockedIncrement(&response_from_iface(iface)->ref);}
++static ULONG WINAPI response_Release(struct response_iface *iface){struct token_response *o=response_from_iface(iface);ULONG r=InterlockedDecrement(&o->ref);if(!r){WindowsDeleteString(o->token);if(o->account)account_Release(&o->account->iface);if(o->properties)IMap_HSTRING_HSTRING_Release(o->properties);free(o);}return r;}
++static HRESULT WINAPI response_GetIids(struct response_iface *i,ULONG *c,IID **ids){return E_NOTIMPL;}
++static HRESULT WINAPI response_GetRuntimeClassName(struct response_iface *i,HSTRING *n){static const WCHAR s[]=L"Windows.Security.Authentication.Web.Core.WebTokenResponse";return WindowsCreateString(s,ARRAY_SIZE(s)-1,n);}
++static HRESULT WINAPI response_GetTrustLevel(struct response_iface *i,TrustLevel *l){*l=BaseTrust;return S_OK;}
++static HRESULT WINAPI response_get_Token(struct response_iface *iface,HSTRING *token){TRACE("returning authorized token (%u UTF-16 chars).\n",WindowsGetStringLen(response_from_iface(iface)->token));return WindowsDuplicateString(response_from_iface(iface)->token,token);}
++static HRESULT WINAPI response_get_ProviderError(struct response_iface *i,void **e){TRACE("token response %p get ProviderError %p.\n",response_from_iface(i),e);if(!e)return E_POINTER;*e=NULL;return S_OK;}
++static HRESULT WINAPI response_get_WebAccount(struct response_iface *iface,struct account_iface **account){struct token_response *o=response_from_iface(iface);TRACE("token response %p get WebAccount %p.\n",o,account);if(!account)return E_POINTER;*account=o->account?&o->account->iface:NULL;if(*account)account_AddRef(*account);return S_OK;}
++/* NULL is not "this response has no properties", it is a pointer the caller
++ * has to guess is absent. An empty map answers the question -- and because
++ * every Lookup on it is traced, it is also the cheapest way to find out which
++ * keys Office expects a real broker to have filled in. */
++static HRESULT WINAPI response_get_Properties(struct response_iface *i,void **p)
++{
++    struct token_response *o=response_from_iface(i);HRESULT hr;
++    TRACE("token response %p get Properties %p.\n",o,p);
++    if(!p)return E_POINTER;
++    if(!o->properties&&FAILED(hr=webauth_string_map_create(&o->properties))){*p=NULL;return hr;}
++    *p=o->properties;IMap_HSTRING_HSTRING_AddRef(o->properties);return S_OK;
++}
++static const struct response_vtbl response_vtbl={response_QueryInterface,response_AddRef,response_Release,response_GetIids,response_GetRuntimeClassName,response_GetTrustLevel,response_get_Token,response_get_ProviderError,response_get_WebAccount,response_get_Properties};
++struct request_probe; struct request_probe_vtbl
++{
++    INSPECTABLE_VTBL(struct request_probe);
++    HRESULT (WINAPI *get_WebAccountProvider)(struct request_probe *,void **);
++    HRESULT (WINAPI *get_Scope)(struct request_probe *,HSTRING *);
++    HRESULT (WINAPI *get_ClientId)(struct request_probe *,HSTRING *);
++};
++struct request_probe { const struct request_probe_vtbl *lpVtbl; };
++static HRESULT read_token_file(const WCHAR *path,HSTRING *token)
++{
++    HANDLE file;DWORD size,got;char *buf;WCHAR *wide;int len;HRESULT hr;
++    *token=NULL;file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
++    if(file==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(GetLastError());
++    size=GetFileSize(file,NULL);if(size==INVALID_FILE_SIZE||!size||size>65536){CloseHandle(file);return E_FAIL;}
++    if(!(buf=malloc(size))){CloseHandle(file);return E_OUTOFMEMORY;}
++    if(!ReadFile(file,buf,size,&got,NULL)||got!=size){hr=HRESULT_FROM_WIN32(GetLastError());SecureZeroMemory(buf,size);free(buf);CloseHandle(file);return hr;}
++    CloseHandle(file);len=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,buf,size,NULL,0);
++    if(!len||(wide=malloc((len+1)*sizeof(WCHAR)))==NULL){SecureZeroMemory(buf,size);free(buf);return E_OUTOFMEMORY;}
++    MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,buf,size,wide,len);wide[len]=0;
++    hr=WindowsCreateString(wide,len,token);SecureZeroMemory(wide,(len+1)*sizeof(WCHAR));free(wide);SecureZeroMemory(buf,size);free(buf);
++    return hr;
++}
++
++/* Office does not ask for "a token", it asks for a token for a scope: sixteen
++ * requests in one start-up, ten of them for
++ * service::officeapps.live.com::MBI_SSL_SHORT and the rest for graph, the
++ * consent service, ads and ssl.live.com. Handing the same string back for
++ * every one of them is not a broker, it is a fixed answer shaped like a token,
++ * and a service is entitled to reject a ticket minted for someone else's
++ * audience -- which from here would be indistinguishable from a bad token.
++ *
++ * So: one file per scope under Z:\tmp\office-wam-tokens. When that directory
++ * exists it is the whole truth, and a scope with no file has no token. The
++ * single-file form is still read when the directory is absent, so a prefix set
++ * up the old way keeps working. */
++static void scope_file_name(HSTRING scope,WCHAR *out,UINT32 max)
++{
++    const WCHAR *s;UINT32 len=0,i,n=0;
++    s=WindowsGetStringRawBuffer(scope,&len);
++    for(i=0;i<len&&n+1<max;i++)
++    {
++        WCHAR c=s[i];
++        out[n++]=(c=='.'||c=='-'||c=='_'||(c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z'))?c:'_';
++    }
++    out[n]=0;
++}
++
++static HRESULT load_authorized_token(HSTRING scope,HSTRING *token)
++{
++    static const WCHAR dir[]=L"Z:\\tmp\\office-wam-tokens";
++    static const WCHAR legacy[]=L"Z:\\tmp\\office-wam-token.txt";
++    WCHAR path[MAX_PATH],name[512];
++    DWORD attr;
++
++    *token=NULL;
++    attr=GetFileAttributesW(dir);
++    if(attr==INVALID_FILE_ATTRIBUTES||!(attr&FILE_ATTRIBUTE_DIRECTORY))
++    {
++        TRACE("no per-scope token store; falling back to the single-token file.\n");
++        return read_token_file(legacy,token);
++    }
++    scope_file_name(scope,name,ARRAY_SIZE(name));
++    wcscpy(path,dir);wcscat(path,L"\\");wcsncat(path,name,ARRAY_SIZE(path)-ARRAY_SIZE(dir)-8);wcscat(path,L".txt");
++    TRACE("token for scope %s -> %s.\n",debugstr_hstring(scope),debugstr_w(path));
++    return read_token_file(path,token);
++}
++static HRESULT create_web_account(IUnknown *provider,struct web_account **out)
++{
++    struct web_account *a;
++    if(!out)return E_POINTER;*out=NULL;
++    if(!(a=calloc(1,sizeof(*a))))return E_OUTOFMEMORY;
++    a->iface.lpVtbl=&account_vtbl;a->iface2.lpVtbl=&account2_vtbl;a->ref=1;
++    a->provider=provider;if(provider)IUnknown_AddRef(provider);
++    *out=a;return S_OK;
++}
++
++/* The one account this prefix holds, or nothing if Office has never recorded a
++ * CID here. Every place that has to name the signed-in account goes through
++ * this, so FindAccountAsync, FindAllAccounts* and the account on a token
++ * response cannot disagree about whether it exists. */
++static HRESULT create_prefix_account(void *provider,struct web_account **out)
++{
++    WCHAR cid[256];
++    *out=NULL;
++    if(!office_connected_cid(cid,sizeof(cid)))
++    {
++        TRACE("no ConnectedAccountCID in this prefix.\n");
++        return S_FALSE;
++    }
++    return create_web_account((IUnknown *)provider,out);
++}
++
++static HRESULT create_token_response(void *request,HSTRING token,struct token_response **out)
++{
++    struct token_response *r;struct web_account *a;void *provider=NULL;HRESULT hr;
++    if(!out)return E_POINTER;*out=NULL;if(request)((struct request_probe*)request)->lpVtbl->get_WebAccountProvider((struct request_probe*)request,&provider);
++    hr=create_web_account((IUnknown *)provider,&a);
++    if(provider)IUnknown_Release((IUnknown*)provider);
++    if(FAILED(hr))return hr;
++    if(!(r=calloc(1,sizeof(*r)))){account_Release(&a->iface);return E_OUTOFMEMORY;}r->iface.lpVtbl=&response_vtbl;r->ref=1;r->account=a;
++    if(FAILED(WindowsDuplicateString(token,&r->token))){response_Release(&r->iface);return E_OUTOFMEMORY;}*out=r;return S_OK;
++}
++
++static const GUID IID_IWebTokenRequestResult =
++    {0xc12a8305,0xd1f8,0x4483,{0x8d,0x54,0x38,0xfe,0x29,0x27,0x84,0xff}};
++struct token_result_iface;
++struct token_result_vtbl
++{
++    INSPECTABLE_VTBL(struct token_result_iface);
++    HRESULT (WINAPI *get_ResponseData)(struct token_result_iface *, struct empty_vector **);
++    HRESULT (WINAPI *get_ResponseStatus)(struct token_result_iface *, INT *);
++    HRESULT (WINAPI *get_ResponseError)(struct token_result_iface *, void **);
++    HRESULT (WINAPI *InvalidateCacheAsync)(struct token_result_iface *, void **);
++};
++struct token_result_iface { const struct token_result_vtbl *lpVtbl; };
++struct token_result { struct token_result_iface iface; LONG ref; INT status; struct empty_vector *responses; };
++static struct token_result *token_result_from_iface(struct token_result_iface *iface)
++{ return CONTAINING_RECORD(iface,struct token_result,iface); }
++static HRESULT WINAPI token_result_QueryInterface(struct token_result_iface *iface,REFIID iid,void **out)
++{
++    struct token_result *obj=token_result_from_iface(iface);TRACE("token result %p QI %s.\n",obj,debugstr_guid(iid));
++    if(!out)return E_POINTER;if(!IsEqualGUID(iid,&IID_IUnknown)&&!IsEqualGUID(iid,&IID_IInspectable)&&
++       !IsEqualGUID(iid,&IID_IAgileObject)&&!IsEqualGUID(iid,&IID_IWebTokenRequestResult)){*out=NULL;return E_NOINTERFACE;}
++    *out=iface;InterlockedIncrement(&obj->ref);return S_OK;
++}
++static ULONG WINAPI token_result_AddRef(struct token_result_iface *iface)
++{return InterlockedIncrement(&token_result_from_iface(iface)->ref);}
++static ULONG WINAPI token_result_Release(struct token_result_iface *iface)
++{struct token_result *obj=token_result_from_iface(iface);ULONG ref=InterlockedDecrement(&obj->ref);if(!ref){vector_Release(obj->responses);free(obj);}return ref;}
++static HRESULT WINAPI token_result_GetIids(struct token_result_iface *iface,ULONG *c,IID **i){return E_NOTIMPL;}
++static HRESULT WINAPI token_result_GetRuntimeClassName(struct token_result_iface *iface,HSTRING *name)
++{static const WCHAR n[]=L"Windows.Security.Authentication.Web.Core.WebTokenRequestResult";return WindowsCreateString(n,ARRAY_SIZE(n)-1,name);}
++static HRESULT WINAPI token_result_GetTrustLevel(struct token_result_iface *iface,TrustLevel *level){*level=BaseTrust;return S_OK;}
++static HRESULT WINAPI token_result_get_ResponseData(struct token_result_iface *iface,struct empty_vector **responses)
++{struct token_result *obj=token_result_from_iface(iface);TRACE("token result %p get responses %p.\n",obj,responses);if(!responses)return E_POINTER;*responses=obj->responses;vector_AddRef(*responses);return S_OK;}
++static HRESULT WINAPI token_result_get_ResponseStatus(struct token_result_iface *iface,INT *status)
++{struct token_result *obj=token_result_from_iface(iface);TRACE("token result %p status %d.\n",obj,obj->status);if(!status)return E_POINTER;*status=obj->status;return S_OK;}
++static HRESULT WINAPI token_result_get_ResponseError(struct token_result_iface *iface,void **error)
++{if(!error)return E_POINTER;*error=NULL;return S_OK;}
++static HRESULT WINAPI token_result_InvalidateCacheAsync(struct token_result_iface *iface,void **operation)
++{
++    /* Nothing is cached in here -- the tokens are read off disk on every call,
++     * so an invalidation has already happened by the time it is asked for.
++     * Saying so is different from saying the call does not exist. */
++    TRACE("token result %p InvalidateCacheAsync %p.\n",token_result_from_iface(iface),operation);
++    return create_action(operation);
++}
++static const struct token_result_vtbl token_result_vtbl=
++{
++    token_result_QueryInterface,token_result_AddRef,token_result_Release,
++    token_result_GetIids,token_result_GetRuntimeClassName,token_result_GetTrustLevel,
++    token_result_get_ResponseData,token_result_get_ResponseStatus,
++    token_result_get_ResponseError,token_result_InvalidateCacheAsync,
++};
++static HRESULT create_token_result_operation(INT status,IUnknown *item,void **result)
++{
++    struct token_result *payload;struct empty_vector *vector;HRESULT hr;
++    if(!(vector=calloc(1,sizeof(*vector))))return E_OUTOFMEMORY;vector->lpVtbl=&empty_vector_vtbl;vector->ref=1;vector->item=item;if(item)IUnknown_AddRef(item);
++    if(!(payload=calloc(1,sizeof(*payload)))){vector_Release(vector);return E_OUTOFMEMORY;}
++    payload->iface.lpVtbl=&token_result_vtbl;payload->ref=1;payload->status=status;payload->responses=vector;
++    hr=create_object_operation((IUnknown *)&payload->iface,result);token_result_Release(&payload->iface);return hr;
++}
++
++/* WebTokenRequestStatus: 0 Success, 1 UserCancel, 2 AccountSwitch,
++ * 3 UserInteractionRequired, 4 AccountProviderNotAvailable, 5 ProviderError. */
++#define WEB_TOKEN_SUCCESS                    0
++#define WEB_TOKEN_USER_CANCEL                1
++#define WEB_TOKEN_USER_INTERACTION_REQUIRED  3
++
++static HRESULT token_result_for_request(void *request,INT no_token_status,void **result)
++{
++    HSTRING scope=NULL,token;struct token_response *response;HRESULT hr;
++
++    if(request)((struct request_probe*)request)->lpVtbl->get_Scope((struct request_probe*)request,&scope);
++    hr=load_authorized_token(scope,&token);
++    if(SUCCEEDED(hr))
++    {
++        hr=create_token_response(request,token,&response);
++        WindowsDeleteString(token);WindowsDeleteString(scope);
++        if(FAILED(hr))return hr;
++        hr=create_token_result_operation(WEB_TOKEN_SUCCESS,(IUnknown *)&response->iface,result);
++        response_Release(&response->iface);return hr;
++    }
++    TRACE("no token held for scope %s (%#lx), answering status %d.\n",debugstr_hstring(scope),hr,no_token_status);
++    WindowsDeleteString(scope);
++    return create_token_result_operation(no_token_status,NULL,result);
++}
++
++static HRESULT WINAPI statics_GetTokenSilentlyAsync(struct webauth_statics *iface,void *request,void **result)
++{
++    TRACE("GetTokenSilentlyAsync iface %p, request %p, result %p.\n",iface,request,result);
++    return token_result_for_request(request,WEB_TOKEN_USER_INTERACTION_REQUIRED,result);
++}
++static HRESULT WINAPI statics_GetTokenSilentlyWithWebAccountAsync(struct webauth_statics *iface,void *request,void *account,void **result)
++{
++    TRACE("GetTokenSilentlyWithWebAccountAsync iface %p, request %p, account %p, result %p.\n",iface,request,account,result);
++    /* The account argument names which of the broker's accounts to use. This
++     * broker has exactly one, so the answer cannot differ from the silent call
++     * next to it -- and failing here while that one succeeds would be a
++     * difference Office has no way to explain. */
++    return token_result_for_request(request,WEB_TOKEN_USER_INTERACTION_REQUIRED,result);
++}
++/* The interactive pair. A real broker puts a sign-in window on the screen
++ * here; this one cannot, so when it has no token the honest answer is the one
++ * Windows gives for a prompt that produced no credential -- UserCancel, a
++ * terminal state Office handles -- and not UserInteractionRequired, which
++ * asks the caller to do the very thing it just asked us to do. */
++static HRESULT WINAPI statics_RequestTokenAsync(struct webauth_statics *iface,void *request,void **result)
++{
++    TRACE("RequestTokenAsync iface %p, request %p, result %p.\n",iface,request,result);
++    return token_result_for_request(request,WEB_TOKEN_USER_CANCEL,result);
++}
++static HRESULT WINAPI statics_RequestTokenWithWebAccountAsync(struct webauth_statics *iface,void *request,void *account,void **result)
++{
++    TRACE("RequestTokenWithWebAccountAsync iface %p, request %p, account %p, result %p.\n",iface,request,account,result);
++    return token_result_for_request(request,WEB_TOKEN_USER_CANCEL,result);
++}
++static HRESULT WINAPI statics_FindAccountAsync(struct webauth_statics *iface, void *provider,
++                                               HSTRING account_id, void **result)
++{
++    struct web_account *account;
++    WCHAR cid[256] = {0};
++    HRESULT hr;
++
++    TRACE("FindAccountAsync iface %p, provider %p, account_id %s, result %p.\n",
++          iface, provider, debugstr_hstring(account_id), result);
++    /* "there is no account with that id" and "this API does not exist" are not
++     * the same answer to the caller. Office asks this about an account id it
++     * read out of its own cache; on E_NOTIMPL it concludes the broker itself
++     * is broken and stops, where a completed operation is something it can act
++     * on. Same distinction as sppc's licensing status, which is the other
++     * place this cost a day.
++     *
++     * Answering "no such account" for the id we hand back off every token
++     * response is its own kind of wrong, though: Office asks this fifteen
++     * times per start-up, always about the CID it wrote when it last licensed,
++     * and a broker that mints tokens for an account it says it does not have
++     * is not consistent enough to be believed. */
++    if (account_id && office_connected_cid(cid, sizeof(cid)) &&
++        !wcscmp(WindowsGetStringRawBuffer(account_id, NULL), cid))
++    {
++        if (FAILED(hr = create_web_account((IUnknown *)provider, &account))) return hr;
++        hr = create_object_operation((IUnknown *)&account->iface, result);
++        account_Release(&account->iface);
++        return hr;
++    }
++    TRACE("asked for account %s, this prefix holds %s.\n",
++          debugstr_hstring(account_id), debugstr_w(cid));
++    return create_object_operation(NULL, result);
++}
++static HRESULT WINAPI statics_FindAccountProviderAsync(struct webauth_statics *iface,HSTRING provider_id,void **result)
++{
++    TRACE("FindAccountProviderAsync iface %p, provider_id %s, result %p.\n",iface,debugstr_hstring(provider_id),result);
++    return create_provider_operation(provider_id,NULL,result);
++}
++static HRESULT WINAPI statics_FindAccountProviderWithAuthorityAsync(struct webauth_statics *iface,
++        HSTRING provider_id, HSTRING authority, void **result)
++{
++    TRACE("FindAccountProviderWithAuthorityAsync iface %p, provider_id %s, authority %s, result %p.\n",
++          iface, debugstr_hstring(provider_id), debugstr_hstring(authority), result);
++    return create_provider_operation(provider_id, authority, result);
++}
++
++static const struct webauth_statics_vtbl statics_vtbl =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_GetTokenSilentlyAsync, statics_GetTokenSilentlyWithWebAccountAsync,
++    statics_RequestTokenAsync, statics_RequestTokenWithWebAccountAsync,
++    statics_FindAccountAsync, statics_FindAccountProviderAsync,
++    statics_FindAccountProviderWithAuthorityAsync,
++};
++
++BASE_METHODS(struct webauth_statics4, statics4, statics4_iface)
++
++/* Office asked for the accounts under its client id thirty-five times in one
++ * start-up and was told there were none -- while the same run took sixteen
++ * tokens from us for the account it had just been told did not exist. Report
++ * the one account this prefix holds so the two answers agree. */
++static HRESULT findall_for_provider(void *provider, void **result)
++{
++    struct web_account *account;
++    HRESULT hr;
++
++    if ((hr = create_prefix_account(provider, &account)) != S_OK)
++        return SUCCEEDED(hr) ? create_findall_operation(NULL, result) : hr;
++    hr = create_findall_operation((IUnknown *)&account->iface, result);
++    account_Release(&account->iface);
++    return hr;
++}
++
++static HRESULT WINAPI statics4_FindAllAccountsAsync(struct webauth_statics4 *iface,
++        void *provider, void **result)
++{
++    TRACE("FindAllAccountsAsync iface %p, provider %p, result %p.\n", iface, provider, result);
++    return findall_for_provider(provider, result);
++}
++static HRESULT WINAPI statics4_FindAllAccountsWithClientIdAsync(struct webauth_statics4 *iface,
++        void *provider, HSTRING client_id, void **result)
++{
++    TRACE("FindAllAccountsWithClientIdAsync iface %p, provider %p, client_id %s, result %p.\n",
++          iface, provider, debugstr_hstring(client_id), result);
++    return findall_for_provider(provider, result);
++}
++/* The system-provider trio. The non-system siblings on the statics interface
++ * above already hand back a provider for these same ids, and the object they
++ * return reports IsSystemProvider TRUE -- so refusing here would be two
++ * different answers about one object rather than a missing feature. */
++static HRESULT WINAPI statics4_FindSystemAccountProviderAsync(struct webauth_statics4 *iface,
++        HSTRING provider_id, void **result)
++{
++    TRACE("FindSystemAccountProviderAsync iface %p, provider_id %s, result %p.\n",
++          iface, debugstr_hstring(provider_id), result);
++    return create_provider_operation(provider_id, NULL, result);
++}
++static HRESULT WINAPI statics4_FindSystemAccountProviderWithAuthorityAsync(struct webauth_statics4 *iface,
++        HSTRING provider_id, HSTRING authority, void **result)
++{
++    TRACE("FindSystemAccountProviderWithAuthorityAsync iface %p, provider_id %s, authority %s, result %p.\n",
++          iface, debugstr_hstring(provider_id), debugstr_hstring(authority), result);
++    return create_provider_operation(provider_id, authority, result);
++}
++static HRESULT WINAPI statics4_FindSystemAccountProviderWithAuthorityForUserAsync(struct webauth_statics4 *iface,
++        HSTRING provider_id, HSTRING authority, void *user, void **result)
++{
++    TRACE("FindSystemAccountProviderWithAuthorityForUserAsync iface %p, provider_id %s, authority %s, user %p, result %p.\n",
++          iface, debugstr_hstring(provider_id), debugstr_hstring(authority), user, result);
++    return create_provider_operation(provider_id, authority, result);
++}
++
++static const struct webauth_statics4_vtbl statics4_vtbl =
++{
++    statics4_QueryInterface, statics4_AddRef, statics4_Release,
++    statics4_GetIids, statics4_GetRuntimeClassName, statics4_GetTrustLevel,
++    statics4_FindAllAccountsAsync, statics4_FindAllAccountsWithClientIdAsync,
++    statics4_FindSystemAccountProviderAsync,
++    statics4_FindSystemAccountProviderWithAuthorityAsync,
++    statics4_FindSystemAccountProviderWithAuthorityForUserAsync,
++};
++
++static struct webauth_factory_impl impl =
++{
++    {&factory_vtbl}, {&statics_vtbl}, {&statics4_vtbl}, 1,
++};
++
++IActivationFactory *webauth_factory = &impl.IActivationFactory_iface;
+diff --git a/dlls/windows.security.authentication.onlineid/webtoken.c b/dlls/windows.security.authentication.onlineid/webtoken.c
+new file mode 100644
+index 0000000..14c97ff
+--- /dev/null
++++ b/dlls/windows.security.authentication.onlineid/webtoken.c
+@@ -0,0 +1,523 @@
++/* WinRT Windows.Security.Authentication.Web.Core.WebTokenRequest
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(webauth);
++
++static const GUID IID_IWebTokenRequest =
++    {0xb77b4d68,0xadcb,0x4673,{0xb3,0x64,0x0c,0xf7,0xb3,0x5c,0xaf,0x97}};
++static const GUID IID_IWebTokenRequest2 =
++    {0xd700c079,0x30c8,0x4397,{0x96,0x54,0x96,0x1c,0x3b,0xe8,0xb8,0x55}};
++static const GUID IID_IWebTokenRequest3 =
++    {0x5a755b51,0x3bb1,0x41a5,{0xa6,0x3d,0x90,0xbc,0x32,0xc7,0xdb,0x9a}};
++static const GUID IID_IWebTokenRequestFactory =
++    {0x6cf2141c,0x0ff0,0x4c67,{0xb8,0x4f,0x99,0xdd,0xbe,0x4a,0x72,0xc9}};
++
++struct token_request;
++struct token_request2;
++struct token_request3;
++struct token_request_factory;
++
++#define INSPECTABLE_VTBL(type) \
++    HRESULT (WINAPI *QueryInterface)(type *, REFIID, void **); \
++    ULONG (WINAPI *AddRef)(type *); \
++    ULONG (WINAPI *Release)(type *); \
++    HRESULT (WINAPI *GetIids)(type *, ULONG *, IID **); \
++    HRESULT (WINAPI *GetRuntimeClassName)(type *, HSTRING *); \
++    HRESULT (WINAPI *GetTrustLevel)(type *, TrustLevel *)
++
++struct token_request_vtbl
++{
++    INSPECTABLE_VTBL(struct token_request);
++    HRESULT (WINAPI *get_WebAccountProvider)(struct token_request *, void **);
++    HRESULT (WINAPI *get_Scope)(struct token_request *, HSTRING *);
++    HRESULT (WINAPI *get_ClientId)(struct token_request *, HSTRING *);
++    HRESULT (WINAPI *get_PromptType)(struct token_request *, INT *);
++    HRESULT (WINAPI *get_Properties)(struct token_request *, IMap_HSTRING_HSTRING **);
++};
++struct token_request2_vtbl
++{
++    INSPECTABLE_VTBL(struct token_request2);
++    HRESULT (WINAPI *get_AppProperties)(struct token_request2 *, IMap_HSTRING_HSTRING **);
++};
++struct token_request3_vtbl
++{
++    INSPECTABLE_VTBL(struct token_request3);
++    HRESULT (WINAPI *get_CorrelationId)(struct token_request3 *, HSTRING *);
++    HRESULT (WINAPI *put_CorrelationId)(struct token_request3 *, HSTRING);
++};
++struct token_request_factory_vtbl
++{
++    INSPECTABLE_VTBL(struct token_request_factory);
++    HRESULT (WINAPI *Create)(struct token_request_factory *, void *, HSTRING, HSTRING, struct token_request **);
++    HRESULT (WINAPI *CreateWithPromptType)(struct token_request_factory *, void *, HSTRING, HSTRING, INT, struct token_request **);
++    HRESULT (WINAPI *CreateWithProvider)(struct token_request_factory *, void *, struct token_request **);
++    HRESULT (WINAPI *CreateWithScope)(struct token_request_factory *, void *, HSTRING, struct token_request **);
++};
++
++struct token_request { const struct token_request_vtbl *lpVtbl; };
++struct token_request2 { const struct token_request2_vtbl *lpVtbl; };
++struct token_request3 { const struct token_request3_vtbl *lpVtbl; };
++struct token_request_factory { const struct token_request_factory_vtbl *lpVtbl; };
++
++struct token_request_impl
++{
++    struct token_request iface;
++    struct token_request2 iface2;
++    struct token_request3 iface3;
++    LONG ref;
++    IUnknown *provider;
++    HSTRING scope;
++    HSTRING client_id;
++    HSTRING correlation_id;
++    INT prompt_type;
++    IMap_HSTRING_HSTRING *properties;
++};
++
++struct factory_impl
++{
++    IActivationFactory IActivationFactory_iface;
++    struct token_request_factory factory_iface;
++    LONG ref;
++};
++static struct factory_impl factory_impl;
++
++static struct token_request_impl *impl_from_request(struct token_request *iface)
++{ return CONTAINING_RECORD(iface, struct token_request_impl, iface); }
++static struct token_request_impl *impl_from_request2(struct token_request2 *iface)
++{ return CONTAINING_RECORD(iface, struct token_request_impl, iface2); }
++static struct token_request_impl *impl_from_request3(struct token_request3 *iface)
++{ return CONTAINING_RECORD(iface, struct token_request_impl, iface3); }
++
++static HRESULT request_query(struct token_request_impl *obj, REFIID iid, void **out)
++{
++    TRACE("request %p QI %s.\n", obj, debugstr_guid(iid));
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IWebTokenRequest))
++        *out = &obj->iface;
++    else if (IsEqualGUID(iid, &IID_IWebTokenRequest2)) *out = &obj->iface2;
++    else if (IsEqualGUID(iid, &IID_IWebTokenRequest3)) *out = &obj->iface3;
++    if (!*out) { FIXME("request interface %s not implemented.\n", debugstr_guid(iid)); return E_NOINTERFACE; }
++    InterlockedIncrement(&obj->ref);
++    return S_OK;
++}
++static ULONG request_addref(struct token_request_impl *obj) { return InterlockedIncrement(&obj->ref); }
++static ULONG request_release(struct token_request_impl *obj)
++{
++    ULONG ref = InterlockedDecrement(&obj->ref);
++    if (!ref)
++    {
++        if (obj->provider) IUnknown_Release(obj->provider);
++        if (obj->properties) IMap_HSTRING_HSTRING_Release(obj->properties);
++        WindowsDeleteString(obj->scope);
++        WindowsDeleteString(obj->client_id);
++        WindowsDeleteString(obj->correlation_id);
++        free(obj);
++    }
++    return ref;
++}
++
++#define REQUEST_BASE(type, prefix, from) \
++static HRESULT WINAPI prefix##_QueryInterface(type *iface, REFIID iid, void **out) { return request_query(from(iface), iid, out); } \
++static ULONG WINAPI prefix##_AddRef(type *iface) { return request_addref(from(iface)); } \
++static ULONG WINAPI prefix##_Release(type *iface) { return request_release(from(iface)); } \
++static HRESULT WINAPI prefix##_GetIids(type *iface, ULONG *count, IID **iids) { return E_NOTIMPL; } \
++static HRESULT WINAPI prefix##_GetRuntimeClassName(type *iface, HSTRING *name) \
++{ static const WCHAR n[] = L"Windows.Security.Authentication.Web.Core.WebTokenRequest"; return WindowsCreateString(n, ARRAY_SIZE(n)-1, name); } \
++static HRESULT WINAPI prefix##_GetTrustLevel(type *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
++REQUEST_BASE(struct token_request, request, impl_from_request)
++REQUEST_BASE(struct token_request2, request2, impl_from_request2)
++REQUEST_BASE(struct token_request3, request3, impl_from_request3)
++
++struct string_map_entry { HSTRING key, value; };
++struct string_map
++{
++    IMap_HSTRING_HSTRING IMap_HSTRING_HSTRING_iface;
++    IIterable_IKeyValuePair_HSTRING_HSTRING IIterable_iface;
++    LONG ref;
++    struct string_map_entry *entries;
++    UINT size, capacity;
++};
++static struct string_map *impl_from_string_map(IMap_HSTRING_HSTRING *iface)
++{ return CONTAINING_RECORD(iface, struct string_map, IMap_HSTRING_HSTRING_iface); }
++static int string_map_find(struct string_map *map, HSTRING key)
++{
++    UINT i;
++    for (i=0; i<map->size; i++) { INT32 order; if (SUCCEEDED(WindowsCompareStringOrdinal(map->entries[i].key,key,&order)) && !order) return i; }
++    return -1;
++}
++static HRESULT WINAPI string_map_QueryInterface(IMap_HSTRING_HSTRING *iface, REFIID iid, void **out)
++{
++    TRACE("string map %p QI %s.\n", iface, debugstr_guid(iid));
++    if (!out) return E_POINTER;
++    if (IsEqualGUID(iid,&IID_IIterable_IKeyValuePair_HSTRING_HSTRING))
++        *out=&impl_from_string_map(iface)->IIterable_iface;
++    else if (IsEqualGUID(iid,&IID_IUnknown) || IsEqualGUID(iid,&IID_IInspectable) ||
++             IsEqualGUID(iid,&IID_IAgileObject) || IsEqualGUID(iid,&IID_IMap_HSTRING_HSTRING))
++        *out=iface;
++    else { FIXME("string map %p QI %s not implemented.\n",iface,debugstr_guid(iid)); *out=NULL; return E_NOINTERFACE; }
++    IMap_HSTRING_HSTRING_AddRef(iface); return S_OK;
++}
++static ULONG WINAPI string_map_AddRef(IMap_HSTRING_HSTRING *iface)
++{ return InterlockedIncrement(&impl_from_string_map(iface)->ref); }
++static ULONG WINAPI string_map_Release(IMap_HSTRING_HSTRING *iface)
++{
++    struct string_map *map=impl_from_string_map(iface); ULONG ref=InterlockedDecrement(&map->ref); UINT i;
++    if (!ref) { for(i=0;i<map->size;i++){WindowsDeleteString(map->entries[i].key);WindowsDeleteString(map->entries[i].value);} free(map->entries); free(map); }
++    return ref;
++}
++static HRESULT WINAPI string_map_GetIids(IMap_HSTRING_HSTRING *iface,ULONG *count,IID **iids){return E_NOTIMPL;}
++static HRESULT WINAPI string_map_GetRuntimeClassName(IMap_HSTRING_HSTRING *iface,HSTRING *name){return E_NOTIMPL;}
++static HRESULT WINAPI string_map_GetTrustLevel(IMap_HSTRING_HSTRING *iface,TrustLevel *level){*level=BaseTrust;return S_OK;}
++static HRESULT WINAPI string_map_Lookup(IMap_HSTRING_HSTRING *iface,HSTRING key,HSTRING *value)
++{
++    struct string_map *map=impl_from_string_map(iface); int i=string_map_find(map,key);
++    TRACE("string map %p Lookup %s -> %d.\n",map,debugstr_hstring(key),i);
++    if(!value)return E_POINTER; if(i<0){*value=NULL;return E_BOUNDS;} return WindowsDuplicateString(map->entries[i].value,value);
++}
++static HRESULT WINAPI string_map_get_Size(IMap_HSTRING_HSTRING *iface,UINT *size)
++{if(!size)return E_POINTER;*size=impl_from_string_map(iface)->size;return S_OK;}
++static HRESULT WINAPI string_map_HasKey(IMap_HSTRING_HSTRING *iface,HSTRING key,boolean *found)
++{if(!found)return E_POINTER;*found=string_map_find(impl_from_string_map(iface),key)>=0;return S_OK;}
++static HRESULT WINAPI string_map_GetView(IMap_HSTRING_HSTRING *iface,IMapView_HSTRING_HSTRING **view)
++{FIXME("string map %p GetView %p stub.\n",iface,view);if(view)*view=NULL;return E_NOTIMPL;}
++static HRESULT WINAPI string_map_Insert(IMap_HSTRING_HSTRING *iface,HSTRING key,HSTRING value,boolean *replaced)
++{
++    struct string_map *map=impl_from_string_map(iface); int i=string_map_find(map,key); struct string_map_entry *entries;
++    TRACE("string map %p Insert %s = %s, old %d.\n",map,debugstr_hstring(key),debugstr_hstring(value),i);
++    if(!replaced)return E_POINTER; *replaced=i>=0;
++    if(i>=0){WindowsDeleteString(map->entries[i].value);return WindowsDuplicateString(value,&map->entries[i].value);}
++    if(map->size==map->capacity){UINT cap=map->capacity?map->capacity*2:8;if(!(entries=realloc(map->entries,cap*sizeof(*entries))))return E_OUTOFMEMORY;map->entries=entries;map->capacity=cap;}
++    i=map->size++; map->entries[i].key=NULL; map->entries[i].value=NULL;
++    if(FAILED(WindowsDuplicateString(key,&map->entries[i].key))||FAILED(WindowsDuplicateString(value,&map->entries[i].value)))return E_OUTOFMEMORY;
++    return S_OK;
++}
++static HRESULT WINAPI string_map_Remove(IMap_HSTRING_HSTRING *iface,HSTRING key)
++{
++    struct string_map *map=impl_from_string_map(iface);int i=string_map_find(map,key);if(i<0)return E_BOUNDS;
++    WindowsDeleteString(map->entries[i].key);WindowsDeleteString(map->entries[i].value);map->entries[i]=map->entries[--map->size];return S_OK;
++}
++static HRESULT WINAPI string_map_Clear(IMap_HSTRING_HSTRING *iface)
++{
++    struct string_map *map=impl_from_string_map(iface);UINT i;for(i=0;i<map->size;i++){WindowsDeleteString(map->entries[i].key);WindowsDeleteString(map->entries[i].value);}map->size=0;return S_OK;
++}
++static const IMap_HSTRING_HSTRINGVtbl string_map_vtbl=
++{
++    string_map_QueryInterface,string_map_AddRef,string_map_Release,
++    string_map_GetIids,string_map_GetRuntimeClassName,string_map_GetTrustLevel,
++    string_map_Lookup,string_map_get_Size,string_map_HasKey,string_map_GetView,
++    string_map_Insert,string_map_Remove,string_map_Clear,
++};
++/* A WinRT map is iterable, and that is not an optional extra: Office asks the
++ * property bag on a token response for IIterable<IKeyValuePair<String,String>>
++ * the moment it is handed one, and a map that answered E_NOINTERFACE there
++ * took Word down with an unhandled 0xe0000002 rather than doing without it. */
++struct key_value_pair
++{
++    IKeyValuePair_HSTRING_HSTRING IKeyValuePair_iface;
++    LONG ref;
++    HSTRING key,value;
++};
++static struct key_value_pair *impl_from_pair(IKeyValuePair_HSTRING_HSTRING *iface)
++{ return CONTAINING_RECORD(iface,struct key_value_pair,IKeyValuePair_iface); }
++static HRESULT WINAPI pair_QueryInterface(IKeyValuePair_HSTRING_HSTRING *iface,REFIID iid,void **out)
++{
++    if(!out)return E_POINTER;
++    if(!IsEqualGUID(iid,&IID_IUnknown)&&!IsEqualGUID(iid,&IID_IInspectable)&&
++       !IsEqualGUID(iid,&IID_IAgileObject)&&!IsEqualGUID(iid,&IID_IKeyValuePair_HSTRING_HSTRING))
++    { FIXME("key/value pair %p QI %s not implemented.\n",iface,debugstr_guid(iid));*out=NULL;return E_NOINTERFACE; }
++    *out=iface;InterlockedIncrement(&impl_from_pair(iface)->ref);return S_OK;
++}
++static ULONG WINAPI pair_AddRef(IKeyValuePair_HSTRING_HSTRING *iface)
++{ return InterlockedIncrement(&impl_from_pair(iface)->ref); }
++static ULONG WINAPI pair_Release(IKeyValuePair_HSTRING_HSTRING *iface)
++{
++    struct key_value_pair *pair=impl_from_pair(iface);ULONG ref=InterlockedDecrement(&pair->ref);
++    if(!ref){WindowsDeleteString(pair->key);WindowsDeleteString(pair->value);free(pair);}
++    return ref;
++}
++static HRESULT WINAPI pair_GetIids(IKeyValuePair_HSTRING_HSTRING *iface,ULONG *count,IID **iids){return E_NOTIMPL;}
++static HRESULT WINAPI pair_GetRuntimeClassName(IKeyValuePair_HSTRING_HSTRING *iface,HSTRING *name){return E_NOTIMPL;}
++static HRESULT WINAPI pair_GetTrustLevel(IKeyValuePair_HSTRING_HSTRING *iface,TrustLevel *level){*level=BaseTrust;return S_OK;}
++static HRESULT WINAPI pair_get_Key(IKeyValuePair_HSTRING_HSTRING *iface,HSTRING *key)
++{ return WindowsDuplicateString(impl_from_pair(iface)->key,key); }
++static HRESULT WINAPI pair_get_Value(IKeyValuePair_HSTRING_HSTRING *iface,HSTRING *value)
++{ return WindowsDuplicateString(impl_from_pair(iface)->value,value); }
++static const IKeyValuePair_HSTRING_HSTRINGVtbl key_value_pair_vtbl=
++{
++    pair_QueryInterface,pair_AddRef,pair_Release,
++    pair_GetIids,pair_GetRuntimeClassName,pair_GetTrustLevel,
++    pair_get_Key,pair_get_Value,
++};
++static HRESULT create_key_value_pair(HSTRING key,HSTRING value,IKeyValuePair_HSTRING_HSTRING **out)
++{
++    struct key_value_pair *pair;
++    if(!(pair=calloc(1,sizeof(*pair))))return E_OUTOFMEMORY;
++    pair->IKeyValuePair_iface.lpVtbl=&key_value_pair_vtbl;pair->ref=1;
++    if(FAILED(WindowsDuplicateString(key,&pair->key))||FAILED(WindowsDuplicateString(value,&pair->value)))
++    { pair_Release(&pair->IKeyValuePair_iface);return E_OUTOFMEMORY; }
++    *out=&pair->IKeyValuePair_iface;return S_OK;
++}
++
++struct string_map_iterator
++{
++    IIterator_IKeyValuePair_HSTRING_HSTRING IIterator_iface;
++    LONG ref;
++    struct string_map *map;
++    UINT index;
++};
++static struct string_map_iterator *impl_from_iterator(IIterator_IKeyValuePair_HSTRING_HSTRING *iface)
++{ return CONTAINING_RECORD(iface,struct string_map_iterator,IIterator_iface); }
++static HRESULT WINAPI iterator_QueryInterface(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,REFIID iid,void **out)
++{
++    if(!out)return E_POINTER;
++    if(!IsEqualGUID(iid,&IID_IUnknown)&&!IsEqualGUID(iid,&IID_IInspectable)&&
++       !IsEqualGUID(iid,&IID_IAgileObject)&&!IsEqualGUID(iid,&IID_IIterator_IKeyValuePair_HSTRING_HSTRING))
++    { FIXME("map iterator %p QI %s not implemented.\n",iface,debugstr_guid(iid));*out=NULL;return E_NOINTERFACE; }
++    *out=iface;InterlockedIncrement(&impl_from_iterator(iface)->ref);return S_OK;
++}
++static ULONG WINAPI iterator_AddRef(IIterator_IKeyValuePair_HSTRING_HSTRING *iface)
++{ return InterlockedIncrement(&impl_from_iterator(iface)->ref); }
++static ULONG WINAPI iterator_Release(IIterator_IKeyValuePair_HSTRING_HSTRING *iface)
++{
++    struct string_map_iterator *it=impl_from_iterator(iface);ULONG ref=InterlockedDecrement(&it->ref);
++    if(!ref){IMap_HSTRING_HSTRING_Release(&it->map->IMap_HSTRING_HSTRING_iface);free(it);}
++    return ref;
++}
++static HRESULT WINAPI iterator_GetIids(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,ULONG *count,IID **iids){return E_NOTIMPL;}
++static HRESULT WINAPI iterator_GetRuntimeClassName(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,HSTRING *name){return E_NOTIMPL;}
++static HRESULT WINAPI iterator_GetTrustLevel(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,TrustLevel *level){*level=BaseTrust;return S_OK;}
++static HRESULT WINAPI iterator_get_Current(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,IKeyValuePair_HSTRING_HSTRING **value)
++{
++    struct string_map_iterator *it=impl_from_iterator(iface);
++    if(!value)return E_POINTER;*value=NULL;
++    if(it->index>=it->map->size)return E_BOUNDS;
++    return create_key_value_pair(it->map->entries[it->index].key,it->map->entries[it->index].value,value);
++}
++static HRESULT WINAPI iterator_get_HasCurrent(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,boolean *value)
++{
++    struct string_map_iterator *it=impl_from_iterator(iface);
++    if(!value)return E_POINTER;*value=it->index<it->map->size;return S_OK;
++}
++static HRESULT WINAPI iterator_MoveNext(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,boolean *value)
++{
++    struct string_map_iterator *it=impl_from_iterator(iface);
++    if(it->index<it->map->size)it->index++;
++    if(!value)return E_POINTER;*value=it->index<it->map->size;return S_OK;
++}
++static HRESULT WINAPI iterator_GetMany(IIterator_IKeyValuePair_HSTRING_HSTRING *iface,UINT32 items_size,
++                                       IKeyValuePair_HSTRING_HSTRING **items,UINT32 *value)
++{
++    struct string_map_iterator *it=impl_from_iterator(iface);UINT32 count=0;HRESULT hr=S_OK;
++    if(!value)return E_POINTER;
++    while(count<items_size&&it->index<it->map->size)
++    {
++        if(FAILED(hr=create_key_value_pair(it->map->entries[it->index].key,
++                                           it->map->entries[it->index].value,&items[count])))break;
++        count++;it->index++;
++    }
++    *value=count;return hr;
++}
++static const IIterator_IKeyValuePair_HSTRING_HSTRINGVtbl string_map_iterator_vtbl=
++{
++    iterator_QueryInterface,iterator_AddRef,iterator_Release,
++    iterator_GetIids,iterator_GetRuntimeClassName,iterator_GetTrustLevel,
++    iterator_get_Current,iterator_get_HasCurrent,iterator_MoveNext,iterator_GetMany,
++};
++
++static struct string_map *impl_from_iterable(IIterable_IKeyValuePair_HSTRING_HSTRING *iface)
++{ return CONTAINING_RECORD(iface,struct string_map,IIterable_iface); }
++static HRESULT WINAPI iterable_QueryInterface(IIterable_IKeyValuePair_HSTRING_HSTRING *iface,REFIID iid,void **out)
++{ return string_map_QueryInterface(&impl_from_iterable(iface)->IMap_HSTRING_HSTRING_iface,iid,out); }
++static ULONG WINAPI iterable_AddRef(IIterable_IKeyValuePair_HSTRING_HSTRING *iface)
++{ return string_map_AddRef(&impl_from_iterable(iface)->IMap_HSTRING_HSTRING_iface); }
++static ULONG WINAPI iterable_Release(IIterable_IKeyValuePair_HSTRING_HSTRING *iface)
++{ return string_map_Release(&impl_from_iterable(iface)->IMap_HSTRING_HSTRING_iface); }
++static HRESULT WINAPI iterable_GetIids(IIterable_IKeyValuePair_HSTRING_HSTRING *iface,ULONG *count,IID **iids){return E_NOTIMPL;}
++static HRESULT WINAPI iterable_GetRuntimeClassName(IIterable_IKeyValuePair_HSTRING_HSTRING *iface,HSTRING *name){return E_NOTIMPL;}
++static HRESULT WINAPI iterable_GetTrustLevel(IIterable_IKeyValuePair_HSTRING_HSTRING *iface,TrustLevel *level){*level=BaseTrust;return S_OK;}
++static HRESULT WINAPI iterable_First(IIterable_IKeyValuePair_HSTRING_HSTRING *iface,
++                                     IIterator_IKeyValuePair_HSTRING_HSTRING **value)
++{
++    struct string_map *map=impl_from_iterable(iface);
++    struct string_map_iterator *it;
++    TRACE("string map %p First %p, %u entries.\n",map,value,map->size);
++    if(!value)return E_POINTER;*value=NULL;
++    if(!(it=calloc(1,sizeof(*it))))return E_OUTOFMEMORY;
++    it->IIterator_iface.lpVtbl=&string_map_iterator_vtbl;it->ref=1;it->map=map;
++    IMap_HSTRING_HSTRING_AddRef(&map->IMap_HSTRING_HSTRING_iface);
++    *value=&it->IIterator_iface;return S_OK;
++}
++static const IIterable_IKeyValuePair_HSTRING_HSTRINGVtbl string_map_iterable_vtbl=
++{
++    iterable_QueryInterface,iterable_AddRef,iterable_Release,
++    iterable_GetIids,iterable_GetRuntimeClassName,iterable_GetTrustLevel,
++    iterable_First,
++};
++
++HRESULT webauth_string_map_create(IMap_HSTRING_HSTRING **out)
++{
++    struct string_map *map;if(!out)return E_POINTER;*out=NULL;if(!(map=calloc(1,sizeof(*map))))return E_OUTOFMEMORY;
++    map->IMap_HSTRING_HSTRING_iface.lpVtbl=&string_map_vtbl;
++    map->IIterable_iface.lpVtbl=&string_map_iterable_vtbl;
++    map->ref=1;*out=&map->IMap_HSTRING_HSTRING_iface;return S_OK;
++}
++static HRESULT ensure_properties(struct token_request_impl *obj)
++{
++    if(obj->properties)return S_OK;
++    return webauth_string_map_create(&obj->properties);
++}
++
++static HRESULT WINAPI request_get_WebAccountProvider(struct token_request *iface, void **provider)
++{
++    struct token_request_impl *obj = impl_from_request(iface);
++    TRACE("request %p get provider %p.\n", obj, provider);
++    if (!provider) return E_POINTER;
++    *provider = obj->provider;
++    if (*provider) IUnknown_AddRef(obj->provider);
++    return S_OK;
++}
++static HRESULT WINAPI request_get_Scope(struct token_request *iface, HSTRING *scope)
++{ return WindowsDuplicateString(impl_from_request(iface)->scope, scope); }
++static HRESULT WINAPI request_get_ClientId(struct token_request *iface, HSTRING *id)
++{ return WindowsDuplicateString(impl_from_request(iface)->client_id, id); }
++static HRESULT WINAPI request_get_PromptType(struct token_request *iface, INT *type)
++{ if (!type) return E_POINTER; *type = impl_from_request(iface)->prompt_type; return S_OK; }
++static HRESULT WINAPI request_get_Properties(struct token_request *iface, IMap_HSTRING_HSTRING **properties)
++{
++    struct token_request_impl *obj = impl_from_request(iface);
++    HRESULT hr;
++    TRACE("request %p get Properties %p.\n", obj, properties);
++    if (!properties) return E_POINTER;
++    if (FAILED(hr = ensure_properties(obj))) { *properties = NULL; return hr; }
++    *properties = obj->properties; IMap_HSTRING_HSTRING_AddRef(*properties); return S_OK;
++}
++static HRESULT WINAPI request2_get_AppProperties(struct token_request2 *iface, IMap_HSTRING_HSTRING **properties)
++{ return request_get_Properties(&impl_from_request2(iface)->iface, properties); }
++static HRESULT WINAPI request3_get_CorrelationId(struct token_request3 *iface, HSTRING *id)
++{ return WindowsDuplicateString(impl_from_request3(iface)->correlation_id, id); }
++static HRESULT WINAPI request3_put_CorrelationId(struct token_request3 *iface, HSTRING id)
++{
++    struct token_request_impl *obj = impl_from_request3(iface);
++    TRACE("request %p set correlation id %s.\n", obj, debugstr_hstring(id));
++    WindowsDeleteString(obj->correlation_id);
++    return WindowsDuplicateString(id, &obj->correlation_id);
++}
++
++static const struct token_request_vtbl request_vtbl =
++{
++    request_QueryInterface, request_AddRef, request_Release,
++    request_GetIids, request_GetRuntimeClassName, request_GetTrustLevel,
++    request_get_WebAccountProvider, request_get_Scope, request_get_ClientId,
++    request_get_PromptType, request_get_Properties,
++};
++static const struct token_request2_vtbl request2_vtbl =
++{
++    request2_QueryInterface, request2_AddRef, request2_Release,
++    request2_GetIids, request2_GetRuntimeClassName, request2_GetTrustLevel,
++    request2_get_AppProperties,
++};
++static const struct token_request3_vtbl request3_vtbl =
++{
++    request3_QueryInterface, request3_AddRef, request3_Release,
++    request3_GetIids, request3_GetRuntimeClassName, request3_GetTrustLevel,
++    request3_get_CorrelationId, request3_put_CorrelationId,
++};
++
++static HRESULT create_request(void *provider, HSTRING scope, HSTRING client_id, INT prompt,
++                              struct token_request **result)
++{
++    struct token_request_impl *obj;
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!(obj = calloc(1, sizeof(*obj)))) return E_OUTOFMEMORY;
++    obj->iface.lpVtbl = &request_vtbl; obj->iface2.lpVtbl = &request2_vtbl;
++    obj->iface3.lpVtbl = &request3_vtbl; obj->ref = 1; obj->provider = provider;
++    if (provider) IUnknown_AddRef((IUnknown *)provider);
++    WindowsDuplicateString(scope, &obj->scope);
++    WindowsDuplicateString(client_id, &obj->client_id);
++    obj->prompt_type = prompt;
++    *result = &obj->iface;
++    TRACE("created request %p provider %p scope %s client %s prompt %d.\n",
++          obj, provider, debugstr_hstring(scope), debugstr_hstring(client_id), prompt);
++    return S_OK;
++}
++
++static HRESULT WINAPI request_factory_Create(struct token_request_factory *iface, void *provider,
++        HSTRING scope, HSTRING client_id, struct token_request **result)
++{ return create_request(provider, scope, client_id, 0, result); }
++static HRESULT WINAPI request_factory_CreateWithPromptType(struct token_request_factory *iface, void *provider,
++        HSTRING scope, HSTRING client_id, INT prompt, struct token_request **result)
++{ return create_request(provider, scope, client_id, prompt, result); }
++static HRESULT WINAPI request_factory_CreateWithProvider(struct token_request_factory *iface, void *provider,
++        struct token_request **result)
++{ return create_request(provider, NULL, NULL, 0, result); }
++static HRESULT WINAPI request_factory_CreateWithScope(struct token_request_factory *iface, void *provider,
++        HSTRING scope, struct token_request **result)
++{ return create_request(provider, scope, NULL, 0, result); }
++
++static struct factory_impl *impl_from_factory(IActivationFactory *iface)
++{ return CONTAINING_RECORD(iface, struct factory_impl, IActivationFactory_iface); }
++static HRESULT WINAPI factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++{
++    struct factory_impl *obj = impl_from_factory(iface);
++    TRACE("token factory %p QI %s.\n", obj, debugstr_guid(iid));
++    if (!out) return E_POINTER; *out = NULL;
++    if (IsEqualGUID(iid,&IID_IUnknown) || IsEqualGUID(iid,&IID_IInspectable) ||
++        IsEqualGUID(iid,&IID_IAgileObject) || IsEqualGUID(iid,&IID_IActivationFactory))
++        *out = &obj->IActivationFactory_iface;
++    else if (IsEqualGUID(iid,&IID_IWebTokenRequestFactory)) *out = &obj->factory_iface;
++    if (!*out) return E_NOINTERFACE;
++    InterlockedIncrement(&obj->ref); return S_OK;
++}
++static ULONG WINAPI factory_AddRef(IActivationFactory *iface) { return InterlockedIncrement(&impl_from_factory(iface)->ref); }
++static ULONG WINAPI factory_Release(IActivationFactory *iface) { return InterlockedDecrement(&impl_from_factory(iface)->ref); }
++static HRESULT WINAPI factory_GetIids(IActivationFactory *iface, ULONG *count, IID **iids) { return E_NOTIMPL; }
++static HRESULT WINAPI factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *name)
++{ static const WCHAR n[] = L"Windows.Security.Authentication.Web.Core.WebTokenRequest"; return WindowsCreateString(n,ARRAY_SIZE(n)-1,name); }
++static HRESULT WINAPI factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *level) { *level=BaseTrust; return S_OK; }
++static HRESULT WINAPI factory_ActivateInstance(IActivationFactory *iface, IInspectable **value)
++{ if (value) *value=NULL; return E_NOTIMPL; }
++static const IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++static struct factory_impl *impl_from_request_factory(struct token_request_factory *iface)
++{ return CONTAINING_RECORD(iface, struct factory_impl, factory_iface); }
++#define FACTORY_BASE(name) \
++static HRESULT WINAPI name##_QueryInterface(struct token_request_factory *iface, REFIID iid, void **out) \
++{ return factory_QueryInterface(&impl_from_request_factory(iface)->IActivationFactory_iface,iid,out); } \
++static ULONG WINAPI name##_AddRef(struct token_request_factory *iface) \
++{ return factory_AddRef(&impl_from_request_factory(iface)->IActivationFactory_iface); } \
++static ULONG WINAPI name##_Release(struct token_request_factory *iface) \
++{ return factory_Release(&impl_from_request_factory(iface)->IActivationFactory_iface); } \
++static HRESULT WINAPI name##_GetIids(struct token_request_factory *iface, ULONG *count, IID **iids) { return E_NOTIMPL; } \
++static HRESULT WINAPI name##_GetRuntimeClassName(struct token_request_factory *iface,HSTRING *n) \
++{ return factory_GetRuntimeClassName(&impl_from_request_factory(iface)->IActivationFactory_iface,n); } \
++static HRESULT WINAPI name##_GetTrustLevel(struct token_request_factory *iface,TrustLevel *l) { *l=BaseTrust; return S_OK; }
++FACTORY_BASE(request_factory)
++static const struct token_request_factory_vtbl request_factory_vtbl =
++{
++    request_factory_QueryInterface, request_factory_AddRef, request_factory_Release,
++    request_factory_GetIids, request_factory_GetRuntimeClassName, request_factory_GetTrustLevel,
++    request_factory_Create, request_factory_CreateWithPromptType,
++    request_factory_CreateWithProvider, request_factory_CreateWithScope,
++};
++static struct factory_impl factory_impl =
++{
++    {&factory_vtbl}, {&request_factory_vtbl}, 1,
++};
++IActivationFactory *webtoken_request_factory = &factory_impl.IActivationFactory_iface;
+-- 
+2.53.0
+

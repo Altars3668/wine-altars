@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 12:00:00 +0000
+Subject: [PATCH] onlineid: distinguish the MSAL response contract in captures
+
+原生 WAM A/B 已确认：相同 scope 的默认请求返回 t/p ticket，而 Office 的
+api-version=2.0、oauth2_batch=1、x-client-info=1 请求返回多字段封装。
+
+新增显式 WINE_WAM_CAPTURE_DIR 诊断模式，直接读取已获准采集的原始文件，
+不再额外复制凭据。严格匹配本次采集的 provider/client/scope/API 属性，
+不把完整封装交给 legacy 请求，不产生或改写 token 字段。
+
+完整响应进入真实 Word 后，ParseMsaResponse 的 id_token/client_info/
+access_token 长度由全0变为原生长度，OneAuth/IdentityCache开始写入；重启
+后账户页显示已登录。但交互路径仍出现53u4r/12009，许可证尚未签发。
+这是固定样本对照仪器，不是完整在线 broker、通用缓存或刷新实现。
+
+StringMap 的 TRACE 不再输出属性值，避免登录提示或凭据进入日志。
+---
+--- a/dlls/windows.security.authentication.onlineid/webauth.c
++++ b/dlls/windows.security.authentication.onlineid/webauth.c
+@@ -768,6 +768,8 @@
+     HRESULT (WINAPI *get_WebAccountProvider)(struct request_probe *,void **);
+     HRESULT (WINAPI *get_Scope)(struct request_probe *,HSTRING *);
+     HRESULT (WINAPI *get_ClientId)(struct request_probe *,HSTRING *);
++    HRESULT (WINAPI *get_PromptType)(struct request_probe *,INT *);
++    HRESULT (WINAPI *get_Properties)(struct request_probe *,IMap_HSTRING_HSTRING **);
+ };
+ struct request_probe { const struct request_probe_vtbl *lpVtbl; };
+ static HRESULT read_token_file(const WCHAR *path,HSTRING *token)
+@@ -828,11 +830,105 @@
+     TRACE("token for scope %s -> %s.\n",debugstr_hstring(scope),debugstr_w(path));
+     return read_token_file(path,token);
+ }
++/* 诊断模式直接读取获准采集的原始目录，不再复制一份凭据。
++ * 固定文件名来自 wamprobe 的导出协议，不由请求中的字符串构造。 */
++static HRESULT capture_file_path(const WCHAR *name,WCHAR *path,UINT capacity)
++{
++    DWORD length=GetEnvironmentVariableW(L"WINE_WAM_CAPTURE_DIR",path,capacity);
++
++    if(!length)return S_FALSE;
++    if(length>=capacity || length+1+wcslen(name)>=capacity)
++        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
++    if(path[length-1]!='\\')path[length++]='\\';
++    wcscpy(path+length,name);
++    return S_OK;
++}
++
++static BOOL hstring_matches(HSTRING value,const WCHAR *expected)
++{
++    UINT32 len;
++    const WCHAR *text=WindowsGetStringRawBuffer(value,&len);
++    return len==wcslen(expected) && !memcmp(text,expected,len*sizeof(*text));
++}
++
++static BOOL request_property_matches(IMap_HSTRING_HSTRING *properties,
++                                     const WCHAR *name,const WCHAR *expected)
++{
++    HSTRING key=NULL,value=NULL;
++    BOOL match=FALSE;
++
++    if(SUCCEEDED(WindowsCreateString(name,wcslen(name),&key)) &&
++       SUCCEEDED(IMap_HSTRING_HSTRING_Lookup(properties,key,&value)))
++        match=hstring_matches(value,expected);
++    WindowsDeleteString(value);
++    WindowsDeleteString(key);
++    return match;
++}
++
++/* 这是固定样本的 A/B 仪器，不是在线 broker。仅允许与该次原生采集
++ * 相同的 provider/client/scope/API 契约，不能把完整封装当作裸 ticket
++ * 返回给旧式调用者；也不生成或改写 token 内的任何字段。 */
++static HRESULT load_captured_token(struct request_probe *request,HSTRING scope,HSTRING *token)
++{
++    struct provider_iface *provider=NULL;
++    struct provider_iface2 *provider2=NULL;
++    IMap_HSTRING_HSTRING *properties=NULL;
++    HSTRING client=NULL,id=NULL,authority=NULL;
++    WCHAR path[MAX_PATH];
++    HRESULT hr;
++
++    *token=NULL;
++    if((hr=capture_file_path(L"response-0-token",path,ARRAY_SIZE(path)))!=S_OK)return hr;
++    if(!request || !hstring_matches(scope,L"service::ssl.live.com::MBI_SSL_SHORT openid profile"))
++        return S_FALSE;
++    if(FAILED(hr=request->lpVtbl->get_ClientId(request,&client)))goto done;
++    if(!hstring_matches(client,L"00000000480728C5")){hr=S_FALSE;goto done;}
++    if(FAILED(hr=request->lpVtbl->get_WebAccountProvider(request,(void **)&provider)))goto done;
++    if(!provider){hr=E_UNEXPECTED;goto done;}
++    if(FAILED(hr=provider->lpVtbl->get_Id(provider,&id)))goto done;
++    if(!hstring_matches(id,L"https://login.microsoft.com")){hr=S_FALSE;goto done;}
++    if(FAILED(hr=provider->lpVtbl->QueryInterface(provider,&IID_IWebAccountProvider2,(void **)&provider2)))goto done;
++    if(FAILED(hr=provider2->lpVtbl->get_Authority(provider2,&authority)))goto done;
++    if(!hstring_matches(authority,L"consumers")){hr=S_FALSE;goto done;}
++    if(FAILED(hr=request->lpVtbl->get_Properties(request,&properties)))goto done;
++    if(!properties){hr=E_UNEXPECTED;goto done;}
++    if(!request_property_matches(properties,L"api-version",L"2.0") ||
++       !request_property_matches(properties,L"oauth2_batch",L"1") ||
++       !request_property_matches(properties,L"x-client-info",L"1"))
++    {hr=S_FALSE;goto done;}
++    hr=read_token_file(path,token);
++    TRACE("matched native capture request, hr %#lx, token length %u.\n",hr,WindowsGetStringLen(*token));
++
++done:
++    if(properties)IMap_HSTRING_HSTRING_Release(properties);
++    if(provider2)provider2->lpVtbl->Release(provider2);
++    if(provider)provider->lpVtbl->Release(provider);
++    WindowsDeleteString(client);
++    WindowsDeleteString(id);
++    WindowsDeleteString(authority);
++    return hr;
++}
++
+ static HRESULT load_account_metadata_file(const WCHAR *name,HSTRING *value)
+ {
+     static const WCHAR dir[]=L"Z:\\tmp\\office-wam-tokens\\";
+     WCHAR path[MAX_PATH];
+-
++    const WCHAR *captured_name;
++    HRESULT hr;
++
++    if(!wcscmp(name,L"account-id"))captured_name=L"response-0-account-id";
++    else if(!wcscmp(name,L"account-username"))captured_name=L"response-0-account-name";
++    else return E_INVALIDARG;
++    hr=capture_file_path(captured_name,path,ARRAY_SIZE(path));
++    if(hr!=S_FALSE)
++    {
++        if(FAILED(hr))return hr;
++        hr=read_token_file(path,value);
++        /* 显式采集目录不完整时，不拿历史 CID 填补主体信息。 */
++        if(hr==HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr==HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
++            return E_UNEXPECTED;
++        return hr;
++    }
+     wcscpy(path,dir);
+     wcsncat(path,name,ARRAY_SIZE(path)-ARRAY_SIZE(dir));
+     return read_token_file(path,value);
+@@ -1143,8 +1239,9 @@
+     HSTRING scope=NULL,token;struct token_response *response;HRESULT hr;
+ 
+     if(request)((struct request_probe*)request)->lpVtbl->get_Scope((struct request_probe*)request,&scope);
+-    hr=load_authorized_token(scope,&token);
+-    if(SUCCEEDED(hr))
++    hr=load_captured_token(request,scope,&token);
++    if(hr==S_FALSE)hr=load_authorized_token(scope,&token);
++    if(hr==S_OK)
+     {
+         hr=create_token_response(request,token,&response);
+         WindowsDeleteString(token);WindowsDeleteString(scope);
+--- a/dlls/windows.security.authentication.onlineid/webtoken.c
++++ b/dlls/windows.security.authentication.onlineid/webtoken.c
+@@ -195,7 +195,8 @@
+ static HRESULT WINAPI string_map_Insert(IMap_HSTRING_HSTRING *iface,HSTRING key,HSTRING value,boolean *replaced)
+ {
+     struct string_map *map=impl_from_string_map(iface); int i=string_map_find(map,key); struct string_map_entry *entries;
+-    TRACE("string map %p Insert %s = %s, old %d.\n",map,debugstr_hstring(key),debugstr_hstring(value),i);
++    /* 属性可能含登录提示或凭据，不把值写入诊断日志。 */
++    TRACE("string map %p Insert %s, value length %u, old %d.\n",map,debugstr_hstring(key),WindowsGetStringLen(value),i);
+     if(!replaced)return E_POINTER; *replaced=i>=0;
+     if(i>=0){WindowsDeleteString(map->entries[i].value);return WindowsDuplicateString(value,&map->entries[i].value);}
+     if(map->size==map->capacity){UINT cap=map->capacity?map->capacity*2:8;if(!(entries=realloc(map->entries,cap*sizeof(*entries))))return E_OUTOFMEMORY;map->entries=entries;map->capacity=cap;}

@@ -50,14 +50,28 @@ static void dump_acc(IAccessible *acc, VARIANT self, int depth)
 
     printf("%*s", depth * 2, "");
 
-    if (IAccessible_get_accName(acc, self, &s) == S_OK) put("name", s);
+    /* SUCCEEDED, not == S_OK: MSAA servers routinely answer S_FALSE and still
+     * hand back the string, and Office's licensing dialog is one of them --
+     * every line of its text was being dropped on the floor here, which made
+     * the dialog look like it had nothing to say. */
+    if (SUCCEEDED(IAccessible_get_accName(acc, self, &s))) put("name", s);
     s = NULL;
-    if (IAccessible_get_accValue(acc, self, &s) == S_OK) put("value", s);
+    if (SUCCEEDED(IAccessible_get_accValue(acc, self, &s))) put("value", s);
     s = NULL;
-    if (IAccessible_get_accDescription(acc, self, &s) == S_OK) put("desc", s);
+    if (SUCCEEDED(IAccessible_get_accDescription(acc, self, &s))) put("desc", s);
+    s = NULL;
+    if (SUCCEEDED(IAccessible_get_accHelp(acc, self, &s))) put("help", s);
     VariantInit(&vrole);
     if (IAccessible_get_accRole(acc, self, &vrole) == S_OK && V_VT(&vrole) == VT_I4)
         printf("[%s]", role_name(V_I4(&vrole)));
+    {
+        /* Screen coordinates, not window-relative: what a synthetic click or
+         * XTest event needs is where the pixel actually is, and Office's own
+         * controls have no HWND to ask GetWindowRect of. */
+        long x = 0, y = 0, w = 0, h = 0;
+        if (IAccessible_accLocation(acc, &x, &y, &w, &h, self) == S_OK && (w || h))
+            printf(" rect=(%ld,%ld,%ld,%ld)", x, y, w, h);
+    }
     printf("\n");
 
     if (V_I4(&self) != CHILDID_SELF) return;      /* a simple element has no children */

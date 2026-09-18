@@ -1,0 +1,1038 @@
+d3d11/dxgi/wined3d: surfaces shared between devices
+
+Office's UI compositor -- it calls itself AirSpace -- renders its text and icons
+on one D3D device and composites them on another, through a texture created
+with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.  Wine had none of the three pieces
+that needs, and Office named the result itself: forty
+`.?AVDeviceError@AirSpace@@` C++ exceptions per dialog, exactly matching forty
+stubbed GetSharedHandle calls and forty E_NOINTERFACEs for IID_IDXGIKeyedMutex.
+
+  wined3d   a process-global handle registry.  wined3d_resource_get_shared_handle
+            creates a kernel handle for a resource and remembers it,
+            wined3d_resource_from_shared_handle resolves it back, and
+            resource_cleanup drops the entry.  Both dxgi and d3d11 link wined3d,
+            so this is the one place both sides reach without new plumbing.
+
+  dxgi      IDXGIResource::GetSharedHandle uses it.  IDXGIKeyedMutex exists at
+            last -- Wine declares it in dxgi.idl and implemented nothing.
+
+  d3d11     OpenSharedResource (D3D11 and D3D10) resolves the handle, and
+            shared.c carries the surface: each participant gets a texture on its
+            own device, they share one keyed-mutex state, and the content moves
+            between them at the point the mutex already defines -- whoever
+            acquires gets the pixels of whoever released last.
+
+The reason each participant needs its own texture is worth stating, because the
+shorter route looks like it works.  wined3d cannot give two devices one piece of
+storage: a wined3d texture's GL object belongs to the context that created it,
+and handing the same texture to a second device makes **every call succeed while
+the pixels quietly do not cross**.  tools/d3dshare in the wine-altars tree is
+sixty lines that measure exactly this -- device B clears the surface red, device
+A reads it back -- and it took the aliasing shortcut off the table in one run
+after it had already cost a day.
+
+So the content is moved out through a staging texture on one device and in
+through a staging texture on the other.  That is a round trip through system
+memory per handoff.  It is the honest price of not having shared storage, and it
+is paid only by surfaces an application actually shares.
+
+Measured, reading pixels off the screen (xwd -root, not the window's own
+drawable -- see below):
+
+                                        before      after
+    Word start screen, distinct colours      8       ~1300
+    SETLANG dialog,    distinct colours    577        1263
+    C++ exceptions from Office              43           3
+    IDWriteTextLayout::Draw                  0          32
+    glyph runs rasterised                    4          78
+    D3D11 DrawIndexed                        8         188
+
+Before this, Word showed an empty grey frame with one blank card and no text at
+all, and Office's Language Preferences dialog showed panels and borders with
+every label, list entry and button caption missing.  Both now render completely.
+
+Two things this does not fix, both verified pre-existing by building without it:
+Word's licensing dialog is still a black rectangle, and Word fails to open a
+window at all on roughly one start in three.
+
+Note for anyone measuring this: `import -window`/`xwd -id` on the top-level
+reads Wine's own window surface, which is GDI content, not what is on the
+screen.  The GL child window composited over it is invisible to that read.  Use
+`xwd -root` and crop.
+diff --git a/dlls/d3d11/Makefile.in b/dlls/d3d11/Makefile.in
+index 27db1f6..eaf6645 100644
+--- a/dlls/d3d11/Makefile.in
++++ b/dlls/d3d11/Makefile.in
+@@ -11,6 +11,7 @@ SOURCES = \
+ 	device.c \
+ 	inputlayout.c \
+ 	shader.c \
++	shared.c \
+ 	state.c \
+ 	texture.c \
+ 	utils.c \
+diff --git a/dlls/d3d11/d3d11_private.h b/dlls/d3d11/d3d11_private.h
+index d9cb912..672e9b7 100644
+--- a/dlls/d3d11/d3d11_private.h
++++ b/dlls/d3d11/d3d11_private.h
+@@ -37,6 +37,7 @@
+ #include "wine/wined3d.h"
+ #include "wine/winedxgi.h"
+ #include "wine/rbtree.h"
++#include "wine/list.h"
+ 
+ struct d3d_device;
+ 
+@@ -133,10 +134,13 @@ struct d3d_texture1d *unsafe_impl_from_ID3D11Texture1D(ID3D11Texture1D *iface);
+ struct d3d_texture1d *unsafe_impl_from_ID3D10Texture1D(ID3D10Texture1D *iface);
+ 
+ /* ID3D11Texture2D, ID3D10Texture2D */
++struct d3d_shared_surface;
++
+ struct d3d_texture2d
+ {
+     ID3D11Texture2D ID3D11Texture2D_iface;
+     ID3D10Texture2D ID3D10Texture2D_iface;
++    IDXGIKeyedMutex IDXGIKeyedMutex_iface;
+     LONG refcount;
+ 
+     IUnknown *dxgi_resource;
+@@ -144,6 +148,15 @@ struct d3d_texture2d
+     struct wined3d_swapchain *swapchain;
+     D3D11_TEXTURE2D_DESC desc;
+     ID3D11Device5 *device;
++
++    /* Set when this texture takes part in a surface shared between devices.
++     * The shared state carries the keyed mutex and remembers whose pixels are
++     * current; this texture's own IDXGIKeyedMutex_iface is what identifies it
++     * to the handoff. */
++    struct d3d_shared_surface *shared;
++    struct list shared_entry;
++    ID3D11Texture2D *staging_read;
++    ID3D11Texture2D *staging_write;
+ };
+ 
+ static inline struct d3d_texture2d *impl_from_ID3D11Texture2D(ID3D11Texture2D *iface)
+@@ -154,6 +167,9 @@ static inline struct d3d_texture2d *impl_from_ID3D11Texture2D(ID3D11Texture2D *i
+ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DESC *desc,
+         struct wined3d_texture *wined3d_texture,
+         const D3D11_SUBRESOURCE_DATA *data, struct d3d_texture2d **out);
++HRESULT d3d_texture2d_get_keyed_mutex(struct d3d_texture2d *texture, void **out);
++HRESULT d3d_shared_surface_attach(struct d3d_texture2d *owner, struct d3d_texture2d *texture);
++void d3d_texture2d_cleanup_shared(struct d3d_texture2d *texture);
+ struct d3d_texture2d *unsafe_impl_from_ID3D11Texture2D(ID3D11Texture2D *iface);
+ struct d3d_texture2d *unsafe_impl_from_ID3D10Texture2D(ID3D10Texture2D *iface);
+ 
+diff --git a/dlls/d3d11/device.c b/dlls/d3d11/device.c
+index 60ce120..6b82143 100644
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -4593,12 +4593,78 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateDeferredContext(ID3D11Device
+     return S_OK;
+ }
+ 
++HRESULT d3d_device_open_shared_resource(struct d3d_device *device, HANDLE handle, REFIID iid, void **out)
++{
++    struct wined3d_resource_desc wined3d_desc;
++    struct wined3d_resource *wined3d_resource;
++    struct d3d_texture2d *owner, *texture;
++    D3D11_TEXTURE2D_DESC desc;
++    HRESULT hr;
++
++    if (!out)
++        return E_INVALIDARG;
++    *out = NULL;
++
++    if (!(wined3d_resource = wined3d_resource_from_shared_handle(handle)))
++    {
++        WARN("Unknown shared handle %p.\n", handle);
++        return E_INVALIDARG;
++    }
++
++    wined3d_mutex_lock();
++    wined3d_resource_get_desc(wined3d_resource, &wined3d_desc);
++    wined3d_mutex_unlock();
++
++    if (wined3d_desc.resource_type != WINED3D_RTYPE_TEXTURE_2D)
++    {
++        FIXME("Unhandled resource type %#x.\n", wined3d_desc.resource_type);
++        return E_NOTIMPL;
++    }
++
++    if (!(owner = wined3d_resource_get_parent(wined3d_resource)))
++    {
++        WARN("Shared resource %p has no parent.\n", wined3d_resource);
++        return E_FAIL;
++    }
++
++    /* The opening device is a different wined3d device, and wined3d cannot give
++     * two of those one piece of storage: handing over the originating texture
++     * makes every call succeed while the pixels quietly do not cross.  So the
++     * opener gets a texture of its own, and the content moves between them at
++     * the keyed mutex handoff. */
++    desc = owner->desc;
++    /* The opener's copy is never the one GDI draws into, and asking for a
++     * GDI-compatible texture here wedges Word before its main window appears. */
++    desc.MiscFlags &= ~D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
++    if (FAILED(hr = d3d_texture2d_create(device, &desc, NULL, NULL, &texture)))
++    {
++        WARN("Failed to create a texture for shared handle %p, hr %#lx.\n", handle, hr);
++        return hr;
++    }
++
++    if (FAILED(hr = d3d_shared_surface_attach(owner, texture)))
++    {
++        ID3D11Texture2D_Release(&texture->ID3D11Texture2D_iface);
++        return hr;
++    }
++
++    TRACE("Opened handle %p: owner %p on device %p, opened %p on device %p.\n",
++            handle, owner, owner->device, texture, device);
++
++    hr = ID3D11Texture2D_QueryInterface(&texture->ID3D11Texture2D_iface, iid, out);
++    ID3D11Texture2D_Release(&texture->ID3D11Texture2D_iface);
++
++    return hr;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResource(ID3D11Device5 *iface, HANDLE resource, REFIID iid,
+         void **out)
+ {
+-    FIXME("iface %p, resource %p, iid %s, out %p stub!\n", iface, resource, debugstr_guid(iid), out);
++    struct d3d_device *device = impl_from_ID3D11Device5(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, resource %p, iid %s, out %p.\n", iface, resource, debugstr_guid(iid), out);
++
++    return d3d_device_open_shared_resource(device, resource, iid, out);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *iface, DXGI_FORMAT format,
+@@ -7501,10 +7567,12 @@ static UINT STDMETHODCALLTYPE d3d10_device_GetCreationFlags(ID3D10Device1 *iface
+ static HRESULT STDMETHODCALLTYPE d3d10_device_OpenSharedResource(ID3D10Device1 *iface,
+         HANDLE resource_handle, REFIID guid, void **resource)
+ {
+-    FIXME("iface %p, resource_handle %p, guid %s, resource %p stub!\n",
++    struct d3d_device *device = impl_from_ID3D10Device(iface);
++
++    TRACE("iface %p, resource_handle %p, guid %s, resource %p.\n",
+             iface, resource_handle, debugstr_guid(guid), resource);
+ 
+-    return E_NOTIMPL;
++    return d3d_device_open_shared_resource(device, resource_handle, guid, resource);
+ }
+ 
+ static void STDMETHODCALLTYPE d3d10_device_SetTextFilterSize(ID3D10Device1 *iface, UINT width, UINT height)
+diff --git a/dlls/d3d11/texture.c b/dlls/d3d11/texture.c
+index b2ef96d..9564168 100644
+--- a/dlls/d3d11/texture.c
++++ b/dlls/d3d11/texture.c
+@@ -535,6 +535,18 @@ static HRESULT STDMETHODCALLTYPE d3d11_texture2d_QueryInterface(ID3D11Texture2D
+         IUnknown_AddRef((IUnknown *)*object);
+         return S_OK;
+     }
++    else if (IsEqualGUID(riid, &IID_IDXGIKeyedMutex))
++    {
++        /* Handled here rather than in dxgi: the handoff has to move pixels
++         * between two devices, and this is the side that knows about both
++         * textures and both device contexts. */
++        if (FAILED(hr = d3d_texture2d_get_keyed_mutex(texture, object)))
++        {
++            WARN("%s not available on this texture, returning %#lx.\n", debugstr_guid(riid), hr);
++            *object = NULL;
++        }
++        return hr;
++    }
+ 
+     TRACE("Forwarding to dxgi resource.\n");
+ 
+@@ -752,6 +764,7 @@ static void STDMETHODCALLTYPE d3d_texture2d_wined3d_object_released(void *parent
+ {
+     struct d3d_texture2d *texture = parent;
+ 
++    d3d_texture2d_cleanup_shared(texture);
+     if (texture->dxgi_resource) IUnknown_Release(texture->dxgi_resource);
+     free(texture);
+ }
+diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
+index 483aac4..8b9285c 100644
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -199,6 +199,7 @@ struct dxgi_resource
+ {
+     IDXGISurface2 IDXGISurface2_iface;
+     IDXGIResource1 IDXGIResource1_iface;
++    IDXGIKeyedMutex IDXGIKeyedMutex_iface;
+     IUnknown IUnknown_iface;
+     IUnknown *outer_unknown;
+     LONG refcount;
+@@ -208,6 +209,15 @@ struct dxgi_resource
+     struct wined3d_resource *wined3d_resource;
+     unsigned int subresource_idx;
+     HDC dc;
++
++    /* IDXGIKeyedMutex.  A resource created with D3D11_RESOURCE_MISC_SHARED_-
++     * KEYEDMUTEX carries one, and its users synchronise on it rather than on
++     * anything wined3d knows about.  Within a process this is exactly a mutex
++     * plus the key the next acquirer has to name. */
++    CRITICAL_SECTION mutex_cs;
++    CONDITION_VARIABLE mutex_cv;
++    UINT64 mutex_key;
++    BOOL mutex_acquired;
+ };
+ 
+ HRESULT dxgi_resource_init(struct dxgi_resource *resource, IDXGIDevice *device,
+diff --git a/dlls/dxgi/resource.c b/dlls/dxgi/resource.c
+index 67921de..baee4fa 100644
+--- a/dlls/dxgi/resource.c
++++ b/dlls/dxgi/resource.c
+@@ -54,6 +54,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_resource_inner_QueryInterface(IUnknown *if
+         return S_OK;
+     }
+ 
++    else if (IsEqualGUID(riid, &IID_IDXGIKeyedMutex))
++    {
++        IDXGIKeyedMutex_AddRef(&resource->IDXGIKeyedMutex_iface);
++        *out = &resource->IDXGIKeyedMutex_iface;
++        return S_OK;
++    }
++
+     WARN("%s not implemented, returning E_NOINTERFACE\n", debugstr_guid(riid));
+ 
+     *out = NULL;
+@@ -82,6 +89,7 @@ static ULONG STDMETHODCALLTYPE dxgi_resource_inner_Release(IUnknown *iface)
+         if (resource->parent_resource)
+             IDXGIResource1_Release(resource->parent_resource);
+         wined3d_private_store_cleanup(&resource->private_store);
++        DeleteCriticalSection(&resource->mutex_cs);
+         free(resource);
+     }
+ 
+@@ -385,9 +393,11 @@ static HRESULT STDMETHODCALLTYPE dxgi_resource_GetDevice(IDXGIResource1 *iface,
+ /* IDXGIResource methods */
+ static HRESULT STDMETHODCALLTYPE dxgi_resource_GetSharedHandle(IDXGIResource1 *iface, HANDLE *shared_handle)
+ {
+-    FIXME("iface %p, shared_handle %p stub!\n", iface, shared_handle);
++    struct dxgi_resource *resource = impl_from_IDXGIResource1(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, shared_handle %p.\n", iface, shared_handle);
++
++    return wined3d_resource_get_shared_handle(resource->wined3d_resource, shared_handle);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_resource_GetUsage(IDXGIResource1 *iface, DXGI_USAGE *usage)
+@@ -515,6 +525,135 @@ static const struct IUnknownVtbl dxgi_resource_inner_unknown_vtbl =
+     dxgi_resource_inner_Release,
+ };
+ 
++/* IDXGIKeyedMutex methods */
++
++static inline struct dxgi_resource *impl_from_IDXGIKeyedMutex(IDXGIKeyedMutex *iface)
++{
++    return CONTAINING_RECORD(iface, struct dxgi_resource, IDXGIKeyedMutex_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_QueryInterface(IDXGIKeyedMutex *iface,
++        REFIID riid, void **object)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_QueryInterface(&resource->IDXGIResource1_iface, riid, object);
++}
++
++static ULONG STDMETHODCALLTYPE dxgi_keyed_mutex_AddRef(IDXGIKeyedMutex *iface)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_AddRef(&resource->IDXGIResource1_iface);
++}
++
++static ULONG STDMETHODCALLTYPE dxgi_keyed_mutex_Release(IDXGIKeyedMutex *iface)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_Release(&resource->IDXGIResource1_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_SetPrivateData(IDXGIKeyedMutex *iface,
++        REFGUID guid, UINT data_size, const void *data)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_SetPrivateData(&resource->IDXGIResource1_iface, guid, data_size, data);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_SetPrivateDataInterface(IDXGIKeyedMutex *iface,
++        REFGUID guid, const IUnknown *object)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_SetPrivateDataInterface(&resource->IDXGIResource1_iface, guid, object);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_GetPrivateData(IDXGIKeyedMutex *iface,
++        REFGUID guid, UINT *data_size, void *data)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_GetPrivateData(&resource->IDXGIResource1_iface, guid, data_size, data);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_GetParent(IDXGIKeyedMutex *iface,
++        REFIID riid, void **parent)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_GetParent(&resource->IDXGIResource1_iface, riid, parent);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_GetDevice(IDXGIKeyedMutex *iface,
++        REFIID riid, void **device)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    return IDXGIResource1_GetDevice(&resource->IDXGIResource1_iface, riid, device);
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_AcquireSync(IDXGIKeyedMutex *iface,
++        UINT64 key, DWORD timeout)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    DWORD start = GetTickCount(), remaining = timeout;
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, key %s, timeout %lu.\n", iface, wine_dbgstr_longlong(key), timeout);
++
++    EnterCriticalSection(&resource->mutex_cs);
++    while (resource->mutex_acquired || resource->mutex_key != key)
++    {
++        if (timeout != INFINITE)
++        {
++            DWORD elapsed = GetTickCount() - start;
++            remaining = elapsed >= timeout ? 0 : timeout - elapsed;
++        }
++        if (!SleepConditionVariableCS(&resource->mutex_cv, &resource->mutex_cs, remaining))
++        {
++            hr = WAIT_TIMEOUT;
++            break;
++        }
++    }
++    if (SUCCEEDED(hr))
++        resource->mutex_acquired = TRUE;
++    LeaveCriticalSection(&resource->mutex_cs);
++
++    return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE dxgi_keyed_mutex_ReleaseSync(IDXGIKeyedMutex *iface, UINT64 key)
++{
++    struct dxgi_resource *resource = impl_from_IDXGIKeyedMutex(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, key %s.\n", iface, wine_dbgstr_longlong(key));
++
++    EnterCriticalSection(&resource->mutex_cs);
++    if (!resource->mutex_acquired)
++    {
++        WARN("Released without being acquired.\n");
++        hr = E_FAIL;
++    }
++    else
++    {
++        resource->mutex_acquired = FALSE;
++        resource->mutex_key = key;
++        WakeAllConditionVariable(&resource->mutex_cv);
++    }
++    LeaveCriticalSection(&resource->mutex_cs);
++
++    return hr;
++}
++
++static const struct IDXGIKeyedMutexVtbl dxgi_keyed_mutex_vtbl =
++{
++    dxgi_keyed_mutex_QueryInterface,
++    dxgi_keyed_mutex_AddRef,
++    dxgi_keyed_mutex_Release,
++    dxgi_keyed_mutex_SetPrivateData,
++    dxgi_keyed_mutex_SetPrivateDataInterface,
++    dxgi_keyed_mutex_GetPrivateData,
++    dxgi_keyed_mutex_GetParent,
++    dxgi_keyed_mutex_GetDevice,
++    dxgi_keyed_mutex_AcquireSync,
++    dxgi_keyed_mutex_ReleaseSync,
++};
++
+ HRESULT dxgi_resource_init(struct dxgi_resource *resource, IDXGIDevice *device,
+         IUnknown *outer, BOOL needs_surface, struct wined3d_resource *wined3d_resource,
+         IDXGIResource1 *parent_resource, unsigned int subresource_index)
+@@ -532,8 +671,13 @@ HRESULT dxgi_resource_init(struct dxgi_resource *resource, IDXGIDevice *device,
+     else
+         resource->IDXGISurface2_iface.lpVtbl = NULL;
+     resource->IDXGIResource1_iface.lpVtbl = &dxgi_resource_vtbl;
++    resource->IDXGIKeyedMutex_iface.lpVtbl = &dxgi_keyed_mutex_vtbl;
+     resource->IUnknown_iface.lpVtbl = &dxgi_resource_inner_unknown_vtbl;
+     resource->refcount = 1;
++    InitializeCriticalSection(&resource->mutex_cs);
++    InitializeConditionVariable(&resource->mutex_cv);
++    resource->mutex_key = 0;
++    resource->mutex_acquired = FALSE;
+     wined3d_private_store_init(&resource->private_store);
+     resource->outer_unknown = outer ? outer : &resource->IUnknown_iface;
+     resource->device = device;
+diff --git a/dlls/wined3d/resource.c b/dlls/wined3d/resource.c
+index edc8b9c..7da7899 100644
+--- a/dlls/wined3d/resource.c
++++ b/dlls/wined3d/resource.c
+@@ -221,10 +221,116 @@ static void wined3d_resource_destroy_object(void *object)
+     context_resource_released(resource->device, resource);
+ }
+ 
++/* Shared resources.
++ *
++ * A resource created with D3D11_RESOURCE_MISC_SHARED* is handed to another
++ * device by handle.  Wine cannot yet share the storage across two
++ * wined3d_devices, but the handle has to exist and resolve back to the
++ * originating resource before any of that can be built on top, and returning
++ * a failure from GetSharedHandle is what stops applications one step earlier
++ * than they need to be stopped.  This is the registry, and nothing more: what
++ * the opening device does with the resource is its own business. */
++
++static struct list wined3d_shared_resources = LIST_INIT(wined3d_shared_resources);
++
++struct wined3d_shared_resource
++{
++    struct list entry;
++    HANDLE handle;
++    struct wined3d_resource *resource;
++};
++
++HRESULT CDECL wined3d_resource_get_shared_handle(struct wined3d_resource *resource, HANDLE *handle)
++{
++    struct wined3d_shared_resource *shared;
++
++    TRACE("resource %p, handle %p.\n", resource, handle);
++
++    if (!handle)
++        return E_INVALIDARG;
++
++    wined3d_mutex_lock();
++
++    LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
++    {
++        if (shared->resource == resource)
++        {
++            *handle = shared->handle;
++            wined3d_mutex_unlock();
++            TRACE("Returning existing handle %p.\n", *handle);
++            return WINED3D_OK;
++        }
++    }
++
++    if (!(shared = malloc(sizeof(*shared))))
++    {
++        wined3d_mutex_unlock();
++        return E_OUTOFMEMORY;
++    }
++
++    /* A real kernel handle, so the value is unique for as long as the resource
++     * lives and an application that duplicates or closes it does something
++     * sane. */
++    if (!(shared->handle = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        free(shared);
++        wined3d_mutex_unlock();
++        return E_FAIL;
++    }
++    shared->resource = resource;
++    list_add_head(&wined3d_shared_resources, &shared->entry);
++
++    wined3d_mutex_unlock();
++
++    *handle = shared->handle;
++    TRACE("Created handle %p.\n", *handle);
++
++    return WINED3D_OK;
++}
++
++struct wined3d_resource * CDECL wined3d_resource_from_shared_handle(HANDLE handle)
++{
++    struct wined3d_shared_resource *shared;
++    struct wined3d_resource *resource = NULL;
++
++    TRACE("handle %p.\n", handle);
++
++    wined3d_mutex_lock();
++    LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
++    {
++        if (shared->handle == handle)
++        {
++            resource = shared->resource;
++            break;
++        }
++    }
++    wined3d_mutex_unlock();
++
++    return resource;
++}
++
++static void wined3d_resource_release_shared_handle(struct wined3d_resource *resource)
++{
++    struct wined3d_shared_resource *shared, *next;
++
++    wined3d_mutex_lock();
++    LIST_FOR_EACH_ENTRY_SAFE(shared, next, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
++    {
++        if (shared->resource != resource)
++            continue;
++        list_remove(&shared->entry);
++        CloseHandle(shared->handle);
++        free(shared);
++    }
++    wined3d_mutex_unlock();
++}
++
+ void resource_cleanup(struct wined3d_resource *resource)
+ {
+     TRACE("Cleaning up resource %p.\n", resource);
+ 
++    wined3d_resource_release_shared_handle(resource);
++
+     if (!(resource->access & WINED3D_RESOURCE_ACCESS_CPU) && resource->usage & WINED3DUSAGE_VIDMEM_ACCOUNTING)
+     {
+         TRACE("Decrementing device memory pool by %u.\n", resource->size);
+diff --git a/dlls/wined3d/wined3d.spec b/dlls/wined3d/wined3d.spec
+index dc86887..34509df 100644
+--- a/dlls/wined3d/wined3d.spec
++++ b/dlls/wined3d/wined3d.spec
+@@ -208,7 +208,9 @@
+ @ cdecl wined3d_rendertarget_view_set_parent(ptr ptr ptr)
+ 
+ @ cdecl wined3d_resource_get_desc(ptr ptr)
++@ cdecl wined3d_resource_from_shared_handle(ptr)
+ @ cdecl wined3d_resource_get_parent(ptr)
++@ cdecl wined3d_resource_get_shared_handle(ptr ptr)
+ @ cdecl wined3d_resource_get_priority(ptr)
+ @ cdecl wined3d_resource_get_sub_resource_count(ptr)
+ @ cdecl wined3d_resource_get_sub_resource_desc(ptr long ptr)
+diff --git a/include/wine/wined3d.h b/include/wine/wined3d.h
+index 9918ac6..aa81150 100644
+--- a/include/wine/wined3d.h
++++ b/include/wine/wined3d.h
+@@ -2747,6 +2747,8 @@ ULONG __cdecl wined3d_rasterizer_state_incref(struct wined3d_rasterizer_state *s
+ void __cdecl wined3d_resource_get_desc(const struct wined3d_resource *resource,
+         struct wined3d_resource_desc *desc);
+ void * __cdecl wined3d_resource_get_parent(const struct wined3d_resource *resource);
++HRESULT __cdecl wined3d_resource_get_shared_handle(struct wined3d_resource *resource, HANDLE *handle);
++struct wined3d_resource * __cdecl wined3d_resource_from_shared_handle(HANDLE handle);
+ unsigned int __cdecl wined3d_resource_get_priority(const struct wined3d_resource *resource);
+ unsigned int __cdecl wined3d_resource_get_sub_resource_count(struct wined3d_resource *resource);
+ HRESULT __cdecl wined3d_resource_get_sub_resource_desc(struct wined3d_resource *resource,
+diff --git a/dlls/d3d11/shared.c b/dlls/d3d11/shared.c
+new file mode 100644
+index 0000000..a417ef2
+--- /dev/null
++++ b/dlls/d3d11/shared.c
+@@ -0,0 +1,410 @@
++/*
++ * Surfaces shared between D3D devices.
++ *
++ * A texture created with D3D11_RESOURCE_MISC_SHARED* is handed to a second
++ * device by handle, and the two devices hand it back and forth through an
++ * IDXGIKeyedMutex.  Office's UI compositor is built on exactly this: it renders
++ * its text and icons on one device and composites them on another.
++ *
++ * Wine cannot give two wined3d devices one piece of storage -- a wined3d
++ * texture's GL object belongs to the context that created it, and handing the
++ * same texture to a second device makes every call succeed while the pixels
++ * quietly do not cross (tools/d3dshare in the wine-altars tree measures this).
++ * So each participant gets a texture of its own and the content is moved
++ * between them at the point the keyed mutex already defines: whoever acquires
++ * the surface gets the pixels of whoever released it last.
++ *
++ * That costs a round trip through system memory per handoff.  It is the honest
++ * price of not having shared storage, and it is paid only by surfaces an
++ * application actually shares.
++ */
++
++#include "d3d11_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(d3d11);
++
++struct d3d_shared_surface
++{
++    LONG refcount;
++
++    CRITICAL_SECTION cs;
++    CONDITION_VARIABLE cv;
++    UINT64 key;
++    BOOL acquired;
++
++    struct d3d_texture2d *content;  /* whose pixels are current, NULL if nobody has written */
++    struct list textures;
++};
++
++static struct d3d_shared_surface *shared_surface_create(void)
++{
++    struct d3d_shared_surface *shared;
++
++    if (!(shared = calloc(1, sizeof(*shared))))
++        return NULL;
++
++    shared->refcount = 1;
++    InitializeCriticalSection(&shared->cs);
++    InitializeConditionVariable(&shared->cv);
++    list_init(&shared->textures);
++
++    return shared;
++}
++
++static void shared_surface_decref(struct d3d_shared_surface *shared)
++{
++    if (InterlockedDecrement(&shared->refcount))
++        return;
++    DeleteCriticalSection(&shared->cs);
++    free(shared);
++}
++
++/* The texture's own device's immediate context.  Released by the caller. */
++static ID3D11DeviceContext *texture_context(struct d3d_texture2d *texture)
++{
++    ID3D11DeviceContext *context = NULL;
++    ID3D11Device5_GetImmediateContext(texture->device, &context);
++    return context;
++}
++
++static HRESULT texture_get_staging(struct d3d_texture2d *texture, UINT cpu_access,
++        ID3D11Texture2D **staging)
++{
++    ID3D11Texture2D **cache = cpu_access == D3D11_CPU_ACCESS_READ
++            ? &texture->staging_read : &texture->staging_write;
++    D3D11_TEXTURE2D_DESC desc;
++    HRESULT hr;
++
++    if (*cache)
++    {
++        *staging = *cache;
++        return S_OK;
++    }
++
++    desc = texture->desc;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Usage = D3D11_USAGE_STAGING;
++    desc.BindFlags = 0;
++    desc.CPUAccessFlags = cpu_access;
++    desc.MiscFlags = 0;
++
++    if (FAILED(hr = ID3D11Device5_CreateTexture2D(texture->device, &desc, NULL, cache)))
++    {
++        WARN("Failed to create a staging texture, hr %#lx.\n", hr);
++        return hr;
++    }
++
++    *staging = *cache;
++    return S_OK;
++}
++
++/* Move src's pixels to dst.  The two live on different devices, so this goes
++ * out through a staging texture on one and in through a staging texture on the
++ * other; there is no shorter path without shared storage. */
++static HRESULT shared_surface_transfer(struct d3d_texture2d *src, struct d3d_texture2d *dst)
++{
++    ID3D11DeviceContext *src_context = NULL, *dst_context = NULL;
++    ID3D11Texture2D *src_staging, *dst_staging;
++    D3D11_MAPPED_SUBRESOURCE src_map, dst_map;
++    unsigned int y, row, rows;
++    HRESULT hr;
++
++    if (src->desc.Width != dst->desc.Width || src->desc.Height != dst->desc.Height
++            || src->desc.Format != dst->desc.Format)
++    {
++        WARN("Shared textures do not match: %ux%u fmt %#x vs %ux%u fmt %#x.\n",
++                src->desc.Width, src->desc.Height, src->desc.Format,
++                dst->desc.Width, dst->desc.Height, dst->desc.Format);
++        return E_INVALIDARG;
++    }
++
++    if (FAILED(hr = texture_get_staging(src, D3D11_CPU_ACCESS_READ, &src_staging)))
++        return hr;
++    if (FAILED(hr = texture_get_staging(dst, D3D11_CPU_ACCESS_WRITE, &dst_staging)))
++        return hr;
++
++    if (!(src_context = texture_context(src)) || !(dst_context = texture_context(dst)))
++    {
++        hr = E_FAIL;
++        goto done;
++    }
++
++    ID3D11DeviceContext_CopyResource(src_context, (ID3D11Resource *)src_staging,
++            (ID3D11Resource *)&src->ID3D11Texture2D_iface);
++    if (FAILED(hr = ID3D11DeviceContext_Map(src_context, (ID3D11Resource *)src_staging,
++            0, D3D11_MAP_READ, 0, &src_map)))
++    {
++        WARN("Failed to map the source staging texture, hr %#lx.\n", hr);
++        goto done;
++    }
++
++    if (FAILED(hr = ID3D11DeviceContext_Map(dst_context, (ID3D11Resource *)dst_staging,
++            0, D3D11_MAP_WRITE, 0, &dst_map)))
++    {
++        WARN("Failed to map the destination staging texture, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Unmap(src_context, (ID3D11Resource *)src_staging, 0);
++        goto done;
++    }
++
++    row = min(src_map.RowPitch, dst_map.RowPitch);
++    rows = src->desc.Height;
++    for (y = 0; y < rows; ++y)
++        memcpy((char *)dst_map.pData + (size_t)y * dst_map.RowPitch,
++                (const char *)src_map.pData + (size_t)y * src_map.RowPitch, row);
++
++    ID3D11DeviceContext_Unmap(dst_context, (ID3D11Resource *)dst_staging, 0);
++    ID3D11DeviceContext_Unmap(src_context, (ID3D11Resource *)src_staging, 0);
++
++    ID3D11DeviceContext_CopyResource(dst_context, (ID3D11Resource *)&dst->ID3D11Texture2D_iface,
++            (ID3D11Resource *)dst_staging);
++
++    TRACE("Moved %ux%u from texture %p to texture %p.\n", src->desc.Width, rows, src, dst);
++    hr = S_OK;
++
++done:
++    if (dst_context) ID3D11DeviceContext_Release(dst_context);
++    if (src_context) ID3D11DeviceContext_Release(src_context);
++    return hr;
++}
++
++/* IDXGIKeyedMutex, one per participating texture, all over the same state. */
++
++static inline struct d3d_texture2d *impl_from_IDXGIKeyedMutex(IDXGIKeyedMutex *iface)
++{
++    return CONTAINING_RECORD(iface, struct d3d_texture2d, IDXGIKeyedMutex_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_QueryInterface(IDXGIKeyedMutex *iface,
++        REFIID riid, void **out)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Texture2D_QueryInterface(&texture->ID3D11Texture2D_iface, riid, out);
++}
++
++static ULONG STDMETHODCALLTYPE d3d_keyed_mutex_AddRef(IDXGIKeyedMutex *iface)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Texture2D_AddRef(&texture->ID3D11Texture2D_iface);
++}
++
++static ULONG STDMETHODCALLTYPE d3d_keyed_mutex_Release(IDXGIKeyedMutex *iface)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Texture2D_Release(&texture->ID3D11Texture2D_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_SetPrivateData(IDXGIKeyedMutex *iface,
++        REFGUID guid, UINT size, const void *data)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Texture2D_SetPrivateData(&texture->ID3D11Texture2D_iface, guid, size, data);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_SetPrivateDataInterface(IDXGIKeyedMutex *iface,
++        REFGUID guid, const IUnknown *object)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Texture2D_SetPrivateDataInterface(&texture->ID3D11Texture2D_iface, guid, object);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_GetPrivateData(IDXGIKeyedMutex *iface,
++        REFGUID guid, UINT *size, void *data)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Texture2D_GetPrivateData(&texture->ID3D11Texture2D_iface, guid, size, data);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_GetParent(IDXGIKeyedMutex *iface,
++        REFIID riid, void **parent)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Device5_QueryInterface(texture->device, riid, parent);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_GetDevice(IDXGIKeyedMutex *iface,
++        REFIID riid, void **device)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    return ID3D11Device5_QueryInterface(texture->device, riid, device);
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_AcquireSync(IDXGIKeyedMutex *iface,
++        UINT64 key, DWORD timeout)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    struct d3d_shared_surface *shared = texture->shared;
++    DWORD start = GetTickCount(), remaining = timeout;
++    struct d3d_texture2d *content = NULL;
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, key %s, timeout %lu.\n", iface, wine_dbgstr_longlong(key), timeout);
++
++    if (!shared)
++        return E_FAIL;
++
++    EnterCriticalSection(&shared->cs);
++    while (shared->acquired || shared->key != key)
++    {
++        if (timeout != INFINITE)
++        {
++            DWORD elapsed = GetTickCount() - start;
++            remaining = elapsed >= timeout ? 0 : timeout - elapsed;
++        }
++        if (!SleepConditionVariableCS(&shared->cv, &shared->cs, remaining))
++        {
++            LeaveCriticalSection(&shared->cs);
++            return WAIT_TIMEOUT;
++        }
++    }
++    shared->acquired = TRUE;
++    if (shared->content && shared->content != texture)
++        content = shared->content;
++    LeaveCriticalSection(&shared->cs);
++
++    /* Outside the lock: the transfer touches two device contexts and the other
++     * participant cannot acquire while we hold it. */
++    if (content)
++        hr = shared_surface_transfer(content, texture);
++
++    return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_ReleaseSync(IDXGIKeyedMutex *iface, UINT64 key)
++{
++    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
++    struct d3d_shared_surface *shared = texture->shared;
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, key %s.\n", iface, wine_dbgstr_longlong(key));
++
++    if (!shared)
++        return E_FAIL;
++
++    EnterCriticalSection(&shared->cs);
++    if (!shared->acquired)
++    {
++        WARN("Released without being acquired.\n");
++        hr = E_FAIL;
++    }
++    else
++    {
++        /* Whoever held it may have drawn, so its pixels are now the ones that
++         * matter.  The copy happens when somebody else acquires. */
++        shared->content = texture;
++        shared->acquired = FALSE;
++        shared->key = key;
++        WakeAllConditionVariable(&shared->cv);
++    }
++    LeaveCriticalSection(&shared->cs);
++
++    return hr;
++}
++
++static const struct IDXGIKeyedMutexVtbl d3d_keyed_mutex_vtbl =
++{
++    d3d_keyed_mutex_QueryInterface,
++    d3d_keyed_mutex_AddRef,
++    d3d_keyed_mutex_Release,
++    d3d_keyed_mutex_SetPrivateData,
++    d3d_keyed_mutex_SetPrivateDataInterface,
++    d3d_keyed_mutex_GetPrivateData,
++    d3d_keyed_mutex_GetParent,
++    d3d_keyed_mutex_GetDevice,
++    d3d_keyed_mutex_AcquireSync,
++    d3d_keyed_mutex_ReleaseSync,
++};
++
++static BOOL texture_is_shared(const struct d3d_texture2d *texture)
++{
++    return !!(texture->desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED
++            | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE));
++}
++
++/* Give this texture shared state, creating it if this is the first participant. */
++static struct d3d_shared_surface *texture_get_shared(struct d3d_texture2d *texture)
++{
++    struct d3d_shared_surface *shared;
++
++    if (texture->shared)
++        return texture->shared;
++
++    if (!(shared = shared_surface_create()))
++        return NULL;
++
++    texture->shared = shared;
++    texture->IDXGIKeyedMutex_iface.lpVtbl = &d3d_keyed_mutex_vtbl;
++    list_add_tail(&shared->textures, &texture->shared_entry);
++
++    /* The texture the surface was created from *is* the surface, so its pixels
++     * are the surface's pixels until somebody else writes.  Without this a
++     * newly opened texture starts uninitialised and whoever composites it first
++     * gets a black rectangle. */
++    shared->content = texture;
++
++    TRACE("Created shared state %p for texture %p.\n", shared, texture);
++
++    return shared;
++}
++
++HRESULT d3d_shared_surface_attach(struct d3d_texture2d *owner, struct d3d_texture2d *texture)
++{
++    struct d3d_shared_surface *shared;
++
++    if (!(shared = texture_get_shared(owner)))
++        return E_OUTOFMEMORY;
++
++    InterlockedIncrement(&shared->refcount);
++    texture->shared = shared;
++    texture->IDXGIKeyedMutex_iface.lpVtbl = &d3d_keyed_mutex_vtbl;
++
++    EnterCriticalSection(&shared->cs);
++    list_add_tail(&shared->textures, &texture->shared_entry);
++    LeaveCriticalSection(&shared->cs);
++
++    TRACE("Attached texture %p to shared state %p (owner %p).\n", texture, shared, owner);
++
++    return S_OK;
++}
++
++HRESULT d3d_texture2d_get_keyed_mutex(struct d3d_texture2d *texture, void **out)
++{
++    if (!texture_is_shared(texture))
++        return E_NOINTERFACE;
++
++    if (!texture_get_shared(texture))
++        return E_OUTOFMEMORY;
++
++    ID3D11Texture2D_AddRef(&texture->ID3D11Texture2D_iface);
++    *out = &texture->IDXGIKeyedMutex_iface;
++
++    return S_OK;
++}
++
++void d3d_texture2d_cleanup_shared(struct d3d_texture2d *texture)
++{
++    struct d3d_shared_surface *shared = texture->shared;
++
++    if (texture->staging_read)
++    {
++        ID3D11Texture2D_Release(texture->staging_read);
++        texture->staging_read = NULL;
++    }
++    if (texture->staging_write)
++    {
++        ID3D11Texture2D_Release(texture->staging_write);
++        texture->staging_write = NULL;
++    }
++
++    if (!shared)
++        return;
++
++    EnterCriticalSection(&shared->cs);
++    list_remove(&texture->shared_entry);
++    if (shared->content == texture)
++        shared->content = NULL;
++    LeaveCriticalSection(&shared->cs);
++
++    texture->shared = NULL;
++    shared_surface_decref(shared);
++}

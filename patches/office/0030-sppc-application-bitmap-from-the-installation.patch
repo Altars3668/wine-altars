@@ -1,0 +1,200 @@
+Subject: [PATCH] sppc: answer ApplicationBitmap from the installed product definitions
+
+接在 0029 之后。过了 ActivePlugins 闸门以后，Office 会枚举全部已注册 SKU 并对每一个
+查询 ApplicationBitmap（本机实测 33 个 SKU、65 次调用）。这个属性此前是 stub，枚举
+因此得不到匹配的 SKU，FullValidationHr 停在 0xC004F015。
+
+原生对照（Windows 10.0.29648.1000，tools/sppcprobe/sku-info.c）：
+查询返回 hr=0、type=1 即 SL_DATA_SZ、size=22，内容是 UTF-16 的 "0x0001F1BB" 加结尾
+NUL，长度以字节计，缓冲区由调用方 LocalFree。**不是 DWORD，也不是二进制位域。**
+失败契约同批采集：未知属性名和未知 SKU 都是 0xC004F012（不是 SKU_NOT_FOUND，也不是
+F015）；句柄、SKU、长度、数据四个空指针都是 0x80070057；每条失败路径都不改写调用方
+的输出。因此旧 stub 预先清零输出的做法也一并改掉。slc 的查询转发到 sppc，结果一致。
+
+取值不必虚构：安装自带的 root/Licenses16 里，1390 个 .xrm-ms 文件带有
+<tm:infoStr name="ApplicationBitmap">。它描述某个 SKU 覆盖哪些应用，属于产品定义，
+不是许可状态、密钥或设备绑定。归属只认同一个 license 块内显式的 productSkuId，
+不按文件名推断：位图在 -ul-oob/-ul-phn 文件里而不在 -ppd 里，按文件名配对会错位。
+全量扫描 1768 个文件零解析失败，548 个 SKU 得到位图，**同一 SKU 从未出现两个取值**，
+本机 33 个已注册 SKU 全部命中。参考机为 {149dbce7-...} 返回的 0x0001F1BB 与本地
+O365ProPlusR_Subscription1-ul-oob.xrm-ms 里的取值逐字符一致。
+
+目录侧按 SKU 自己定位它注册在哪个应用下，不硬编码 Office 的应用 ID；注册表不保证
+字符串带结尾 NUL，而调用方按字节长度读取，所以读回后显式确认。
+
+**这不授予任何许可。** 权利评估照常返回未授权，本函数不参与许可判断；能读到位图只
+说明该 SKU 已安装注册，不说明它已获授权。
+
+验证：全新隔离 prefix 的 Python 回归通过（目录部分 28 项，含位图归属、冲突拒绝、
+格式校验、缺失拒绝、同值重复、安装目录外符号链接拒绝），失败与跳过均为零。
+
+部署后实测对比（同一 prefix，只换这两个 DLL）：
+
+  0029（位图为 stub）：出现 375x178 的许可拦截对话框，无崩溃
+  本补丁            ：不再出现该对话框，Office 进入主 UI 渲染
+
+也就是说许可拦截第一次被真正走通，而不是被绕过。**但 Word 随后在主 UI 渲染路径上
+以 0x1e3c3840 崩溃**，栈经 mso40uiwin32client、d2d1 和 d3d11，属于本项目已知的共享
+表面/呈现缺陷范围，与本补丁无关但使 Word 仍不可用。许可证依然没有签发，Office 依然
+没有激活，三大应用的编辑保存仍未验证。
+
+依据：
+- https://learn.microsoft.com/en-us/windows/win32/api/slpublic/nf-slpublic-slgetproductskuinformation
+- https://raw.githubusercontent.com/microsoft/win32metadata/main/generation/WinSDK/RecompiledIdlHeaders/um/slpublic.h
+
+---
+--- a/dlls/sppc/sppc.c
++++ b/dlls/sppc/sppc.c
+@@ -138,14 +138,32 @@
+     return SL_E_VALUE_NOT_FOUND;
+ }
+ 
++/* ApplicationBitmap 说明某个 SKU 覆盖哪些应用，Office 在枚举已注册产品时逐个查询它。
++ *
++ * 原生对照（Windows 10.0.29648.1000）：查询返回 SL_DATA_SZ，内容是 "0x" 加八位十六进制
++ * 的字符串，长度以字节计并含结尾 NUL，缓冲区由调用方 LocalFree。未知属性名和未知 SKU
++ * 都返回 SL_E_VALUE_NOT_FOUND —— 不是 SKU_NOT_FOUND，也不是 F015；四个空指针参数都是
++ * E_INVALIDARG；每条失败路径都不改写调用方的输出，所以这里不再预先清零。
++ *
++ * 取值来自安装注册目录，是产品定义而不是授权：能读到位图不表示该 SKU 已获许可，
++ * 权利评估照常返回未授权。其余属性尚未实现，不用占位值冒充。
++ */
+ HRESULT WINAPI SLGetProductSkuInformation(HSLC handle, const SLID *product_sku_id, LPCWSTR name,
+                                           SLDATATYPE *type, UINT *cb_value, BYTE **value)
+ {
+-    FIXME("(%p,%s,%s,%p,%p,%p) stub\n", handle, wine_dbgstr_guid(product_sku_id),
+-          debugstr_w(name), type, cb_value, value);
+-    if (cb_value) *cb_value = 0;
+-    if (value) *value = NULL;
+-    return SL_E_VALUE_NOT_FOUND;
++    HRESULT hr;
++
++    TRACE("handle %p sku %s name %s type %p size %p value %p.\n", handle,
++          wine_dbgstr_guid(product_sku_id), debugstr_w(name), type, cb_value, value);
++
++    if (!handle || !product_sku_id || !name || !cb_value || !value) return E_INVALIDARG;
++    if (FAILED(hr = sppc_context_validate(handle))) return hr;
++    /* 大小写敏感性没有原生实测，按 Windows 属性名惯例不区分。 */
++    if (wcsicmp(name, L"ApplicationBitmap")) return SL_E_VALUE_NOT_FOUND;
++    if (FAILED(hr = sppc_catalog_sku_string(product_sku_id, L"ApplicationBitmap", cb_value, value)))
++        return hr;
++    if (type) *type = SL_DATA_SZ;
++    return S_OK;
+ }
+ 
+ HRESULT WINAPI SLGetSLIDList(HSLC handle, int query_id_type, const SLID *query_id,
+--- a/dlls/sppc/catalog.c
++++ b/dlls/sppc/catalog.c
+@@ -101,3 +101,91 @@
+     if (root) RegCloseKey(root);
+     return hr;
+ }
++
++/* 读取某个已注册 SKU 的字符串属性。取值来自安装注册目录，描述的是产品定义，
++ * 不是许可状态、密钥或设备绑定；读到值不表示该产品已授权。
++ *
++ * 原生 API 只按 SKU 查询，所以这里自己找出它注册在哪个应用下，而不是硬编码
++ * Office 的应用 ID。找不到应用、SKU 或该属性时一律按未找到处理，绝不退回其他
++ * SKU 的取值。成功时输出 LocalAlloc 的 UTF-16 字符串，长度以字节计并包含结尾
++ * NUL，由调用方 LocalFree。
++ */
++HRESULT sppc_catalog_sku_string(const SLID *sku, const WCHAR *name, UINT *size, BYTE **value)
++{
++    static const GUID empty_guid;
++    WCHAR app_name[39], sku_name[39];
++    HKEY root = NULL, application = NULL, products = NULL, product = NULL;
++    DWORD version, bytes, type, index, length;
++    BYTE *buffer = NULL;
++    HRESULT hr = SL_E_VALUE_NOT_FOUND;
++    LONG result;
++
++    if (IsEqualGUID(sku, &empty_guid)) return SL_E_VALUE_NOT_FOUND;
++    swprintf(sku_name, ARRAY_SIZE(sku_name), L"{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
++            sku->Data1, sku->Data2, sku->Data3, sku->Data4[0], sku->Data4[1], sku->Data4[2],
++            sku->Data4[3], sku->Data4[4], sku->Data4[5], sku->Data4[6], sku->Data4[7]);
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, catalog_root, 0, KEY_READ | KEY_WOW64_64KEY, &root))
++        return SL_E_VALUE_NOT_FOUND;
++
++    for (index = 0; !product; index++)
++    {
++        length = ARRAY_SIZE(app_name);
++        if (RegEnumKeyExW(root, index, app_name, &length, NULL, NULL, NULL, NULL)) goto done;
++        if (RegOpenKeyExW(root, app_name, 0, KEY_READ | KEY_WOW64_64KEY, &application)) continue;
++        bytes = sizeof(version);
++        result = RegQueryValueExW(application, L"CatalogVersion", NULL, &type, (BYTE *)&version, &bytes);
++        /* 目录存在但版本不对时停下来报错，不把它当成"没有这个 SKU"。 */
++        if (!result && (type != REG_DWORD || bytes != sizeof(version) || version != 1))
++        {
++            hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++            goto done;
++        }
++        if (!result && !RegOpenKeyExW(application, L"Skus", 0, KEY_READ | KEY_WOW64_64KEY, &products))
++            RegOpenKeyExW(products, sku_name, 0, KEY_READ | KEY_WOW64_64KEY, &product);
++        if (products) RegCloseKey(products);
++        products = NULL;
++        RegCloseKey(application);
++        application = NULL;
++    }
++
++    bytes = 0;
++    if ((result = RegQueryValueExW(product, name, NULL, &type, NULL, &bytes)))
++    {
++        hr = result == ERROR_FILE_NOT_FOUND ? SL_E_VALUE_NOT_FOUND : HRESULT_FROM_WIN32(result);
++        goto done;
++    }
++    if (type != REG_SZ || bytes < 2 * sizeof(WCHAR) || bytes > 4096 || bytes % sizeof(WCHAR))
++    {
++        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++        goto done;
++    }
++    if (!(buffer = LocalAlloc(LMEM_FIXED, bytes)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    if ((result = RegQueryValueExW(product, name, NULL, &type, buffer, &bytes)))
++    {
++        hr = HRESULT_FROM_WIN32(result);
++        goto done;
++    }
++    /* 注册表不保证字符串带结尾 NUL，而调用方按字节长度读取，所以这里必须确认。 */
++    if (type != REG_SZ || bytes < 2 * sizeof(WCHAR) || bytes % sizeof(WCHAR) ||
++            ((const WCHAR *)buffer)[bytes / sizeof(WCHAR) - 1])
++    {
++        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++        goto done;
++    }
++    *size = bytes;
++    *value = buffer;
++    buffer = NULL;
++    hr = S_OK;
++
++done:
++    if (buffer) LocalFree(buffer);
++    if (product) RegCloseKey(product);
++    if (products) RegCloseKey(products);
++    if (application) RegCloseKey(application);
++    RegCloseKey(root);
++    return hr;
++}
+--- a/dlls/sppc/sppc_private.h
++++ b/dlls/sppc/sppc_private.h
+@@ -12,4 +12,7 @@
+ /* 句柄有效返回 S_OK，否则返回原生对照的上下文错误。不向外暴露上下文内部结构。 */
+ HRESULT sppc_context_validate(HSLC handle);
+ 
++/* 读取已注册 SKU 的字符串属性；成功时输出 LocalAlloc 的缓冲区，由调用方 LocalFree。 */
++HRESULT sppc_catalog_sku_string(const SLID *sku, const WCHAR *name, UINT *size, BYTE **value);
++
+ #endif
+--- a/dlls/slc/slc.spec
++++ b/dlls/slc/slc.spec
+@@ -21,7 +21,7 @@
+ @ stub SLGetPKeyInformation
+ @ stub SLGetPolicyInformation
+ @ stub SLGetPolicyInformationDWORD
+-@ stub SLGetProductSkuInformation
++@ stdcall SLGetProductSkuInformation(ptr ptr wstr ptr ptr ptr) sppc.SLGetProductSkuInformation
+ @ stub SLGetSAMLicense
+ @ stub SLGetSLIDList
+ @ stdcall SLGetServiceInformation(ptr wstr ptr ptr ptr) sppc.SLGetServiceInformation

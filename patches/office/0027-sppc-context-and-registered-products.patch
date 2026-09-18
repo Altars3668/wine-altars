@@ -1,0 +1,775 @@
+Subject: [PATCH] sppc: retain consumption contexts and registered SKU metadata
+
+原生对照确认：新上下文没有消费历史；拒授与没有历史不同，失败输入对
+历史的影响也不同。不要返回全零SKU或把ApplicationId当作SkuId。
+
+新增独立上下文与显式产品元数据目录。此阶段没有授权/密钥后端，注册
+目录只产生真实SKU的未授权结果，不复制参考机的通知、宽限或授权状态。
+SLConsumeRight拒授时保留实际结果供后续NULL/NULL查询；未知产品清除历史。
+SLC四个核心API转发至SPPC，共用句柄状态，避免同源复编形成两套上下文。
+
+新增隔离winetest及构建配置；调用方负责LocalFree输出数组。其他未实现
+的授权入口仍有明确边界，不以其占位返回证明认证或安装成功。
+依赖已有SPPC表面补丁0002和0005，不修改Office许可判断。
+---
+diff --git a/configure b/configure
+index a900bde..58de7a9 100755
+--- a/configure
++++ b/configure
+@@ -23206,6 +23206,7 @@ wine_fn_config_makefile dlls/sound.drv16 enable_win16
+ wine_fn_config_makefile dlls/spoolss enable_spoolss
+ wine_fn_config_makefile dlls/spoolss/tests enable_tests
+ wine_fn_config_makefile dlls/sppc enable_sppc
++wine_fn_config_makefile dlls/sppc/tests enable_tests
+ wine_fn_config_makefile dlls/srclient enable_srclient
+ wine_fn_config_makefile dlls/srpapi enable_srpapi
+ wine_fn_config_makefile dlls/srvcli enable_srvcli
+diff --git a/configure.ac b/configure.ac
+index 9d1e106..fdd0d2f 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3202,6 +3202,7 @@ WINE_CONFIG_MAKEFILE(dlls/sound.drv16)
+ WINE_CONFIG_MAKEFILE(dlls/spoolss)
+ WINE_CONFIG_MAKEFILE(dlls/spoolss/tests)
+ WINE_CONFIG_MAKEFILE(dlls/sppc)
++WINE_CONFIG_MAKEFILE(dlls/sppc/tests)
+ WINE_CONFIG_MAKEFILE(dlls/srclient)
+ WINE_CONFIG_MAKEFILE(dlls/srpapi)
+ WINE_CONFIG_MAKEFILE(dlls/srvcli)
+diff --git a/dlls/slc/Makefile.in b/dlls/slc/Makefile.in
+index 162aeba..86a3f33 100644
+--- a/dlls/slc/Makefile.in
++++ b/dlls/slc/Makefile.in
+@@ -2,11 +2,9 @@ EXTRADEFS = -D_SLC_
+ MODULE    = slc.dll
+ IMPORTLIB = slc
+ 
+-# CROSSOVER HACK: bug 19782
+-PARENTSRC = ../sppc
++# 有状态 SLC API 通过导出转发共用 SPPC 上下文，不在此复制全局状态。
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+-	slc.c \
+-	sppc.c
++	slc.c
+diff --git a/dlls/slc/slc.spec b/dlls/slc/slc.spec
+index e203aff..f35956b 100644
+--- a/dlls/slc/slc.spec
++++ b/dlls/slc/slc.spec
+@@ -6,8 +6,8 @@
+ @ stub SLpGetLicenseAcquisitionInfo
+ @ stub SLpGetMachineUGUID
+ @ stub SLpVLActivateProduct
+-@ stdcall SLClose(ptr)
+-@ stub SLConsumeRight
++@ stdcall SLClose(ptr) sppc.SLClose
++@ stdcall SLConsumeRight(ptr ptr ptr wstr ptr) sppc.SLConsumeRight
+ @ stub SLConsumeWindowsRight
+ @ stub SLDepositOfflineConfirmationId
+ @ stub SLFireEvent
+@@ -16,7 +16,7 @@
+ @ stub SLGetLicense
+ @ stub SLGetLicenseFileId
+ @ stub SLGetLicenseInformation
+-@ stdcall SLGetLicensingStatusInformation(ptr ptr ptr wstr ptr ptr)
++@ stdcall SLGetLicensingStatusInformation(ptr ptr ptr wstr ptr ptr) sppc.SLGetLicensingStatusInformation
+ @ stub SLGetPKeyId
+ @ stub SLGetPKeyInformation
+ @ stub SLGetPolicyInformation
+@@ -30,7 +30,7 @@
+ @ stub SLInstallLicense
+ @ stub SLInstallProofOfPurchase
+ @ stub SLInstallSAMLicense
+-@ stdcall SLOpen(ptr)
++@ stdcall SLOpen(ptr) sppc.SLOpen
+ @ stub SLReArmWindows
+ @ stub SLRegisterEvent
+ @ stub SLRegisterWindowsEvent
+diff --git a/dlls/sppc/Makefile.in b/dlls/sppc/Makefile.in
+index e9209fe..a0952f6 100644
+--- a/dlls/sppc/Makefile.in
++++ b/dlls/sppc/Makefile.in
+@@ -1,7 +1,10 @@
+ EXTRADEFS = -D_SLC_
+ MODULE    = sppc.dll
++IMPORTS   = advapi32 ntdll
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
++	catalog.c \
++	context.c \
+ 	sppc.c
+diff --git a/dlls/sppc/sppc.c b/dlls/sppc/sppc.c
+index ec7d4f1..285497a 100644
+--- a/dlls/sppc/sppc.c
++++ b/dlls/sppc/sppc.c
+@@ -31,63 +31,7 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(slc);
+ 
+-HRESULT WINAPI SLGetLicensingStatusInformation(HSLC handle, const SLID *app, const SLID *product,
+-                                               LPCWSTR name, UINT *count, SL_LICENSING_STATUS **status)
+-{
+-    SL_LICENSING_STATUS *ret;
+-
+-    /* Failing this call and answering "unlicensed" are not the same thing to a
+-     * caller. Office treats a failure as "the licensing platform is broken" and
+-     * stops with "cannot verify the license for this product"; it treats an
+-     * unlicensed *answer* as something to act on, which is the path that leads
+-     * to its activation and sign-in flow.
+-     *
+-     * Measured on Windows 11 against a machine with a Microsoft 365
+-     * subscription: this succeeds and returns 33 entries, and the entry Word
+-     * asks about is not licensed either -- eStatus 3 with hrReason 0xc004f009,
+-     * the other 32 being eStatus 0 with SL_E_PKEY_NOT_INSTALLED. So even where
+-     * Office works, the answer here is "no product key". Wine has no software
+-     * protection platform, so that is exactly what it can say honestly, in the
+-     * shape the caller expects.
+-     *
+-     * The caller frees the array with LocalFree. */
+-    FIXME("(%p %p %p %s %p %p) reporting one unlicensed sku\n", handle, app, product,
+-          debugstr_w(name), count, status );
+-
+-    if (!count || !status)
+-        return E_INVALIDARG;
+-
+-    if (!(ret = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, sizeof(*ret) )))
+-        return E_OUTOFMEMORY;
+-
+-    if (product) ret->SkuId = *product;
+-    else if (app) ret->SkuId = *app;
+-    ret->eStatus = SL_LICENSING_STATUS_UNLICENSED;
+-    ret->hrReason = SL_E_PKEY_NOT_INSTALLED;
+-
+-    *status = ret;
+-    *count = 1;
+-    return S_OK;
+-}
+-
+-HRESULT WINAPI SLOpen(HSLC *handle)
+-{
+-    FIXME("(%p) stub\n", handle );
+-
+-    if (!handle)
+-        return E_INVALIDARG;
+-
+-    *handle = (HSLC)0xdeadbeef;
+-
+-    return S_OK;
+-}
+-
+-HRESULT WINAPI SLClose(HSLC handle)
+-{
+-    FIXME("(%p) stub\n", handle );
+-
+-    return S_OK;
+-}
++/* 句柄、权利评估和状态查询在 context.c 实现；不能再返回占位 SKU。 */
+ 
+ HRESULT WINAPI SLPersistApplicationPolicies(const SLID *app, const SLID *product, DWORD flags)
+ {
+@@ -134,18 +78,8 @@ HRESULT WINAPI SLFreeApplicationPolicies(HSLP policy)
+     return S_OK;
+ }
+ 
+-/*
+- * SLSetAuthenticationData - the client hands the protection platform a blob of
+- * authentication material. There is no platform here to hand it to, and no
+- * store to keep it in.
+- *
+- * Accepting it is the honest answer rather than a convenient one: the call has
+- * no observable result the caller can read back, so "stored" and "stored into
+- * a platform that keeps nothing" are indistinguishable from the outside, and a
+- * caller that gets a failure treats the licensing stack as broken. Leaving it
+- * as a spec stub is the one thing that is definitely wrong -- calling a Wine
+- * stub raises rather than returning, which aborts the process.
+- */
++/* 尚未实现的认证数据入口；不记录材料内容，也不以当前占位返回值证明
++ * 认证已保存或权利已授予。真正依赖该材料的流程仍需单独实现和验证。 */
+ HRESULT WINAPI SLSetAuthenticationData(HSLC handle, UINT cb_data, const BYTE *data,
+                                        UINT *cb_response, BYTE **response)
+ {
+@@ -157,28 +91,8 @@ HRESULT WINAPI SLSetAuthenticationData(HSLC handle, UINT cb_data, const BYTE *da
+     return S_OK;
+ }
+ 
+-/*
+- * The rest of the Software Protection Platform surface Office reaches for.
+- *
+- * The split is deliberate and follows what a caller can tell apart. A *query*
+- * on a machine with no protection platform genuinely has no answer, so it says
+- * so (SL_E_VALUE_NOT_FOUND) and the caller falls back on its own defaults. An
+- * *action* has no observable result to read back, so completing it and keeping
+- * nothing is indistinguishable from the outside, and returning a failure only
+- * tells the caller its licensing stack is broken.
+- *
+- * Leaving any of them as a spec stub is the one option that is definitely
+- * wrong: calling a Wine stub raises rather than returning, which aborts the
+- * process outright. That is how Word died on SLConsumeRight.
+- */
+-
+-HRESULT WINAPI SLConsumeRight(HSLC handle, const SLID *app, const SLID *product,
+-                              LPCWSTR right, void *reserved)
+-{
+-    FIXME("(%p,%s,%s,%s,%p) stub\n", handle, wine_dbgstr_guid(app),
+-          wine_dbgstr_guid(product), debugstr_w(right), reserved);
+-    return S_OK;
+-}
++/* 其余尚未实现的平台入口。其占位结果不是安装或授权已经生效的证据；
++ * 需要按真实调用逐项补全，不能再以“动作没有可观察结果”为由忽略状态。 */
+ 
+ HRESULT WINAPI SLGetLicense(HSLC handle, const SLID *license_file_id,
+                             UINT *cb_license, BYTE **license)
+diff --git a/include/slerror.h b/include/slerror.h
+index b297441..1fb76cb 100644
+--- a/include/slerror.h
++++ b/include/slerror.h
+@@ -20,9 +20,12 @@
+ #define __WINE_SLERROR_H
+ 
+ #define SL_E_RIGHT_NOT_CONSUMED       0xC004F002
++#define SL_E_GRACE_TIME_EXPIRED       0xC004F009
+ #define SL_E_VALUE_NOT_FOUND          0xC004F012
+ #define SL_E_RIGHT_NOT_GRANTED        0xC004F013
+ #define SL_E_PKEY_NOT_INSTALLED       0xC004F014
++#define SL_E_PRODUCT_SKU_NOT_INSTALLED 0xC004F015
++#define SL_E_NOT_SUPPORT              0xC004F016
+ #define SL_E_DATATYPE_MISMATCHED      0xC004F01E
+ #define SL_E_APPLICATION_POLICIES_MISSING 0xC004F072
+ 
+diff --git a/include/slpublic.h b/include/slpublic.h
+index 827e3bb..b929b79 100644
+--- a/include/slpublic.h
++++ b/include/slpublic.h
+@@ -72,6 +72,8 @@ SLCAPI HRESULT WINAPI SLGetApplicationPolicy(HSLP, LPCWSTR, SLDATATYPE*, UINT*,
+ SLCAPI HRESULT WINAPI SLFreeApplicationPolicies(HSLP);
+ SLCAPI HRESULT WINAPI SLGetWindowsInformationDWORD(LPCWSTR, LPDWORD);
+ SLCAPI HRESULT WINAPI SLOpen(HSLC*);
++SLCAPI HRESULT WINAPI SLClose(HSLC);
++SLCAPI HRESULT WINAPI SLConsumeRight(HSLC, const SLID*, const SLID*, LPCWSTR, void*);
+ 
+ #ifdef __cplusplus
+ }
+--- /dev/null
++++ b/dlls/sppc/catalog.c
+@@ -0,0 +1,103 @@
++/* 显式注册的产品元数据；不扫描许可证、密钥、账户或硬件绑定。 */
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wchar.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winreg.h"
++#include "winternl.h"
++#include "slerror.h"
++#include "sppc_private.h"
++
++static const WCHAR catalog_root[] = L"Software\\Wine\\SPPC\\Applications";
++
++HRESULT sppc_catalog_status(const SLID *app, const SLID *sku, UINT *count, SL_LICENSING_STATUS **status)
++{
++    SL_LICENSING_STATUS *entries = NULL;
++    static const GUID empty_guid;
++    WCHAR app_name[39], sku_name[39];
++    HKEY root = NULL, application = NULL, products = NULL, product = NULL;
++    DWORD version, size, index, length, total, type;
++    UNICODE_STRING string;
++    GUID id;
++    LONG result;
++    UINT used = 0;
++    HRESULT hr = SL_E_PRODUCT_SKU_NOT_INSTALLED;
++
++    *count = 0;
++    *status = NULL;
++    swprintf(app_name, ARRAY_SIZE(app_name), L"{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
++            app->Data1, app->Data2, app->Data3, app->Data4[0], app->Data4[1], app->Data4[2],
++            app->Data4[3], app->Data4[4], app->Data4[5], app->Data4[6], app->Data4[7]);
++    if ((result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, catalog_root, 0, KEY_READ | KEY_WOW64_64KEY, &root))) goto error;
++    if ((result = RegOpenKeyExW(root, app_name, 0, KEY_READ | KEY_WOW64_64KEY, &application))) goto error;
++    size = sizeof(version);
++    if ((result = RegQueryValueExW(application, L"CatalogVersion", NULL, &type, (BYTE *)&version, &size))) goto error;
++    if (type != REG_DWORD || size != sizeof(version) || version != 1)
++    {
++        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++        goto done;
++    }
++    if ((result = RegOpenKeyExW(application, L"Skus", 0, KEY_READ | KEY_WOW64_64KEY, &products))) goto error;
++    if ((result = RegQueryInfoKeyW(products, NULL, NULL, NULL, &total, NULL, NULL, NULL, NULL, NULL, NULL, NULL))) goto error;
++    if (total > 4096)
++    {
++        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++        goto done;
++    }
++    if (total && !(entries = calloc(total, sizeof(*entries))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    for (index = 0; index < total; index++)
++    {
++        length = ARRAY_SIZE(sku_name);
++        result = RegEnumKeyExW(products, index, sku_name, &length, NULL, NULL, NULL, NULL);
++        if (result) goto error;
++        RtlInitUnicodeString(&string, sku_name);
++        if (RtlGUIDFromString(&string, &id) || IsEqualGUID(&id, &empty_guid))
++        {
++            hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++            goto done;
++        }
++        if (sku && !IsEqualGUID(sku, &id)) continue;
++        if ((result = RegOpenKeyExW(products, sku_name, 0, KEY_READ | KEY_WOW64_64KEY, &product))) goto error;
++        size = 0;
++        result = RegQueryValueExW(product, L"Name", NULL, &type, NULL, &size);
++        RegCloseKey(product);
++        product = NULL;
++        if (result) goto error;
++        if (type != REG_SZ || size < 2 * sizeof(WCHAR) || size > 4096)
++        {
++            hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
++            goto done;
++        }
++        entries[used].SkuId = id;
++        entries[used].eStatus = SL_LICENSING_STATUS_UNLICENSED;
++        entries[used].hrReason = SL_E_PKEY_NOT_INSTALLED;
++        /* 没有本机许可/密钥后端的授权证据；时间字段保持零，不借用外机宽限。 */
++        used++;
++    }
++    if (!used) goto done;
++    *count = used;
++    *status = entries;
++    entries = NULL;
++    hr = S_OK;
++    goto done;
++
++error:
++    hr = result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND ?
++            SL_E_PRODUCT_SKU_NOT_INSTALLED : HRESULT_FROM_WIN32(result);
++done:
++    free(entries);
++    if (product) RegCloseKey(product);
++    if (products) RegCloseKey(products);
++    if (application) RegCloseKey(application);
++    if (root) RegCloseKey(root);
++    return hr;
++}
+--- /dev/null
++++ b/dlls/sppc/context.c
+@@ -0,0 +1,159 @@
++/* SLC 上下文与本机未授权评估结果。
++ * API 成功、评估结果存在和权利授予是不同状态，不能用占位记录混淆。
++ */
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "wine/debug.h"
++#include "slerror.h"
++#include "sppc_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(slc);
++
++struct slc_context
++{
++    struct slc_context *next;
++    HSLC handle;
++    UINT count;
++    SL_LICENSING_STATUS *last_status;
++    BOOL evaluated;
++};
++
++static SRWLOCK context_lock = SRWLOCK_INIT;
++static struct slc_context *contexts;
++static ULONG_PTR next_handle;
++
++/* 先查表，再读上下文；任意外部 handle 不作为内存指针解引用。 */
++static struct slc_context *find_context(HSLC handle)
++{
++    struct slc_context *context;
++    for (context = contexts; context; context = context->next)
++        if (context->handle == handle) return context;
++    return NULL;
++}
++
++static HRESULT copy_status(const SL_LICENSING_STATUS *source, UINT source_count,
++        UINT *count, SL_LICENSING_STATUS **status)
++{
++    SL_LICENSING_STATUS *copy = NULL;
++
++    if (source_count)
++    {
++        if (!(copy = LocalAlloc(LMEM_FIXED, source_count * sizeof(*copy)))) return E_OUTOFMEMORY;
++        memcpy(copy, source, source_count * sizeof(*copy));
++    }
++    /* 只有成功后才提交输出，原生错误路径保留调用方的初值。 */
++    *count = source_count;
++    *status = copy;
++    return S_OK;
++}
++
++HRESULT WINAPI SLOpen(HSLC *handle)
++{
++    struct slc_context *context;
++
++    TRACE("handle output %p.\n", handle);
++    if (!handle) return E_INVALIDARG;
++    if (!(context = calloc(1, sizeof(*context)))) return E_OUTOFMEMORY;
++    AcquireSRWLockExclusive(&context_lock);
++    do
++    {
++        next_handle++;
++        context->handle = (HSLC)next_handle;
++    } while (!next_handle || context->handle == INVALID_HANDLE_VALUE || find_context(context->handle));
++    context->next = contexts;
++    contexts = context;
++    *handle = context->handle;
++    ReleaseSRWLockExclusive(&context_lock);
++    return S_OK;
++}
++
++HRESULT WINAPI SLClose(HSLC handle)
++{
++    struct slc_context **entry, *context;
++
++    TRACE("handle %p.\n", handle);
++    if (!handle) return E_INVALIDARG;
++    AcquireSRWLockExclusive(&context_lock);
++    for (entry = &contexts; *entry && (*entry)->handle != handle; entry = &(*entry)->next) {}
++    if (!(context = *entry))
++    {
++        ReleaseSRWLockExclusive(&context_lock);
++        return RPC_NT_SS_CONTEXT_MISMATCH;
++    }
++    *entry = context->next;
++    ReleaseSRWLockExclusive(&context_lock);
++    free(context->last_status);
++    free(context);
++    return S_OK;
++}
++
++HRESULT WINAPI SLGetLicensingStatusInformation(HSLC handle, const SLID *app, const SLID *product,
++        LPCWSTR right, UINT *count, SL_LICENSING_STATUS **status)
++{
++    struct slc_context *context;
++    SL_LICENSING_STATUS *entries = NULL;
++    UINT entry_count = 0;
++    HRESULT hr;
++
++    TRACE("handle %p app %p sku %p count %p status %p.\n", handle, app, product, count, status);
++    if (!handle || !count || !status || (!app && product)) return E_INVALIDARG;
++    AcquireSRWLockExclusive(&context_lock);
++    if (!(context = find_context(handle))) hr = RPC_NT_SS_CONTEXT_MISMATCH;
++    else if (right) hr = SL_E_NOT_SUPPORT;
++    else if (!app)
++    {
++        hr = context->evaluated ? copy_status(context->last_status, context->count, count, status) :
++                SL_E_RIGHT_NOT_CONSUMED;
++    }
++    else
++    {
++        hr = sppc_catalog_status(app, product, &entry_count, &entries);
++        if (SUCCEEDED(hr)) hr = copy_status(entries, entry_count, count, status);
++    }
++    ReleaseSRWLockExclusive(&context_lock);
++    free(entries);
++    return hr;
++}
++
++HRESULT WINAPI SLConsumeRight(HSLC handle, const SLID *app, const SLID *product,
++        LPCWSTR right, void *reserved)
++{
++    struct slc_context *context;
++    SL_LICENSING_STATUS *entries = NULL;
++    UINT count = 0;
++    HRESULT hr;
++
++    TRACE("handle %p app %p sku %p.\n", handle, app, product);
++    if (!handle || !app || reserved) return E_INVALIDARG;
++    AcquireSRWLockExclusive(&context_lock);
++    if (!(context = find_context(handle))) hr = RPC_NT_SS_CONTEXT_MISMATCH;
++    else if (right) hr = SL_E_NOT_SUPPORT;
++    else
++    {
++        /* 参数错误保留旧历史；开始一次有效请求后，未知产品会清除历史。 */
++        free(context->last_status);
++        context->last_status = NULL;
++        context->count = 0;
++        context->evaluated = FALSE;
++        hr = sppc_catalog_status(app, product, &count, &entries);
++        if (SUCCEEDED(hr))
++        {
++            context->last_status = entries;
++            context->count = count;
++            context->evaluated = TRUE;
++            entries = NULL;
++            /* 本阶段没有授权/密钥后端。保留可查询的未授权结果，但不授予权利。 */
++            hr = SL_E_RIGHT_NOT_GRANTED;
++        }
++    }
++    ReleaseSRWLockExclusive(&context_lock);
++    free(entries);
++    return hr;
++}
+--- /dev/null
++++ b/dlls/sppc/sppc_private.h
+@@ -0,0 +1,12 @@
++/* Software Protection Platform 的内部安装目录接口。
++ * 目录只描述注册的产品，不包含也不授予许可证权利。
++ */
++#ifndef __WINE_SPPC_PRIVATE_H
++#define __WINE_SPPC_PRIVATE_H
++
++#include "slpublic.h"
++
++/* 成功时返回 malloc 分配的未授权状态数组，由调用方 free。 */
++HRESULT sppc_catalog_status(const SLID *app, const SLID *sku, UINT *count, SL_LICENSING_STATUS **status);
++
++#endif
+--- /dev/null
++++ b/dlls/sppc/tests/Makefile.in
+@@ -0,0 +1,5 @@
++TESTDLL = sppc.dll
++IMPORTS = advapi32
++
++SOURCES = \
++	context.c
+--- /dev/null
++++ b/dlls/sppc/tests/context.c
+@@ -0,0 +1,226 @@
++/* SPPC 上下文与目录回归。目录 fixture 仅在 Wine 中创建，不授予任何权利。
++ * Copyright 2026 AltarsCN
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#include <stdarg.h>
++#include <string.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windows.h"
++#include "winternl.h"
++#include "slpublic.h"
++#include "slerror.h"
++#include "wine/test.h"
++
++static HRESULT (WINAPI *p_open)(HSLC *);
++static HRESULT (WINAPI *p_close)(HSLC);
++static HRESULT (WINAPI *p_consume)(HSLC, const SLID *, const SLID *, LPCWSTR, void *);
++static HRESULT (WINAPI *p_query)(HSLC, const SLID *, const SLID *, LPCWSTR, UINT *, SL_LICENSING_STATUS **);
++
++static const GUID app = {0x6f209801,0x7177,0x4222,{0x81,0x11,0x10,0,0,0,0,1}};
++static const GUID sku1 = {0x6f209802,0x7177,0x4222,{0x81,0x11,0x10,0,0,0,0,1}};
++static const GUID sku2 = {0x6f209803,0x7177,0x4222,{0x81,0x11,0x10,0,0,0,0,1}};
++static const GUID unknown = {0x6f209804,0x7177,0x4222,{0x81,0x11,0x10,0,0,0,0,1}};
++static const WCHAR app_path[] = L"Software\\Wine\\SPPC\\Applications\\{6f209801-7177-4222-8111-100000000001}";
++
++static void expect_query_error(HSLC handle, const GUID *application, const GUID *sku,
++        const WCHAR *right, HRESULT expected)
++{
++    SL_LICENSING_STATUS *status = (void *)(UINT_PTR)0x1234;
++    UINT count = 0xfeedbeef;
++    HRESULT hr = p_query(handle, application, sku, right, &count, &status);
++
++    ok(hr == expected, "query returned %#lx, expected %#lx\n", hr, expected);
++    ok(count == 0xfeedbeef, "error modified count to %u\n", count);
++    ok(status == (void *)(UINT_PTR)0x1234, "error modified array to %p\n", status);
++}
++
++static void check_unlicensed(HSLC handle, const GUID *application, const GUID *sku, UINT expected)
++{
++    SL_LICENSING_STATUS *status = NULL;
++    GUID empty = {0};
++    UINT count = 0, index;
++    HRESULT hr = p_query(handle, application, sku, NULL, &count, &status);
++
++    ok(hr == S_OK, "query returned %#lx\n", hr);
++    if (FAILED(hr)) return;
++    ok(count == expected, "got %u records, expected %u\n", count, expected);
++    ok(!count || !!status, "nonempty result without array\n");
++    if (status && count <= 2)
++    {
++        for (index = 0; index < count; index++)
++        {
++            ok(!IsEqualGUID(&status[index].SkuId, &empty), "zero SKU\n");
++            ok(IsEqualGUID(&status[index].SkuId, &sku1) || IsEqualGUID(&status[index].SkuId, &sku2), "unexpected SKU\n");
++            if (sku) ok(IsEqualGUID(&status[index].SkuId, sku), "SKU filter ignored\n");
++            ok(status[index].eStatus == SL_LICENSING_STATUS_UNLICENSED, "unexpected status %u\n", status[index].eStatus);
++            ok(status[index].hrReason == SL_E_PKEY_NOT_INSTALLED, "unexpected reason %#lx\n", status[index].hrReason);
++            ok(!status[index].dwGraceTime && !status[index].dwTotalGraceDays && !status[index].qwValidityExpiration,
++                    "unimplemented rights acquired time fields\n");
++        }
++    }
++    LocalFree(status);
++}
++
++static void test_empty_context(void)
++{
++    HSLC first = NULL, second = NULL;
++    SL_LICENSING_STATUS *status = (void *)(UINT_PTR)0x1234;
++    UINT count = 0xfeedbeef;
++    HRESULT hr;
++
++    hr = p_open(NULL);
++    ok(hr == E_INVALIDARG, "SLOpen(NULL) returned %#lx\n", hr);
++    hr = p_open(&first);
++    ok(hr == S_OK && first, "SLOpen returned %#lx, %p\n", hr, first);
++    if (FAILED(hr) || !first) return;
++    hr = p_open(&second);
++    ok(hr == S_OK && second && first != second, "second context %#lx, %p, first %p\n", hr, second, first);
++    expect_query_error(first, NULL, NULL, NULL, SL_E_RIGHT_NOT_CONSUMED);
++    expect_query_error(first, &unknown, NULL, NULL, SL_E_PRODUCT_SKU_NOT_INSTALLED);
++    expect_query_error(first, NULL, &sku1, NULL, E_INVALIDARG);
++    expect_query_error(NULL, &app, NULL, NULL, E_INVALIDARG);
++    expect_query_error((HSLC)(UINT_PTR)0x1234, &app, NULL, NULL, RPC_NT_SS_CONTEXT_MISMATCH);
++    hr = p_query(first, &app, NULL, NULL, NULL, &status);
++    ok(hr == E_INVALIDARG && status == (void *)(UINT_PTR)0x1234, "null count modified output, %#lx\n", hr);
++    hr = p_query(first, &app, NULL, NULL, &count, NULL);
++    ok(hr == E_INVALIDARG && count == 0xfeedbeef, "null array modified output, %#lx\n", hr);
++    if (second) p_close(second);
++    hr = p_close(first);
++    ok(hr == S_OK, "close returned %#lx\n", hr);
++    expect_query_error(first, &app, NULL, NULL, RPC_NT_SS_CONTEXT_MISMATCH);
++}
++
++static BOOL create_catalog(void)
++{
++    static const WCHAR *names[] = {
++        L"Skus\\{6f209802-7177-4222-8111-100000000001}",
++        L"Skus\\{6f209803-7177-4222-8111-100000000001}"
++    };
++    static const WCHAR name[] = L"SPPC test metadata, not a license";
++    HKEY application, product;
++    DWORD disposition, version = 1;
++    unsigned int index;
++    LONG ret;
++
++    if (!GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version"))
++    {
++        skip("Wine catalog fixtures are not registered on native Windows\n");
++        return FALSE;
++    }
++    ret = RegCreateKeyExW(HKEY_LOCAL_MACHINE, app_path, 0, NULL, 0,
++            KEY_ALL_ACCESS | KEY_WOW64_64KEY, NULL, &application, &disposition);
++    if (ret) { skip("cannot create test catalog: %ld\n", ret); return FALSE; }
++    if (disposition != REG_CREATED_NEW_KEY)
++    {
++        RegCloseKey(application);
++        skip("test application already exists; leaving it untouched\n");
++        return FALSE;
++    }
++    ret = RegSetValueExW(application, L"CatalogVersion", 0, REG_DWORD, (BYTE *)&version, sizeof(version));
++    ok(!ret, "set catalog version failed %ld\n", ret);
++    for (index = 0; index < ARRAY_SIZE(names); index++)
++    {
++        ret = RegCreateKeyExW(application, names[index], 0, NULL, 0, KEY_ALL_ACCESS | KEY_WOW64_64KEY,
++                NULL, &product, NULL);
++        ok(!ret, "create SKU failed %ld\n", ret);
++        if (!ret)
++        {
++            ret = RegSetValueExW(product, L"Name", 0, REG_SZ, (const BYTE *)name, sizeof(name));
++            ok(!ret, "set SKU name failed %ld\n", ret);
++            RegCloseKey(product);
++        }
++    }
++    RegCloseKey(application);
++    return TRUE;
++}
++
++static void test_catalog_context(void)
++{
++    HSLC first = NULL, second = NULL;
++    HMODULE slc;
++    HRESULT (WINAPI *slc_open)(HSLC *);
++    HRESULT (WINAPI *slc_close)(HSLC);
++    HRESULT (WINAPI *slc_query)(HSLC, const SLID *, const SLID *, LPCWSTR, UINT *, SL_LICENSING_STATUS **);
++    SL_LICENSING_STATUS *status = NULL;
++    HKEY key;
++    UINT count;
++    HRESULT hr;
++
++    if (!create_catalog()) return;
++    hr = p_open(&first);
++    ok(hr == S_OK && first, "open failed %#lx\n", hr);
++    if (FAILED(hr) || !first) goto cleanup;
++    check_unlicensed(first, &app, NULL, 2);
++    check_unlicensed(first, &app, &sku1, 1);
++    expect_query_error(first, NULL, NULL, NULL, SL_E_RIGHT_NOT_CONSUMED);
++    expect_query_error(first, &app, &unknown, NULL, SL_E_PRODUCT_SKU_NOT_INSTALLED);
++    expect_query_error(first, &app, NULL, L"test-right", SL_E_NOT_SUPPORT);
++    hr = p_consume(first, &app, &sku1, NULL, NULL);
++    ok(hr == SL_E_RIGHT_NOT_GRANTED, "unlicensed SKU granted a right: %#lx\n", hr);
++    check_unlicensed(first, NULL, NULL, 1);
++    check_unlicensed(first, &app, NULL, 2);
++    check_unlicensed(first, NULL, NULL, 1);
++    hr = p_consume(first, NULL, NULL, NULL, NULL);
++    ok(hr == E_INVALIDARG, "invalid consume returned %#lx\n", hr);
++    check_unlicensed(first, NULL, NULL, 1);
++    hr = p_open(&second);
++    ok(hr == S_OK && second, "second open failed %#lx\n", hr);
++    if (second) expect_query_error(second, NULL, NULL, NULL, SL_E_RIGHT_NOT_CONSUMED);
++    hr = p_consume(first, &app, &unknown, NULL, NULL);
++    ok(hr == SL_E_PRODUCT_SKU_NOT_INSTALLED, "unknown SKU returned %#lx\n", hr);
++    expect_query_error(first, NULL, NULL, NULL, SL_E_RIGHT_NOT_CONSUMED);
++    if (second) p_close(second);
++    p_close(first);
++    first = NULL;
++
++    slc = LoadLibraryA("slc.dll");
++    ok(!!slc, "cannot load slc.dll\n");
++    if (slc)
++    {
++        slc_open = (void *)GetProcAddress(slc, "SLOpen");
++        slc_close = (void *)GetProcAddress(slc, "SLClose");
++        slc_query = (void *)GetProcAddress(slc, "SLGetLicensingStatusInformation");
++        ok(slc_open && slc_close && slc_query, "missing SLC exports\n");
++        if (slc_open && slc_close && slc_query)
++        {
++            hr = slc_open(&first);
++            ok(hr == S_OK && first, "cross-DLL open returned %#lx, %p\n", hr, first);
++            if (SUCCEEDED(hr) && first)
++            {
++                hr = p_consume(first, &app, &sku2, NULL, NULL);
++                ok(hr == SL_E_RIGHT_NOT_GRANTED, "cross-DLL consume returned %#lx\n", hr);
++                count = 0;
++                hr = slc_query(first, NULL, NULL, NULL, &count, &status);
++                ok(hr == S_OK && count == 1 && status, "cross-DLL query returned %#lx, %u\n", hr, count);
++                if (status && count == 1) ok(IsEqualGUID(&status[0].SkuId, &sku2), "cross-DLL history changed\n");
++                LocalFree(status);
++                hr = slc_close(first);
++                ok(hr == S_OK, "cross-DLL close returned %#lx\n", hr);
++            }
++        }
++        FreeLibrary(slc);
++    }
++cleanup:
++    if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, app_path, 0, KEY_ALL_ACCESS | KEY_WOW64_64KEY, &key))
++    {
++        RegDeleteTreeW(key, NULL);
++        RegCloseKey(key);
++        RegDeleteKeyExW(HKEY_LOCAL_MACHINE, app_path, KEY_WOW64_64KEY, 0);
++    }
++}
++
++START_TEST(context)
++{
++    HMODULE module = LoadLibraryA("sppc.dll");
++    if (!module) { win_skip("sppc.dll is unavailable\n"); return; }
++    p_open = (void *)GetProcAddress(module, "SLOpen");
++    p_close = (void *)GetProcAddress(module, "SLClose");
++    p_consume = (void *)GetProcAddress(module, "SLConsumeRight");
++    p_query = (void *)GetProcAddress(module, "SLGetLicensingStatusInformation");
++    if (!p_open || !p_close || !p_consume || !p_query) { win_skip("core exports unavailable\n"); FreeLibrary(module); return; }
++    test_empty_context();
++    test_catalog_context();
++    FreeLibrary(module);
++}
