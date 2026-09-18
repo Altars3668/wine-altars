@@ -1,0 +1,125 @@
+Subject: [PATCH] onlineid: do not claim an account provider we cannot serve
+
+这是 Office 在 Wine 下无法登录的最后一道关。
+
+create_provider_operation 对任何 provider id 都返回一个对象，等于对调用方宣称
+"我这个 broker 能处理 Microsoft 账户"。但它产不出 MSA 要的 RPS ticket
+（`k=v&k=v` 形式），凡是走到取 token 那一步都只能失败。
+
+**认领一个服务不了的 provider 比不认领更糟。** 调用方一旦决定走 broker，就会把
+之后每一个失败都当成 broker 故障报给用户，而不是改用自己的登录界面。Office 实测：
+
+  - 交互式请求回 WEB_TOKEN_USER_CANCEL(1) → MSAL 判定"用户取消"
+    （api_error_context "User canceled the flow"，request_duration 1 毫秒——
+     没有人被问过任何问题）
+  - 回 WEB_TOKEN_ACCOUNT_PROVIDER_NOT_AVAILABLE(4) 也没用：Office 把这个状态码
+    **直接画成错误页**给用户看（"出错了 [9zeuw]  Code: 4"），依然不回退
+
+所以退出必须发生在查找提供者这一步，而不是等到要 token 时。改为：被问到
+Microsoft 账户的 provider（id https://login.microsoft.com，authority 为
+consumers 或未指定）时，如实回答这里没有这样的提供者。其余 provider 不受影响。
+
+于是 MSAL 改用自己的界面完成登录。配合打开 Office 自己的 WebView2 登录门
+（见 docs/office365-under-wine.md 关于 IsWebView2ForOneAuthEnabled 的一节），
+登录页由 Chromium 渲染，用户正常完成认证——此后 Office 真实取得权益：
+
+    Office.Licensing.Entitlement.MakeRequestForEntitlements    Success: true
+    Office.Licensing.Entitlement.GetAutoSelectedEntitlement    Success: true
+    Office.Licensing.Nul.Fetcher.GetLicense                    Success: true
+    Office.Licensing.Nul.Validation.FullValidation             Success: true
+
+顺带给 token 请求加一行诊断：只记 scope、client id、prompt 类型和属性条数，
+不记属性值——认证请求的属性袋可能带用户材料。
+
+---
+--- a/dlls/windows.security.authentication.onlineid/webauth.c
++++ b/dlls/windows.security.authentication.onlineid/webauth.c
+@@ -492,12 +492,47 @@
+     return hr;
+ }
+ 
++/* Whether this broker speaks for a given account provider.
++ *
++ * Claiming a provider it cannot serve is worse than claiming none: the caller
++ * then routes sign-in through the broker, and every failure it gets back is
++ * shown to the user as a broker error instead of falling back to the caller's
++ * own sign-in UI.  Office does exactly that -- a WebTokenRequestStatus of
++ * AccountProviderNotAvailable arrives as an error page, not as a reason to try
++ * something else.  A Microsoft-account provider needs RPS tickets, which this
++ * broker cannot produce, so it reports that it has no such provider, and the
++ * caller signs the user in itself. */
++static BOOL provider_is_supported(HSTRING id, HSTRING authority)
++{
++    static const WCHAR msa_provider[] = L"https://login.microsoft.com";
++    static const WCHAR msa_authority[] = L"consumers";
++    UINT32 len = 0;
++    const WCHAR *raw;
++
++    raw = WindowsGetStringRawBuffer(id, &len);
++    if (raw && len && !wcsnicmp(raw, msa_provider, ARRAY_SIZE(msa_provider) - 1))
++    {
++        raw = WindowsGetStringRawBuffer(authority, &len);
++        if (!raw || !len || !wcsicmp(raw, msa_authority))
++            return FALSE;
++    }
++    return TRUE;
++}
++
+ static HRESULT create_provider_operation(HSTRING id, HSTRING authority, void **result)
+ {
+     struct provider *provider;
+     HRESULT hr;
+     if (!result) return E_POINTER;
+     *result = NULL;
++
++    if (!provider_is_supported(id, authority))
++    {
++        TRACE("no account provider here for id %s authority %s.\n",
++              debugstr_hstring(id), debugstr_hstring(authority));
++        return create_object_operation(NULL, result);
++    }
++
+     if (!(provider = calloc(1, sizeof(*provider)))) return E_OUTOFMEMORY;
+     provider->iface.lpVtbl = &provider_vtbl;
+     provider->iface2.lpVtbl = &provider2_vtbl;
+@@ -1288,10 +1323,40 @@
+ #define WEB_TOKEN_USER_CANCEL                1
+ #define WEB_TOKEN_USER_INTERACTION_REQUIRED  3
+ 
++/* What the caller is asking for.  Keys are logged, values are not: a property
++ * bag on an authentication request can carry user material. */
++static void describe_request(void *request)
++{
++    struct request_probe *probe=(struct request_probe *)request;
++    IMap_HSTRING_HSTRING *props=NULL;
++    HSTRING scope=NULL,client=NULL;
++    INT prompt=-1;
++    UINT32 count=0;
++
++    if(!request)return;
++    probe->lpVtbl->get_Scope(probe,&scope);
++    probe->lpVtbl->get_ClientId(probe,&client);
++    probe->lpVtbl->get_PromptType(probe,&prompt);
++    if(SUCCEEDED(probe->lpVtbl->get_Properties(probe,&props))&&props)
++    {
++        IMapView_HSTRING_HSTRING *view=NULL;
++        if(SUCCEEDED(IMap_HSTRING_HSTRING_GetView(props,&view))&&view)
++        {
++            IMapView_HSTRING_HSTRING_get_Size(view,&count);
++            IMapView_HSTRING_HSTRING_Release(view);
++        }
++        IMap_HSTRING_HSTRING_Release(props);
++    }
++    TRACE("request scope=%s client=%s prompt=%d property-count=%u\n",
++          debugstr_hstring(scope),debugstr_hstring(client),prompt,count);
++    WindowsDeleteString(scope);WindowsDeleteString(client);
++}
++
+ static HRESULT token_result_for_request(void *request,INT no_token_status,void **result)
+ {
+     HSTRING scope=NULL,token;struct token_response *response;HRESULT hr;
+ 
++    describe_request(request);
+     if(request)((struct request_probe*)request)->lpVtbl->get_Scope((struct request_probe*)request,&scope);
+     hr=load_captured_token(request,scope,&token);
+     if(hr==S_FALSE)hr=load_authorized_token(scope,&token);

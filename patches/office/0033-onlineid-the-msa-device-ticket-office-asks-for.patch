@@ -1,0 +1,735 @@
+Subject: [PATCH] onlineid: answer the MSA device-ticket request Office actually makes
+
+Office 的登录窗「秒关」和 Office 未激活是同一条链的两端，根因在这里。
+
+Word 启动即触发（无需任何用户操作），WINEDEBUG=-all,+onlineid 实测：
+
+    CreateOnlineIdServiceTicketRequestAdvanced
+        service L"service::https://licensing.m365.svc.cloud.microsoft/::MBI_SSL_SHORT"
+    → E_NOTIMPL
+
+三个工厂/属性方法此前都是 stub，Office 因此连 GetTicketAsync 都到不了。往下的
+链条每一环都有实证：
+
+    OnlineIdServiceTicketRequest 工厂 = stub → E_NOTIMPL
+      → Office.Licensing.RequestMsaDeviceTicket        Result.Code 0x80004001
+         Office.Licensing.GetMsaDeviceTicketForEndpoint Data.Result "HRESULT: 0x80004001"
+         Office.Licensing.GetMsaDeviceTicket            Data.Resource=许可端点,
+                                                        Data.Policy=MBI_SSL_SHORT
+        → MSAL TryEnqueueMsaDeviceCredentialAcquisitionAndContinue:1296
+                "MsaDeviceOperationProvider is not available"
+          → ReturnResponseDueToMissingParameter:726 / ReadAccountById:601
+            → StatusInternal::UserCanceled → 登录窗消失，许可签不出来
+
+MSAL 遥测里的 api_error_context "User canceled the flow" 是误导：同一批遥测的
+request_duration 是 12（毫秒），read_token_last_error 是 "missing required
+parameter"。12ms 不可能是人的操作。
+
+本补丁做三件事，都不伪造凭据、票据或授权状态：
+
+1. ticket request 是「请求」，不是「票据」：它只携带调用方想要票据的 service 与
+   policy。两段式 CreateOnlineIdServiceTicketRequest(service, policy) 分开保存；
+   advanced 形式把 policy 打包在 "service::<target>::<policy>" 里，因此 Policy
+   属性为空而不是去拆字符串虚构一个值 —— 调用方拿回的就是它传进来的东西。
+
+2. ApplicationId 只是记住调用方的标识。拒绝保存它会让 Office 卡在「建好请求」与
+   「要票据」之间，GetTicketAsync 永远到不了。
+
+3. GetTicketAsync 返回一个已完成的 IAsyncOperation，结果状态是
+   OnlineIdSystemTicketStatus_Error、ExtendedError 为 ERROR_NOT_FOUND，Identity
+   为 NULL。这台机器没有 MSA 设备凭据，所以没有票据可给，也不发明一个。要紧的是
+   答案的形状：E_NOTIMPL 说的是「这个 provider 不存在」，而 Error 说的是
+   「provider 可用，本设备没有凭据」—— 后者正是一台从未关联 MSA 的 Windows 机器
+   会报的状态，是调用方本就要处理的情形。
+
+   操作在交出去之前就已完成，所以之后注册的 completion handler 必须立刻回调，
+   否则等回调的调用方会永远等下去。Office 实测会 QueryInterface 出 IAsyncInfo
+   并读它的 Status，因此 IAsyncInfo 必须可达。
+
+实测（WINEDEBUG=-all,+onlineid，Word 启动）：补丁前 Office 在
+CreateOnlineIdServiceTicketRequest 就停下；补丁后完整走完
+put_ApplicationId → GetTicketAsync → QI(IAsyncInfo) → get_Status →
+put_Completed → GetResults → get_Status → get_ExtendedError，onlineid 通道
+零 fixme。
+
+tools/onlineidprobe/ticket.c 按 Office 的调用形状复核这份契约，含往返校验与
+「不得声称签发了票据」的断言，19 项全过、failures=0。
+
+端到端对照（同一 prefix、同一脚本、同一次点击「登录或创建帐户」，唯一变量是这个
+DLL；每 10 秒采样一次登录浏览器窗口是否存活，共 120 秒）：
+
+    改动前        存活 0/12   —— 登录窗根本没出现
+    本补丁之后    存活 12/12  —— 登录窗稳定，加载出 HRD 页面
+                              （document name="Sign in"，450x519 的
+                               Internet Explorer_Server + NsContainer 栈完整）
+
+这正是此前报告的「登录窗秒关」。
+
+注意：MSAL 自己的 "MsaDeviceOperationProvider is not available" 走的是另一条
+路径（WAM/webauth），本补丁不触及，仍待处理。
+
+---
+--- a/dlls/windows.security.authentication.onlineid/ticket.c
++++ b/dlls/windows.security.authentication.onlineid/ticket.c
+@@ -114,20 +114,175 @@
+     factory_ActivateInstance,
+ };
+ 
++/* A ticket request is the request, not the ticket: it carries the service and
++ * policy the caller wants a ticket for, and nothing else.  Returning E_NOTIMPL
++ * from the factory stopped Office before it ever reached GetTicketAsync, so
++ * Office.Licensing.RequestMsaDeviceTicket failed with E_NOTIMPL and the account
++ * stack reported "MsaDeviceOperationProvider is not available".  Handing back a
++ * well-formed request object grants nothing on its own; acquiring an actual
++ * ticket is still GetTicketAsync's job.
++ */
++struct ticket_request
++{
++    IOnlineIdServiceTicketRequest IOnlineIdServiceTicketRequest_iface;
++    LONG ref;
++    HSTRING service;
++    HSTRING policy;
++};
++
++static inline struct ticket_request *impl_from_IOnlineIdServiceTicketRequest( IOnlineIdServiceTicketRequest *iface )
++{
++    return CONTAINING_RECORD( iface, struct ticket_request, IOnlineIdServiceTicketRequest_iface );
++}
++
++static HRESULT WINAPI ticket_request_QueryInterface( IOnlineIdServiceTicketRequest *iface, REFIID iid, void **out )
++{
++    struct ticket_request *impl = impl_from_IOnlineIdServiceTicketRequest( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IOnlineIdServiceTicketRequest ))
++    {
++        *out = &impl->IOnlineIdServiceTicketRequest_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ticket_request_AddRef( IOnlineIdServiceTicketRequest *iface )
++{
++    struct ticket_request *impl = impl_from_IOnlineIdServiceTicketRequest( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI ticket_request_Release( IOnlineIdServiceTicketRequest *iface )
++{
++    struct ticket_request *impl = impl_from_IOnlineIdServiceTicketRequest( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->service );
++        WindowsDeleteString( impl->policy );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI ticket_request_GetIids( IOnlineIdServiceTicketRequest *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ticket_request_GetRuntimeClassName( IOnlineIdServiceTicketRequest *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Security_Authentication_OnlineId_OnlineIdServiceTicketRequest,
++                                ARRAY_SIZE(RuntimeClass_Windows_Security_Authentication_OnlineId_OnlineIdServiceTicketRequest) - 1,
++                                class_name );
++}
++
++static HRESULT WINAPI ticket_request_GetTrustLevel( IOnlineIdServiceTicketRequest *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    if (!trust_level) return E_POINTER;
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_request_get_Service( IOnlineIdServiceTicketRequest *iface, HSTRING *value )
++{
++    struct ticket_request *impl = impl_from_IOnlineIdServiceTicketRequest( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    return WindowsDuplicateString( impl->service, value );
++}
++
++static HRESULT WINAPI ticket_request_get_Policy( IOnlineIdServiceTicketRequest *iface, HSTRING *value )
++{
++    struct ticket_request *impl = impl_from_IOnlineIdServiceTicketRequest( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    return WindowsDuplicateString( impl->policy, value );
++}
++
++static const struct IOnlineIdServiceTicketRequestVtbl ticket_request_vtbl =
++{
++    ticket_request_QueryInterface,
++    ticket_request_AddRef,
++    ticket_request_Release,
++    /* IInspectable methods */
++    ticket_request_GetIids,
++    ticket_request_GetRuntimeClassName,
++    ticket_request_GetTrustLevel,
++    /* IOnlineIdServiceTicketRequest methods */
++    ticket_request_get_Service,
++    ticket_request_get_Policy,
++};
++
++/* A NULL HSTRING is the empty string in WinRT, so duplicating one is not an
++ * error and leaves the member NULL.  Either string is only stored, never
++ * parsed: the advanced form packs service and policy into one
++ * "service::<target>::<policy>" string and the caller gets back exactly what it
++ * passed in.
++ */
++static HRESULT ticket_request_create( HSTRING service, HSTRING policy, IOnlineIdServiceTicketRequest **out )
++{
++    struct ticket_request *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IOnlineIdServiceTicketRequest_iface.lpVtbl = &ticket_request_vtbl;
++    impl->ref = 1;
++
++    if (FAILED(hr = WindowsDuplicateString( service, &impl->service )) ||
++        FAILED(hr = WindowsDuplicateString( policy, &impl->policy )))
++    {
++        WindowsDeleteString( impl->service );
++        free( impl );
++        return hr;
++    }
++
++    *out = &impl->IOnlineIdServiceTicketRequest_iface;
++    return S_OK;
++}
++
+ DEFINE_IINSPECTABLE( ticket_request_factory_statics, IOnlineIdServiceTicketRequestFactory, struct ticket_request_factory_statics, IActivationFactory_iface )
+ 
+ static HRESULT WINAPI ticket_request_factory_statics_CreateOnlineIdServiceTicketRequest( IOnlineIdServiceTicketRequestFactory *iface, HSTRING service,
+                                                                                          HSTRING policy, IOnlineIdServiceTicketRequest **request )
+ {
+-    FIXME( "iface %p, service %s, policy %s, request %p stub!\n", iface, debugstr_hstring( service ), debugstr_hstring( policy ), request );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, service %s, policy %s, request %p.\n", iface, debugstr_hstring( service ), debugstr_hstring( policy ), request );
++
++    if (!request) return E_POINTER;
++    return ticket_request_create( service, policy, request );
+ }
+ 
+ static HRESULT WINAPI ticket_request_factory_statics_CreateOnlineIdServiceTicketRequestAdvanced( IOnlineIdServiceTicketRequestFactory *iface, HSTRING service,
+                                                                                                  IOnlineIdServiceTicketRequest **request )
+ {
+-    FIXME( "iface %p, service %s, request %p stub!\n", iface, debugstr_hstring( service ), request );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, service %s, request %p.\n", iface, debugstr_hstring( service ), request );
++
++    if (!request) return E_POINTER;
++    /* The advanced form carries the policy inside the service string, so there
++     * is no separate policy to remember. */
++    return ticket_request_create( service, NULL, request );
+ }
+ 
+ static const struct IOnlineIdServiceTicketRequestFactoryVtbl ticket_request_factory_statics_vtbl =
+--- a/dlls/windows.security.authentication.onlineid/authenticator.c
++++ b/dlls/windows.security.authentication.onlineid/authenticator.c
+@@ -119,6 +119,7 @@
+ {
+     IOnlineIdSystemAuthenticatorForUser IOnlineIdSystemAuthenticatorForUser_iface;
+     LONG ref;
++    GUID app_id;
+ };
+ 
+ static inline struct authenticator *impl_from_IOnlineIdSystemAuthenticatorForUser( IOnlineIdSystemAuthenticatorForUser *iface )
+@@ -184,23 +185,465 @@
+     return E_NOTIMPL;
+ }
+ 
++/* Office asks for an MSA *device* ticket: a ticket the machine itself holds,
++ * used for the licensing endpoint before any user has signed in.  This machine
++ * has no MSA device credential, so there is no ticket to hand back and none is
++ * invented here.  What matters is the shape of the answer.  Returning E_NOTIMPL
++ * says the provider does not exist, and the account stack then reports
++ * "MsaDeviceOperationProvider is not available" and gives up.  Completing the
++ * operation with OnlineIdSystemTicketStatus_Error says the provider works and
++ * this device simply has no credential -- the same thing a Windows machine that
++ * was never linked to an MSA reports, and a state callers are expected to
++ * handle.
++ */
++struct ticket_result
++{
++    IOnlineIdSystemTicketResult IOnlineIdSystemTicketResult_iface;
++    LONG ref;
++    OnlineIdSystemTicketStatus status;
++    HRESULT extended_error;
++};
++
++static inline struct ticket_result *impl_from_IOnlineIdSystemTicketResult( IOnlineIdSystemTicketResult *iface )
++{
++    return CONTAINING_RECORD( iface, struct ticket_result, IOnlineIdSystemTicketResult_iface );
++}
++
++static HRESULT WINAPI ticket_result_QueryInterface( IOnlineIdSystemTicketResult *iface, REFIID iid, void **out )
++{
++    struct ticket_result *impl = impl_from_IOnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IOnlineIdSystemTicketResult ))
++    {
++        *out = &impl->IOnlineIdSystemTicketResult_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ticket_result_AddRef( IOnlineIdSystemTicketResult *iface )
++{
++    struct ticket_result *impl = impl_from_IOnlineIdSystemTicketResult( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI ticket_result_Release( IOnlineIdSystemTicketResult *iface )
++{
++    struct ticket_result *impl = impl_from_IOnlineIdSystemTicketResult( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI ticket_result_GetIids( IOnlineIdSystemTicketResult *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ticket_result_GetRuntimeClassName( IOnlineIdSystemTicketResult *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Security_Authentication_OnlineId_OnlineIdSystemTicketResult,
++                                ARRAY_SIZE(RuntimeClass_Windows_Security_Authentication_OnlineId_OnlineIdSystemTicketResult) - 1,
++                                class_name );
++}
++
++static HRESULT WINAPI ticket_result_GetTrustLevel( IOnlineIdSystemTicketResult *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    if (!trust_level) return E_POINTER;
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++/* No credential means no identity.  A NULL out-parameter with S_OK is how a
++ * result without an identity is reported; the status says why. */
++static HRESULT WINAPI ticket_result_get_Identity( IOnlineIdSystemTicketResult *iface, IOnlineIdSystemIdentity **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_result_get_Status( IOnlineIdSystemTicketResult *iface, OnlineIdSystemTicketStatus *value )
++{
++    struct ticket_result *impl = impl_from_IOnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = impl->status;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_result_get_ExtendedError( IOnlineIdSystemTicketResult *iface, HRESULT *value )
++{
++    struct ticket_result *impl = impl_from_IOnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = impl->extended_error;
++    return S_OK;
++}
++
++static const struct IOnlineIdSystemTicketResultVtbl ticket_result_vtbl =
++{
++    ticket_result_QueryInterface,
++    ticket_result_AddRef,
++    ticket_result_Release,
++    /* IInspectable methods */
++    ticket_result_GetIids,
++    ticket_result_GetRuntimeClassName,
++    ticket_result_GetTrustLevel,
++    /* IOnlineIdSystemTicketResult methods */
++    ticket_result_get_Identity,
++    ticket_result_get_Status,
++    ticket_result_get_ExtendedError,
++};
++
++static HRESULT ticket_result_create( OnlineIdSystemTicketStatus status, HRESULT extended_error,
++                                     IOnlineIdSystemTicketResult **out )
++{
++    struct ticket_result *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IOnlineIdSystemTicketResult_iface.lpVtbl = &ticket_result_vtbl;
++    impl->ref = 1;
++    impl->status = status;
++    impl->extended_error = extended_error;
++
++    *out = &impl->IOnlineIdSystemTicketResult_iface;
++    return S_OK;
++}
++
++/* The operation is finished before it is handed out, so a completion handler
++ * registered afterwards has to be invoked immediately -- a caller that waits
++ * for a callback that already happened would wait forever. */
++struct ticket_operation
++{
++    IAsyncOperation_OnlineIdSystemTicketResult IAsyncOperation_OnlineIdSystemTicketResult_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    IOnlineIdSystemTicketResult *result;
++    IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult *handler;
++};
++
++static inline struct ticket_operation *impl_from_IAsyncOperation_OnlineIdSystemTicketResult(
++        IAsyncOperation_OnlineIdSystemTicketResult *iface )
++{
++    return CONTAINING_RECORD( iface, struct ticket_operation, IAsyncOperation_OnlineIdSystemTicketResult_iface );
++}
++
++static inline struct ticket_operation *impl_from_IAsyncInfo( IAsyncInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct ticket_operation, IAsyncInfo_iface );
++}
++
++static HRESULT WINAPI ticket_operation_QueryInterface( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                       REFIID iid, void **out )
++{
++    struct ticket_operation *impl = impl_from_IAsyncOperation_OnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperation_OnlineIdSystemTicketResult ))
++    {
++        *out = &impl->IAsyncOperation_OnlineIdSystemTicketResult_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        *out = &impl->IAsyncInfo_iface;
++        IInspectable_AddRef( (IInspectable *)*out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ticket_operation_AddRef( IAsyncOperation_OnlineIdSystemTicketResult *iface )
++{
++    struct ticket_operation *impl = impl_from_IAsyncOperation_OnlineIdSystemTicketResult( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI ticket_operation_Release( IAsyncOperation_OnlineIdSystemTicketResult *iface )
++{
++    struct ticket_operation *impl = impl_from_IAsyncOperation_OnlineIdSystemTicketResult( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult_Release( impl->handler );
++        if (impl->result) IOnlineIdSystemTicketResult_Release( impl->result );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI ticket_operation_GetIids( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ticket_operation_GetRuntimeClassName( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                            HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ticket_operation_GetTrustLevel( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                      TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    if (!trust_level) return E_POINTER;
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_put_Completed( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                      IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult *handler )
++{
++    struct ticket_operation *impl = impl_from_IAsyncOperation_OnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (impl->handler) IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult_Release( impl->handler );
++    impl->handler = handler;
++    if (!handler) return S_OK;
++
++    IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult_AddRef( handler );
++    /* Already complete, so the callback is due now rather than later. */
++    IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult_Invoke( handler, iface, Completed );
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_get_Completed( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                      IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult **handler )
++{
++    struct ticket_operation *impl = impl_from_IAsyncOperation_OnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (!handler) return E_POINTER;
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_OnlineIdSystemTicketResult_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_GetResults( IAsyncOperation_OnlineIdSystemTicketResult *iface,
++                                                   IOnlineIdSystemTicketResult **results )
++{
++    struct ticket_operation *impl = impl_from_IAsyncOperation_OnlineIdSystemTicketResult( iface );
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    if (!results) return E_POINTER;
++    if ((*results = impl->result)) IOnlineIdSystemTicketResult_AddRef( *results );
++    return S_OK;
++}
++
++static const struct IAsyncOperation_OnlineIdSystemTicketResultVtbl ticket_operation_vtbl =
++{
++    ticket_operation_QueryInterface,
++    ticket_operation_AddRef,
++    ticket_operation_Release,
++    /* IInspectable methods */
++    ticket_operation_GetIids,
++    ticket_operation_GetRuntimeClassName,
++    ticket_operation_GetTrustLevel,
++    /* IAsyncOperation<OnlineIdSystemTicketResult> methods */
++    ticket_operation_put_Completed,
++    ticket_operation_get_Completed,
++    ticket_operation_GetResults,
++};
++
++static HRESULT WINAPI ticket_operation_info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{
++    struct ticket_operation *impl = impl_from_IAsyncInfo( iface );
++    return ticket_operation_QueryInterface( &impl->IAsyncOperation_OnlineIdSystemTicketResult_iface, iid, out );
++}
++
++static ULONG WINAPI ticket_operation_info_AddRef( IAsyncInfo *iface )
++{
++    struct ticket_operation *impl = impl_from_IAsyncInfo( iface );
++    return ticket_operation_AddRef( &impl->IAsyncOperation_OnlineIdSystemTicketResult_iface );
++}
++
++static ULONG WINAPI ticket_operation_info_Release( IAsyncInfo *iface )
++{
++    struct ticket_operation *impl = impl_from_IAsyncInfo( iface );
++    return ticket_operation_Release( &impl->IAsyncOperation_OnlineIdSystemTicketResult_iface );
++}
++
++static HRESULT WINAPI ticket_operation_info_GetIids( IAsyncInfo *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ticket_operation_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ticket_operation_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    if (!trust_level) return E_POINTER;
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    TRACE( "iface %p, id %p.\n", iface, id );
++    if (!id) return E_POINTER;
++    *id = 1;
++    return S_OK;
++}
++
++/* The operation completed; whether a ticket came back is the result's status,
++ * not the operation's. */
++static HRESULT WINAPI ticket_operation_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    TRACE( "iface %p, status %p.\n", iface, status );
++    if (!status) return E_POINTER;
++    *status = Completed;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
++{
++    TRACE( "iface %p, error_code %p.\n", iface, error_code );
++    if (!error_code) return E_POINTER;
++    *error_code = S_OK;
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_info_Cancel( IAsyncInfo *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI ticket_operation_info_Close( IAsyncInfo *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl ticket_operation_info_vtbl =
++{
++    ticket_operation_info_QueryInterface,
++    ticket_operation_info_AddRef,
++    ticket_operation_info_Release,
++    /* IInspectable methods */
++    ticket_operation_info_GetIids,
++    ticket_operation_info_GetRuntimeClassName,
++    ticket_operation_info_GetTrustLevel,
++    /* IAsyncInfo methods */
++    ticket_operation_info_get_Id,
++    ticket_operation_info_get_Status,
++    ticket_operation_info_get_ErrorCode,
++    ticket_operation_info_Cancel,
++    ticket_operation_info_Close,
++};
++
++static HRESULT ticket_operation_create( IOnlineIdSystemTicketResult *result,
++                                        IAsyncOperation_OnlineIdSystemTicketResult **out )
++{
++    struct ticket_operation *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_OnlineIdSystemTicketResult_iface.lpVtbl = &ticket_operation_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &ticket_operation_info_vtbl;
++    impl->ref = 1;
++    impl->result = result;
++    IOnlineIdSystemTicketResult_AddRef( result );
++
++    *out = &impl->IAsyncOperation_OnlineIdSystemTicketResult_iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI authenticator_GetTicketAsync( IOnlineIdSystemAuthenticatorForUser *iface, IOnlineIdServiceTicketRequest *request,
+                                                     IAsyncOperation_OnlineIdSystemTicketResult **operation )
+ {
+-    FIXME( "iface %p, request %p, operation %p stub!\n", iface, request, operation );
+-    return E_NOTIMPL;
++    IOnlineIdSystemTicketResult *result;
++    HRESULT hr;
++
++    TRACE( "iface %p, request %p, operation %p.\n", iface, request, operation );
++
++    if (!operation) return E_POINTER;
++    if (!request) return E_INVALIDARG;
++
++    /* No MSA device credential exists here, so report that rather than a
++     * ticket.  ERROR_NOT_FOUND is the credential that is missing, not a
++     * transport failure. */
++    if (FAILED(hr = ticket_result_create( OnlineIdSystemTicketStatus_Error,
++                                          HRESULT_FROM_WIN32( ERROR_NOT_FOUND ), &result )))
++        return hr;
++
++    hr = ticket_operation_create( result, operation );
++    IOnlineIdSystemTicketResult_Release( result );
++    return hr;
+ }
+ 
++/* The application id identifies the caller to the MSA service; the
++ * authenticator only has to remember it.  Refusing to store it stopped Office
++ * between building its ticket request and asking for a ticket, so GetTicketAsync
++ * was never reached.  Keeping the id grants nothing by itself.
++ */
+ static HRESULT WINAPI authenticator_put_ApplicationId( IOnlineIdSystemAuthenticatorForUser *iface, GUID value )
+ {
+-    FIXME( "iface %p, value %s stub!\n", iface, debugstr_guid( &value ) );
+-    return E_NOTIMPL;
++    struct authenticator *impl = impl_from_IOnlineIdSystemAuthenticatorForUser( iface );
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_guid( &value ) );
++
++    impl->app_id = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI authenticator_get_ApplicationId( IOnlineIdSystemAuthenticatorForUser *iface, GUID *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct authenticator *impl = impl_from_IOnlineIdSystemAuthenticatorForUser( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = impl->app_id;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI authenticator_get_User( IOnlineIdSystemAuthenticatorForUser *iface, __x_ABI_CWindows_CSystem_CIUser **user )

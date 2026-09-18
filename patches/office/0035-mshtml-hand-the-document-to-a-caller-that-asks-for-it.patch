@@ -1,0 +1,110 @@
+Subject: [PATCH] mshtml: answer WM_HTML_GETOBJECT
+
+嵌入浏览器把自己的 IHTMLDocument2 交给进程外调用方的标准途径，是让对方
+RegisterWindowMessage(L"WM_HTML_GETOBJECT") 后发给 "Internet Explorer_Server"
+窗口，再用 ObjectFromLresult 把返回值换回接口指针。Wine 的 mshtml 里这个消息
+**完全没有实现**（全树 grep 零结果），调用方拿到 0，没有任何办法够到文档。
+
+消息号是运行时注册的，不能写成 switch 标签，所以在 switch 之后单独比较。
+oleacc 进 DELAYIMPORTS 而不是 IMPORTS：只有真的有人问文档时才需要它。
+
+同时修一处返回值错误。create_marshaled_doc 在跨线程创建失败时：
+
+    if(FAILED(params.hres)) {
+        ...
+        return hres;        /* CreateStreamOnHGlobal 的 S_OK */
+    }
+
+报告的是成功，而 *ppv 从未被赋值——调用方于是拿着一个没有对象的 S_OK 往下走。
+改为返回真正的失败码，并在消息没送达时也留一行诊断。
+
+验证：外部进程 SendMessage 后 ObjectFromLresult hr=0 拿到文档，可经
+IHTMLWindow2::execScript 操作页面。
+
+---
+diff --git a/dlls/mshtml/Makefile.in b/dlls/mshtml/Makefile.in
+index bc712a2..809ad77 100644
+--- a/dlls/mshtml/Makefile.in
++++ b/dlls/mshtml/Makefile.in
+@@ -1,7 +1,7 @@
+ MODULE    = mshtml.dll
+ IMPORTLIB = mshtml
+ IMPORTS   = strmiids uuid urlmon shlwapi shell32 ole32 oleaut32 user32 gdi32 advapi32
+-DELAYIMPORTS = wininet inetcomm
++DELAYIMPORTS = wininet inetcomm oleacc
+ 
+ SOURCES = \
+ 	conpoint.c \
+diff --git a/dlls/mshtml/task.c b/dlls/mshtml/task.c
+index 06de7b1..6614ea1 100644
+--- a/dlls/mshtml/task.c
++++ b/dlls/mshtml/task.c
+@@ -500,10 +500,14 @@ HRESULT create_marshaled_doc(HWND main_thread_hwnd, REFIID riid, void **ppv)
+ 
+     res = SendMessageW(main_thread_hwnd, WM_CREATEDOC, 0, (LPARAM)&params);
+     TRACE("SendMessage ret %x\n", res);
++    if(!res)
++        WARN("WM_CREATEDOC did not reach hwnd %p\n", main_thread_hwnd);
+     if(FAILED(params.hres)) {
+-        WARN("EM_CREATEDOC failed: %08lx\n", params.hres);
++        WARN("WM_CREATEDOC failed: %08lx\n", params.hres);
+         IStream_Release(params.stream);
+-        return hres;
++        /* Returning hres here reported success while *ppv was never set: the
++         * caller then had a stream error code of S_OK and no object. */
++        return params.hres;
+     }
+ 
+     zero.QuadPart = 0;
+diff --git a/dlls/mshtml/view.c b/dlls/mshtml/view.c
+index fe7448e..75d337d 100644
+--- a/dlls/mshtml/view.c
++++ b/dlls/mshtml/view.c
+@@ -30,6 +30,8 @@
+ 
+ #include "wine/debug.h"
+ 
++#include "oleacc.h"
++
+ #include "mshtml_private.h"
+ #include "htmlevent.h"
+ 
+@@ -160,6 +162,13 @@ void notif_focus(HTMLDocumentObj *This)
+     IOleControlSite_Release(site);
+ }
+ 
++/* Registered by name, so its value is only known at run time and it cannot be
++ * a switch label.  This is how an embedded browser hands its document to an
++ * outside caller: the caller registers the same name, sends the message, and
++ * turns the LRESULT back into an interface with ObjectFromLresult.  Without an
++ * answer here the caller gets 0 and has no way to reach the document at all. */
++static UINT html_getobject_msg;
++
+ static LRESULT WINAPI serverwnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+ {
+     HTMLDocumentObj *This;
+@@ -202,7 +211,15 @@ static LRESULT WINAPI serverwnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
+     case WM_MOUSEACTIVATE:
+         return MA_ACTIVATE;
+     }
+-        
++
++    if(msg && msg == html_getobject_msg) {
++        TRACE("(%p) WM_HTML_GETOBJECT\n", This);
++        if(!This)
++            return 0;
++        return LresultFromObject(&IID_IHTMLDocument2, wParam,
++                                 (IUnknown*)&This->IHTMLDocument2_iface);
++    }
++
+     return DefWindowProcW(hwnd, msg, wParam, lParam);
+ }
+ 
+@@ -218,6 +235,7 @@ static void register_serverwnd_class(void)
+     };
+     wndclass.hInstance = hInst;
+     serverwnd_class = RegisterClassExW(&wndclass);
++    html_getobject_msg = RegisterWindowMessageW(L"WM_HTML_GETOBJECT");
+ }
+ 
+ static HRESULT activate_window(HTMLDocumentObj *This)

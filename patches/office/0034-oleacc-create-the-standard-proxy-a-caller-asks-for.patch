@@ -1,0 +1,217 @@
+Subject: [PATCH] oleacc: implement CreateStdAccessibleProxy
+
+CreateStdAccessibleProxyA/W 在 spec 里是 stub，而 stub 条目会让调用方直接
+abort，不是返回一个它能处理的失败：
+
+    wine: Call from 0x... to unimplemented function
+          oleacc.dll.CreateStdAccessibleProxyW, aborting
+
+Office 的富文本控件会在无障碍客户端遍历界面时调用它。实测任何走 MSAA 的工具
+（本仓库的 tools/uidump 就是一例，屏幕阅读器同理）碰到 Riched20 都会把整个
+Office 进程带走，栈是 Riched20 → oleacc。
+
+这个入口与 CreateStdAccessibleObject 的区别只有一处：**类名由调用方指定**，
+而不是从窗口去问。自绘控件用它来声明"我的行为像某个标准控件"。因此
+find_class_data 增加一个可选的类名参数，NULL 时维持原状去问窗口。
+
+指定了类名就不再回退到 WM_GETOBJECT/OBJID_QUERYCLASSNAMEIDX：那条回退是问
+窗口"你是第几类"，而窗口未必认同调用方替它选的类名。
+
+验证：此前必然让 Word 崩溃的 uidump 现在完整跑完，Word 进程存活。
+
+---
+diff --git a/dlls/oleacc/client.c b/dlls/oleacc/client.c
+index d16285a..7998f69 100644
+--- a/dlls/oleacc/client.c
++++ b/dlls/oleacc/client.c
+@@ -900,7 +900,7 @@ static const struct win_class_data classes[] = {
+     {NULL}
+ };
+ 
+-HRESULT create_client_object(HWND hwnd, const IID *iid, void **obj)
++HRESULT create_client_object(HWND hwnd, const WCHAR *proxy_class, const IID *iid, void **obj)
+ {
+     const struct win_class_data *data;
+     Client *client;
+@@ -913,7 +913,7 @@ HRESULT create_client_object(HWND hwnd, const IID *iid, void **obj)
+     if(!client)
+         return E_OUTOFMEMORY;
+ 
+-    data = find_class_data(hwnd, classes);
++    data = find_class_data(hwnd, proxy_class, classes);
+ 
+     client->IAccessible_iface.lpVtbl = &ClientVtbl;
+     client->IOleWindow_iface.lpVtbl = &ClientOleWindowVtbl;
+diff --git a/dlls/oleacc/main.c b/dlls/oleacc/main.c
+index b2096d5..eca410a 100644
+--- a/dlls/oleacc/main.c
++++ b/dlls/oleacc/main.c
+@@ -51,14 +51,20 @@ int convert_child_id(VARIANT *v)
+     }
+ }
+ 
+-const struct win_class_data* find_class_data(HWND hwnd, const struct win_class_data *classes)
++const struct win_class_data* find_class_data(HWND hwnd, const WCHAR *proxy_class,
++        const struct win_class_data *classes)
+ {
+     WCHAR class_name[64];
+     int i, idx;
+ 
+-    if(!RealGetWindowClassW(hwnd, class_name, ARRAY_SIZE(class_name)))
+-        return NULL;
+-    TRACE("got window class: %s\n", debugstr_w(class_name));
++    if(proxy_class) {
++        lstrcpynW(class_name, proxy_class, ARRAY_SIZE(class_name));
++        TRACE("using proxy class: %s\n", debugstr_w(class_name));
++    }else {
++        if(!RealGetWindowClassW(hwnd, class_name, ARRAY_SIZE(class_name)))
++            return NULL;
++        TRACE("got window class: %s\n", debugstr_w(class_name));
++    }
+ 
+     for(i=0; classes[i].name; i++) {
+         if(!wcsicmp(class_name, classes[i].name)) {
+@@ -68,6 +74,9 @@ const struct win_class_data* find_class_data(HWND hwnd, const struct win_class_d
+         }
+     }
+ 
++    if(proxy_class)
++        return NULL;
++
+     idx = SendMessageW(hwnd, WM_GETOBJECT, 0, OBJID_QUERYCLASSNAMEIDX);
+     if(idx) {
+         for(i=0; classes[i].name; i++) {
+@@ -84,23 +93,68 @@ const struct win_class_data* find_class_data(HWND hwnd, const struct win_class_d
+     return NULL;
+ }
+ 
+-HRESULT WINAPI CreateStdAccessibleObject( HWND hwnd, LONG idObject,
+-        REFIID riidInterface, void** ppvObject )
++static HRESULT create_std_accessible(HWND hwnd, const WCHAR *proxy_class, LONG idObject,
++        REFIID riid, void **obj)
+ {
+-    TRACE("%p %ld %s %p\n", hwnd, idObject,
+-          debugstr_guid( riidInterface ), ppvObject );
+-
+     switch(idObject) {
+     case OBJID_CLIENT:
+-        return create_client_object(hwnd, riidInterface, ppvObject);
++        return create_client_object(hwnd, proxy_class, riid, obj);
+     case OBJID_WINDOW:
+-        return create_window_object(hwnd, riidInterface, ppvObject);
++        return create_window_object(hwnd, proxy_class, riid, obj);
+     default:
+         FIXME("unhandled object id: %ld\n", idObject);
+         return E_NOTIMPL;
+     }
+ }
+ 
++HRESULT WINAPI CreateStdAccessibleObject( HWND hwnd, LONG idObject,
++        REFIID riidInterface, void** ppvObject )
++{
++    TRACE("%p %ld %s %p\n", hwnd, idObject,
++          debugstr_guid( riidInterface ), ppvObject );
++
++    return create_std_accessible(hwnd, NULL, idObject, riidInterface, ppvObject);
++}
++
++/* Owner-drawn controls use this to say which standard control they behave
++ * like, instead of letting their own window class decide.  Riched20 asks for
++ * it while an accessibility client walks the tree, and a stub entry there
++ * takes the whole process down rather than returning a failure the caller
++ * could handle. */
++HRESULT WINAPI CreateStdAccessibleProxyW( HWND hwnd, const WCHAR *class_name, LONG idObject,
++        REFIID riidInterface, void** ppvObject )
++{
++    TRACE("%p %s %ld %s %p\n", hwnd, debugstr_w(class_name), idObject,
++          debugstr_guid( riidInterface ), ppvObject );
++
++    if(!class_name)
++        return E_INVALIDARG;
++    return create_std_accessible(hwnd, class_name, idObject, riidInterface, ppvObject);
++}
++
++HRESULT WINAPI CreateStdAccessibleProxyA( HWND hwnd, const char *class_name, LONG idObject,
++        REFIID riidInterface, void** ppvObject )
++{
++    WCHAR *wide;
++    HRESULT hres;
++    int len;
++
++    TRACE("%p %s %ld %s %p\n", hwnd, debugstr_a(class_name), idObject,
++          debugstr_guid( riidInterface ), ppvObject );
++
++    if(!class_name)
++        return E_INVALIDARG;
++
++    len = MultiByteToWideChar(CP_ACP, 0, class_name, -1, NULL, 0);
++    if(!len || !(wide = malloc(len * sizeof(WCHAR))))
++        return E_OUTOFMEMORY;
++    MultiByteToWideChar(CP_ACP, 0, class_name, -1, wide, len);
++
++    hres = create_std_accessible(hwnd, wide, idObject, riidInterface, ppvObject);
++    free(wide);
++    return hres;
++}
++
+ HRESULT WINAPI ObjectFromLresult( LRESULT result, REFIID riid, WPARAM wParam, void **ppObject )
+ {
+     WCHAR atom_str[ARRAY_SIZE(lresult_atom_prefix)+3*8+3];
+diff --git a/dlls/oleacc/oleacc.spec b/dlls/oleacc/oleacc.spec
+index 9ad6e91..9e05072 100644
+--- a/dlls/oleacc/oleacc.spec
++++ b/dlls/oleacc/oleacc.spec
+@@ -3,8 +3,8 @@
+ @ stdcall AccessibleObjectFromPoint(int64 ptr ptr)
+ @ stdcall AccessibleObjectFromWindow(ptr long ptr ptr)
+ @ stdcall CreateStdAccessibleObject(ptr long ptr ptr)
+-@ stub CreateStdAccessibleProxyA
+-@ stub CreateStdAccessibleProxyW
++@ stdcall CreateStdAccessibleProxyA(long str long ptr ptr)
++@ stdcall CreateStdAccessibleProxyW(long wstr long ptr ptr)
+ @ stdcall -private DllGetClassObject(ptr ptr ptr)
+ @ stdcall -private DllRegisterServer()
+ @ stdcall -private DllUnregisterServer()
+diff --git a/dlls/oleacc/oleacc_private.h b/dlls/oleacc/oleacc_private.h
+index 2b9ac0e..d665148 100644
+--- a/dlls/oleacc/oleacc_private.h
++++ b/dlls/oleacc/oleacc_private.h
+@@ -25,10 +25,13 @@ struct win_class_data {
+     BOOL stub;
+     const void *vtbl;
+ };
+-const struct win_class_data* find_class_data(HWND, const struct win_class_data*);
++/* A NULL class name means "ask the window"; a non-NULL one is the caller's
++ * choice of which standard control to behave like, which is what
++ * CreateStdAccessibleProxy exists to express. */
++const struct win_class_data* find_class_data(HWND, const WCHAR*, const struct win_class_data*);
+ 
+-HRESULT create_client_object(HWND, const IID*, void**);
+-HRESULT create_window_object(HWND, const IID*, void**);
++HRESULT create_client_object(HWND, const WCHAR*, const IID*, void**);
++HRESULT create_window_object(HWND, const WCHAR*, const IID*, void**);
+ HRESULT get_accpropservices_factory(REFIID, void**);
+ 
+ int convert_child_id(VARIANT *v);
+diff --git a/dlls/oleacc/window.c b/dlls/oleacc/window.c
+index e6b9c27..04e2cf6 100644
+--- a/dlls/oleacc/window.c
++++ b/dlls/oleacc/window.c
+@@ -496,7 +496,7 @@ static const struct win_class_data classes[] = {
+     {NULL}
+ };
+ 
+-HRESULT create_window_object(HWND hwnd, const IID *iid, void **obj)
++HRESULT create_window_object(HWND hwnd, const WCHAR *proxy_class, const IID *iid, void **obj)
+ {
+     Window *window;
+     HRESULT hres;
+@@ -508,7 +508,7 @@ HRESULT create_window_object(HWND hwnd, const IID *iid, void **obj)
+     if(!window)
+         return E_OUTOFMEMORY;
+ 
+-    find_class_data(hwnd, classes);
++    find_class_data(hwnd, proxy_class, classes);
+ 
+     window->IAccessible_iface.lpVtbl = &WindowVtbl;
+     window->IOleWindow_iface.lpVtbl = &WindowOleWindowVtbl;
