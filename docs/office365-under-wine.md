@@ -6259,3 +6259,53 @@ MathType 版还有 `MT*` 并在版本资源里写 WIRIS），然后把它们移�
 
 清理后实测：启用宏打开文档不再崩溃，运行时错误 76 也消失，VBA 引擎能正常加载、
 运行、报告错误；默认设置下用户文档照常打开；项目回归 62 项全过。
+
+## 把 MathType 和 AxMath 整个搬过来（2026-09-18）
+
+前一节把 MathType 的残留移走只是止血——产品本身没装。这一节把它和 AxMath 从原机
+（`/mnt/win-c`）完整搬过来。
+
+### 光复制 Program Files 没用
+
+两个产品都把"自己装没装"这件事记在注册表里，MathType 还往 **Office 自己的目录**
+里放文件。只复制程序目录，`MathPage.wll` 仍然找不到安装信息，宏一启用照样崩。
+要搬的是四类东西：程序目录、`ProgramData`、Office 目录里的 64 位组件、以及注册表
+（`Design Science\DSMT7` 的 32/64 两个视图、`HKCU` 设置、OLE 对象注册）。
+
+### 注册表上的两个坑
+
+**一、hivexregedit 的导出不能直接喂给 Wine 的 regedit。** 它把每个值写成一行，
+REG_SZ 以 `hex(1)` 形式出现，而 Wine 的 .reg 解析器会截断这种长行——
+`C:\Program Files (x86)\MathType\System` 存进去变成 `C`。偏偏这正是决定"产品能不能
+被找到"的值，而且失败是静默的。`scripts/import-win-registry.py` 改为逐值调用
+`reg add`（参数没有行长限制），并且从不打印值：这类导出可能带授权材料。
+
+**二、32 位安装程序只写 32 位视图，而 MathType 自己的 64 位 MathPage.wll 从 64 位
+视图读安装目录。** 在 Windows 上它靠 `KEY_WOW64_32KEY` 跨过去；与其依赖这个，
+脚本把同一份**真实**值镜像到 64 位视图。没有任何值是编造的，全部来自原机。
+
+### 必须重建 Wine 带 WoW64
+
+MathType.exe、AxMath.exe 和 MathType 的语言 DLL 全是 32 位。原来的构建是
+`--enable-archs=x86_64`，32 位程序根本起不来（`failed to load syswow64\ntdll.dll`）。
+`build-wine.sh` 改为接受 `ARCHS`（默认仍是 x86_64），用 `ARCHS=i386,x86_64` 重建到
+独立的 `dist-wow64`，不动当时还在工作的 `dist-cx`。所有补丁在两个架构上都在。
+
+重建暴露了一个真实缺陷：`kernelbase/debug.c` 里 `stack_scan_from` 在定义前被调用，
+隐式声明（非 static）与真正的 static 定义冲突。64 位一直是增量构建所以从没编译到，
+干净的 32 位构建直接失败。已修。
+
+切换 prefix 用 `scripts/enable-wow64.sh`：从 Windows 搬来的 prefix 里带着 Windows
+自己的 `syswow64`（861 个微软二进制），Wine 加载不了它们，必须让位给 wineboot 重建
+Wine 的 32 位运行时——移走而不是删除。
+
+### 结果
+
+MathType 和 AxMath 都能正常启动（`EQNWINCLASS` 公式编辑窗口、`AxMath - Untitled`
+主窗口），`MathPage.wll` 工作，OLE 对象注册到位，插入公式走 `插入 > 对象`。
+Word 打开文档正常，启用宏不再崩溃。
+
+**唯一没能打通的是 MathType 的 Word 工具栏模板。** 即使用它自带的 64 位版本，
+运行时仍要解析语言 DLL（`mswCHS.dll` 等），而那些只有 32 位。64 位的 Word 进程
+加载不了 32 位 DLL——WoW64 是按进程隔离的，不是把两者混在一个进程里——VBE7 在
+接线阶段就崩。这一条 WoW64 也救不了，所以脚本不安装该模板。
