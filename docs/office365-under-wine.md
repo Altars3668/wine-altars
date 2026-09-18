@@ -6325,9 +6325,17 @@ Word 打开文档正常，启用宏不再崩溃。
   反复调用是每个控件一个字体对象，属正常。
 - **WoW64 缺失**：装上 WoW64、两个产品都能跑之后，这个崩溃一模一样。
 
-MathType 自己的 `Setup.exe` 能跑起来并认出已有安装（`Setup.inf` 里
-`cfgDLLReg=1` 会做 DLL 注册，那正是手工补不全的部分），但它的按钮不响应任何
-模拟点击——MSAA 的 `accDoDefaultAction` 返回 E_NOTIMPL，窗口消息和坐标点击也
-不动。让它跑完需要真实的鼠标输入。
+MathType 自己的 `Setup.exe` 能跑起来并认出已有安装，但**跑不完**：它先要求
+关掉 Office（照做后）随即报「文件 Setup.exe 无法安装, 因为通用 I/O 错误」。
+原因是我们搬过来的是**已安装的目录**而不是安装介质——注册表里的
+`InstallFromDir` 指向一个早已不存在的临时源目录，Setup 无源可取。
+
+而 `Setup.inf` 里 `$register_dll` 只有两行（`MathPage\32\MathPage.wll` 和
+`MathPage\64\MathPage.wll`），也就是说它要做的 DLL 注册只有 MathPage.wll 这一个。
+手工 `regsvr32` 两个版本都试过：32 位返回 0、64 位注册完不退出（regsvr32 的老毛病），
+但注册表里没有出现任何 MathPage 相关的类，模板照旧崩。
+
+原机上也找不到 MathType/AxMath 的安装包（`Downloads` 和分区里都没有），所以无法
+用原始安装程序在 prefix 里重装一遍。要真正打通工具栏集成，缺的就是这个安装包。
 
 在此之前该模板不安装；公式通过 `插入 > 对象` 走 OLE 注册，MathType 主程序照常用。
