@@ -6219,3 +6219,43 @@ Windows 的实际行为就是保留它。修改已回退，测试恢复 0 failur
 索引 `0x18` 是从栈槽 `[rsp+0x50]` 读出来的，写入它的代码还没追到；要继续得在 VBE7
 函数入口往下做逆向，而这是第三方组件（MathType）触发的私有路径。当前可用的处置仍是
 把 `MathPage.wll` 移开。
+
+### 结论：是 MathType 的残留，不是 Wine 的缺陷（2026-09-18）
+
+追到指令层之后再往上问一句"这个组件凭什么在这里"，答案就出来了：
+**MathType 根本没装。** 注册表里没有任何 `Design Science` / `WIRIS` / `MathType`
+键，也没有安装目录——而 `MathPage.wll` 的字符串表里明写着它要找
+
+```
+HKLM\SOFTWARE\Design Science\DSMT7\Directories
+HKCU\SOFTWARE\Design Science\DSMT7\MathPage
+HKCU\SOFTWARE\Design Science\DSMT7\WCStats
+```
+
+一个都不存在。这是从 Windows 迁移 prefix 时带过来的孤儿：文件在，产品不在。
+它找不到安装信息就把内部状态留空，VBE7 随后拿着这份没建起来的东西索引越界，
+把一个容量字段当函数指针调用——就是 `0x4000`。
+
+MathType 往 Office **自己的目录**里放了两样东西：
+
+```
+root\Office16\MathPage.wll                     替换掉 Office 自带的那个
+root\Office16\STARTUP\MathType Commands 2016.dotm
+```
+
+**这解释了之前二分里最反常的一条**：把注册表里 7 个加载项全部 `LoadBehavior=0`
+仍然崩，而 `/a` 不崩。因为这两个文件不靠注册表登记——Word 会加载那个目录下的
+每一个 `.wll` 和 `.dotm`，只有 `/a` 拦得住。
+
+后果分两档：`MathPage.wll` 让宏一启用就崩；那个 `.dotm` 的 AutoExec 找不到
+MathType，每次启动弹一个运行时错误 76。
+
+这不是 Wine 特有的。同样的残留在 Windows 上表现一样，所以修法是清掉残留，
+而不是在 Wine 里绕开它。`scripts/fix-orphan-mathtype.sh` 做这件事：先确认
+MathType 确实没装、文件确实是 MathType 的（Office 自带版只导出 `MP*`，
+MathType 版还有 `MT*` 并在版本资源里写 WIRIS），然后把它们移到
+`Microsoft Office\mathtype-orphans\`——移走而不是删除，装回 MathType 就能放回去。
+脚本幂等，已接入 `import-office.sh`。
+
+清理后实测：启用宏打开文档不再崩溃，运行时错误 76 也消失，VBA 引擎能正常加载、
+运行、报告错误；默认设置下用户文档照常打开；项目回归 62 项全过。
