@@ -6387,3 +6387,75 @@ Windows 的规矩，64 位 Word 顺着 ProgID 找过去应该找不到类。于�
 
 教训和本文档前面那次 `oVft` 一样：改 Wine 或改 prefix 之前，先做一次会失败的对照
 实验，否则分不清是修好了还是本来就没坏。
+
+### 拿到安装包之后：MathType 正式安装了，工具栏仍然崩
+
+上一节说"缺的就是安装包"。安装包拿到了（`MathType-win-zh-7.12.2.466.exe`），
+于是前面关于"搬过来的不是安装介质"的推断可以直接验证——**是对的**：这个 exe 是
+NSIS v3.10 自解压包，它把 110MB 载荷解到 `%LOCALAPPDATA%\Temp\mathtype.tmp`，
+里面正是 `setup.exe` / `setup.inf` / `mathpagex64.wll` / `wordui2013x64.dotm` 这套
+安装介质，装完后 `InstallFromDir` 指向它。原来那份搬过来的安装里，这个目录早就没了。
+
+**「通用 I/O 错误」的真正原因也查清了，而且很蠢：** 我是从**已安装目录**运行
+`Setup.exe` 的，而它要做的事情之一就是把介质里的 `setup.exe` 复制到那个目录——
+等于自己覆盖自己，于是报「文件 Setup.exe 无法安装, 因为通用 I/O 错误」。
+从介质目录 `...\Temp\mathtype.tmp\setup.exe` 运行，一路走到「MathType 已成功安装」。
+
+安装器做成了手工怎么都做不成的那一步：
+
+```
+regsvr32: Successfully registered DLL 'C:\Program Files (x86)\MathType\MathPage\64\MathPage.wll'
+```
+
+它也确实装了 Word 集成，只是装在 **Office 自己的机器级 STARTUP 目录**，不是用户的：
+`root\Office16\STARTUP\MathType Commands 2016.dotm`。我起初只查了 Office16 目录本身和
+用户的 `%APPDATA%\...\Word\STARTUP`，因此一度以为"安装器没做 Office 集成"——错的。
+
+**结果是：干净安装、正版介质、DLL 由安装器自己注册，工具栏模板照样让 Word 崩。**
+这条排除了"安装不全 / 搬运残缺"这一整类解释。实测：
+
+| 配置 | 结果 |
+| --- | --- |
+| STARTUP 里放 2016 模板 | 3 次里崩 2 次，约 5 秒；另一次没走到初始化 VBA |
+| 只放 `MathPage.wll` | 不崩 |
+| 2013 / 2010 版模板 | 同样崩 |
+| 模板移出 | Word 起来、VBA 初始化完成、根本不加载 `MathPage.WLL` |
+
+判定"没崩"要看 VBE7 有没有被加载：Word 常常两三分钟还停在登录框上，那种"没崩"
+只是没走到 VBA 而已。`+loaddll` 下崩溃那次 1586 行、VBE7 出现 16 次，没崩那次只有
+110 行、VBE7 一次都没出现——一开始我把后者当成"修好了"。
+
+崩溃现场（靠 `kernelbase` 里那段栈扫描诊断打出来的）：
+
+```
+wine: Unhandled page fault on execute access to 0000000000004000
+  VBE7.DLL +0xebd3e      <- 返回地址：发出这次间接调用的就是 VBE7 自己
+  ...
+  MathPage.WLL +0x0
+  wwlib.dll +0xe7a923
+rsp+0x50: 0000000000000003  0000000000000018   <- 槽号 3、偏移 0x18
+```
+
+也就是 VBE7 从某个对象的虚表取第 4 项（`0x18`）去调，槽里是 `0x4000`。调用是
+**VBE7 自己发出的**，不是 Wine 的 `ITypeInfo::Invoke`（否则返回地址会在 oleaut32）。
+
+这一轮新排除的方向：
+
+- **`LHashValOfNameSysA` 不认 SYS_WIN64**：日志里 VBE7 对每个名字先按 syskind 3
+  再按 1 算哈希，而 Wine 的 trace 对 3 打印的是空串，看着很像没处理。读实现：哈希
+  只在 `SYS_MAC` 时改变（`nMask`），1 和 3 出同样的值，空串只是 trace 文本没覆盖。
+- **VBE7 反复 QI 的 `{cacc1e82-…}` / `{cacc1e83-…}` Wine 没实现**：这两个 IID 在
+  VBE7.DLL 里有，但原机 Windows 的 `oleaut32.dll`（64 位和 32 位）、`ole32.dll`、
+  MSO 各 DLL 里**都没有**——在 Windows 上同样会 `E_NOINTERFACE`，不是差异点。
+- **崩溃前最后那个 `0x4000` 页错误是第二次异常**：末尾那段是 `_XcptFilter` 的 SEH
+  展开，属于 Office 自己的崩溃上报路径。第一次异常在 694906 行，地址相同。
+
+因此 `scripts/fix-orphan-mathtype.sh` 改了前提：以前它只在"MathType 不在了"时清残留，
+现在**无论 MathType 装没装，都把 Word 工具栏模板移出 Office 的 STARTUP**，并说明原因。
+想试新版 Wine 是否修好，用 `MATHTYPE_TEMPLATE=keep` 保留它。
+
+现状（全部实测，不是推断）：MathType 7.12.2.466 由自带安装器正式装好、主程序可用、
+`Equation.DSMT4` 在 64 位客户端里能激活并给出 `IOleObject`；Word 正常启动、VBA 初始化
+完成、功能区是 `开始 插入 设计 布局 引用 邮件 审阅 视图 AxMath Zotero 帮助`。
+公式编辑走 AxMath 的功能区，MathType 的公式走 `插入 > 对象`。
+装之前的状态备份在 `$WINEPREFIX/mathtype-preinstall-backup`（含注册表导出和旧目录）。
