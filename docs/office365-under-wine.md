@@ -6459,3 +6459,42 @@ rsp+0x50: 0000000000000003  0000000000000018   <- 槽号 3、偏移 0x18
 完成、功能区是 `开始 插入 设计 布局 引用 邮件 审阅 视图 AxMath Zotero 帮助`。
 公式编辑走 AxMath 的功能区，MathType 的公式走 `插入 > 对象`。
 装之前的状态备份在 `$WINEPREFIX/mathtype-preinstall-backup`（含注册表导出和旧目录）。
+
+### 「把原来的激活挪过来」：没有可挪的
+
+重装之后 MathType 弹「该版本 MathType 尚未激活」，要么试用 30 天，要么输入产品密钥。
+自然的想法是：安装器把原来的激活覆盖掉了，搬回来就行。查下来**不是**——原本就没有。
+
+先定位激活状态存在哪。安装日志给了准信：
+
+```
+Opening config file at ...\Temp\mathtype.tmp\MT7.dsc: Success
+Install state before registration dialog: checksum = good,
+    state = installStateUninstalled, installDate = 01/01/70, now = 09/18/26
+```
+
+也就是 `MT7.DSC` 是注册状态文件，安装器确实用一份「未注册」的新文件（1985 字节）
+覆盖了原来那份（2001 字节）。于是把原来的原样搬回去试——**两份都试了**：
+
+| 放进去的 MT7.DSC | 结果 |
+| --- | --- |
+| prefix 里重装前那份（2001 字节） | 仍然「尚未激活」 |
+| 原机 Windows 上那份（2001 字节，2024-11-20） | 仍然「尚未激活」 |
+
+再直接跑重装前留下的整套旧程序（`MathType.pre-installer\MathType.exe`，7.8）：
+**它弹同一个激活对话框**。所以这个 prefix 里从一开始就没激活过。
+
+原机上也确实没有：`Program Files (x86)\MathType` 下除 `MT7.DSC` 外没有任何许可文件；
+`ProgramData`、各用户 `AppData` 下没有 wiris/mathtype 目录；`HKCU\Software\JavaSoft\Prefs`
+下只有一个无关程序（激活界面 `mathtypelib.exe` 是 Java 写的，所以这里值得一查）；
+`HKLM\...\Design Science` 全部 88 个值里没有一个像注册信息——只有根键下的 `MachTime`
+和 `Random` 两个不透明值，那是试用计时，不是激活。原机装的是 MathType 7.8.0（WIRIS）。
+
+这也印证了此前的一个猜测："这个毛病感觉 Windows 里好像也有"——确实如此，原机上它
+同样没激活，只是平时只用 `插入 > 对象` 插公式，不碰需要激活的功能就看不出来。
+
+`MT7.DSC` 已还原成 7.12 安装器自己写的那份；重装前那两份和原机那份都没动，分别在
+`$WINEPREFIX/mathtype-preinstall-backup/` 和原分区里。注册表里的试用计时值是随原机
+一起搬过来的真实状态，没有重置——重置它等于绕过试用期，不做。
+
+要真正激活只有两条正路：输入产品密钥，或者点那个 30 天试用（用掉就没了，所以留给你决定）。
