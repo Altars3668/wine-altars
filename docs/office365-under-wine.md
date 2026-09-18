@@ -6166,3 +6166,56 @@ MathType 的公式编辑本身走 COM，不受影响。
 
 注意：默认宏安全设置（禁用并通知）下 Word 压根不加载 VBA，所以平时碰不到
 这个崩溃，只表现为"宏没启用"。
+
+### 追到崩溃指令：VBE7 用越界索引取了一个不是函数指针的字段
+
+给 `kernelbase` 的故障诊断补上寄存器与栈字之后（winedbg 在这些故障上只打两条
+dbghelp fixme 就停了），可以不靠调试器把数据流追出来。
+
+崩溃指令是 VBE7 里的一次间接调用：
+
+```
+1800ebc76:  mov  0x68(%rsp),%rax        ; rax = 对象 S
+1800ebc7b:  mov  0x30(%rax),%rax        ; 表 = S->field30
+1800ebc83:  movzwl 0x50(%rsp),%eax      ; 索引（16 位）
+1800ebc8c:  mov  0x18(%rcx,%rax,1),%rax ; 取 [表 + 索引 + 0x18]
+1800ebc91:  mov  %rax,0xb8(%rsp)
+...
+1800ebd37:  call *0xb8(%rsp)            ← 故障，值为 0x4000
+```
+
+运行时取到的那张表长这样（索引为 `0x18`，于是落在 `+0x30`）：
+
+```
++0x00: 0                     +0x08: S
++0x10: 堆指针                 +0x18: VBE7 真实 VA
++0x20: VBE7 真实 VA           +0x28: VBE7 真实 VA
++0x30: 0x0000000000004000 ★   +0x38: 0x0000000000003FD4
+```
+
+前三项是解析好的函数地址，`+0x30`/`+0x38` 是一对相差 44 的小整数——看形状是
+容量/已用之类的字段，不是函数指针。**索引选错了表项，越过了函数数组的末尾。**
+
+`GetProcAddress` 这条路是干净的：relay 显示 VBE7 对 MathPage 只解析了一个符号，
+`GetProcAddress(base,"MTAPIGetNestingLevel")` 返回 `base+0x1b780`，完全正确。
+
+### 两个查下来不成立的假设
+
+**一、SYS_WIN32 的类型库在 64 位进程里被放大。** 崩溃前最后的 typelib 活动是查
+`{4cee785c-...}` 2.0 —— Microsoft Forms 2.0，注册在 `win32` 键下、指向
+`Temp\VBE\MSForms.exd`。那个 `.exd` 的 `syskind` 确实是 `SYS_WIN32`，于是
+`oVft = VtableOffset * sizeof(void*) / ptr_size` 把偏移乘了 2。但这不是 Wine 写坏的：
+**64 位的 FM20.DLL 内嵌的类型库本身就标着 `SYS_WIN32`**（微软自己的文件如此），
+`.exd` 只是继承了它。实验性地停掉这个缩放，崩溃照旧。
+
+**二、dispinterface 不该保留 vtable 槽位。** 解析路径对 `FUNC_DISPATCH` 存 `oVft=0`，
+而返回路径（`TLB_AllocAndInitFuncDesc`）把 funckind 改成 `FUNC_DISPATCH` 却保留原
+偏移，看起来是个不一致。改成一并清零之后，**Wine 自己的 typelib 测试报了 38 个失败**：
+`Interface ITestDispInherit: Function parse_lcid: desc->oVft expected 104 got 0`——
+Windows 的实际行为就是保留它。修改已回退，测试恢复 0 failures。
+
+### 还差什么
+
+索引 `0x18` 是从栈槽 `[rsp+0x50]` 读出来的，写入它的代码还没追到；要继续得在 VBE7
+函数入口往下做逆向，而这是第三方组件（MathType）触发的私有路径。当前可用的处置仍是
+把 `MathPage.wll` 移开。
