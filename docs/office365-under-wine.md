@@ -6063,3 +6063,74 @@ Latin Modern Math 字体与嵌入的 `.odttf`、加载项、磁盘空间、地�
 - 真实文档逐字符比对：Wine 读出的文本与 Python 只差 87 个纯空白，那是 xmllite 单独
   报为 `Whitespace` 节点的部分，`80110 + 87 = 80197` 精确吻合，无一处内容损坏。
 - 用户的原始文档现在能正常打开。
+
+## AMSI：接上宿主机的杀毒引擎（2026-09-18）
+
+Office 在运行宏之前会让 AMSI 扫描内容，并为此按 CLSID 请求 Antimalware 类。
+Wine 原来的 amsi 是 stub：每次扫描都回 `AMSI_RESULT_NOT_DETECTED`，而且根本没有
+那个 COM 类。这两件事各自都有害，方向还相反：
+
+- 拿到答案的调用方有理由相信"有东西看过这段内容"，而实际上没有；
+- 拿不到类的调用方（Office 就是）把它当成"扫描没能进行"，于是**无论用户怎么选都
+  拒绝运行宏**——因为它无法区分"扫过了，干净"和"根本没扫"。
+
+### 实现：走 clamd 的 INSTREAM
+
+PE 侧保留 AMSI 的 API 与 COM 表面，真正的扫描交给 unix 侧：连本地 socket，按
+clamd 的 `zINSTREAM` 协议把字节送过去，把引擎的结论原样带回来。socket 位置依次取
+`WINE_AMSI_CLAMD_SOCKET`、clamd 自己的配置、发行版常见路径——所以换个位置或换一个
+说同样协议的引擎，都不用改代码。
+
+`AmsiScanString` 把调用方持有的 UTF-16 转成 UTF-8 再送，因为引擎匹配的是脚本实际
+写成的字节。
+
+### 不许把"没扫成"变成"干净"
+
+这是整件事的要害，也是实现里唯一不肯让步的地方：
+
+- 引擎不可达时，`AmsiInitialize` 和类工厂**都失败**（`0x80070032`），不交出 context。
+  调用方由此知道自己没有扫描能力，而不是拿到一个毫无意义的判决。
+- 连接中断、超出大小上限、协议异常，一律作为失败返回，判决字段原样不动。
+- 句柄来自调用方，所以校验用 SEH 兜住，被塞进一个从来不属于我们的指针也不会崩。
+
+代价要说清楚：**clamd 没在跑时，Office 会拒绝运行宏。** 这是正确的行为——
+装上并启动 `clamav-daemon` 即可，`scripts/register-amsi.sh` 会如实报告当前状态。
+
+### 验证
+
+`tools/amsiprobe` 覆盖 11 个用例，全部通过：EICAR 测试串经扁平 API 与 COM 两条路
+都返回 `DETECTED`，普通宏文本返回 `NOT_DETECTED`，空缓冲正常，无效参数与野指针句柄
+返回 `E_INVALIDARG` 而不是崩溃。停掉 clamd 后单独跑 `--expect-no-engine`，确认
+`AmsiInitialize` 失败且不交出 context。
+
+Office 侧的实证：Word 启动时日志为
+
+```
+trace:amsi:AmsiInitialize L"OFFICE_VBA", ...
+trace:amsi:probe scanner ready at "/var/run/clamav/clamd.ctl"
+```
+
+`OFFICE_VBA` 正是宏引擎用的 app name，fixme 归零。
+
+老 prefix 需要注册这个类（新建 prefix 由 Wine 自动登记），否则
+`CoCreateInstance` 返回 `REGDB_E_CLASSNOTREG`；`scripts/register-amsi.sh` 负责这件事，
+已接入 `import-office.sh`。
+
+### 宏仍然跑不起来，但阻塞点在别处
+
+AMSI 通了之后，宏依然没能运行，原因是另一个独立缺陷：把宏安全设置临时放开后，
+Word 加载 VBA 工程时 **VBE7.DLL 直接崩溃**：
+
+```
+Unhandled page fault on execute access to 0000000000004000
+  VBE7.DLL +0xebd3e / +0x3fdb40 / +0xec2a2 ...
+```
+
+跳到 `0x4000` 执行，是典型的"拿到一个没被正确填写的值当函数指针用"。用
+`WINEDLLOVERRIDES=amsi=d` 完全禁掉 amsi 再试，崩溃与调用栈**一模一样**——
+确认与本次 AMSI 改动无关，是既有问题。崩溃前刷了大量
+`fixme:ole:ITypeInfo_fnGetMops`，但那个 stub 已经正确设置 `*pBstrMops = NULL`
+并返回 `S_OK`，不是崩溃源，还需要继续定位。
+
+默认宏安全设置（禁用并通知）下 Word 压根不加载 VBA，所以不会碰到这个崩溃——
+这也是为什么平时只表现为"宏没启用"。
