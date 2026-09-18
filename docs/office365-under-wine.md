@@ -6498,3 +6498,107 @@ Install state before registration dialog: checksum = good,
 一起搬过来的真实状态，没有重置——重置它等于绕过试用期，不做。
 
 要真正激活只有两条正路：输入产品密钥，或者点那个 30 天试用（用掉就没了，所以留给你决定）。
+
+## 系统集成：让它像装在机器上的软件
+
+到这里为止，Office 能跑、能开文档、能编公式，但它还不像一个装在系统里的程序：
+菜单里找不到、双击文档要靠 Wine 的通用处理器、任务栏图标不归组、打印属性是个
+英文小对话框。这一节把这四件事做完。
+
+### 一、双击文档与菜单项
+
+Wine 的 winemenubuilder 已经按扩展名生成了一批 `.desktop`，但它们是**处理器不是应用**：
+
+```
+[Desktop Entry]
+Name=Microsoft Word
+Exec=env "WINEPREFIX=..." wine start /ProgIDOpen "Word.Document.12" %f
+NoDisplay=true          ← 菜单里看不到
+Icon=7A2C_WINWORD.0
+```
+
+`NoDisplay=true` 意味着 Office 在应用菜单里根本不存在，也就无法固定到任务栏；
+而且没有 `StartupWMClass`，窗口起来之后不会和启动它的图标归为一组。
+
+`scripts/install-desktop-integration.sh` 为装上的每个 Office 程序生成一个正常条目：
+中英双语名称、真实图标（winemenubuilder 已从 exe 里抽好，8 个程序全有）、
+它真正能打开的 MIME 类型、以及桌面动作（新建文档）。本机结果：
+
+```
+word / excel / powerpoint / outlook / onenote / access / publisher / visio
+共 8 个，desktop-file-validate 全部 OK
+默认打开程序已指向 wine-altars-word.desktop 等（Word 6 种、Excel 6 种、PPT 5 种…）
+```
+
+### 二、任务栏归组
+
+靠的是 `StartupWMClass`。Wine 用可执行文件名做窗口类名，实测：
+
+```
+xwininfo: 0xa0001f ("winword.exe" "winword.exe")
+wine-altars-word.desktop: StartupWMClass=winword.exe
+```
+
+两边对上，窗口才会落到那个图标下，而不是另起一个通用图标。
+
+### 三、启动器：语言、路径、进程
+
+`scripts/office-launch.sh` 统一三件事，缺一个都会露馅：
+
+- **语言**。Wine 从进程 locale 选自己的资源。本机宿主是 `en_US.UTF-8`，于是中文
+  Office 配英文 Wine 对话框——打印属性正是最常撞见的那个。关键细节：**必须设
+  `LANG` 并 `unset LC_ALL`**，只设 `LC_MESSAGES` 无效。实测：
+
+  ```
+  unset LC_ALL + LANG=zh_CN   → reg: 找不到所指定的注册表项
+  LANG=zh_CN 但继承 LC_ALL=en → reg: Unable to find the specified registry key
+  ```
+
+  本机 `LC_ALL=en_US.UTF-8` 是显式设置的，会压过 `LANG`，这一步不做就白做。
+- **路径**。桌面条目交过来的是 Unix 路径，Office 要 Windows 路径，用 `winepath -w` 转。
+- **进程**。用 `exec` 而不是留一层壳，窗口管理器按 WM_CLASS 匹配，中间多一个进程只会
+  多一个退不干净的尾巴。
+
+### 四、打印：从「不像 Windows」到像
+
+原状：点"打印机属性"弹出的是 Wine 的单页英文 `Options` 对话框，只有纸张大小、纸盒、
+方向、打印质量四项。Windows 上这里是「打印首选项」的多标签页。
+
+底层其实是好的——`tools/printprobe` 把 Office 点那个按钮时走的 API 逐步拆开量过：
+
+```
+DocumentProperties(size)   = 3776        驱动能给出 DevMode
+DocumentProperties(out)    = 1           拿得到
+CreateDC                   = 成功         可打印区 2433x3183, 205x269mm, 300dpi
+```
+
+CUPS 队列已由 Wine 自动桥接，`wineps.drv` 走 PostScript，DevMode 里是从 PPD 真实
+导入的纸张（含 16k 等国内纸型）。问题只在 UI 和默认值上。改了三处：
+
+**1. 拆成 Windows 那样的两页**（`dlls/wineps.drv`）。`布局`：方向、双面、份数、
+逐份打印；`纸张/质量`：纸张大小、纸盒、打印质量、颜色。一个对话框过程服务两页——
+不在当前页上的控件根本找不到，所有会碰它的调用自然成了空操作，于是两页互不需要知道
+对方的存在。双面和颜色按 PPD 能力决定显示与否：PPD 没声明 `*ColorDevice` 就不给颜色
+选项，给了却被静默忽略比不给更糟。
+
+**2. 中文**。po 里本来就有译文，缺的是新加控件的：`布局`、`纸张/质量`、`份数`、
+`逐份打印`、`双面打印`、`黑白` 已补进 `po/zh_CN.po`。
+
+**3. 默认纸张**。Wine 本来会读 `LOCALE_IPAPERSIZE`，但紧接着被一句
+"We'll let the ppd override the devmode" 无条件覆盖——于是中文环境也默认 Letter，
+只因 PPD 出自美版机型。改成 PPD 先定、locale 的纸型若在 PPD 列表里则胜出。实测
+从 `纸张=1`（Letter）变成 `纸张=9`（A4），并且一直传到作业票：
+
+```
+%!PS-Adobe-3.0
+%cupsJobTicket: media=A4
+%%Creator: Wine PostScript Driver
+```
+
+这里有个容易自摆乌龙的地方：Wine 会把 DevMode 缓存进打印机的注册表键，之后一直用
+缓存那份，读 locale 的代码只在没有缓存时才跑。所以 `scripts/setup-printing.sh` 清缓存
+时**必须在启动器同一个 locale 下重建**——我第一版在英文 shell 里清，结果又把 Letter
+写了回去。
+
+`printprobe -print` 能把一页渲染成文件，整条链路（驱动、DevMode、字体、页面设置）
+不费一张纸就能验：`StartDoc/StartPage/EndPage/EndDoc` 全部返回成功。
