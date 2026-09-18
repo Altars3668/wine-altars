@@ -19,7 +19,8 @@
 # "TestGate.DisableBrokerForOneAuth" without it is silently ignored.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="${DIST:-$ROOT/dist-cx}"
+# The caller usually resolved which wine runs this prefix; don't second-guess it.
+WINE="${WINE:-${DIST:-$ROOT/dist-cx}/bin/wine}"
 export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
 
 KEY='HKCU\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\word'
@@ -28,7 +29,7 @@ for gate in \
     'Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled' \
     'Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth'
 do
-    WINEDEBUG=-all "$DIST/bin/wine" reg add "$KEY" /v "$gate" /t REG_SZ /d true /f /reg:64 >/dev/null 2>&1
+    WINEDEBUG=-all "$WINE" reg add "$KEY" /v "$gate" /t REG_SZ /d true /f /reg:64 >/dev/null 2>&1
     echo "enabled $gate"
 done
 
