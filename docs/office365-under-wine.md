@@ -6925,3 +6925,57 @@ err:ole:marshal_object Failed to create an IRpcStubBuffer ...
 
 `uiclick` 因此加了 `-click`：跳过默认动作，直接点对象自报的位置。一个"报告成功却什么
 都没做"的默认动作，比明确失败更坏——它会把你推去应用里找根本不存在的 bug。
+
+### 登录框认错账户：线索在 Outlook 的邮件配置里，不在任何身份缓存
+
+登录并激活之后，每次启动仍弹出另一个账户的登录框。查这个花了很久，因为**所有看起来
+该负责的地方都是干净的**：
+
+| 查过并排除的 | 结果 |
+| --- | --- |
+| `OneAuth/accounts/` | 只有一个账户，`email` / `login_name` / `account_hints` 全是正确的那个 |
+| `OneAuth/blobs/` 里那个以旧邮箱命名的文件 | 删掉后**自己长回来**——它是结果不是原因 |
+| `IdentityCache` | 整个移开，无变化 |
+| WebView2 数据目录（67MB） | 整个移开、全新重建，无变化 |
+| wininet 的 Cookie | 清空，无变化 |
+| `Identity` 整棵子树 / `ServicesManagerCache` | 只有正确账户那一个 ID |
+| `LanguageResources\LocalCache\<旧邮箱>` | 删掉，无变化 |
+
+决定性的一步是去看 **Office 请求的 URL**。WebView2 的 `History` 里存着它：
+
+```
+login.microsoftonline.com/...?...login_hint=user%40example.com
+login.live.com/...?...login_hint=user%40example.com
+```
+
+**是 Office 自己把这个地址当 `login_hint` 传出去的**——所以它一定存在本地。但全 prefix
+搜明文只命中 WebView2 的 History 和 Favicons，都是导航留下的痕迹。
+
+漏掉的是**注册表里的二进制值**：`user.reg` 把 REG_BINARY 写成十六进制字节，搜
+`account` 自然搜不到，要搜 `61,00,63,00,63,00,6f,00,75,00,6e,00,74,00`（UTF-16LE 的
+十六进制形式）。一搜就中：
+
+```
+HKCU\Software\Microsoft\Office\16.0\Outlook\Profiles\Outlook\caa1c55647359940981dcf71a08288f2
+  值 001f3d16
+```
+
+那是一个 **Outlook 的 MAPI 邮件配置条目**，配着旧账户——随 `import-office.sh` 的
+`Outlook\Profiles` 一起从原机搬过来的。Word 读 Outlook 的默认配置来决定用户身份，于是
+把它当成了登录提示。删掉那一个条目之后：
+
+```
+登录/对话框窗口: 0 个
+(display name) (user@example.com) 已登录
+```
+
+教训有两条，都值得记：
+
+- **搜注册表要连二进制形式一起搜。** 明文搜索在 `user.reg` 上会漏掉所有 REG_BINARY，
+  而账户、配置这类东西恰恰常存在二进制值里。
+- **先看应用发出去的请求，再去猜它从哪读的。** 这一轮前面清了五处存储、每次都没效果；
+  真正定位是靠 URL 里的 `login_hint`——它直接证明了"值在本地"，把范围从"哪里存着旧
+  账户"缩小成"哪个二进制值里有这个字符串"。
+
+（另外：被移开的 `IdentityCache` 与 WebView2 目录没有再放回去，Office 已经重建了干净的
+副本，登录与激活都在。备份仍在 `$WINEPREFIX/identity-repair-*/`。）
