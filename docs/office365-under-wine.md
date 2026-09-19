@@ -7409,3 +7409,51 @@ if(child_node->node->parent != This->node)
 下一步该做的是把这个差异做实：拿一个带未声明前缀的片段，比对 MSXML 与 Wine 的
 `nodeName` / `prefix` / `namespaceURI` / `parentNode`，再决定是在解析时保住前缀，
 还是在 `removeChild` 上放宽父子判定。
+
+### 把 `removeChild` 那一处再挖了一层，然后停手
+
+`tools/xmlprobe` 按 C2R 的用法复现了几种情形，Wine 下的结果：
+
+| 情形 | `nodeName` | `prefix` |
+|---|---|---|
+| 前缀已声明 | `appv:TargetOSes` | `appv` |
+| **前缀未声明** | **`TargetOSes`** | **`<null>`** |
+
+**Wine 会把未声明的前缀整个丢掉**（libxml2 报 `XML_NS_ERR_UNDEFINED_NAMESPACE` 后按
+无前缀恢复）。这解释了那 584 条警告的后果，但**不是**这次失败的直接原因——往下挖，
+时序才是关键。
+
+`+msxml` 的完整调用序列（重复了 16 次，形状完全一致）：
+
+```
+elem.selectSingleNode("//appv:Extensions")   -> found 1 matches   拿到节点 N
+  ... 中途 someParent.replaceChild(新, N)     -> N 被摘出去
+elem.selectSingleNode("//appv:Extensions")   -> found 0 matches
+  ...
+elem.removeChild(N)                          -> E_INVALIDARG
+```
+
+两点要注意：
+
+- **`//` 是从文档根开始搜的**，不管在哪个节点上调用。所以 `elem.selectSingleNode("//…")`
+  返回的节点**本来就未必是 `elem` 的孩子**。
+- Wine 的 `create_node` 每次都新建一个包装对象，所以日志里不同的 `domelem` 指针
+  可能包着**同一个 libxml2 节点**。不能按指针判断"是不是同一个元素"。
+
+C2R 拿的是第一次查询的结果，而它在中途已经被 `replaceChild` 摘走了。**在 Windows 上
+这一步为什么不失败，我没有证据。** 可能是 MSXML 的 `replaceChild` 语义不同、可能是
+两次查询返回的节点不同、也可能是 C2R 在 Windows 上根本走的另一条分支。
+
+**要往下走，需要一台真 MSXML 来对照**：同一份清单、同一串 `SelectionNamespaces`、
+同一组调用，比对 `selectSingleNode` 返回哪个节点、`replaceChild` 之后 `parentNode`
+是什么、`removeChild` 返回什么。`tools/xmlprobe` 就是为此写的，拿到 Windows 上直接跑。
+
+在有对照之前不动 `dlls/msxml3`。本轮已经因为"探针通过就宣称修好"在 BITS 上栽过一次，
+同样的错误不再犯第二遍。
+
+### 而且这一步未必非修不可
+
+Word 已经能从 C2R 装出来的树里启动。App-V 注册做的事情——把 `vreg` 导进 HKLM、
+把 `vfs` 摊到该去的位置——正是 `scripts/apply-office-registry.sh` 和 `import-office.sh`
+在导入路径上手工做掉的。C2R 装出的 `root\vfs`、`root\vreg` 结构与真机导入的一致，
+所以补完这一步不一定要经过 MSXML。
