@@ -7223,87 +7223,41 @@ else if (job->jobProgress.FilesTransferred == job->jobProgress.FilesTotal)
 **12288 字节**（不是 366 MB 的整个文件），本地文件 **508192 字节**（= 500000 + 8192），
 `GetFileRanges` 回来的两段与请求一致。
 
-### BITS 的第二个洞：job 能跑了，但没人告诉调用方
+### BITS 的第二个洞是个假的，我追了三版才确认
 
-`AddFileWithRanges` 修好之后，C2R 的报错换了一句：
+`AddFileWithRanges` 修好之后，C2R 换了一句报错：
 
 ```
 BGTransportJob::StartDownload  "Timeout while waiting for download to start."
 ```
 
-job 能 resume 了，下载也在跑，但 C2R 不知道。它注册了 `IBackgroundCopyCallback` 等通知，
-而 `dlls/qmgr` 只在**全部文件传完**时发一次 `JobTransferred`：
+读上去像"调用方在等被告知传输开始"。而 `dlls/qmgr` 确实只在全部文件传完时发一次
+`JobTransferred`，`JobModification` 一次不发，`JobError` 也不发——尽管
+`BG_NOTIFY_JOB_ERROR` 本来就在新 job 的默认 notify_flags 里。看起来对得上，于是我去补了。
 
-- `JobModification` 一次都不发——调用方无从得知"传输开始了"；
-- `JobError` 也不发，尽管 `BG_NOTIFY_JOB_ERROR` 本来就在新 job 的默认 notify_flags 里，
-  于是失败的 job 会让调用方一直等一个永远不来的通知。
+**这个读法是错的，而且补上去的东西比缺着更糟。** 三版都在同一个干净安装上量过：
 
-探针加上回调计数，前后对照（同一个成功的两段下载）：
+| 通知的发法 | 结果 |
+|---|---|
+| 直接在 `transitionJobState` 里发 | 安装在遥测阶段硬停。这个函数有两个调用点在 `progress_callback_http` 里——**WinHTTP 自己的异步回调线程**，而那正是传输在等的线程 |
+| 改由 job 自己的线程发 | 一样硬停。回调是**同步跨进程调用**，客户端正阻塞在一次 BITS 调用里等这个 job：job 要等客户端返回，客户端要等 job 完成 |
+| 改用线程池异步发 | 走得更远——cab 真的通过 BITS 下完、客户端 `Complete()` 了 job 并创建了下一个——然后仍然停住 |
+| **完全不发** | **60 秒装好 C2R 客户端，`Timeout while waiting` 出现 0 次**，setup 继续走到 `LaunchAction` |
 
-```
-修复前   JobModification 0   JobTransferred 1   JobError 0
-修复后   JobModification 3   JobTransferred 1   JobError 0
-```
+最后一行推翻了前提：**那句超时根本不是缺通知造成的**，它出自一个被我中途打断、装了一半的
+prefix。干净安装里，`AddFileWithRanges` 修好之后 C2R 一次都不报。
 
-3 次正是路上的状态变化：QUEUED→CONNECTING、CONNECTING→TRANSFERRING、完成后回 QUEUED。
+所以三个通知提交都撤了（`git revert`，不是删掉——三次各自撞坏了什么值得留在历史里），
+只留下 `AddFileWithRanges`、`GetFileRanges` 和 206 这三处确实必要的修改。
 
-通知从 `transitionJobState` 发出——那里本来就已经确定"状态确实变了"。发之前先给 callback
-加引用并放掉锁，因为回调完全有权反过来调用它被告知的那个 job。`TRANSFERRED` 不在这里发，
-它由 `processJob` 按整个 job 发一次，不是按文件。
+**还有一条关于测试的教训，比这个 bug 本身更值钱。** `tools/bitsprobe` 三版**全部通过**：
+`JobModification` 3 次、12288 字节、退出码 0。它恰恰是唯一复现不出这个死锁的调用方——
+**它在 MTA 里轮询 `GetState`，而 C2R 在 STA 里阻塞等待**。探针能验证"通知送到了"，
+验证不了"送通知这件事是安全的"。功能正确和并发安全是两回事，同一个探针答不了第二个问题。
 
-**这两个洞的形状是同一个**，也和本文前面 winhttp 选项 77 那条一样：**一个"返回成功"的空
-实现，或一个只做了一半的契约，会在两三层之外变成一个看不出来路的错误码**。`AddFileWithRanges`
-返回 S_OK 却什么都没加，两层之外是 `BG_E_EMPTY`；通知只发一半，两层之外是"等待超时"。
-排查这类问题，与其顺着错误码往回猜，不如把调用方的调用序列原样复现一遍——`tools/bitsprobe`
-就是干这个的。
-
-### 走得更远之后冒出来的第三件事：一个 .NET 小工具把安装堵死
-
-BITS 修好、安装能推进到流式下载之后，出现了一个之前够不着的故障：安装停住不动，
-C2R 日志每两秒刷一条
-
-```
-ScenarioController::CheckProcessPool - Failed to get/create ui process pool,
-and we are not the ui handler. Cannot process event
-```
-
-`ps` 里有一个 `winedbg --auto` 已经挂了两分钟，`/proc/<pid>/wchan` 是 `anon_pipe_read`。
-往前翻 stderr：
-
-```
-at Microsoft.Office.C2R.InspectorOfficeGadget.Main (System.String[] args)
-[ERROR] FATAL UNHANDLED EXCEPTION: System.IO.FileNotFoundException:
-  Could not load file or assembly 'Windows, Version=255.255.255.255, ...'
-wine: Unhandled exception 0xc06d007f ... starting debugger...
-WineDbg attached to pid 01e0
-```
-
-C2R 会起一个 .NET 写的 `InspectorOfficeGadget`。wine-mono 没有 WinRT 投影程序集
-`Windows`，它必崩；崩了触发 `winedbg --auto`，而 winedbg 阻塞在管道读上不退出，
-崩溃进程就死不掉，C2R 的 process pool 建不起来，整个安装卡住。
-
-**两层问题，只有一层在这棵树里。** wine-mono 缺 WinRT 是另一个项目的事；
-`winedbg --auto` 在这种场景下挂住不退是 Wine 的健壮性问题，但挖进去性价比不高。
-可做的是不让 Mono 参与。**但环境变量这条路走不通**——
-
-```sh
-export WINEDLLOVERRIDES="mscoree=d"      # 无效
-```
-
-这个小工具是 **ClickToRun 服务**起的，而服务进程的环境来自 `CreateEnvironmentBlock`，
-是从注册表建的，根本看不到调用方 shell 里的变量（这正是本文前面 services.exe 那一节的
-同一件事：服务不继承你的环境）。要管得住服务的子进程，必须写进 prefix 的注册表：
-
-```sh
-wine reg add 'HKCU\Software\Wine\DllOverrides' /v mscoree /t REG_SZ /d "" /f
-```
-
-这不是遮盖——Office 本身不需要 .NET，`scripts/setup-prefix.sh` 早就把 Mono 关掉了。
-关掉之后 C2R 起不了那个小工具，干脆地跳过，而不是崩溃再挂死一个调试器。
-
-**这三件事的顺序有意思**：wintrust 的野指针要先修，才看得见 30029；30029 修好，才
-看得见 BITS 退到单流；BITS 修好，才走得到会触发 .NET 小工具的那一步。每修一个，下一个
-才露头——所以"装不上"从来不是一个原因。
+要把这些通知真正做对，需要认真对待客户端的公寓模型：异步投递不能比 job 活得久，
+callback 代理多半还要 marshal 成不会因为 STA 阻塞而拖住服务的形式。在想清楚之前，
+**不发严格优于发**——C2R 不需要它，自己会正确退路。
 
 ### 第四件：`0xc06d007f`，以及两个诊断脚本骗了我一次
 
@@ -7363,21 +7317,3 @@ wine: Unhandled exception 0xc06d007f in thread 278 ...
 wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 ```
 
-### 一个自己造的回归：通知不能从 WinHTTP 的回调线程发
-
-上面那个 `JobModification` 的修法，第一版是错的，值得记下来。
-
-我把通知直接放在 `transitionJobState` 里发。问题是这个函数的调用者里**有两个在
-`progress_callback_http` 内部**——那是 WinHTTP 自己的异步回调线程。注册进来的
-callback 是个跨进程代理，**从 WinHTTP 的回调线程里发一次出站 COM 调用，堵住的正是
-传输在等的那个线程**：回调末尾要 `SetEvent(job->wait)`，而 `wait_for_completion`
-正阻塞在它上面。
-
-实测：带第一版的安装在遥测阶段之后直接停住——0 个连接、0 进度、setup.exe 0% CPU
-等在一个超时上、日志一分多钟没有新行。
-
-改成**记录与投递分离**：任何线程发生状态变化时，只在锁内记下"要报什么"；由 job
-自己的线程在几个明确安全的点投递——转到 CONNECTING 之后、转到 TRANSFERRING 之后、
-以及一次传输收尾时（WinHTTP 回调线程记下的东西也在这里补发）。
-
-探针结果不变，这正是要点：两段、12288 字节、`JobModification` 3 次、`JobTransferred` 1 次。

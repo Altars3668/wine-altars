@@ -225,7 +225,7 @@ int wmain(int argc, WCHAR **argv)
 
     outf(L"  回调: JobModification %ld 次, JobTransferred %ld 次, JobError %ld 次%ls\n",
          n_modification, n_transferred, n_error,
-         n_modification ? L"" : L"   <- 从未被告知传输开始");
+         n_modification ? L"" : L"   （Wine 不发 JobModification，见 dlls/qmgr 的 revert）");
 
     hr = IBackgroundCopyJob_Complete(job);
     outf(L"  Complete                                0x%08lx\n", hr);
@@ -243,8 +243,13 @@ int wmain(int argc, WCHAR **argv)
         CloseHandle(h);
         outf(L"  本地文件 %I64d 字节，按范围应为 %I64u  %ls\n",
              size.QuadPart, want, (UINT64)size.QuadPart == want ? L"一致" : L"不一致");
+        /* What this checks is the ranges: the right bytes at the right offsets
+         * and nothing else fetched.  The callback counts are reported, not
+         * required -- Wine deliberately does not send JobModification, because
+         * doing so from the service deadlocks a client that is inside a BITS
+         * call waiting for this job.  See the revert in dlls/qmgr. */
         if ((UINT64)size.QuadPart == want && prog.BytesTransferred == ranges[0].Length + ranges[1].Length
-            && n_modification > 0 && n_transferred == 1)
+            && n_transferred == 1)
             rc = 0;
     }
     else outf(L"  打开 %ls 失败 err=%lu\n", local, GetLastError());
