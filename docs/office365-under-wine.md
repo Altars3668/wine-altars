@@ -6773,3 +6773,51 @@ Word 启动，WM_CLASS = ("winword.exe" "winword.exe")   ← 与 StartupWMClass 
 `scripts/office-launch.sh` 和 `scripts/install-desktop-integration.sh` 已删除；
 `scripts/install-start-menu.sh` 只做安装期该做的两件事：建快捷方式、写 prefix 的语言，
 剩下的交给 Wine。
+
+### 菜单项点了没反应：它启动的是另一个 Wine
+
+上一节做完之后，从开始菜单点 Word **没有任何反应**，再点一次会弹安全模式提示，选"否"
+仍然没反应。
+
+原因是 winemenubuilder 写出的 `Exec=` 里是一个裸 `wine`，点击时从 PATH 解析。这台机器上：
+
+```
+/usr/bin/wine -> /opt/wine-stable/bin/wine     （winehq-stable 包）
+```
+
+也就是说菜单项拿**发行版的 Wine** 去开我们的 prefix。实测它确实会启动 WINWORD.EXE
+（日志里有 `msowercrash.dll`、`get_dummy_preferred_ui_language 0x409` 这些 Office 自己的
+痕迹），但缺了这棵树上的全部补丁，**退出码 3，一个窗口都没画出来**——于是 Word 认为
+上次运行失败，下次启动就问要不要安全模式。整个过程没有任何地方说明"跑的是哪个 Wine"。
+
+改法是让条目记住写它的那个 Wine。`WINELOADER` 正是当前进程所用的加载器路径，
+winemenubuilder 把它转成 Unix 路径写进 `Exec=`，菜单项和文件关联两处共用一个 helper，
+变量不存在时仍退回裸 `wine`。现在条目长这样：
+
+```
+Exec=env "WINEPREFIX=..." "/opt/wine-altars/lib/wine/x86_64-unix/wine" "C:\...\Word.lnk"
+```
+
+文件关联那批不会自动重写——`winemenubuilder -a` 只在关联有变化时才动手，判据是
+`HKCU\Software\Wine\FileOpenAssociations`。清掉那个键再跑 `-a` 才会全量重建。
+**注意它会连带清掉属于其它 prefix 的关联**（这台机器上少了 18 个 QQ音乐 / ClickOnce 的），
+重建后要把那些补回去。
+
+### 让系统的 `wine` 就是这一个
+
+`scripts/install-system-wine.sh` 把构建结果复制到 `/opt/wine-altars`，再用
+`/usr/local/bin`（在 PATH 里排在 `/usr/bin` 之前）指过去。**不动 winehq-stable 的任何
+文件**，撤回就是删掉那些链接（`--uninstall`）。
+
+用复制而不是软链到构建目录：把整个系统指向一个 git 工作树，一次重建或一次误删就会
+带走机器上所有 Wine 程序。代价是重建之后要重跑本脚本刷新 `/opt`。
+
+这是一个**系统级改动**：机器上所有 Wine 程序都会改用这个构建。它是 CrossOver 血统的
+Wine 加上 `patches/wine` 的补丁，通常是改善或无差别，但这是你的机器，要清楚这一点。
+
+验收（干净登录环境、PATH 只有系统路径、不设任何变量）：
+
+```
+PATH 上的 wine: /usr/local/bin/wine -> /opt/wine-altars/bin/wine
+执行条目里的 Exec  ->  OpusApp 窗口 "Word" 出现，WM_CLASS = winword.exe
+```
