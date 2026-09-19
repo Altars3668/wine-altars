@@ -6821,3 +6821,40 @@ Wine 加上 `patches/wine` 的补丁，通常是改善或无差别，但这是�
 PATH 上的 wine: /usr/local/bin/wine -> /opt/wine-altars/bin/wine
 执行条目里的 Exec  ->  OpusApp 窗口 "Word" 出现，WM_CLASS = winword.exe
 ```
+
+### "点了没反应"的另一半：Office 是单实例，它把点击交给了看不见的那个
+
+换成绝对加载器路径之后，从开始菜单点 Word 仍然没反应，再点一次出安全模式提示。
+这一次不是条目的问题——用一个包装器把桌面启动器真正传进来的参数抓下来，一切都是对的：
+
+```
+argv[0]=[env]
+argv[1]=[WINEPREFIX=/home/user/.wine-altars-office]
+argv[2]=[/opt/wine-altars/lib/wine/x86_64-unix/wine]
+argv[3]=[C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Word.lnk]
+DISPLAY=[:0]
+```
+
+反斜杠正确还原成单个，加载器是我们的，语言是 `0x804`（中文）。Word 进程也确实起来了，
+然后**退出码 3，一个窗口都没有**。
+
+先猜"残留的 wineserver 绑在别的显示上"，做实验**否掉了**：故意在 `:77` 留一个
+wineserver，再从 `:0` 启动，窗口照样落在 `:0`（20 个）。Wine 是按进程各自的 `DISPLAY`
+走的。
+
+真正的原因是 **Office 的单实例移交**。先前的测试在 `:77` 上留下了一个还活着的
+WINWORD.EXE；从 `:0` 点菜单时，新进程把请求交给那个已有实例、自己退出，而那个实例在
+你看不见的显示上。构造实验验证：
+
+| 状态 | 从 `:0` 点菜单的结果 |
+| --- | --- |
+| `:77` 上已有 Word（22 个窗口） | `:0` 上 **0 个**窗口，进程数仍是 1，退出码 3 |
+| 全部清干净 | `:0` 上 **5 秒**出现 20 个窗口，连点两次都一样 |
+
+第二次点出安全模式提示也随之而来：Word 看到连续几次"启动后没能正常运行"，就问要不要
+安全模式——而选"否"之后新进程还是移交给那个旧实例，于是依然没反应。
+
+教训是给调试用的：**在别的显示上跑测试，跑完必须把进程清干净**，否则下一次真实点击会
+静默地交给那个残留实例。清理时 `pkill` 要用 `-x` 按进程名精确匹配（`-f` 会匹配到调用者
+自己的命令行），而且进程名要列全：`wineserver`、`wineboot.exe`、`winedevice.exe`、
+`services.exe`、`WINWORD.EXE` 等，少一个就还会有残留把 prefix 占住。
