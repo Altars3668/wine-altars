@@ -7012,3 +7012,143 @@ Sep 19 06:31:24  systemd: app-gnome-wine\x2dPrograms\x2dWord-3717613.scope: Cons
 **但因果没有证实。** 闪退只出现过一次，我没能复现；"查询失败"与"fail-fast"只是相邻，
 不是被证明的因果。这个选项本身错在它自己的形状上，值得修——但不能因此宣称闪退已解决。
 再遇到闪退，直接从 journal 捞 `Word.desktop` 的输出，比任何猜测都快。
+
+## 从 C2R 装一遍：安装器自己能不能在 Wine 上跑完
+
+到这里为止，这个 prefix 里的 Office 是从一台真实 Windows 机器导入的。那条路能走通，
+但对别人没用——要发布给公众，得能从微软官方的安装器装出来。所以开一个全新 prefix，
+拿 Office 部署工具（ODT）的 `setup.exe` 直接 `/configure` 一遍，看它卡在哪。
+
+### 先拿到安装器
+
+`download.microsoft.com` 在这台机器上 TLS 握手失败：它的证书链要 `Microsoft TLS RSA
+Root G2`，本机的发行版根证书包里没有。**没有为此装任何根证书**——换 CDN 即可：
+
+```
+https://officecdn.microsoft.com/pr/wsus/setup.exe      6.9M
+```
+
+配置只装 Word（`ExcludeApp` 掉其余全部），`Display Level="None"`，`Channel=Current`，
+`zh-cn`，64 位，日志写到 `C:\c2rlog`。
+
+### 第一次：wintrust 在清理时写进了别人的内存
+
+装到一半整个卡死，`wine` 打出一个页错误：
+
+```
+wine: Unhandled page fault on write access to 00006FFFF9BDCFC0 at address 00006FFFF92EB8A4
+wine:   00006FFFF92EE235  L"wintrust.dll" +0xe235
+wine:   00006FFFF9BE499E  L"crypt32.dll" +0x4499e
+```
+
+把 VMA `0x18000b8a4` 反汇编出来是 `movq $0xffffffffffffffff,0x10(%rax)`，在
+`SoftpubCleanup` 里，就是这一句：
+
+```c
+CloseHandle(data->pWintrustData->pFile->hFile);
+data->pWintrustData->pFile->hFile = INVALID_HANDLE_VALUE;   /* 这里 */
+```
+
+`WinVerifyTrust` 的 `WTD_STATEACTION_CLOSE` 自带一个 `WINTRUST_DATA`，而
+`WINTRUST_DefaultClose` 清理时用的还是当初 VERIFY 那次的指针。调用方在 verify 返回
+之后完全有权把那块结构释放或复用掉，于是这一写就落到了现在占着那块内存的东西上。
+改成用 close 这次传进来的结构——**调用方此刻担保的就是它**——之后同样的安装零崩溃。
+
+### 第二次：不崩了，但一分钟后回滚
+
+`setup.exe` 退出码 108，prefix 只长了 184MB。注册表说得很清楚：
+
+```
+HKLM\SOFTWARE\Microsoft\Office\ClickToRun
+  LastScenario        REMOVEINSTALLATION
+  LastScenarioResult  Failure
+  ScenarioLastError   1
+```
+
+C2R 客户端本身是装成功的（`ApiClient.dll`、`AppV*.dll` 齐全），日志也在
+（`C:\windows\WINHOST-*.log`，UTF-16LE）。里面有三类扎眼的东西，**其中两类是幌子**：
+
+- `Transport::Connect ... 0x80040154 "Unable to create DeliveryOptimization instance."`
+  ——Delivery Optimization 是 Windows 的下载 COM 服务，Wine 没有。但 C2R 有
+  `FailOverTransport`，它退回去用别的传输，下载照样完成了。
+- `CabManager::ValidateCatalogFile` 错误 188。日志自己下一行就写着
+  `"but catalog errors are non-fatal, continuing"`。
+
+真正致命的是第三条，在 repoman 把 10205 个下载任务全部算完之后：
+
+```
+C2R::RepomanPipeline::OpenStreamSession  ErrorCode 30029  InvalidArgument
+  Failed to get path root %ProgramFiles%\Microsoft Office\Updates\Download\
+  PackageFiles\116F7616-..., driveNumber=-1
+```
+
+### `driveNumber=-1` 是个能直接读懂的数字
+
+二进制里的格式串是 `Failed to get path root %s, driveNumber=%d`。带 driveNumber 的
+「取路径根」只可能是 `PathGetDriveNumberW`——它对 A–Z 返回 0–25，失败返回 -1。
+喂给它的字符串以 `%` 开头，当然不是盘符。
+
+也就是说 C2R 把**没展开的** `%ProgramFiles%\...` 直接当路径用了。注册表里确实如此：
+
+```
+Scenario\INSTALL  PipelineInstallPath   = %ProgramFiles%\Microsoft Office
+                  PipelineDownloadPath  = %ProgramFiles%\Microsoft Office\Updates\...
+```
+
+而从真实 Windows 导入的那个 prefix 里，同样两个值是 `C:\Program Files\Microsoft
+Office`。**所以这两个值本该在写入时就展开好**，不是 C2R 的存储约定。
+
+### 谁写的，以及为什么没展开
+
+`PipelineInstallPath` 这个字符串只出现在一个二进制里：`OfficeClickToRun.exe`，
+也就是 **ClickToRun 服务**。
+
+开 relay（只跟 `ExpandEnvironmentStringsW`、`RegGetValue*`、`RegSetValue*`）跑一遍，
+看到两件事：
+
+- C2R 把**每一个**要写进注册表的值都过一遍 `ExpandEnvironmentStringsW`——
+  `"zh-cn"`、`"CDN"`、`"TASKSTATE_EXECUTING"` 都过。所以没展开只能是展开失败。
+- 32 位的 `setup.exe` 用的是 `%ProgramW6432%`（返回 17 个字符 = `C:\Program Files`），
+  它很清楚 32 位进程里 `%ProgramFiles%` 会指到 `(x86)` 去。
+
+关键的一次对照出在 relay 脚本本身的一个差别上：某一轮我在安装前 `wineserver -k` 了一下，
+那一轮服务写进去的是 `RegSetValueExW(..., "PipelineInstallPath", ..., cbData=0x44)`
+——68 字节 = 33 个字符加结尾 NUL = `C:\Program Files\Microsoft Office`，**展开好的**。
+
+### 根因：服务拿到的环境，是 prefix 还没建好时的那一份
+
+装一个只做 `cmd /c set > 文件` 的服务，两种条件下各跑一次：
+
+| 条件 | 服务进程的环境变量 | `ProgramFiles` |
+|---|---|---|
+| 新建 prefix 后直接起服务 | 18 个 | 没有 |
+| 新建 prefix 后先重启 wineserver | 43 个 | `C:\Program Files` |
+
+18 个那一份里，**一个来自注册表的变量都没有**——没有 `PATH`、没有 `OS`、没有
+`windir`、没有 `ProgramData`、没有 `USERPROFILE`。
+
+代码里的时序对得上。`programs/wineboot/wineboot.c` 的 `main`：
+
+```
+start_services_process();                  /* services.exe 在这里起来 */
+if (init || update) update_wineprefix( update );   /* wine.inf 在这之后才跑 */
+```
+
+新建 prefix 时，services.exe 启动的那一刻，`Session Manager\Environment` 和
+`CurrentVersion\ProgramFilesDir` 都还不存在。而 `programs/services/services.c` 把
+`CreateEnvironmentBlock` 的结果**存进一个静态变量**，此后这个 services.exe 启动的
+每一个服务都拿这一份。只有重启 wineserver 才会换掉它。
+
+于是链条完整了：新建 prefix → 立刻装 Office → ClickToRun 服务的环境里没有
+`ProgramFiles` → 它把 `%ProgramFiles%\Microsoft Office` 原样写进注册表 →
+`PathGetDriveNumber` 返回 -1 → 30029 → 10205 个任务全部作废，整个安装回滚。
+
+**而"新建 prefix 之后紧接着装东西"正是所有安装脚本的写法。**
+
+### 修法
+
+把环境块改成每次启动服务时现建，不再缓存。这也是 Windows 的行为——改了系统环境变量，
+服务重启就能拿到新值，不需要重启服务管理器；服务启动本来就稀疏，代价可以忽略。
+
+改完之后，同一个对照实验里「新建 prefix 后直接起服务」拿到 43 个变量，`ProgramFiles`、
+`ProgramW6432`、`ProgramData`、`PATH`、`windir` 全在——**没有重启 wineserver**。
