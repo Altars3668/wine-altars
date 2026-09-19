@@ -7457,3 +7457,39 @@ Word 已经能从 C2R 装出来的树里启动。App-V 注册做的事情——�
 把 `vfs` 摊到该去的位置——正是 `scripts/apply-office-registry.sh` 和 `import-office.sh`
 在导入路径上手工做掉的。C2R 装出的 `root\vfs`、`root\vreg` 结构与真机导入的一致，
 所以补完这一步不一定要经过 MSXML。
+
+### 想绕过 App-V 注册，绕不过去
+
+既然 `scripts/export-office-registry.py` 本来就会读 `root/vreg/*.vreg.dat`（标准 regf
+蜂巢）并做 App-V 路径令牌替换，那就给它加个 `--vreg-only`，直接对 C2R 装出的 prefix 用——
+Wine prefix 没有真机的 SOFTWARE 蜂巢和 NTUSER.DAT，原来的流程走不下去。
+
+跑出来是 **0 个键**。原因一看文件大小就明白：
+
+| | vreg 文件 | 总大小 |
+|---|---|---|
+| C2R 装的 | 15 个，**每个都是 8192 字节** | 124 KB |
+| 真机导入的 | 23 个，64 KB–1 MB 不等 | 11 MB |
+
+8192 字节是**空 regf 蜂巢的最小尺寸**。C2R 把壳创建出来了，内容是
+APPLYCONFIGURATION 阶段写进去的——而那一步正是失败的那一步。
+
+所以链条是闭合的，没有旁路：
+
+```
+清单合并 removeChild 失败 → APPLYCONFIGURATION 失败 → vreg 是空壳
+                                                   → 什么都没注册
+```
+
+数字上的差距：
+
+| | C2R 装的 | 真机导入的 |
+|---|---|---|
+| `Word.Application` ProgID | **0** | 7 |
+| HKLM Office 键 | **23** | 42085 |
+| Classes 键 | 15353 | 38194 |
+| `system.reg` | 3.9 MB | 21 MB |
+
+Word 能启动，是因为它从自己的目录里跑；但没有 ProgID、没有文件关联、没有 COM 自动化。
+**要让 C2R 装出可用的 Office，必须修掉那个 `removeChild`** —— 而修它需要一台真 MSXML
+来对照，`tools/xmlprobe` 已经为此写好，拿到 Windows 上直接跑就是。
