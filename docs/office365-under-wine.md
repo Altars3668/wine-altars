@@ -7223,41 +7223,64 @@ else if (job->jobProgress.FilesTransferred == job->jobProgress.FilesTotal)
 **12288 字节**（不是 366 MB 的整个文件），本地文件 **508192 字节**（= 500000 + 8192），
 `GetFileRanges` 回来的两段与请求一致。
 
-### BITS 的第二个洞是个假的，我追了三版才确认
+### BITS 这条路我走错了，四个改动最后全部撤回
 
-`AddFileWithRanges` 修好之后，C2R 换了一句报错：
+这一段记录一次**完整的失败**，因为它的教训比成功的那几条更有用。
 
+C2R 的传输失败序列是 `DOStreaming → BITS → 自己的单流 HTTP`。Delivery Optimization
+Wine 没有（也不该在这里补），但 BITS 有——`dlls/qmgr` 是完整实现。查下去，缺的只有一个方法：
+
+```c
+static HRESULT WINAPI BackgroundCopyJob_AddFileWithRanges(...)
+{
+    FIXME("...: stub\n");
+    return S_OK;          /* 返回成功，但什么都没加 */
+}
 ```
-BGTransportJob::StartDownload  "Timeout while waiting for download to start."
+
+C2R 用 `IBackgroundCopyJob3::AddFileWithRanges` 加文件，Wine 装作成功却没往 job 里放
+东西，紧接着 `Resume()`：
+
+```c
+else if (job->jobProgress.FilesTransferred == job->jobProgress.FilesTotal)
+    hr = BG_E_EMPTY;      /* 0 == 0 */
 ```
 
-读上去像"调用方在等被告知传输开始"。而 `dlls/qmgr` 确实只在全部文件传完时发一次
-`JobTransferred`，`JobModification` 一次不发，`JobError` 也不发——尽管
-`BG_NOTIFY_JOB_ERROR` 本来就在新 job 的默认 notify_flags 里。看起来对得上，于是我去补了。
+`BG_E_EMPTY` 就是日志里那个 `0x80200003`。把它实现掉之后，`tools/bitsprobe` 验证完全正确：
+请求偏移 1000 的 4096 字节和偏移 500000 的 8192 字节，实际只传 **12288 字节**，本地文件
+**508192 字节**，`GetFileRanges` 与请求一致。
 
-**这个读法是错的，而且补上去的东西比缺着更糟。** 三版都在同一个干净安装上量过：
+**然后 Office 就装不上了。**
 
-| 通知的发法 | 结果 |
+同一个干净 prefix、其它条件全同，只差这一个提交：
+
+| `AddFileWithRanges` | 结果 |
 |---|---|
-| 直接在 `transitionJobState` 里发 | 安装在遥测阶段硬停。这个函数有两个调用点在 `progress_callback_http` 里——**WinHTTP 自己的异步回调线程**，而那正是传输在等的线程 |
-| 改由 job 自己的线程发 | 一样硬停。回调是**同步跨进程调用**，客户端正阻塞在一次 BITS 调用里等这个 job：job 要等客户端返回，客户端要等 job 完成 |
-| 改用线程池异步发 | 走得更远——cab 真的通过 BITS 下完、客户端 `Complete()` 了 job 并创建了下一个——然后仍然停住 |
-| **完全不发** | **60 秒装好 C2R 客户端，`Timeout while waiting` 出现 0 次**，setup 继续走到 `LaunchAction` |
+| 实现掉 | 42 分钟没装上 C2R 客户端；日志停在 `StartDownload`（`"Time to start job 185ms"`，文件 `v64_*.cab`），`JobTransferredOrCompleted` **从未出现**，没有临时文件、没有 socket——job 躺在队列里没被取走 |
+| **保持 stub** | **30 秒装好客户端**，`Office\Updates` 建出来，继续下载 |
 
-最后一行推翻了前提：**那句超时根本不是缺通知造成的**，它出自一个被我中途打断、装了一半的
-prefix。干净安装里，`AddFileWithRanges` 修好之后 C2R 一次都不报。
+排除过的：不是通知（早已撤销，没有它照样挂）；不是 CDN 的 DNS 覆盖（撤掉无变化）；
+不是崩溃（无异常，setup.exe 在 5 秒 `GetTickCount64`/`Sleep` 重试循环里）。
 
-所以三个通知提交都撤了（`git revert`，不是删掉——三次各自撞坏了什么值得留在历史里），
-只留下 `AddFileWithRanges`、`GetFileRanges` 和 206 这三处确实必要的修改。
+**一个"成功的空实现"在这里反而是对的**：它让 C2R 立刻失败并正确退路，安装得以完成。
+把它实现掉，C2R 就改走 BITS，而 Wine 的 BITS 在这个负载下会停摆。
 
-**还有一条关于测试的教训，比这个 bug 本身更值钱。** `tools/bitsprobe` 三版**全部通过**：
-`JobModification` 3 次、12288 字节、退出码 0。它恰恰是唯一复现不出这个死锁的调用方——
-**它在 MTA 里轮询 `GetState`，而 C2R 在 STA 里阻塞等待**。探针能验证"通知送到了"，
-验证不了"送通知这件事是安全的"。功能正确和并发安全是两回事，同一个探针答不了第二个问题。
+所以这一轮 qmgr 的四个提交（`AddFileWithRanges`、`GetFileRanges`、206、以及三版通知）
+**全部 `git revert`**，qmgr 回到基线，一行未改。留下的是 `tools/bitsprobe` 和这段记录。
 
-要把这些通知真正做对，需要认真对待客户端的公寓模型：异步投递不能比 job 活得久，
-callback 代理多半还要 marshal 成不会因为 STA 阻塞而拖住服务的形式。在想清楚之前，
-**不发严格优于发**——C2R 不需要它，自己会正确退路。
+### 下次接着查 BITS，该从哪儿下手
+
+- `dlls/qmgr/qmgr.c` 的队列是**单线程**：`processJob` 在它上面同步执行，
+  `wait_for_completion` 用 `INFINITE`。任何一次传输卡住，后面所有 job 永远排不上。
+- `SetNoProgressTimeout` qmgr 存下来了，**从不使用**。
+- 真正没搞清的是：探针 `Resume` 的 job 会被取走，C2R `Resume` 的不会。差别可能在
+  公寓模型、在跨进程代理、也可能在 C2R 同时持有多个 job。
+
+**还有一条关于测试的教训，比这个 bug 本身更值钱。** `bitsprobe` 每一版都通过：
+12288 字节、退出码 0。它恰恰是唯一复现不出问题的调用方——**它在 MTA 里轮询 `GetState`，
+而 C2R 在 STA 里阻塞等待，并且一次跑多个 job**。探针能验证"范围下载是对的"，
+验证不了"让这条路生效之后整体还能不能跑"。**功能正确 ≠ 集成安全**，这两件事要分开测，
+而唯一能测第二件的是真实负载。
 
 ### 第四件：`0xc06d007f`，以及两个诊断脚本骗了我一次
 
