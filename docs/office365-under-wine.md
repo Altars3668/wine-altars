@@ -7304,3 +7304,61 @@ wine reg add 'HKCU\Software\Wine\DllOverrides' /v mscoree /t REG_SZ /d "" /f
 **这三件事的顺序有意思**：wintrust 的野指针要先修，才看得见 30029；30029 修好，才
 看得见 BITS 退到单流；BITS 修好，才走得到会触发 .NET 小工具的那一步。每修一个，下一个
 才露头——所以"装不上"从来不是一个原因。
+
+### 第四件：`0xc06d007f`，以及两个诊断脚本骗了我一次
+
+关掉 Mono 之后，`setup.exe` **自己**崩了，退出码 84，安装日志只有五行：
+
+```
+wine: Unhandled exception 0xc06d007f in thread 268 at address 7B5C92FB
+WineDbg attached to pid 01bc
+EXIT=84
+```
+
+`0xc06d007f` 不是随便一个码。`VcppException(sev, err) = 0xC06D0000 | err`，
+`err = 0x7F = 127 = ERROR_PROC_NOT_FOUND`——**VC++ 延迟加载助手找不到某个导出函数**。
+（`0xC06D007E` 是找不到模块。）延迟加载绑不上不会返回错误，它直接抛异常，没人接就死。
+
+**先绕了一圈**：我拿 `scripts/pe-delay-imports.py` 列出 setup.exe 的延迟导入，
+再用 `scripts/check-wine-exports.py` 检查，得到"共 0 项缺失"。两个问题：
+
+- `check-wine-exports.py` 的第一个参数是 **Wine 的 DLL 目录**，清单从 stdin 读。
+  我传了个 .exe，stdin 是空的——于是它老老实实报了 0，看起来和"体检通过"一模一样。
+- `pe-delay-imports.py` 每个 DLL 只打前 6 个函数，后面写 `...`。ole32 那一行正好
+  被截断，**`CoCancelCall` 排在第七个**。
+
+两个脚本都改了：前者参数不对或 stdin 是终端就报错退出，遇到被截断的行会警告；
+后者默认打全，`-s` 才给摘要。**一个静悄悄返回 0 的诊断工具比没有工具更糟。**
+
+**直接的办法**：给 `GetProcAddress` 开 relay，看崩溃线程最后问了什么。
+
+```
+0278:Call KERNEL32.GetProcAddress(79ff0000,"CoCancelCall") ret=00809943
+0278:Ret  KERNEL32.GetProcAddress() retval=00000000
+wine: Unhandled exception 0xc06d007f in thread 278 ...
+```
+
+线程号对得上。Wine 的 ole32 导出了 `CoEnableCallCancellation` 和
+`CoDisableCallCancellation`，**唯独漏了这一组里的第三个 `CoCancelCall`**；combase 里
+它只是 `@ stub`，没有任何 DLL 以调用方 import 的那个名字导出它。
+
+补上之后 `ole32!CoCancelCall` 能解析到，返回 `RPC_E_CALL_COMPLETE`（0x80010117）。
+这个返回值是诚实的：Wine 不跟踪未完成的调用，**"那个调用已经结束了"就是实情**，
+而不是敷衍——Windows 在被取消的调用已经返回后也是这么答的，调用方认得这个码。
+
+### 顺带修掉一个把崩溃变成卡死的设置
+
+上面那次崩溃之所以让安装**卡住**而不是干脆失败，是因为 `winedbg --auto` 弹了一个
+"Program Error" 对话框在等人点。实测：
+
+```
+无 DISPLAY    崩溃后 2 秒退出
+有 DISPLAY    挂满 60 秒（超时才结束），xdotool 能看到窗口 "Program Error"
+```
+
+`/proc/<pid>/wchan` 是 `anon_pipe_read`。这是 Wine 的既定行为，不是 bug，但对无人值守
+安装是致命的——任何一个子进程崩溃都会把父进程一起堵死。无人值守时应该关掉：
+
+```sh
+wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
+```

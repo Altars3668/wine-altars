@@ -38,8 +38,18 @@ def parse(path):
                 t += 8 if magic==0x20b else 4
         out.append((dll,funcs)); o+=32
     return out
-for p in sys.argv[1:]:
+# The list is what check-wine-exports.py reads, so truncating it hides imports
+# from the check.  CoCancelCall sat seventh in ole32's list, past the old cut,
+# and the checker reported nothing missing while setup.exe died on it.  Pass
+# -s/--short for the one-line-per-DLL summary; the default prints all of them.
+short = '-s' in sys.argv[1:] or '--short' in sys.argv[1:]
+for p in [a for a in sys.argv[1:] if not a.startswith('-')]:
     r=parse(p)
     if r:
         print("==", p.rsplit('/',1)[-1])
-        for dll,fs in r: print("   %-34s %s" % (dll, ' '.join(fs[:6]) + (' ...' if len(fs)>6 else '')))
+        for dll,fs in r:
+            if short:
+                print("   %-34s %s" % (dll, ' '.join(fs[:6]) + (' ...' if len(fs)>6 else '')))
+            else:
+                for i in range(0, len(fs), 6):
+                    print("   %-34s %s" % (dll if i==0 else '', ' '.join(fs[i:i+6])))
