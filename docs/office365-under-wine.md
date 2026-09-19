@@ -6977,5 +6977,12 @@ HKCU\Software\Microsoft\Office\16.0\Outlook\Profiles\Outlook\caa1c55647359940981
   真正定位是靠 URL 里的 `login_hint`——它直接证明了"值在本地"，把范围从"哪里存着旧
   账户"缩小成"哪个二进制值里有这个字符串"。
 
-（另外：被移开的 `IdentityCache` 与 WebView2 目录没有再放回去，Office 已经重建了干净的
-副本，登录与激活都在。备份仍在 `$WINEPREFIX/identity-repair-*/`。）
+**还有一条是我自己制造的故障，记下来免得重犯。** 上面那串排除实验里，我把
+`IdentityCache` 移开之后没有放回去，以为 Office 会重建——它没有。结果下一次启动
+Office 报「你的帐户或设备出现问题」要求修复：账户记录在 `OneAuth` 里好好的，而令牌
+材料（RT / AT / ID / Accounts）在 `IdentityCache` 里，被我拿走了。**这两个目录是同一
+次登录写出的一套东西**，时间戳都是同一秒；只留一半，Office 认得出账户却取不到令牌。
+把原样备份放回去即刻恢复。
+
+排除实验每移走一样，都要在下一步开始前放回原处——尤其是这种成对的状态。备份都在
+`$WINEPREFIX/identity-repair-*/`。
