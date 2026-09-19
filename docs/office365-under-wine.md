@@ -6693,3 +6693,83 @@ GetTokenSilentlyAsync / FindAllAccounts             不再出现
 
 启动 Office 时会自己弹出 `OneAuthWebView2Browser` 登录页。**账号密码要你自己输**——
 我不会代输，也没有任何地方伪造登录状态。
+
+## 更正：桌面集成不该由脚本做，Wine 自己就会
+
+前面那一节用一个自写的 `.desktop` 生成器加一个 `office-launch.sh` 包装脚本解决了菜单、
+图标、任务栏归组和界面语言。能用，但**方向错了**：启动路径上挂着我的脚本，而这四件事
+本来就是 Wine 的职责。查下去发现每一件它都已经实现了，只是被两个缺陷挡住。
+
+### 一、菜单项：`cx_mode` 硬编码成 1，条目全被丢掉
+
+`winemenubuilder` 有完整的 XDG 写出实现——名称、`Icon`、工作目录，连窗口管理器归组用的
+`StartupWMClass` 都会写（它从目标 exe 文件名取小写，正是 `winword.exe`）。但
+`programs/winemenubuilder/cxmenu.c` 里：
+
+```c
+int cx_mode = 1;
+```
+
+CrossOver 不自己写条目，它把每一项交给外部发布器 `wineshelllink`。那个程序属于
+CrossOver，不属于 Wine。**这里没有它**，于是 `__wine_unix_spawnvp` 生成的每一项都喷进
+虚空，静默失败。这就是"复制来的 prefix 只有文件关联、没有应用程序"的真正原因，和快捷
+方式有多少无关。
+
+改成默认 0，`WINE_CX_MENUS=1` 可以切回去。
+
+### 二、快捷方式：这个 prefix 里一个都没有
+
+Wine 的菜单支持**完全由 `.lnk` 驱动**（`winemenubuilder` 每次处理一个链接）。而这个
+prefix 是复制已装好的 Office 得来的，从没跑过安装程序，所以 `ProgramData\...\Start Menu`
+下连一个 Office 快捷方式都没有——MathType 有，因为它的安装器真的跑过。
+
+所以正确做法是**建快捷方式，而不是建 `.desktop`**。`tools/mkshortcut` 用
+`IShellLinkW` + `IPersistFile::Save` 创建，和安装程序做的是同一件事；保存动作本身就会
+让 shell32 去调 winemenubuilder。结果是 Wine 自己写出：
+
+```
+[Desktop Entry]
+Name=Word
+Exec=env "WINEPREFIX=..." wine "C:\ProgramData\...\Start Menu\Programs\Word.lnk"
+Path=/home/.../Office16
+Icon=7A2C_WINWORD.0
+StartupWMClass=winword.exe
+```
+
+八个程序齐全，图标和窗口类都是 Wine 推导的。
+
+### 三、界面语言：注册表里的开关本来就有，但坏了
+
+`dlls/ntdll/locale.c` 有一段 CrossOver 的 locale 覆盖，读 `HKCU\Software\Wine` 下的
+`LC_ALL` / `LC_CTYPE` / `LC_MESSAGES`。两个缺陷让它一半失效：
+
+- `LC_CTYPE` 和 `LC_MESSAGES` 解析的是 `bufferW`，也就是 `KEY_VALUE_PARTIAL_INFORMATION`
+  的结构头，而不是它后面的字符串（`LC_ALL` 那一支用的是 `info->Data`，是对的）；
+- 两者都赋给 `system_lcid`。于是 `LC_MESSAGES`——唯一一个含义就是"界面语言"的类别——
+  永远到不了下面那句 `NtSetDefaultUILanguage`。
+
+实测（宿主 `LC_ALL=en_US.UTF-8`）：
+
+| prefix 里设的值 | Wine 的报错语言 |
+| --- | --- |
+| `LC_MESSAGES=zh_CN.UTF-8` | 英文（无效） |
+| `LC_ALL=zh_CN.UTF-8` | 中文（但连带改了整个 locale） |
+
+两处都修好之后，只设 `LC_MESSAGES` 就能让界面变中文而不动其它类别。
+
+### 结果：启动路径上没有脚本了
+
+宿主保持 `LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8`，不设任何变量，直接执行 Wine 自己写的
+那行 `Exec`：
+
+```
+Word 启动，WM_CLASS = ("winword.exe" "winword.exe")   ← 与 StartupWMClass 对上
+打印属性页：布局 / 方向 / 纵向(P) / 横向(L) / 份数(C) / 逐份打印(O) / 确定 / 取消
+```
+
+双击文档走 Wine 自己的 `wine-extension-*.desktop`（`wine start /ProgIDOpen`，路径转换由
+`start.exe` 做），关联默认值在删掉我那批条目后自动回到了它们。
+
+`scripts/office-launch.sh` 和 `scripts/install-desktop-integration.sh` 已删除；
+`scripts/install-start-menu.sh` 只做安装期该做的两件事：建快捷方式、写 prefix 的语言，
+剩下的交给 Wine。

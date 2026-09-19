@@ -12,14 +12,15 @@
 #     is right -- the code that consults LOCALE_IPAPERSIZE only runs when there
 #     is no cached DevMode to use.  Clearing it makes Wine build a fresh one.
 #
-#   * The UI language.  Wine picks its resources from the process locale, not
-#     from Office's, which is how a Chinese Word ends up with an English
-#     printer properties sheet.  scripts/office-launch.sh sets this per launch.
+#   * The UI language.  Wine takes it from the prefix
+#     (HKCU\Software\Wine\LC_MESSAGES), set by
+#     scripts/install-start-menu.sh, so it no longer depends on who starts
+#     Office.  This script reads the same value rather than inventing one.
 #
 # Those two interact, and getting it wrong is easy: the rebuilt DevMode takes
 # its paper size from whatever locale the rebuild happens under.  Clearing the
-# cache from an English shell simply writes Letter back.  So this script runs
-# the regeneration under the same locale the launcher uses, not the caller's.
+# cache from an English shell simply writes Letter back.  So the regeneration
+# runs under the prefix's own language, not the caller's.
 #
 # Nothing is invented: the DevMode is rebuilt from the queue's own PPD, and the
 # key is exported first so the old one can be put back.
@@ -31,7 +32,10 @@ WINE="$DIST/bin/wine"
 : "${WINEPREFIX:?set WINEPREFIX}"
 export WINEPREFIX WINEDEBUG=-all
 
-# Same locale as scripts/office-launch.sh, for the reason in the header.
+# The prefix's own language, for the reason in the header; fall back to the
+# same default install-start-menu.sh uses if it has not been set yet.
+: "${WINE_UI_LANG:=$("$WINE" reg query 'HKCU\Software\Wine' /v LC_MESSAGES 2>/dev/null |
+      grep -oP '(?<=LC_MESSAGES)\s+REG_SZ\s+\K.*' | tr -d '\r')}"
 : "${WINE_UI_LANG:=zh_CN.UTF-8}"
 export LANG="$WINE_UI_LANG"
 export LANGUAGE="${WINE_UI_LANG%%.*}"
@@ -73,10 +77,10 @@ else
     echo "    （tools/printprobe 没编译，跳过验证）"
 fi
 
-say "界面语言（本脚本与启动器用的是同一套：$WINE_UI_LANG）"
+say "界面语言（取自 prefix：$WINE_UI_LANG）"
 msg=$("$WINE" reg query 'HKCU\NoSuchKeyHere' 2>&1 | head -1)
 case "$msg" in
-    *Unable*) echo "    !! 仍是英文资源——检查 $WINE_UI_LANG 这个 locale 是否已生成（locale -a）" ;;
+    *Unable*) echo "    !! 仍是英文资源——检查 HKCU\Software\Wine\LC_MESSAGES 与 locale -a" ;;
     *)        echo "    Wine 已使用本地化资源" ;;
 esac
 say "done"
