@@ -6895,8 +6895,33 @@ WINWORD.EXE；从 `:0` 点菜单时，新进程把请求交给那个已有实例
 
 | 入口 | 干净状态下的结果 |
 | --- | --- |
-| 首次运行对话框「登录或创建帐户」 | **无反应**。追踪显示点击后 webauth / onlineid 两个通道**一条调用都没有**——它连认证层都没走到 |
-| 文件 → 帐户 → 登录 | **可用**。5 秒打开 `OneAuthWebView2Browser`，页面是空白的「电子邮件或电话」 |
+| 首次运行对话框「登录或创建帐户」 | **可用**（真实鼠标点击，5 秒打开登录页） |
+| 文件 → 帐户 → 登录 | **可用**，同样 5 秒，页面是空白的「电子邮件或电话」 |
 
-所以对新用户来说，能走通的门是**帐户页里的那个登录**，不是首次运行对话框上的那个。
-后者是一个仍待查的缺陷：它在到达任何认证 API 之前就没了下文。
+**这里要更正我自己的一个错误结论。** 起初我判定首次运行那个按钮"无反应、是发布拦路虎"，
+依据是 `uiclick` 点它之后 webauth / onlineid 两个通道一条调用都没有。那是**工具造成的
+假象**：`uiclick` 用的是 `accDoDefaultAction`，而 Office 这个自绘的 NetUI 按钮对它
+**回 S_OK 却什么都不做**。改用 `xdotool` 在同一个 `accLocation` 上发真实鼠标点击，
+5 秒就打开了 `OneAuthWebView2Browser`。
+
+顺带把同一段追踪里另一个吓人的东西也归位：那 835 次
+
+```
+err:ole:marshal_object Failed to create an IRpcStubBuffer from IPSFactory
+for {00020404-...} with error 0x80004002
+```
+
+（`{00020404}` 是 `IEnumVARIANT`）看着像 COM 编组坏了，查注册表、查 oleaut32 的
+`DllGetClassObject`、查生成的存根表，全是好的。上下文才说明问题：
+
+```
+fixme:oleacc:LresultFromObject unsupported wParam = ffffffff
+fixme:ole:RemUnknown_QueryInterface No interface for iid {000209fa-...}
+err:ole:marshal_object Failed to create an IRpcStubBuffer ...
+```
+
+`LresultFromObject` 是响应 `WM_GETOBJECT` 的无障碍接口——**那是我自己的 uidump/uiclick
+在问 Office 要可访问对象**，跟登录路径毫无关系。
+
+`uiclick` 因此加了 `-click`：跳过默认动作，直接点对象自报的位置。一个"报告成功却什么
+都没做"的默认动作，比明确失败更坏——它会把你推去应用里找根本不存在的 bug。

@@ -7,10 +7,20 @@
  * the same tree uidump prints, finds the first accessible object whose name
  * contains it, and calls its default action.
  *
- *   uiclick <name-substring> [class-substring]
+ *   uiclick [-click] <name-substring> [class-substring]
  *
  * Prints what it pressed, or every candidate name when it finds nothing, so a
  * failed match is a listing rather than a silence.
+ *
+ * accDoDefaultAction can also succeed and do nothing. Office's NetUI controls
+ * are drawn by Office, and some of them answer S_OK to the default action
+ * without acting on it -- measured on the first-run sign-in dialog's own
+ * button, where accDoDefaultAction returned S_OK, nothing happened, and a real
+ * click at the same accLocation opened the sign-in page five seconds later.
+ * A silent no-op that reports success is worse than a failure, because it
+ * reads as "the application ignored the click" and sends you looking for a bug
+ * in the application. Pass -click to skip the default action and click where
+ * the object says it is.
  *
  * accDoDefaultAction is not enough on its own. It works on Office's own
  * NetUI-drawn controls, which is what this was written for, but Wine's oleacc
@@ -30,6 +40,7 @@
 #include <stdio.h>
 #include <string.h>
 
+static int force_click;        /* -click: 跳过默认动作，直接点它自报的位置 */
 static const char *want_name, *want_class, *set_value, *type_value;
 static int clicked, listed, exact_pass;
 
@@ -148,7 +159,7 @@ static void walk(IAccessible *acc, VARIANT self, int depth)
                 hr = put_value(acc, self, set_value);
                 printf("set \"%s\" -> %#lx\n", name, hr);
             } else {
-                hr = IAccessible_accDoDefaultAction(acc, self);
+                hr = force_click ? E_NOTIMPL : IAccessible_accDoDefaultAction(acc, self);
                 if (FAILED(hr)) {
                     HRESULT hr2 = click_at_location(acc, self);
                     printf("pressed \"%s\" -> %#lx (accDoDefaultAction), "
@@ -232,8 +243,14 @@ int main(int argc, char **argv)
         set_value = arg_utf8(wargv[2]);
         want_name = arg_utf8(wargv[3]);
         want_class = wargc > 4 ? arg_utf8(wargv[4]) : NULL;
+    } else if (wargc > 2 && !wcscmp(wargv[1], L"-click")) {
+        /* Some Office controls answer S_OK to accDoDefaultAction and do
+         * nothing; this skips straight to a real click. */
+        force_click = 1;
+        want_name = arg_utf8(wargv[2]);
+        want_class = wargc > 3 ? arg_utf8(wargv[3]) : NULL;
     } else {
-        if (wargc < 2) { fprintf(stderr, "usage: uiclick [-set <value>] <name-substring> [class-substring]\n"); return 2; }
+        if (wargc < 2) { fprintf(stderr, "usage: uiclick [-click|-set <value>|-type <text>] <name-substring> [class-substring]\n"); return 2; }
         want_name = arg_utf8(wargv[1]);
         want_class = wargc > 2 ? arg_utf8(wargv[2]) : NULL;
     }
