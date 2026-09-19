@@ -6602,3 +6602,94 @@ CUPS 队列已由 Wine 自动桥接，`wineps.drv` 走 PostScript，DevMode 里�
 
 `printprobe -print` 能把一页渲染成文件，整条链路（驱动、DevMode、字体、页面设置）
 不费一张纸就能验：`StartDoc/StartPage/EndPage/EndDoc` 全部返回成功。
+
+## 登录改成原生的那一条，并且让它留得住
+
+### 它为什么会"掉"
+
+登录一直靠的是 WAM 令牌：`windows.security.authentication.onlineid` 这个 shim 按
+scope 从 `Z:\tmp\office-wam-tokens` 一个文件一个文件地读，令牌由
+`scripts/mint-wam-tokens.sh` 从一台 Windows 机器上取来。它自己的头注释就写着
+"useless within hours"。
+
+这次掉的具体原因是两层叠加：
+
+- 令牌是 9 月 6 日铸的，**当天就过期了**；
+- 文件也没了——这台机器的 tmpfiles 规则是 `q /tmp 1777 root root 10d`，`/tmp` 下超过
+  10 天的文件自动清除，9 月 6 日到 9 月 18 日正好过线。目录空着，时间戳停在 9 月 6 日。
+
+Office 那边 `Identity\ConnectedAccountCID` 还留着，`Identity\Identities` 却是 0 条——
+不是"登录过期待刷新"，是只剩一个悬空的账号指针。
+
+### 真正的毛病：broker 认领了一个它服务不了的提供者
+
+文档前面早有结论："认领一个服务不了的 provider 比不认领更糟"。但 shim 一直是无条件
+认领的。带 `+webauth` 实测一次启动：
+
+```
+FindAccountProviderWithAuthorityAsync   20 次
+FindAccountProviderAsync                18 次   ← 每次都给出提供者
+GetTokenSilentlyAsync                    6 次   → no token held → status 3
+WebView2 相关行                          0     ← Office 自己的登录页从未运行
+```
+
+于是改成：**手上没有令牌就不认领**。判据是令牌库本身，六个查找入口都走同一个
+`create_provider_operation`，一处守卫全覆盖。改完再测：
+
+```
+standing aside so the caller uses its own sign-in   13 次
+GetTokenSilentlyAsync / FindAllAccounts             不再出现
+启动后第 10 秒                                      OneAuthWebView2Browser
+```
+
+`OneAuthWebView2Browser` 正是文档前面记过的那个成功形态。连测两次都是第 10 秒出现。
+
+这条规则同时保留了两条路：铸了令牌就用 WAM（临时救急），没令牌就走 Office 自己的
+窗口（持久）。不需要开关，令牌库在不在就是开关。
+
+### 登录结果留不留得住：DPAPI
+
+原生登录把状态用 DPAPI 密封后写进 profile。这一条要是不成立，登录当场有效、重启即失，
+看上去就像"又掉了"。`tools/dpapiprobe` 分两个进程验证，中间还杀掉 wineserver：
+
+```
+第一个进程：封装成功，180 字节
+（杀掉 wineserver）
+第二个进程：解封成功: 内容一致 ✓
+```
+
+所以登录一次就够了。
+
+### 安装流程里删掉了一件本来就做不成的事
+
+`import-office.sh` 原来第 7 步会把原机的 `OneAuth` / `IdentityCache` / `TokenBroker`
+一并复制过来。**那在这里永远解不开**——它们在写入它们的那台机器上用 DPAPI 密封，
+这里没有对应的密钥。Office 拿到读不了的缓存不会"重新登录"，而是报"无法访问你的账户"
+且**不给登录表单**，比空 profile 更糟。这一步改成明确跳过并说明原因。
+
+### 一个被实测证伪的顺手改动
+
+既然跨机缓存有害，我顺手把 prefix 里现存的 6 处也移走了（移动不删除）。结果**更糟**：
+没有账号记录之后，Office 不再走 WebToken 那条路，改用 `OnlineIdAuthenticator` 要 MSA
+的 RPS ticket——而这正是本文前面记过的、Wine 产不出来的东西。追踪里
+`webauth:statics_FindAccountProvider*` 归零、`standing aside` 归零，全变成
+`onlineid:ticket_*`，登录窗再也不出现。已全部放回，`OneAuthWebView2Browser` 随即恢复。
+
+所以 `verify-signin.sh --move-foreign-caches` 保留为**对症手段**，只在 Office 真的报
+"无法访问你的账户"时用；默认那一项只作提示，不算缺陷。教训还是老一条：改之前先想清楚
+现象是不是你要治的那个。
+
+### 现在的状态
+
+`scripts/verify-signin.sh` 把整条链路逐环检查，并接进了 `import-office.sh`：
+
+```
+[ 好 ] WebView2 / 绕过 broker 两个门    已开
+[ 好 ] WebView2 运行时                  153.0.4234.32
+[ 好 ] broker 让位                      无令牌，broker 不认领提供者
+[ 好 ] DPAPI 跨进程                     登录结果可持久
+[ -- ] 身份缓存                         4 处早于本 prefix；保持原样
+```
+
+启动 Office 时会自己弹出 `OneAuthWebView2Browser` 登录页。**账号密码要你自己输**——
+我不会代输，也没有任何地方伪造登录状态。
