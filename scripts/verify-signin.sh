@@ -21,13 +21,21 @@
 # checks each link of that chain and says which one is missing.
 #
 # --move-foreign-caches moves the identity caches aside (moved, not deleted).
-# Do this only for the symptom it is the remedy for -- Office saying it cannot
-# access your account, with no sign-in form offered.  Measured here, on a
-# prefix that was *not* showing that symptom, removing them made things worse:
-# with no account on file Office stops using the WebToken path and falls back
-# to OnlineIdAuthenticator, asking for an MSA RPS ticket that cannot be
-# produced here, and its sign-in window stops appearing at all.  The caches
-# were put back.
+# It is the remedy for one symptom and only that one: Office saying your
+# account cannot be accessed.  Measured both ways.
+#
+# With a broken account record in the caches, File > Account shows "帐户错误"
+# and "很抱歉，当前无法访问您的帐户" -- and every sign-in entry point leads
+# back to the same dead account, because the account is remembered in the
+# OneAuth cache, not in the registry.  Moving the caches aside clears that and
+# File > Account > Sign in then opens a blank Microsoft sign-in page.
+#
+# On a prefix *not* showing that message, moving them is a step backwards:
+# Office then greets you with its first-run "sign in to set up Office" dialog,
+# whose button reaches no authentication API at all (measured: not one call on
+# either the webauth or onlineid channel after the click).  The working entry
+# point in that state is File > Account > Sign in, which does open the page --
+# so if you move the caches, use that door, not the first-run one.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
