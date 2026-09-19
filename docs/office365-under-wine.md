@@ -6986,3 +6986,29 @@ Office 报「你的帐户或设备出现问题」要求修复：账户记录在 
 
 排除实验每移走一样，都要在下一步开始前放回原处——尤其是这种成对的状态。备份都在
 `$WINEPREFIX/identity-repair-*/`。
+
+### 一次闪退，以及菜单启动带来的一个意外好处
+
+从开始菜单启动的 Word 跑了 26.8 秒就没了。**证据全在 journal 里**——这是把
+`.desktop` 交给 Wine 自己生成之后的副产品：桌面启动的程序在 systemd scope 下运行，
+Wine 写到 stderr 的一切都进了用户 journal，不需要事先套任何包装脚本。
+
+```
+Sep 19 06:30:59  Word.desktop[3717731]: ... 启动
+Sep 19 06:31:19  Word.desktop[3717731]: 033c:fixme:winhttp:request_query_option unimplemented option 77
+Sep 19 06:31:19  Word.desktop[3717731]: 0340:fixme:winhttp:request_query_option unimplemented option 77
+Sep 19 06:31:19  Word.desktop[3717731]: 0200:err:seh:NtRaiseException Unhandled exception code 1e044000
+Sep 19 06:31:24  systemd: app-gnome-wine\x2dPrograms\x2dWord-3717613.scope: Consumed 20.177s CPU ... 857.6M peak
+```
+
+`0x1e044000` 是 Office 自己的 fail-fast 码（同族的 `0x1e3c3840` 本文前面记过）。
+紧邻的两条 FIXME 是 `WINHTTP_OPTION_AUTOLOGON_POLICY`（77）。
+
+查下来那是 Wine 的一个实打实的缺陷，而且形状很清楚：这个选项**设得进、读不出**。
+`request_set_option` 把它存到 `object_header.logon_policy`，而 `request_query_option`
+没有对应的 case，落到 `default:` 返回 `ERROR_INVALID_PARAMETER`。值就在那里等着被读。
+补上之后 `+winhttp` 下已经查不到 `unimplemented option 77`。
+
+**但因果没有证实。** 闪退只出现过一次，我没能复现；"查询失败"与"fail-fast"只是相邻，
+不是被证明的因果。这个选项本身错在它自己的形状上，值得修——但不能因此宣称闪退已解决。
+再遇到闪退，直接从 journal 捞 `Word.desktop` 的输出，比任何猜测都快。
