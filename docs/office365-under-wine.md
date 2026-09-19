@@ -7152,3 +7152,107 @@ if (init || update) update_wineprefix( update );   /* wine.inf 在这之后才�
 
 改完之后，同一个对照实验里「新建 prefix 后直接起服务」拿到 43 个变量，`ProgramFiles`、
 `ProgramW6432`、`ProgramData`、`PATH`、`windir` 全在——**没有重启 wineserver**。
+
+### 装得动之后：为什么还这么慢
+
+安装能跑通之后，下载速度成了下一个问题。这一段的结论分两半，一半是环境，一半是 Wine。
+
+**环境那一半**：本机所在的网络，路由器跑 passwall2。查下来分流是
+对的——`microsoft.com` 在 DNS 规则和路由规则里都命中 `direct`，`route.final` 也是 `direct`，
+没有被代理绕出国。但 C2R 的日志里只有两个主机：
+
+| 主机 | 用途 | 落点 | RTT |
+|---|---|---|---|
+| `officecdn.microsoft.com` | 元数据 | `...wyy.ctlcdn.cn` → 106.41.206.x | 3.0 ms |
+| `f.c2r.ts.cdn.office.net` | **payload** | `office.microsoft.map.fastly.net` | 205.8 ms |
+
+真正下载 payload 的是第二个，它**不匹配**直连关键字表里的 `microsoft.com`，CNAME 一路落到
+境外。而那个电信节点接受 `Host: f.c2r.ts.cdn.office.net` 并正常返回 206，所以在路由器上加了
+
+```
+uci add_list dhcp.@dnsmasq[0].address='/c2r.ts.cdn.office.net/106.41.206.187'   # 以及 .188 / .98
+```
+
+**一个走错的路**：中途试过用 `address=/c2r.ts.cdn.office.net/::` 压掉 AAAA，那是错的——`::`
+会被当成本机回环，curl 连到本机服务拿到 404。已撤销。AAAA 仍回 Fastly 的 v6，而本机没有
+IPv6 默认路由，这条还没解决。
+
+**Wine 那一半才是重点**。换到 3 ms 的国内节点后仍然只有 100–200 KB/s，说明瓶颈不是距离。
+安装器全程只开**一条** TCP 连接——因为它本该用的两条快路都断了：
+
+```
+Data.FailOver_1: "DOStreaming"     0x80040154  Unable to create DeliveryOptimization instance
+Data.FailOver_2: "BITS"            0x80200003  Unable to resume job
+                                               "Ran out of sources to retry from."
+```
+
+Delivery Optimization 是 Windows 的下载服务，Wine 没有，这个短期内也不会有。但 BITS
+有——`dlls/qmgr` 是完整的一份实现。查下去，缺的只有一个方法：
+
+```c
+static HRESULT WINAPI BackgroundCopyJob_AddFileWithRanges(...)
+{
+    FIXME("...: stub\n");
+    return S_OK;          /* 返回成功，但什么都没加 */
+}
+```
+
+C2R 用 `IBackgroundCopyJob3::AddFileWithRanges` 加文件（它要按字节段取一个几 GB 的 stream
+文件），Wine 装作成功却没往 job 里放任何东西。紧接着 `Resume()`：
+
+```c
+else if (job->jobProgress.FilesTransferred == job->jobProgress.FilesTotal)
+    hr = BG_E_EMPTY;      /* 0 == 0 */
+```
+
+`BG_E_EMPTY` 就是 `0x80200003`——日志里那个码。**一个"成功"的空实现，在两层之外变成一个
+看不出来路的错误码。**
+
+`tools/bitsprobe` 按 C2R 的调用序列复现了它，前后对照：
+
+```
+修复前   AddFileWithRanges 0x00000000   Resume 0x80200003
+修复后   AddFileWithRanges 0x00000000   Resume 0x00000000   状态 TRANSFERRED
+```
+
+修复是让它真的把文件加进 job 并带上范围，`transfer_file_http` 对每个范围发一次带
+`Range:` 头的请求、按偏移落盘。顺带把 `GetFileRanges` 从 `E_NOTIMPL` 实现掉，并在
+`hresult_from_http_response` 里点名 206——带范围请求的成功码本来就是它，不该落到 FIXME。
+
+验证用真实 CDN：请求偏移 1000 的 4096 字节和偏移 500000 的 8192 字节，总共传了
+**12288 字节**（不是 366 MB 的整个文件），本地文件 **508192 字节**（= 500000 + 8192），
+`GetFileRanges` 回来的两段与请求一致。
+
+### BITS 的第二个洞：job 能跑了，但没人告诉调用方
+
+`AddFileWithRanges` 修好之后，C2R 的报错换了一句：
+
+```
+BGTransportJob::StartDownload  "Timeout while waiting for download to start."
+```
+
+job 能 resume 了，下载也在跑，但 C2R 不知道。它注册了 `IBackgroundCopyCallback` 等通知，
+而 `dlls/qmgr` 只在**全部文件传完**时发一次 `JobTransferred`：
+
+- `JobModification` 一次都不发——调用方无从得知"传输开始了"；
+- `JobError` 也不发，尽管 `BG_NOTIFY_JOB_ERROR` 本来就在新 job 的默认 notify_flags 里，
+  于是失败的 job 会让调用方一直等一个永远不来的通知。
+
+探针加上回调计数，前后对照（同一个成功的两段下载）：
+
+```
+修复前   JobModification 0   JobTransferred 1   JobError 0
+修复后   JobModification 3   JobTransferred 1   JobError 0
+```
+
+3 次正是路上的状态变化：QUEUED→CONNECTING、CONNECTING→TRANSFERRING、完成后回 QUEUED。
+
+通知从 `transitionJobState` 发出——那里本来就已经确定"状态确实变了"。发之前先给 callback
+加引用并放掉锁，因为回调完全有权反过来调用它被告知的那个 job。`TRANSFERRED` 不在这里发，
+它由 `processJob` 按整个 job 发一次，不是按文件。
+
+**这两个洞的形状是同一个**，也和本文前面 winhttp 选项 77 那条一样：**一个"返回成功"的空
+实现，或一个只做了一半的契约，会在两三层之外变成一个看不出来路的错误码**。`AddFileWithRanges`
+返回 S_OK 却什么都没加，两层之外是 `BG_E_EMPTY`；通知只发一半，两层之外是"等待超时"。
+排查这类问题，与其顺着错误码往回猜，不如把调用方的调用序列原样复现一遍——`tools/bitsprobe`
+就是干这个的。
