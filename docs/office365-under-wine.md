@@ -7362,3 +7362,22 @@ wine: Unhandled exception 0xc06d007f in thread 278 ...
 ```sh
 wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 ```
+
+### 一个自己造的回归：通知不能从 WinHTTP 的回调线程发
+
+上面那个 `JobModification` 的修法，第一版是错的，值得记下来。
+
+我把通知直接放在 `transitionJobState` 里发。问题是这个函数的调用者里**有两个在
+`progress_callback_http` 内部**——那是 WinHTTP 自己的异步回调线程。注册进来的
+callback 是个跨进程代理，**从 WinHTTP 的回调线程里发一次出站 COM 调用，堵住的正是
+传输在等的那个线程**：回调末尾要 `SetEvent(job->wait)`，而 `wait_for_completion`
+正阻塞在它上面。
+
+实测：带第一版的安装在遥测阶段之后直接停住——0 个连接、0 进度、setup.exe 0% CPU
+等在一个超时上、日志一分多钟没有新行。
+
+改成**记录与投递分离**：任何线程发生状态变化时，只在锁内记下"要报什么"；由 job
+自己的线程在几个明确安全的点投递——转到 CONNECTING 之后、转到 TRANSFERRING 之后、
+以及一次传输收尾时（WinHTTP 回调线程记下的东西也在这里补发）。
+
+探针结果不变，这正是要点：两段、12288 字节、`JobModification` 3 次、`JobTransferred` 1 次。
