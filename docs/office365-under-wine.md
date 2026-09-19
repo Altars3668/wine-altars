@@ -7340,3 +7340,72 @@ wine: Unhandled exception 0xc06d007f in thread 278 ...
 wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 ```
 
+
+## 从 C2R 装一遍：结果
+
+修完 wintrust、services.exe 的环境块和 `ole32!CoCancelCall` 之后，ODT 的 `setup.exe`
+在一个全新 prefix 里跑到了这个地步：
+
+```
+C:\Program Files\Microsoft Office\
+  root\Office16\WINWORD.EXE          1,557,304 字节
+  root\Office16\                     282 个文件，1.7 GB
+  root\vfs  root\vreg                都在，结构与真机导入的一致
+  root\                              3.3 GB
+  AppXManifest.xml  PackageManifests  Updates
+```
+
+**而且它能启动**：直接跑 `WINWORD.EXE`，窗口起来了，标题是「Microsoft 365 和 Office」
+（首次运行的登录/激活页）。
+
+`setup.exe` 本身的退出码是 106，因为最后一步没做完：
+
+```
+Office.ClickToRun.C2RClient.OfficeVirtRegistration
+  Result.Code 30088  UnexpectedError
+  Data.PrevVirtBeforeRegistration    "None"
+  Data.CurrentVirtBeforeRegistration "AppVReady"
+  Data.ErrorMessage "Orchestration::UpdateAppV: TryRefreshMergedManifest failed"
+```
+
+注册表把这一步的性质说得最清楚：
+
+```
+C2R 装的 prefix:   PrevVirtualizationMechanism=None       VirtualizationMechanism=AppVReady
+真机导入的 prefix: PrevVirtualizationMechanism=AppVReady  VirtualizationMechanism=AppVRegistered
+```
+
+`AppVReady → AppVRegistered` 这一跃没有完成。而这正是 `scripts/apply-office-registry.sh`
+和 `import-office.sh` 在导入路径上**手工做掉的那件事**——把 `vreg` 导进 HKLM、把 `vfs`
+摊到它本该被投射到的位置。所以 C2R 装出来的树是完整的，缺的只是注册。
+
+### 差的那一步，根因查到了
+
+把 `WINEDEBUG` 写进 `HKLM\System\CurrentControlSet\Control\Session Manager\Environment`
+（这样 `CreateEnvironmentBlock` 会把它发给服务进程——本文前面那条发现的第三次应用），
+带 `+msxml` 再跑一遍，抓到两条：
+
+```
+584 × warn:msxml:doparse Namespace prefix appv is not defined
+  1 × warn:msxml:node_remove_child childNode 00007CD54A2FA7F0 is not a child of 00007CD54A2FA6D0
+```
+
+第二条就是 `removeChild` 返回 `E_INVALIDARG` 的那一处，在 `dlls/msxml3/node.c`：
+
+```c
+if(child_node->node->parent != This->node)
+{
+    WARN("childNode %p is not a child of %p\n", child, This);
+    return E_INVALIDARG;
+}
+```
+
+第一条解释了为什么会这样。`AppXManifest.xml` 的根元素**是**声明了
+`xmlns:appv="http://schemas.microsoft.com/appv/2010/manifest"` 的，全文 616 处 `appv:`。
+但 C2R 合并清单时处理的是**片段**，片段里没有根上的那行声明——于是 libxml2 报"前缀未定义"，
+**丢掉前缀**继续；而 MSXML 遇到未声明前缀会把 `appv:Foo` 整个当作节点名保留下来。
+两边建出的树不一样，C2R 手里的节点在 Wine 的树里就不是它以为的那个父节点的孩子。
+
+下一步该做的是把这个差异做实：拿一个带未声明前缀的片段，比对 MSXML 与 Wine 的
+`nodeName` / `prefix` / `namespaceURI` / `parentNode`，再决定是在解析时保住前缀，
+还是在 `removeChild` 上放宽父子判定。
