@@ -7256,3 +7256,51 @@ job 能 resume 了，下载也在跑，但 C2R 不知道。它注册了 `IBackgr
 返回 S_OK 却什么都没加，两层之外是 `BG_E_EMPTY`；通知只发一半，两层之外是"等待超时"。
 排查这类问题，与其顺着错误码往回猜，不如把调用方的调用序列原样复现一遍——`tools/bitsprobe`
 就是干这个的。
+
+### 走得更远之后冒出来的第三件事：一个 .NET 小工具把安装堵死
+
+BITS 修好、安装能推进到流式下载之后，出现了一个之前够不着的故障：安装停住不动，
+C2R 日志每两秒刷一条
+
+```
+ScenarioController::CheckProcessPool - Failed to get/create ui process pool,
+and we are not the ui handler. Cannot process event
+```
+
+`ps` 里有一个 `winedbg --auto` 已经挂了两分钟，`/proc/<pid>/wchan` 是 `anon_pipe_read`。
+往前翻 stderr：
+
+```
+at Microsoft.Office.C2R.InspectorOfficeGadget.Main (System.String[] args)
+[ERROR] FATAL UNHANDLED EXCEPTION: System.IO.FileNotFoundException:
+  Could not load file or assembly 'Windows, Version=255.255.255.255, ...'
+wine: Unhandled exception 0xc06d007f ... starting debugger...
+WineDbg attached to pid 01e0
+```
+
+C2R 会起一个 .NET 写的 `InspectorOfficeGadget`。wine-mono 没有 WinRT 投影程序集
+`Windows`，它必崩；崩了触发 `winedbg --auto`，而 winedbg 阻塞在管道读上不退出，
+崩溃进程就死不掉，C2R 的 process pool 建不起来，整个安装卡住。
+
+**两层问题，只有一层在这棵树里。** wine-mono 缺 WinRT 是另一个项目的事；
+`winedbg --auto` 在这种场景下挂住不退是 Wine 的健壮性问题，但挖进去性价比不高。
+可做的是不让 Mono 参与。**但环境变量这条路走不通**——
+
+```sh
+export WINEDLLOVERRIDES="mscoree=d"      # 无效
+```
+
+这个小工具是 **ClickToRun 服务**起的，而服务进程的环境来自 `CreateEnvironmentBlock`，
+是从注册表建的，根本看不到调用方 shell 里的变量（这正是本文前面 services.exe 那一节的
+同一件事：服务不继承你的环境）。要管得住服务的子进程，必须写进 prefix 的注册表：
+
+```sh
+wine reg add 'HKCU\Software\Wine\DllOverrides' /v mscoree /t REG_SZ /d "" /f
+```
+
+这不是遮盖——Office 本身不需要 .NET，`scripts/setup-prefix.sh` 早就把 Mono 关掉了。
+关掉之后 C2R 起不了那个小工具，干脆地跳过，而不是崩溃再挂死一个调试器。
+
+**这三件事的顺序有意思**：wintrust 的野指针要先修，才看得见 30029；30029 修好，才
+看得见 BITS 退到单流；BITS 修好，才走得到会触发 .NET 小工具的那一步。每修一个，下一个
+才露头——所以"装不上"从来不是一个原因。
