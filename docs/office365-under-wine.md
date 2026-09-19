@@ -7493,3 +7493,130 @@ APPLYCONFIGURATION 阶段写进去的——而那一步正是失败的那一步�
 Word 能启动，是因为它从自己的目录里跑；但没有 ProgID、没有文件关联、没有 COM 自动化。
 **要让 C2R 装出可用的 Office，必须修掉那个 `removeChild`** —— 而修它需要一台真 MSXML
 来对照，`tools/xmlprobe` 已经为此写好，拿到 Windows 上直接跑就是。
+
+## App-V 注册跨过去了：三个 msxml 缺陷，一层压一层
+
+上一节停在「要一台真 MSXML 才能往下走」。后来发现**真机产物本身就是对照物** ——
+导入的 prefix 里有一份 Windows 的 C2R 亲手写出的 `AppXManifest.xml`。照着它一层层剥，
+三个缺陷全部定位并修好，App-V 注册从此完成。
+
+### 一、未声明的前缀被丢掉
+
+C2R 合并清单时用 `loadXML` 加载片段，片段长这样（trace 原样打印的）：
+
+```xml
+<appv:Extensions>
+	<appv:Extension Category="AppV.FileTypeAssociation">…
+```
+
+**没有 `xmlns:appv` 声明。** libxml2 的 SAX1 路径建了一个带前缀、`href` 为 NULL 的
+`xmlNs` 挂到 nsDef 上，然后因为这个守卫从不把它设成元素的命名空间：
+
+```c
+if ((ns != NULL) && (ns->href != NULL) && ...) xmlSetNs(ret, ns);
+```
+
+守卫上面的注释说的是**默认命名空间**未绑定时该留 NULL；具名前缀不该按这个处理——
+丢掉前缀等于把元素改了名。
+
+**真机对照**（同一份清单，Word-only 对四件套，看形状不看数量）：
+
+| | 真机 Windows | Wine 修前 | Wine 修后 |
+|---|---|---|---|
+| `<appv:Extension>` | 3704 | **0** | **630** |
+| `<Extension>`（丢了前缀的） | 0 | **630** | **0** |
+| 合并后清单 | 5.1 MB | 596 KB | 754 KB |
+
+### 二、插入文档时不绑定命名空间
+
+前缀保住了还不够。真机清单里那个插入的元素是这样的：
+
+```xml
+<appv:Extensions xmlns:appv="http://schemas.microsoft.com/appv/2010/manifest">
+```
+
+**它带着自己的声明。** 而喂进去的片段没有，trace 里也没有任何 `setAttribute` ——
+只能是 MSXML 在节点插入文档时把前缀绑到了目标文档的声明上，绑定了序列化时才会再写一次。
+
+Wine 不做这步，于是链条是：
+
+```
+插入后节点没有 URI → 第二次 selectSingleNode("//appv:Extensions") 找不到
+                  → C2R 回退去删那个已被 replaceChild 换走的旧节点
+                  → removeChild E_INVALIDARG → 30088
+```
+
+补上之后 `tools/xmlprobe` 实测：同样的片段放进声明了该前缀的文档，再查回来，
+**S_FALSE 变成 S_OK**，XSLPattern 与 XPath 都是。
+
+### 三、XSD 的 `\uXXXX` 转义
+
+清单合并通过后，错误前移到 App-V 自己的包配置：
+
+```
+OISVAPI::ConfigurePackage Failed. publishScope = 1
+  [AppV Error: Code(0x3e504e25-0x80004005) … File(xmlutils.cpp : 624)]
+错误 30175
+```
+
+`+msxml` 抓到真因：
+
+```
+err:msxml:Schema_parse error code 1756: Element '{…XMLSchema}pattern':
+  The value '[^﷐-﷯￹-￿\p{IsPrivateUse}]+' … is not a valid regular expression.
+fixme:msxml:cache_entry_from_xsd_doc failed to parse doc
+```
+
+**XML Schema 正则没有数字转义**——文法里只有 `\n`、`\r`、`\t`、标点转义、字符类简写和
+`\p{…}`。MSXML 额外接受 `\uXXXX`，照着它写的 schema 就这么用。libxml2 按规范拒绝该面，
+**整个 schema 就加不进去**，App-V 拿不到校验用的 schema，配置包失败。
+
+改法是在交给 schema 解析器的那份副本上把 `\uXXXX` 换成它表示的字符。`U+0000` 换成
+`U+0001`——C 字符串装不下 NUL，而对一个匹配 XML 内容的模式来说两者无从区分，XML 本来
+就不能含这两个字符中的任何一个。
+
+**只改这一处，同一个安装续跑的结果**：
+
+```
+VirtualizationMechanism   AppVReady  ->  AppVRegistered
+HKLM Office 键            23         ->  2902
+setup.exe                 exit 106   ->  exit 5
+```
+
+`AppVRegistered` 正是真机导入的那个 prefix 里的值。
+
+### 现在卡在哪
+
+几乎所有任务都是 `TASKSTATE_COMPLETED`：`STREAM`、`APPLYCONFIGURATION`、
+`INTEGRATE_INSTALL`、`STAGEREGISTRY`、`FONTS`、`MIGRATE`、`UNINSTALLCENTENNIAL`。
+外层 `SCENARIO`/`BRANCH`/`GROUP` 还停在 `EXECUTING`，因为 `OfficeClickToRun.exe` 崩了：
+
+```
+Unhandled page fault on read access to 0  at OfficeClickToRun.exe+0x75707c
+rax=0x80004002 (E_NOINTERFACE)  rcx=0
+```
+
+反汇编那一段：
+
+```asm
+lea  rdx,[rip+0x30a288]   # IID {0847E909-53CD-4E4F-832E-57D180F6E447}
+mov  rax,[rax]            # vtbl[0] = QueryInterface
+call [rip+0x8774f]
+mov  rcx,[rbp+0x28]       # out 参数，失败时仍是 NULL
+mov  rax,[rcx]            # ← 崩在这里，不检查返回值
+```
+
+那个 IID **只出现在 `OfficeClickToRun.exe` 自己里**——是 C2R 的私有接口，在它自己的
+对象上查的，不是 Wine 缺的东西。说明更早某一步给了它一个类型不对的对象。
+
+可用性：Word 能启动，主窗口标题 `Microsoft Word 16.0`；但它报
+「此功能看似已中断，并需要修复」——注册仍不完整（HKLM Office 键 2902，真机 42085）。
+
+顺带抓到但尚未定性的两条：
+
+- `marshal_object Failed to create an IRpcStubBuffer from IPSFactory for
+  {659cdeac-…}`（`IBackgroundCopyCallback2`）。代理 DLL 里**有**这个 IID，
+  `CStdStubBuffer_Construct` 也成功了，失败在其后对服务端对象的 QI——
+  `SetNotifyInterface` 先问 Callback2、不成再退回 Callback，这条 err 可能只是噪音。
+- `apartment_add_dll couldn't load in-process dll msoxmlmf.dll`（64 次）——
+  那个文件在 prefix 里根本不存在。
