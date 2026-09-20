@@ -8265,3 +8265,67 @@ NULL 锚点返回 FALSE 且 GetLastError=87
 确认坐标到位），但合成点击送不进 Wine——点「插入」标签页，截图里选中的
 仍是「开始」。所以 **`:0` 只能靠真人点，`:77` 才能做自动化点击验证**。
 两个缺陷本身与显示无关（一个是 CRT 导出、一个是 user32 导出）。
+
+## 登录之后满载：react-native-win32 的 terminate 循环（字体下拉是无辜的）
+
+用户报「登录激活成功了，字体栏，下拉后卡死」。下拉确实卡，但卡的原因不在下拉。
+
+### 对照：同一个下拉，两个时刻
+
+| 时机 | 打开字体下拉 | 结果 |
+|---|---|---|
+| 启动 42 秒 | CPU 0% → **6%** | 列表正常弹出 |
+| 启动 364 秒 | CPU **99%** | UI 不响应 |
+
+Word 在启动后约 60–90 秒开始有**一个后台线程吃满一个核**，与是否碰过下拉无关。
+第一次量到这点是在准备对照实验时——「点之前 CPU 就已经 94%」。
+
+### 真正的循环
+
+一个线程的栈把链条完整摊开：
+
+```
+react-native-win32+0x3170f9 → kernelbase RaiseException
+  → dispatch_exception → call_seh_handlers
+  → react-native-win32 的处理器 → terminate() → abort() → raise(SIGABRT)
+  → mso20win32client+0x5230a9 → mso20win32client+0x41594d
+```
+
+最后那一帧在往 NULL 写——Office 崩溃处理器「强制产生转储」的惯用法。
+`WINEDEBUG=+seh` 一次 2.5 分钟的运行里抓到 **836,592 次 `code=c0000005`**，
+`info[0]=1 info[1]=0`（写 NULL），出错地址恒为 `mso20win32client+0x41594d`。
+进程既不死也不恢复，无限重复。
+
+即：**React Native 抛了个没人接的 C++ 异常 → terminate → abort → Office 的崩溃
+处理器故意触发访问违例 → 这个违例被层层 SEH 消化掉 → 从头再来。**
+
+### 被证伪的几条路（别再走）
+
+| 猜测 | 证据 |
+|---|---|
+| 字体太多 | 列表约 1063 项（MSAA 树重复遍历会看到 6084，需去重） |
+| Wine 字体代码慢 | `+font` 在点开后 2.7 MB 就停止增长；`SelectObject` 仅 24 次/秒 |
+| 消息泵空转 | `GetInputState` 437 次/秒、`WM_TIMER` 14 次/秒，不足以解释 CPU |
+| 线程池自旋 | 给 `timerqueue`/`waitqueue`/`ioqueue`/`worker` 四个循环和 `tp_object_execute` 都加了计数，全不触发 |
+| 缺 `chakra.dll` | RN 确实延迟导入它（Wine 没有，错误 126），但 `+loaddll` 证明实际加载的是 Office 自带的 `v8jsi.dll`（V8），从没去找 chakra |
+| 本轮新加的 `__C_specific_handler_noexcept` | 它的 terminate 分支带 ERR 日志，**零次触发** |
+
+### 排查方法上踩的坑
+
+- **`WINEDEBUG=-all` 会连 err 通道一起关掉**。自己往 Wine 里加的 `ERR()` 埋点因此
+  全部静默，一度误判成「埋点不触发」。排查时必须用默认 WINEDEBUG。
+- **winedbg 的 attach 会把线程停在 syscall 边界**，frame 0 不可信（总是停在某个
+  syscall thunk 的 `ret` 上）；调用方帧是真的。判断线程在用户态还是内核态，
+  看 `/proc/<tid>/stat` 的 utime/stime 分解。
+- `ps -o %cpu` 是**累计均值**不是瞬时值，要用 `/proc/<pid>/stat` 差分。
+- `pgrep -cf <pattern>` 会匹配到自己的命令行（计数虚高）；Wine 进程的 Linux `comm`
+  是线程名不是 exe 名，`ps -eo comm | grep WINWORD` 得 0。
+- Wine 的线程名都以 `wine_threadpool` 开头且超过 15 字符，`comm` 截断后
+  worker / timerqueue / waitqueue 全都一样；临时把名字改短才能定位。
+- syscall thunk 的编号要**按 thunk 边界**反汇编来认（`mov eax,<n>` 属于哪一个 thunk），
+  凭偏移猜会差一个。
+
+### 还没解决
+
+RN 抛的是什么异常、从哪抛的，尚未定位（`react-native-win32+0x3170f9` 调
+`RaiseException`）。下一步从那里入手，而不是再查字体或消息泵。
