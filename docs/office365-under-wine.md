@@ -8046,3 +8046,79 @@ SLInstallLicense (0000000000000001,11185,...) stub, accepting
 ```
 
 Office 仍未激活，也没有任何许可证被签发——这只是让登录入口第一次可达。
+
+## `INTEGRATE_INSTALL` 失败：integrator 删清单时自己还开着句柄
+
+换成家庭版之后 `setup.exe /configure` 仍返回 106，失败的任务是 `INTEGRATE_INSTALL`。
+后果很具体：Office 的文件类型没被发布，`HKCR\.docx` 只有 `PerceivedType` 没有默认值，
+`Word.Document.12` 根本不存在，于是 Wine 的 winemenubuilder 不会为这个 prefix 写
+`wine-extension-docx.desktop`，**双击文档仍然打开旧 prefix 的 Office**。
+
+C2R 日志里 `C2R::ProcessSpawnerAdapter::SpawnProcessAndWait` 记着完整命令行，
+所以这一步能单独跑，**1 分钟复现，不必等整轮安装**：
+
+```
+wine 'C:\Program Files\Microsoft Office\root\integration\integrator.exe' \
+  /I /Extension /Msi 'MsiName=C2RInt.16.msi,C2RIntLoc.zh-cn.16.msi,*' /C2R \
+  'PackageGUID=<pkg>' 'PackageRoot=C:\Program Files\Microsoft Office\root'
+```
+
+退出码 32 = `ERROR_SHARING_VIOLATION`。`WINEDEBUG=+file,+server` 把它钉死了：
+
+```
+create_file( access=80100080, sharing=00000001 ) → 0x19C   FILE_SHARE_READ
+create_file( access=80100080, sharing=00000003 ) → 0x1A0   READ|WRITE
+ReadFile 0x19C → 4868（整份）
+ReadFile 0x1A0 → 4096/772/0（分块到 EOF）
+close_handle( handle=01a0 )        ← 只关了第二个
+DeleteFileW 同一个文件             → 0x20
+```
+
+integrator 对每份要取消发布的清单开两个读句柄，**只关其中一个**，然后去删它。
+两次打开的 share 模式都不含 `FILE_SHARE_DELETE`，所以这在真 Windows 上也会失败——
+差异不在 Wine 的文件语义，而在**为什么会走到这次删除**。
+
+### 排除掉的（写下来免得再查一遍）
+
+- **不是 Wine 的关闭不同步。** `tools/delprobe`：开(SHARE_READ)+关后删、照 integrator
+  模式开关 6 次后删、映射+解映射+关后删——全部成功；只有句柄真开着时才 32。
+- **不是 msxml 占着。** `tools/xmlholdprobe`：`DOMDocument60` 解析同一份清单，
+  普通路径与 `file:///` URL 两种形式加载后都能删掉。
+- **不是 urlmon。** 日志里 `fixme:urlmon:SecManagerImpl_ProcessUrlAction Unsupported
+  arguments` 只在 `dwFlags||dwReserved` 非零时打印，不改变返回值；实测 `policy 0`
+  = `URLPOLICY_ALLOW`，返回 S_OK。
+- `/proc/<pid>/fd` 里每份清单 4~6 个 fd 是 **Wine 客户端的 unix fd 缓存**，
+  不等于未关闭的 Win32 句柄。真正的判据是服务端的 `close_handle`。
+
+### 真正的触发条件：残留的旧产品清单
+
+`ProgramData\Microsoft\ClickToRun\{PackageGUID}\` 里存的是**上一次集成**的清单集，
+`root\Integration\` 里才是本次要发布的。换产品之后两者不一致：
+
+| 目录 | 含 Excel/PowerPoint/Outlook 清单 |
+|---|---|
+| `root\Integration\` | 有 |
+| `ProgramData\…\{GUID}\`（换产品前） | 没有——只有 ProPlus 那轮的 15 份 |
+
+integrator 因此有一个非空的 Unpublish 组，要逐个删掉旧清单，就撞上自己的句柄。
+而清理失败又让旧清单留在原地，下一轮继续撞——自锁。
+
+把那 15 份陈旧清单挪走（带备份）后单独跑 integrator：**EXIT=0**。
+再跑一轮完整 `/configure`：
+
+| | 之前 | 现在 |
+|---|---|---|
+| `setup.exe /configure` | EXIT=106 | **EXIT=0** |
+| `InstallTaskIntegrateinstall` | Success=false | **Success=true, Result.Code=0** |
+| `ProgramData\{GUID}\` 清单 | 旧的 ProPlus 15 份 | 新的四应用 15 份 |
+
+### 还差一步：应用 ProgID 仍未发布
+
+集成通过了，但 `AppVMachineRegistryStore\Integration\Ownership\Software\Classes`
+下 2842 条里，`Word.*` / `Excel.*` / `PowerPoint.*` / `Outlook.*` **各 0 条**；
+`.docx` / `.xlsx` 只有扩展名本身。所以 `HKCR\.docx` 依旧没有默认值，
+`Word.Document.12` 依旧不存在，文件关联还是接不过来。
+
+这与退出码是两个独立的缺口。暂时把旧 prefix 的 132 个桌面条目清掉了
+（备份在 `~/.cache/wine-altars-desktop-backup-20260920.tar.gz`），
+免得双击文档静默打开另一套 Office；四个应用图标本身可用。
