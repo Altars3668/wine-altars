@@ -344,6 +344,90 @@ static void run_manifest(const WCHAR *path)
     outf(L"\n");
 }
 
+
+/* XSLPattern, which is what a plain DOMDocument selects with, matches
+ * "prefix:name" against the tag as written -- it predates namespaces and does
+ * no URI resolution at all.  XPath does the opposite.  A node whose prefix was
+ * never declared has a name and no URI, so which language is in force decides
+ * whether it can be found again after being put into a document, which is
+ * exactly what Click-to-Run does to the pieces of an AppX manifest. */
+static void run_selection_language(void)
+{
+    static const WCHAR xml[] =
+        L"<Package xmlns:appv=\"http://schemas.microsoft.com/appv/2010/manifest\">"
+        L"<Holder/></Package>";
+    static const WCHAR frag[] = L"<appv:Extensions><appv:Extension Id=\"x\"/></appv:Extensions>";
+    const WCHAR *langs[] = { L"XSLPattern", L"XPath" };
+    size_t l;
+
+    for (l = 0; l < ARRAYSIZE(langs); l++)
+    {
+        IXMLDOMDocument *doc = NULL, *fdoc = NULL;
+        IXMLDOMDocument2 *doc2 = NULL;
+        IXMLDOMElement *root = NULL, *froot = NULL;
+        IXMLDOMNode *found = NULL, *added = NULL;
+        VARIANT_BOOL ok = VARIANT_FALSE;
+        BSTR s;
+        VARIANT v;
+        HRESULT hr;
+
+        outf(L"== 选择语言 %ls\n", langs[l]);
+
+        /* A plain DOMDocument is XSLPattern by default, DOMDocument60 is XPath;
+         * set it explicitly so the two runs differ only in this. */
+        if (FAILED(CoCreateInstance(&CLSID_DOMDocument, NULL, CLSCTX_INPROC_SERVER,
+                                    &IID_IXMLDOMDocument, (void **)&doc)))
+            continue;
+        if (SUCCEEDED(IXMLDOMDocument_QueryInterface(doc, &IID_IXMLDOMDocument2, (void **)&doc2)) && doc2)
+        {
+            BSTR prop = SysAllocString(L"SelectionLanguage");
+            V_VT(&v) = VT_BSTR; V_BSTR(&v) = SysAllocString(langs[l]);
+            hr = IXMLDOMDocument2_setProperty(doc2, prop, v);
+            outf(L"  setProperty(SelectionLanguage) 0x%08lx\n", hr);
+            VariantClear(&v); SysFreeString(prop);
+
+            prop = SysAllocString(L"SelectionNamespaces");
+            V_VT(&v) = VT_BSTR;
+            V_BSTR(&v) = SysAllocString(L"xmlns:appv=\"http://schemas.microsoft.com/appv/2010/manifest\"");
+            IXMLDOMDocument2_setProperty(doc2, prop, v);
+            VariantClear(&v); SysFreeString(prop);
+            IXMLDOMDocument2_Release(doc2);
+        }
+
+        s = SysAllocString(xml);
+        IXMLDOMDocument_loadXML(doc, s, &ok);
+        SysFreeString(s);
+        IXMLDOMDocument_get_documentElement(doc, &root);
+
+        /* The fragment, with no declaration -- exactly what C2R loads. */
+        fdoc = new_doc();
+        s = SysAllocString(frag);
+        IXMLDOMDocument_loadXML(fdoc, s, &ok);
+        SysFreeString(s);
+        IXMLDOMDocument_get_documentElement(fdoc, &froot);
+        if (froot)
+        {
+            outf(L"  片段的根: "); describe((IXMLDOMNode *)froot, L"");
+            IXMLDOMElement_appendChild(root, (IXMLDOMNode *)froot, &added);
+        }
+
+        {
+            BSTR q = SysAllocString(L"//appv:Extensions");
+            hr = IXMLDOMElement_selectSingleNode(root, q, &found);
+            outf(L"  放进文档后 selectSingleNode(\"//appv:Extensions\") 0x%08lx %ls\n",
+                 hr, found ? L"找到" : L"没找到");
+            SysFreeString(q);
+        }
+        if (found) IXMLDOMNode_Release(found);
+        if (added) IXMLDOMNode_Release(added);
+        if (froot) IXMLDOMElement_Release(froot);
+        if (fdoc) IXMLDOMDocument_Release(fdoc);
+        if (root) IXMLDOMElement_Release(root);
+        IXMLDOMDocument_Release(doc);
+        outf(L"\n");
+    }
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -367,6 +451,7 @@ int wmain(int argc, WCHAR **argv)
              L"<Package appv:PackageId=\"9AC08E99\"><Identity/></Package>");
 
     run_cross_document();
+    run_selection_language();
 
     if (argc > 1) { run_manifest(argv[1]); }
 

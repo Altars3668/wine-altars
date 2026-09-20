@@ -8122,3 +8122,146 @@ integrator 因此有一个非空的 Unpublish 组，要逐个删掉旧清单，�
 这与退出码是两个独立的缺口。暂时把旧 prefix 的 132 个桌面条目清掉了
 （备份在 `~/.cache/wine-altars-desktop-backup-20260920.tar.gz`），
 免得双击文档静默打开另一套 Office；四个应用图标本身可用。
+
+## 点「登录」没反应：两个缺失导出，一个盖着另一个
+
+点 Word 的「登录或创建帐户」，面板收起来，然后什么都不发生；两分钟后
+Word 自己死掉。trace 里能看见 `WebView2Loader.dll` 和运行时的
+`EmbeddedBrowserWebView.dll` 都加载了，接着是一段不断重复的
+
+```
+GetEnvironmentVariableW (L"WEBVIEW2_BROWSER_EXECUTABLE_FOLDER" …)
+GetEnvironmentVariableW (L"WEBVIEW2_USER_DATA_FOLDER" …)
+…
+Loaded …EBWebView\x64\EmbeddedBrowserWebView.dll
+```
+
+——环境创建失败、重试、再失败，`msedgewebview2.exe` 一次都没起来。
+
+### 先排除 WebView2 本身
+
+`tools/wv2probe` 直接调 `WebView2Loader.dll` 的两个导出，不经过 Office：
+
+```
+GetAvailableBrowserVersion     : 0x00000000  version=153.0.4234.48
+CreateEnvironmentWithOptions   : 0x00000000 (同步返回)
+handler Invoke                 : hr=0x00000000 env=…
+```
+
+2 秒内起了 2 个 `msedgewebview2` 进程。WebView2 在这个前缀里是好的，
+问题在 Office 走到那一步之前。
+
+同时排除掉的还有特性门：诊断日志 `Primary*.log` 里那条
+`Office.Experimentation.FeatureQueryBatched` 事件带着 1536 个门的取值，
+其中
+
+| 门 | 值 |
+|---|---|
+| `Microsoft.Office.Identity.OneAuthEnabled` | true |
+| `Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled` | true |
+| `Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth` | true |
+| `Microsoft.Office.Identity.BrowserSignIn` | true |
+
+全都已经是对的。顺带纠正一条早先的猜测：`ExternalFeatureOverrides` 里那个
+不带 `.FG.` 的 `Microsoft.Office.Identity.IsWebView2ForOneAuthEnabled`
+**根本不在门控表里**，写不写都一样。
+
+### 真正的第一层：`__C_specific_handler_noexcept` 是个 stub
+
+Word 的 stderr 被同一行刷屏：
+
+```
+wine: Call from … to unimplemented function vcruntime140.dll.__C_specific_handler_noexcept, aborting
+```
+
+Wine 的 `dlls/vcruntime140/vcruntime140.spec` 里它是 `@ stub`，而调用 stub
+会直接 abort 线程。WebView2 的进程内客户端 DLL 拿它当语言处理器，于是
+每次环境创建都死在 unwinder 里，然后被重试——那个循环就是这么来的。
+
+它不是 `__C_specific_handler` 的别名。Office 自带的
+`root\Client\vcruntime140.dll` 里两者 RVA 不同（`0xf270` vs `0xf4c0`），
+反汇编 `0xf270`：
+
+```
+mov  rdi, r8            ; ContextRecord
+mov  rbx, rcx           ; ExceptionRecord
+call 0x250              ; = 0xf270+0x250 = 0xf4c0 = __C_specific_handler
+test byte [rbx+4], 0x66 ; UNWINDING|EXIT_UNWIND|TARGET_UNWIND|COLLIDED_UNWIND
+jne  ret
+cmp  dword [rbx], 0xe06d7363   ; C++ 异常
+jne  ret
+cmp  eax, 1                    ; ExceptionContinueSearch
+jne  ret
+call …; call …; call [terminate]
+int3
+```
+
+即：**先调 `__C_specific_handler`，若答案是「本帧没有处理器」而异常又是
+C++ 异常且不在 unwind 阶段，就 `terminate()`** ——异常正要逃出一个
+`noexcept` 函数。这是 `dlls/msvcrt/except.c` 里现在实现的语义，x86_64 /
+aarch64 / arm 三个分支共用同一段判定；`ucrtbase` 导出、`vcruntime140`
+转发，和真实的那一对排法一致（i386 两边都没有，因为 x86 没有
+`__C_specific_handler`）。
+
+### 第二层：`0xC06D007F`，延迟加载找不到导出
+
+abort 消失之后，底下压着的异常才露出来：
+
+```
+wine: Unhandled exception 0xc06d007f in thread 24 at address … (kernelbase+0xd907)
+wine:   … L"mso30win32client.dll" +0xdea164
+```
+
+`0xC06D007F` = `VcppException(ERROR_SEVERITY_ERROR, ERROR_PROC_NOT_FOUND)`。
+**模块找不到是 `…007E`，这个是模块加载成功但导出不存在**，一下就把范围
+缩小了。`tools/pe-delay-imports.py` 列出 `Mso30win32client.dll` 的全部延迟
+导入，对着 Wine 的导出表比：
+
+| 项 | 判定 |
+|---|---|
+| `api-ms-win-core-winrt-*` | apiset，实际解析到 combase，函数齐全 |
+| `WebView2Loader.dll` | Office 自带，在 Office16 下 |
+| `SLWGA.dll` | Wine 确实没有——但那会是 `…007E` |
+| **`USER32.CalculatePopupWindowPosition`** | **Wine 完全没有这个导出** |
+
+`dlls/user32/user32.spec` 里它是注释掉的 stub，`NtUserCalculatePopupWindowPosition`
+在 `win32u.spec` 里是 `@ stub -syscall`。
+
+这就是 `TrackPopupMenuEx` 做的那套摆位算术，所以实现放在 `dlls/win32u/menu.c`：
+按 `TPM_*` 对齐到锚点 → 与 exclude 矩形相交时，沿**调用方没要求保留的那根轴**
+让开（`TPM_VERTICAL` 保留垂直对齐、左右让；缺省保留水平对齐、上下让）→
+最后整体收进显示器（`TPM_WORKAREA` 则收进工作区）。`winuser.h` 里
+`TPM_WORKAREA`（`0x10000`）和函数声明也一并补上，wow64win 补了 thunk。
+
+`tools/popupprobe` 直接核对十种情形，全部通过：
+
+```
+左上/右下/居中对齐、四角越界贴屏、exclude 默认向下让开、
+TPM_VERTICAL 向右让开、不相交不动、TPM_WORKAREA 贴工作区、
+NULL 锚点返回 FALSE 且 GetLastError=87
+```
+
+### 结果
+
+| | 之前 | 现在 |
+|---|---|---|
+| `unimplemented function` abort | 数千行刷屏 | **0** |
+| 点击后 Word | 两分钟后崩溃 | **存活** |
+| `msedgewebview2` 进程 | 0 | **7** |
+| 顶层窗口 | 无 | `OneAuthWebView2Browser` + `Chrome_WidgetWin_1` 标题 `"Sign in"` 450x519 |
+| 网络 | 无 | 到 `150.171.27.11:443` 的 TLS 连接建立 |
+
+点下去出来的是 Office 自己的 OneAuth WebView2 登录页，不是任何脚本代劳的。
+
+### 测试环境的一个坑：Xvfb 与真实会话
+
+本仓库此前大量可视化测量跑在 `DISPLAY=:77` 上，那是
+`Xvfb :77 -screen 0 1920x1080x24`——**没有 GPU**。WebView2 的 Chromium
+合成器在上面出来的区域，`import -window` 读回来是全黑（截图 43% 黑）；
+而用户真实会话 `DISPLAY=:0`（GNOME Wayland 下的 Xwayland）同样的截图
+**0% 黑**。所以那片黑是 Xvfb 的产物，不是渲染坏了。
+
+反过来，`:0` 上 mutter 不转发 XTEST：`xdotool` 能移动指针（`getmouselocation`
+确认坐标到位），但合成点击送不进 Wine——点「插入」标签页，截图里选中的
+仍是「开始」。所以 **`:0` 只能靠真人点，`:77` 才能做自动化点击验证**。
+两个缺陷本身与显示无关（一个是 CRT 导出、一个是 user32 导出）。

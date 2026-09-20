@@ -44,16 +44,95 @@ static void report_devmode(const DEVMODEW *dm)
            dm->dmPrintQuality, dm->dmYResolution, dm->dmColor, dm->dmDuplex);
 }
 
+
+/* What the property sheet can offer is whatever DeviceCapabilities reports, so
+ * this is the list a user will actually see in the drop-downs -- and the place
+ * to look when something the printer can do is not on offer. */
+static void dump_caps(const WCHAR *name)
+{
+    static const struct { WORD cap; const char *label; } counts[] = {
+        { DC_PAPERS, "纸张" }, { DC_BINS, "纸盒" }, { DC_PAPERNAMES, "纸张名" },
+        { DC_BINNAMES, "纸盒名" }, { DC_MEDIATYPES, "介质类型" },
+        { DC_ENUMRESOLUTIONS, "分辨率" },
+    };
+    size_t i;
+
+    printf("  能力:\n");
+    for (i = 0; i < ARRAYSIZE(counts); i++)
+    {
+        int n = DeviceCapabilitiesW(name, NULL, counts[i].cap, NULL, NULL);
+        printf("    %-10s %s\n", counts[i].label, n < 0 ? "不支持" : "");
+        if (n > 0) printf("      共 %d 项\n", n);
+    }
+    printf("    双面      %d\n", DeviceCapabilitiesW(name, NULL, DC_DUPLEX, NULL, NULL));
+    printf("    逐份      %d\n", DeviceCapabilitiesW(name, NULL, DC_COLLATE, NULL, NULL));
+    printf("    彩色      %d\n", DeviceCapabilitiesW(name, NULL, DC_COLORDEVICE, NULL, NULL));
+    printf("    最大份数  %d\n", DeviceCapabilitiesW(name, NULL, DC_COPIES, NULL, NULL));
+
+    /* The names are what the drop-down shows; print a few so a missing or
+     * untranslated entry is visible rather than inferred. */
+    {
+        int n = DeviceCapabilitiesW(name, NULL, DC_PAPERNAMES, NULL, NULL);
+        if (n > 0)
+        {
+            WCHAR *buf = calloc(n, 64 * sizeof(WCHAR));
+            if (buf && DeviceCapabilitiesW(name, NULL, DC_PAPERNAMES, buf, NULL) == n)
+            {
+                int k;
+                printf("    纸张名(前 8):");
+                for (k = 0; k < n && k < 8; k++) printf(" %s", u8(buf + k * 64));
+                printf("%s\n", n > 8 ? " ..." : "");
+            }
+            free(buf);
+        }
+    }
+}
+
 /* Print one page to a file.  StartDoc's lpszOutput sends the driver's output
  * to a file instead of the spooler, which exercises everything up to the point
  * where the job would be handed to CUPS -- driver, DevMode, fonts and page
  * setup -- and leaves something on disk to look at. */
+/* Settings the property sheet exposes.  They are only worth exposing if they
+ * reach the printer, so -duplex/-copies/-collate/-paper put them into the
+ * DevMode the DC is created with, and the job ticket in the output says whether
+ * they arrived. */
+static int want_duplex, want_copies, want_collate = -1, want_paper;
+
 static void print_to_file(const WCHAR *name, const WCHAR *path)
 {
+    /* An lpszOutput of "-" means print for real, through the spooler and the
+     * print processor -- which is the only path that does manual duplex.
+     * Anything else is written straight out by the driver and never reaches
+     * it. */
     DOCINFOW di = { .cbSize = sizeof(di), .lpszDocName = L"printprobe",
-                    .lpszOutput = path };
-    HDC dc = CreateDCW(NULL, name, NULL, NULL);
+                    .lpszOutput = wcscmp(path, L"-") ? path : NULL };
+    DEVMODEW *dm = NULL;
+    HANDLE pr = NULL;
+    HDC dc;
     int job;
+
+    if (want_duplex || want_copies || want_collate >= 0 || want_paper)
+    {
+        LONG need = DocumentPropertiesW(NULL, NULL, (WCHAR *)name, NULL, NULL, 0);
+        if (need > 0 && OpenPrinterW((WCHAR *)name, &pr, NULL))
+        {
+            dm = calloc(1, need);
+            if (dm && DocumentPropertiesW(NULL, pr, (WCHAR *)name, dm, NULL, DM_OUT_BUFFER) == IDOK)
+            {
+                if (want_duplex)  { dm->dmDuplex = want_duplex;  dm->dmFields |= DM_DUPLEX; }
+                if (want_copies)  { dm->dmCopies = want_copies;  dm->dmFields |= DM_COPIES; }
+                if (want_collate >= 0) { dm->dmCollate = want_collate; dm->dmFields |= DM_COLLATE; }
+                if (want_paper)   { dm->dmPaperSize = want_paper; dm->dmFields |= DM_PAPERSIZE; }
+                /* Let the driver normalise what we just set. */
+                DocumentPropertiesW(NULL, pr, (WCHAR *)name, dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER);
+                printf("  请求: 双面=%d 份数=%d 逐份=%d 纸张=%u\n",
+                       dm->dmDuplex, dm->dmCopies, dm->dmCollate, dm->dmPaperSize);
+            }
+            else { free(dm); dm = NULL; }
+        }
+    }
+
+    dc = CreateDCW(NULL, name, NULL, dm);
 
     printf("\n=== 打印到文件: %s ===\n", u8(path));
     if (!dc) { printf("  CreateDC 失败\n"); return; }
@@ -118,7 +197,10 @@ static void probe_printer(const WCHAR *name, BOOL prompt)
 
     /* Step 3: a device context.  Without one nothing prints at all. */
     {
-        HDC dc = CreateDCW(NULL, name, NULL, dm);
+        HDC dc;
+
+        dump_caps(name);
+        dc = CreateDCW(NULL, name, NULL, dm);
         printf("    CreateDC                   = %s\n", dc ? "成功" : "失败");
         if (dc)
         {
@@ -142,6 +224,10 @@ int wmain(int argc, WCHAR **argv)
         if (!wcscmp(argv[i], L"-prompt")) prompt = TRUE;
         if (!wcscmp(argv[i], L"-dlg"))    dlg = TRUE;
         if (!wcscmp(argv[i], L"-print") && i + 1 < argc) print_to = argv[++i];
+        if (!wcscmp(argv[i], L"-duplex") && i + 1 < argc)  want_duplex  = _wtoi(argv[++i]);
+        if (!wcscmp(argv[i], L"-copies") && i + 1 < argc)  want_copies  = _wtoi(argv[++i]);
+        if (!wcscmp(argv[i], L"-collate") && i + 1 < argc) want_collate = _wtoi(argv[++i]);
+        if (!wcscmp(argv[i], L"-paper") && i + 1 < argc)   want_paper   = _wtoi(argv[++i]);
     }
 
     DWORD needed = 0, count = 0;
