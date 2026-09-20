@@ -96,7 +96,7 @@ static void dump_caps(const WCHAR *name)
  * reach the printer, so -duplex/-copies/-collate/-paper put them into the
  * DevMode the DC is created with, and the job ticket in the output says whether
  * they arrived. */
-static int want_duplex, want_copies, want_collate = -1, want_paper;
+static int want_duplex, want_copies, want_collate = -1, want_paper, want_pages = 1;
 
 static void print_to_file(const WCHAR *name, const WCHAR *path)
 {
@@ -141,21 +141,76 @@ static void print_to_file(const WCHAR *name, const WCHAR *path)
     printf("  StartDoc  = %d%s\n", job, job <= 0 ? " (失败)" : "");
     if (job > 0)
     {
-        static const WCHAR msg[] = L"wine-altars printprobe 测试页 / test page";
-        RECT r = { 200, 200, GetDeviceCaps(dc, HORZRES) - 200, 600 };
+        /* A big page number on each sheet, and a mark near one corner: between
+         * them the order the pages came out in and which way up each one is
+         * are both readable off the paper, which is the only place manual
+         * duplex can be checked. */
+        HFONT big = CreateFontW(400, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                                0, 0, 0, 0, L"Arial");
         HFONT font = CreateFontW(72, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                                  0, 0, 0, 0, L"SimSun");
-        HGDIOBJ old = SelectObject(dc, font);
+        int page;
 
-        printf("  StartPage = %d\n", StartPage(dc));
-        DrawTextW(dc, msg, -1, &r, DT_LEFT | DT_WORDBREAK);
-        Rectangle(dc, 200, 700, GetDeviceCaps(dc, HORZRES) - 200, 900);
-        printf("  EndPage   = %d\n", EndPage(dc));
-        SelectObject(dc, old);
+        for (page = 1; page <= want_pages; page++)
+        {
+            WCHAR num[16], msg[128];
+            RECT r = { 200, 1200, GetDeviceCaps(dc, HORZRES) - 200, 1700 };
+            HGDIOBJ old;
+
+            printf("  StartPage %d = %d\n", page, StartPage(dc));
+
+            old = SelectObject(dc, big);
+            swprintf(num, ARRAYSIZE(num), L"%d", page);
+            TextOutW(dc, 300, 300, num, (int)wcslen(num));
+            SelectObject(dc, font);
+            swprintf(msg, ARRAYSIZE(msg),
+                     L"printprobe 第 %d 页 / page %d  —— 此角为页首左侧", page, page);
+            DrawTextW(dc, msg, -1, &r, DT_LEFT | DT_WORDBREAK);
+            /* top-left corner mark: tells a turned sheet from an unturned one */
+            Rectangle(dc, 60, 60, 260, 160);
+            SelectObject(dc, old);
+
+            printf("  EndPage   %d = %d\n", page, EndPage(dc));
+        }
         DeleteObject(font);
+        DeleteObject(big);
         printf("  EndDoc    = %d\n", EndDoc(dc));
     }
     DeleteDC(dc);
+}
+
+/* Store settings as the printer's own default, the way the Printers folder
+ * does.  Whether they are still there when the printer is next opened is the
+ * whole question: the driver used to re-derive its DevMode from the PPD on
+ * every open and save the result over this. */
+static void set_printer_default(const WCHAR *name)
+{
+    PRINTER_DEFAULTSW def = { NULL, NULL, PRINTER_ALL_ACCESS };
+    PRINTER_INFO_9W info9 = { 0 };
+    DEVMODEW *dm = NULL;
+    HANDLE pr = NULL;
+    LONG need;
+
+    if (!OpenPrinterW((WCHAR *)name, &pr, &def))
+    {
+        printf("\n设为默认: OpenPrinter 失败 %lu\n", GetLastError());
+        return;
+    }
+    need = DocumentPropertiesW(NULL, pr, (WCHAR *)name, NULL, NULL, 0);
+    if (need > 0) dm = calloc(1, need);
+    if (!dm || DocumentPropertiesW(NULL, pr, (WCHAR *)name, dm, NULL, DM_OUT_BUFFER) != IDOK)
+    {
+        printf("\n设为默认: 取不到 DevMode\n");
+        free(dm); ClosePrinter(pr); return;
+    }
+    if (want_duplex) { dm->dmDuplex = want_duplex; dm->dmFields |= DM_DUPLEX; }
+    if (want_paper)  { dm->dmPaperSize = want_paper; dm->dmFields |= DM_PAPERSIZE; }
+    info9.pDevMode = dm;
+    printf("\n设为默认 %s: 双面=%d 纸张=%u -> SetPrinter = %s\n", u8(name),
+           dm->dmDuplex, dm->dmPaperSize,
+           SetPrinterW(pr, 9, (BYTE *)&info9, 0) ? "成功" : "失败");
+    free(dm);
+    ClosePrinter(pr);
 }
 
 static void probe_printer(const WCHAR *name, BOOL prompt)
@@ -217,8 +272,8 @@ static void probe_printer(const WCHAR *name, BOOL prompt)
 
 int wmain(int argc, WCHAR **argv)
 {
-    BOOL prompt = FALSE, dlg = FALSE;
-    const WCHAR *print_to = NULL;
+    BOOL prompt = FALSE, dlg = FALSE, setdef = FALSE;
+    const WCHAR *print_to = NULL, *printer = NULL;
     for (int i = 1; i < argc; i++)
     {
         if (!wcscmp(argv[i], L"-prompt")) prompt = TRUE;
@@ -228,6 +283,17 @@ int wmain(int argc, WCHAR **argv)
         if (!wcscmp(argv[i], L"-copies") && i + 1 < argc)  want_copies  = _wtoi(argv[++i]);
         if (!wcscmp(argv[i], L"-collate") && i + 1 < argc) want_collate = _wtoi(argv[++i]);
         if (!wcscmp(argv[i], L"-paper") && i + 1 < argc)   want_paper   = _wtoi(argv[++i]);
+        if (!wcscmp(argv[i], L"-pages") && i + 1 < argc)   want_pages   = _wtoi(argv[++i]);
+        if (!wcscmp(argv[i], L"-printer") && i + 1 < argc) printer = argv[++i];
+        if (!wcscmp(argv[i], L"-setdefault")) setdef = TRUE;
+    }
+
+    if (setdef)
+    {
+        WCHAR def[256];
+        DWORD len = ARRAYSIZE(def);
+        if (printer) set_printer_default(printer);
+        else if (GetDefaultPrinterW(def, &len)) set_printer_default(def);
     }
 
     DWORD needed = 0, count = 0;
@@ -255,7 +321,8 @@ int wmain(int argc, WCHAR **argv)
     {
         WCHAR def[256];
         DWORD len = ARRAYSIZE(def);
-        if (GetDefaultPrinterW(def, &len)) print_to_file(def, print_to);
+        if (printer) print_to_file(printer, print_to);
+        else if (GetDefaultPrinterW(def, &len)) print_to_file(def, print_to);
         else printf("\n没有默认打印机\n");
     }
 
