@@ -7620,3 +7620,147 @@ mov  rax,[rcx]            # ← 崩在这里，不检查返回值
   `SetNotifyInterface` 先问 Callback2、不成再退回 Callback，这条 err 可能只是噪音。
 - `apartment_add_dll couldn't load in-process dll msoxmlmf.dll`（64 次）——
   那个文件在 prefix 里根本不存在。
+
+## 那个 IID 是 `IPackageManager6`，前面判断错了
+
+上一节说「那个 IID 只出现在 `OfficeClickToRun.exe` 自己里，是 C2R 的私有接口」——不对。
+当时只在 prefix 的一部分目录里搜了，而且搜错了前缀（搜的是 `~/.wine-office`，
+C2R 装的是 `~/.wine-c2r-test`）。重搜一遍，`{0847E909-53CD-4E4F-832E-57D180F6E447}`
+在三个文件里各出现一次：`OfficeClickToRun.exe`，以及两份
+`Microsoft.WindowsAppRuntime.dll`。在后者的 `.rdata` 里它夹在一张 IID 表中间，
+前后是 `IPackageManager3`、`IPackageManager2`、`IPackageManager5`。
+
+还有一个更快的判据我一开始没用上：GUID 第三段的首字符是版本位。参数化的
+`IAsyncOperationWithProgress<T,P>` PIID 是 SHA-1 派生的，版本位必然是 `5`；
+这个 IID 是 `4e4f`，版本位 `4`，即手工分配的固定接口 IID。我却因为它在
+C++/WinRT 二进制里紧邻 `IAsyncOperationWithProgress` 的模板符号，就先入为主
+判成了 PIID，白绕一圈。
+
+对上 `microsoft/windows-rs` 生成的绑定，答案是
+**`Windows.Management.Deployment.IPackageManager6`**，再用 `tpn/winsdk-10` 里
+10.0.16299.0 的 `winrt/windows.management.deployment.idl` 原文核对：contract 5.0，
+uuid 一致，六个方法，第一个正是 `ProvisionPackageForAllUsersAsync`——
+vtable 槽位 6，`mov rax,[rax+0x30]` 取的就是它。
+
+### 完整的崩溃链
+
+LASTRUN 要把 Office 的 MSIX 附加组件集成进来。它做的事，按日志顺序：
+
+```
+FindPackagesByPackageFamilyName(Microsoft.WritingAssistant_8wekyb3d8bbwe)   E_NOTIMPL
+FindPackagesByPackageFamilyName(Microsoft.Outlook.UriHandler_8wekyb3d8bbwe) E_NOTIMPL
+Uri.CreateUri(...\Integration\Addons\OPushUtil.msix)                        OK
+RoGetActivationFactory(Windows.Management.Deployment.StagePackageOptions)   0x80040154
+package_manager_QueryInterface {0847e909-...}                               E_NOINTERFACE
+wine: Unhandled page fault on read access to 0000000000000000 at 14075707C
+```
+
+新 API（`StagePackageOptions`）Wine 没有，C2R 于是回退到
+`IPackageManager6::ProvisionPackageForAllUsersAsync`；Wine 的 `PackageManager`
+只实现了 `IPackageManager` 和 `IPackageManager2`，QI 失败，而 C2R 不检查返回值。
+
+### 问题不在 C2R 不检查返回值
+
+它在 Windows 上不会挨这一下：QI 成功，调用返回一个操作对象，对象自己说部署成没成。
+Wine 这边的桩打破了这个契约——返回 `E_NOTIMPL`，`[out]` 参数原封不动——
+于是调用方按契约去解引用一个从没被写过的指针。
+
+所以修法是**把问题答了，而不是拒答**。Wine 里没有 AppX 包存储：一个包都没注册，
+一个也部署不了。这两件事都有诚实的 WinRT 表达方式：
+
+- `FindPackages*` 返回**空的 `IIterable<Package>`**。零个包匹配，因为确实零个包存在。
+- `FindPackageBy*FullName` 返回 `S_OK` + `*package = NULL`，即"没找到"。
+- 每个 `*Async` 返回一个**已经走到 `AsyncStatus_Error` 的操作**，
+  `IAsyncInfo::ErrorCode` 是 `ERROR_NOT_SUPPORTED`，`GetResults()` 给出一个
+  `DeploymentResult`，里面是同一个错误码和一句说明没有部署任何包的 ErrorText。
+  微软自己的部署示例就是 `if (op.Status == AsyncStatus.Error) { op.GetResults().ErrorText }`，
+  失败的部署走的正是这条路。调用方无论从哪个角度看，看到的都是"没成"。
+- 其余仍是桩的方法，至少把 `[out]` 置 NULL，下一个不看 HRESULT 的调用方拿到的
+  是 NULL，而不是它自己栈上的残留值。
+
+`IPackageManager6` 按 SDK idl 补齐，连带补上签名需要的
+`AddPackageByAppInstallerOptions` 枚举和 `PackageVolume` 运行时类。
+
+### 结果
+
+`tools/appxprobe` 走一遍 C2R 走的同一条路：`QI IPackageManager6` 0x0，
+空集合可正常遍历（First / HasCurrent → 0 个），异步操作 status=Error、
+code=0x80070032，完成回调恰好触发一次，`DeploymentResult.ExtendedErrorCode`
+与之一致。
+
+真实安装里也对上了——`WINEDEBUG=+appx` 的日志显示 C2R 逐字段读了我填的东西：
+
+```
+package_manager_QueryInterface {0847e909-...}              → S_OK
+package_manager6_ProvisionPackageForAllUsersAsync L"aimgr_8wekyb3d8bbwe"
+async_QueryInterface {00000036-...}   (IAsyncInfo)
+async_info_get_Status
+async_GetResults
+deployment_result_get_ExtendedErrorCode
+deployment_result_get_ErrorText
+package_manager_FindPackagesByPackageFamilyName L"aimgr_8wekyb3d8bbwe"   ← 接着处理下一个
+```
+
+处理了三个包（`aimgr`、`Microsoft.Office.ActionsServer`、
+`Microsoft.OfficePushNotificationUtility`），一次没崩。
+
+**`setup.exe /configure` 第一次以 `EXIT=0` 退出**，整个安装零 page fault。
+此前是 exit 5 / 106，且 LASTRUN 必崩。
+
+## 下一个卡点：App-V 虚拟注册表是空的
+
+装完了，Word 也能起来（主窗口 `Microsoft Word 16.0`），但仍报
+「很抱歉，此功能看似已中断，并需要修复」。
+
+这次能指到具体位置。C2R 自己的损坏检查就报了：
+
+```
+Office.ClickToRun.CorruptionCheck  Success: false  Result.Code: 15
+Result.Type: "CorruptFileCount"
+Data.MismatchSizeFiles: "root\vreg\dcfmui.msi.16.zh-cn.vreg.dat|
+   root\vreg\office32mui.msi.16.zh-cn.vreg.dat|root\vreg\officemui.msi.16.zh-cn.vreg.dat|
+   root\vreg\osmmui.msi.16.zh-cn.vreg.dat|root\vreg\osmuxmui.msi.16.zh-cn.vreg.dat"
+```
+
+`root/vreg/` 下 15 个 `.vreg.dat`，**每一个都正好 8192 字节**——用 hivex 打开是
+合法的 regf，但里面只有 `ROOT\REGISTRY` 两级空键。`Result.Code: 15` 就是这 15 个。
+
+这批 hive 装的是 Office 的 COM 注册。真机上：
+
+| | C2R 装的 prefix | 真机 |
+|---|---|---|
+| `HKLM\...\ClickToRun\REGISTRY` 键数 | 6 | 29,791 |
+| `ClickToRun\AppVMachineRegistryStore` | 2,863 | 14,922 |
+| `HKLM\Software\Microsoft\Office` | 2,913 | 42,085 |
+| `root/vreg` 合计 | 122,880 字节（15×8192） | 数 MB |
+| `Word.Application` ProgID | 无 | 有 |
+
+真机上 `Word.Application` 在两处：vreg hive 里的
+`HKLM\Software\Classes\Word.Application`，以及暂存到真实注册表的
+`ClickToRun\REGISTRY\MACHINE\Software\Classes\Word.Application`。两处这里都没有。
+Word 起得来是因为文件都在（VFS 有 3.3 GB），但凡要走 COM 注册的功能都落空。
+
+排除掉的几条：
+
+- **不是 C2RManifest 生成的。** 全部 `C2RManifest.*.xml` 加起来只有 1,988 条
+  `<Registry>`，且完全没有 Word 的 CLSID `{000209FF-…}`。真机单是 word 那个 hive
+  导出就 938 KB。
+- **不是 Wine 的 hive API 桩。** `NtRestoreKey`、`RegRestoreKeyW`、`RegLoadAppKeyW`
+  确实都是"返回成功但什么都不做"的桩（`RegLoadAppKeyW` 还把 `*result` 填成
+  `0xdeadbeef`），本来是很像的嫌疑——但四份安装日志里这些 FIXME **一次都没出现**，
+  它们没被调用。Office 是用自己的 regf writer 直接写文件的。
+- **不是 CabManager 那两条报错。** 日志自己说了
+  「catalog errors are non-fatal, continuing」。
+- **重新流式下载不会带回内容。** 删掉 word 的两个 `.vreg.dat` 再跑一遍
+  `/configure`，它们回来了，仍是 8192；而且 15 个文件的 mtime 是**同一瞬间**
+  （22:15:59），包括我没删的那些——是某一步一次性把它们全写成了空的，
+  不是流式下载逐个落盘。
+- **`scenario=Repair RepairType=QuickRepair` 空跑。** exit 0，vreg 一字节没变。
+
+C2R 二进制里相关的字符串指向这一步：`About to publish vReg`、
+`Unable to find merged VReg file, recreating virtual registry...`、
+`C2R::OfficeContainer::CopyVRegMergedFileToVRegMergedDirectory`。
+下一步是拿 `WINEDEBUG=+file` 抓这一瞬间到底在读什么、写什么。
+
+作为对照：`~/.wine-altars-office`（从真机导入的那个 prefix）这三项分别是
+11 MB / 26,086 / 有——但那是拷来的，不是 C2R 装出来的，不能拿来充数。
