@@ -8329,3 +8329,74 @@ react-native-win32+0x3170f9 → kernelbase RaiseException
 
 RN 抛的是什么异常、从哪抛的，尚未定位（`react-native-win32+0x3170f9` 调
 `RaiseException`）。下一步从那里入手，而不是再查字体或消息泵。
+
+## 那个异常是什么：三个没注册的 WinRT 类
+
+接上节。RN 抛的是哪个异常、从哪抛的，这次查清了。
+
+### 从异常记录直接读出类型名
+
+`0xE06D7363` 的记录里，`ExceptionInformation[2]` 是 `ThrowInfo` 指针、`[3]` 是
+抛出模块的映像基址，所以 `[2]-[3]` 就是 RVA，而 `ThrowInfo` 往下全是该模块
+文件里的静态数据。`scripts/pe-throwinfo.py` 顺着
+`ThrowInfo → CatchableTypeArray → CatchableType → TypeDescriptor` 走下去：
+
+```
+$ pe-throwinfo.py react-native-win32.dll 0x57fb18
+    .?AUhresult_class_not_registered@winrt@@
+    .?AUhresult_error@winrt@@
+```
+
+**`winrt::hresult_class_not_registered`** ——C++/WinRT 在 `RoGetActivationFactory`
+返回 `REGDB_E_CLASSNOTREG` 时抛的那个。
+
+### 和激活失败一一对上
+
+`+seh` 里失败与抛出是同线程紧邻的：
+
+```
+071c:err:combase:RoGetActivationFactory Failed to find library for L"Windows.System.DispatcherQueue"
+071c:trace:seh:dispatch_exception code=e06d7363   info[2]-info[3] = 0x57FB18
+```
+
+Word 一轮里 RN 要的、Wine 没有的类共三个：
+
+| 类 | 状态 |
+|---|---|
+| `Windows.System.DispatcherQueue` | **本轮已实现**（`dlls/coremessaging`），激活失败 4 → 0 |
+| `Windows.Networking.Sockets.MessageWebSocket` | 仍缺 |
+| `Windows.Web.Http.Filters.HttpBaseProtocolFilter` | 仍缺，**它是现在直接引爆循环的那个** |
+
+补完 `DispatcherQueue` 之后，AV 风暴前的最后两条变成：
+
+```
+02f4: Failed ... MessageWebSocket        → e06d7363 (RVA 0x57FB18)
+02f4: Failed ... HttpBaseProtocolFilter  → e06d7363 (RVA 0x57FB18)
+02f4: c0000005 ×1,400,000 ...
+```
+
+### 顺带排除：Wine 的 C++ 异常处理没问题
+
+那个 `ThrowInfo` 列了 `hresult_error` 作为可捕获类型，所以
+`catch (winrt::hresult_error const&)` 本该接住。栈里又出现过
+`__CxxFrameHandler4`（MSVC 2019+ 的压缩 EH 格式），一度怀疑是 Wine 匹配不上
+catch。但 `dlls/msvcrt/handler4.c` 里那几个 FIXME
+（`unsupported flags` / `unknown header` / `function ip_map not found` /
+`unsupported ret addr`）**一次都没触发**——Wine 的 EH 是对的，
+React Native 确实就是没有 catch。
+
+### 现在的处理：不加载这个宿主
+
+两个 WinRT 类要从 IDL 写起（`include/` 里连 `windows.web.http.idl` 都没有），
+不是能顺手补完的。在补上之前，`scripts/disable-office-reactnative.sh`
+用 Wine 的 `DllOverrides` 把 `react-native-win32` 置空，让 `LoadLibrary` 失败，
+Office 当作可选组件缺席处理：
+
+| | 之前 | 禁用之后 |
+|---|---|---|
+| 启动 90 秒后 CPU | 100% | **0–1%** |
+| 运行 225 秒后开字体下拉 | 不响应 | **CPU 1%，列表正常** |
+| 再点一次 | 关不掉 | **正常收起** |
+
+代价是基于 React Native 的那几个 Office 界面不出现——而它们今天本来也不能用，
+只会把整个进程拖死。脚本带 `--undo`，等 Wine 补上那两个类之后撤掉即可。
