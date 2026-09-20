@@ -7934,3 +7934,37 @@ Word 自己也诊断到了——第三次启动时它问「最后两次启动时
   磁盘上也在），而注册表把 COM 类指向了 `Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll`。
 
 下一步是定位那个真正致命的失败。
+
+### 那个弹窗是授权对话框，不是新缺陷
+
+Office 自己的诊断日志给出了因果链。它在
+`%LOCALAPPDATA%\Temp\Diagnostics\WINWORD\Primary*.log`，是**可读的 TSV**
+（16 MB 预分配，有效内容几百 KB），每行一个 `SendEvent {...}`：
+
+```
+03:17:51.314  Office.Word.FileNew.CreateNewFile                     ← 新文档已建好
+03:17:51.796  Office.Telemetry.LoadXmlRules
+03:17:51.800  Office.Licensing.FullValidation   Success=false
+              Result.Code=-1073418219 (0xC004F015)
+              Data.Licenses=""  Data.LicenseStatuses=""
+              Data.ValidAcids="{3AD61E22-E4FE-497F-BDB1-3E51BD872173}"
+03:17:51.809  Office.Performance.Boot                               ← 启动完成
+03:17:52.190  Office.UX.NUIDialog.DialogBootTime  DialogId=4187 IsModal=true
+```
+
+`0xC004F015` 是"未安装许可证"。`Licenses` 和 `LicenseStatuses` 都是空字符串——
+这个 prefix 从来没有登录过，所以**一个许可证都没有**。这不是 Wine 的缺陷，
+是真实状态。
+
+而 `scripts/office-sign-in.sh` 的注释里，这个对话框早就写清楚了：
+
+> the "Sign in" button lives behind the licensing dialog, which quits Word if
+> you dismiss it
+
+也就是说，C2R 装出来的这个 prefix 现在**和之前那个从真机导入的 prefix 处在同一状态**：
+安装本身是完整的，缺的是登录换取许可证这一步，而那条路本仓库已经有工具
+（`scripts/office-sign-in.sh`、`scripts/mint-wam-tokens.sh`、`scripts/verify-signin.sh`）。
+
+顺带记下诊断日志这个入口：`Diagnostics\WINWORD\Primary*.log` 里直接有
+`Office.Licensing.FullValidation` 的 HRESULT、`Office.Performance.Boot` 的各段耗时、
+`Office.UX.NUIDialog.DialogBootTime` 的 DialogId——比从 `WINEDEBUG` 里猜快得多。
