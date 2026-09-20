@@ -7764,3 +7764,70 @@ C2R 二进制里相关的字符串指向这一步：`About to publish vReg`、
 
 作为对照：`~/.wine-altars-office`（从真机导入的那个 prefix）这三项分别是
 11 MB / 26,086 / 有——但那是拷来的，不是 C2R 装出来的，不能拿来充数。
+
+### C2R 自己的数据库说得很清楚
+
+`C:\ProgramData\Microsoft\ClickToRun\ProductReleases\<PRID>\operations.db` 是一个
+**普通的 SQLite 库**（旁边有 `-journal`/`-wal`，`sqlite3` 直接能开），21 MB，
+里面是整个包的关系模型：`Files` 27,255 行、`Paths` 26,501、`Hashes` 82,440
+（带 `Size`）、`FileTasks` 20,410（带 `State`/`Disposition`）。
+不用再从 100 MB 的 trace 里猜，直接查就行。
+
+查 vreg 文件应该多大：
+
+```sql
+select d.Name||'\'||p.Name, h.Size from Paths p
+  join Directories d on d.directory_id=p.directory_id
+  join Files f on f.target_path=p.path_id
+  join Hashes h on h.hash_id=f.hash_id
+ where p.Name like '%vreg%' order by h.Size desc;
+```
+
+```
+  2097152  root\vreg\office.x-none.msi.16.x-none.vreg.dat
+   786432  root\vreg\word.x-none.msi.16.x-none.vreg.dat
+   131072  root\vreg\wordmui.msi.16.zh-cn.vreg.dat
+    ...
+```
+
+磁盘上这 15 个全是 8192。
+
+再查 `FileTasks`，一眼看出 C2R 对它们做了什么：
+
+```
+   op=1  State=2  Disp=2   n=10205      ← 首次安装：全部正常安装，含 vreg（786432 字节那份）
+   op=2  State=1  Disp=1   n=10190      ← 本次操作：待处理
+   op=2  State=2  Disp=8   n=15         ← 本次操作：恰好这 15 个 vreg，另一种处置方式
+```
+
+`Disposition=8` 这一类**只有这 15 个文件**。也就是说 C2R 并不从包里复制它们，
+而是**就地重新生成**——从它暂存在真实注册表里的那棵虚拟注册表
+（`HKLM\Software\Microsoft\Office\ClickToRun\REGISTRY`）。
+真机上那棵树 29,791 个键，这里 6 个，所以生成出来是空的。
+
+两件事因此确定了：
+
+1. **首次安装时这些 hive 是有内容的**（op=1 的任务 State=2 完成，Size=786432），
+   后来被某一步一次性写成空的。
+2. **真正断掉的是"把 hive 灌进 `ClickToRun\REGISTRY`"这一步**，发生在它们还有内容的时候。
+
+还要说明一点：前面写「Wine 的 hive API 一次都没被调用」是根据日志里没有
+`NtRestoreKey` / `RegLoadAppKeyW` / `RegRestoreKeyW` 的 FIXME。这三个确实是
+"返回成功但什么都不做"的桩（`RegLoadAppKeyW` 还把 `*result` 填成 `0xdeadbeef`），
+但 **`NtLoadKey` 和 `NtSaveKey` 不是桩、只有 TRACE 没有 FIXME**，默认日志里本来
+就看不见——它们有没有被调用，前面那个证据什么也没证明。
+
+而 Wine 的 `load_keys()` 只认自己那行 `WINE REGISTRY Version 2` 开头；喂给它一个
+真正的 `regf` 二进制 hive，它返回 `STATUS_NOT_REGISTRY_FILE` 就完了，不打印任何东西。
+所以"C2R 调了 `NtLoadKey`、Wine 静默拒绝"完全说得通，得用 `WINEDEBUG=+reg` 实测才能分清。
+
+集成侧的缺口也量出来了。App-V 清单
+（`ClickToRun\MachineData\Catalog\Packages\{…}\{…}\Manifest.xml`，1.6 MB）
+声明了 1,046 个 `<Extension>`（906 个 `AppV.COM`、129 个 `AppV.FileTypeAssociation`），
+其中 191 个唯一 ProgId，包含全部 `Word.*`。实际写进
+`AppVMachineRegistryStore\Integration\Ownership\Software\Classes` 的只有 126 个，
+**`Word.*` 27 个一个都没有**（真机 27 个齐全）；扩展名也只有 `.docm` `.docx`，
+真机还有 `.doc` `.dochtml` `.docmhtml` `.docxml`。
+
+（注意别拿真机的 761 条总数直接比：真机装的是整套 Office，这个 prefix 只装了 Word，
+其余全在 `ExcludedApps` 里。要比就按 `Word.*` 比。）
