@@ -8400,3 +8400,68 @@ Office 当作可选组件缺席处理：
 
 代价是基于 React Native 的那几个 Office 界面不出现——而它们今天本来也不能用，
 只会把整个进程拖死。脚本带 `--undo`，等 Wine 补上那两个类之后撤掉即可。
+
+## 第二个卡死：GDI 字体锁被泄漏，同一线程自己等自己
+
+RN 那个满载循环挡掉之后，Word 仍然会卡——但这次 CPU 是 **0%**，是等待而不是空转。
+两者是独立的两个问题。
+
+### 抓法
+
+`dlls/win32u/font.c` 的 `font_lock` 是非递归的 `PTHREAD_MUTEX_INITIALIZER`。
+把 22 处 `pthread_mutex_lock( &font_lock )` 换成一个带 5 秒超时的包装，超时就报告
+持有者线程与持有它的函数；再在「持有者就是自己」时用 `backtrace()` 打出
+**取锁时**和**再次取锁时**两条 unix 侧调用栈。
+
+命中后 49 次告警全部一模一样，日志到此为止——**永久自死锁**：
+
+```
+thread 0260 in font_SelectFont has waited over 5s; held by thread 0260 in font_GetGlyphOutline
+```
+
+### 两条栈解出来的位置
+
+用带调试信息的 `win32u.so` 对 `backtrace()` 的地址做 `addr2line`：
+
+| | 调用链 |
+|---|---|
+| **取锁处** | `NtGdiExtTextOutW` → `dibdrv_ExtTextOut`(graphics.c:934) → `cache_glyph_bitmap`(graphics.c:780) → `font_GetGlyphOutline`(font.c:4209) **取锁后没有解锁** |
+| **再取处** | `NtGdiSelectFont` → `dibdrv_SelectFont`(graphics.c:955) → `font_SelectFont`(font.c:4720) |
+
+两条栈的底都是 `NtUserDispatchMessage`，是两次不同的消息派发——所以不是嵌套调用，
+而是前一次**把锁带走了**。`font_GetGlyphOutline` 本身只有
+
+```c
+font_lock_acquire();
+ret = get_glyph_outline( ... );
+font_lock_release();
+```
+
+没有提前返回，所以只能是 `get_glyph_outline` 没有正常返回。
+
+### 现场线索
+
+每次死锁前紧挨着都是同样三行：
+
+```
+fixme:font:get_nearest_charset returning DEFAULT_CHARSET ...
+  file = L"\??\C:\users\crossover\AppData\Local\Microsoft\FontCache\4\PreviewFont\flat_officeFontsPreview_4_42.ttf"
+```
+
+`get_nearest_charset` 只在 `select_font` 里被调用，所以那是三次**成功**的选字体。
+那个文件是 Office 为字体下拉列表生成的**预览字体**（841 KB，`glyf` 表 836 KB，
+约 555 个字形，每个字形是一整条字体名的轮廓）——和「滚字体列表就卡」完全对应。
+
+### 被排除的机制
+
+怀疑过「写用户缓冲区时页错误 → Wine 在 syscall 边界捕获 → unix 栈帧作废 →
+解锁不执行」。`tools/glyphlockprobe` 专门测这个：故意让 `GetGlyphOutlineW` 写进
+保护页，再做一次普通的 `SelectObject(字体)`。结果是那次调用**直接返回 0xC0000005**
+（Wine 在边界上捕获并回传状态），随后的选字体正常——**这条路径不泄漏锁**。
+所以机制另有其因，仍在查。
+
+### 状态
+
+诊断已经能在死锁瞬间打印两条栈，并记下「哪个字形请求没回来」
+（`glyph_in_flight`）。在 `:77` 上人工滚动字体列表 80 次没能复现，
+用户的真实会话能稳定复现，下一步靠那边的现场取这条记录。
