@@ -7968,3 +7968,81 @@ Office 自己的诊断日志给出了因果链。它在
 顺带记下诊断日志这个入口：`Diagnostics\WINWORD\Primary*.log` 里直接有
 `Office.Licensing.FullValidation` 的 HRESULT、`Office.Performance.Boot` 的各段耗时、
 `Office.UX.NUIDialog.DialogBootTime` 的 DialogId——比从 `WINEDEBUG` 里猜快得多。
+
+## 登录入口到不了，是因为 `SLInstallLicense` 把产品定义扔了
+
+把两个功能门打开、WebView2 运行时装好之后，Word 仍然弹「很抱歉，Word 遇到错误…
+是否希望我们立即修复?」，而且**根本没有尝试加载登录界面**——遥测里从
+`Office.Licensing.FullValidation`（失败，`0xC004F015`）直接跳到
+`Office.UX.NUIDialog.DialogBootTime`（`DialogId=4187`，`IsModal=true`），
+中间没有任何 SDX 事件。
+
+`0xC004F015` 是 `SL_E_PRODUCT_SKU_NOT_INSTALLED`，字面意思是"这个产品没装"。
+而 `tools/sppcprobe/README.md` 里 2026-09-07 记的原生对照是：
+
+> 参考机整个 Office App 的评估返回 S_OK，但结果包含 32 条未授权记录和一条通知记录
+
+同一个调用，Windows 答"这是你的 33 条 SKU，全部未授权"，Wine 答"这个应用根本没装"。
+Office 把后者读成"安装损坏"，于是给修复对话框而不是登录界面——登录入口永远到不了。
+
+### 产品定义是安装期交过来的
+
+`WINEDEBUG=+slc` 跟踪一次安装：
+
+```
+SLGetSLIDList (...) stub, returning an empty list
+SLInstallLicense (0000000000000001,11181,...) stub, accepting
+SLInstallLicense (0000000000000001,11185,...) stub, accepting
+... 共 54 次
+```
+
+追踪里 30 个不同的字节数，**30 个全部能在 `root\Licenses16\` 里找到同样大小的文件**。
+也就是说 C2R 就是在用这个 API 把 `*.xrm-ms` 逐份交给许可子系统，
+而 Wine 的 "accepting" 是收下就扔。
+
+这类许可是**产品定义**：PPD 标题写明它描述哪个 SKU（`Office<GUID> PPD License`），
+`sl:appId` 是应用，`tm:editionId` 是版本名，另一些文件带 `ApplicationBitmap`
+说明该 SKU 覆盖哪些应用。里面没有密钥、没有权利、没有账户、没有设备绑定，
+登记它不改变任何状态——目录照样把每个 SKU 报成 `UNLICENSED` /
+`SL_E_PKEY_NOT_INSTALLED`，这就是事实。
+
+`dlls/sppc/license.c` 解析 blob（UTF-8 或两种字节序的 UTF-16），拒绝 DTD 与实体声明，
+按**本地名**匹配元素以免去猜命名空间前缀。位图和 PPD 分散在不同文件、到达顺序不定，
+所以位图先存在 `Software\Wine\SPPC\Bitmaps` 下，等 SKU 自己注册时再合并——
+这样 `sppc_catalog_status` 永远不会看见一个没有 `Name` 的半成品 SKU 键。
+
+`tools/slinstallprobe` 手工装一份再按 Word 的方式评估，10 秒出结果：
+
+| | 之前 | 之后 |
+|---|---|---|
+| `SLConsumeRight`（Office 应用） | `0xC004F015` 产品未安装 | `0xC004F013` 权利未授予 |
+| `SLGetLicensingStatusInformation` | 无记录 | S_OK，**17 条全部 UNLICENSED** |
+| licensed / grace / notification | — | **0 / 0 / 0** |
+
+### 还发现装错了产品
+
+参考机 winref 的 SPPC 目录 34 个键全是 `Office16O365HomePremR_*`，
+`ProductReleaseIds` 也以 `O365HomePremRetail` 为主——订阅是 **Microsoft 365
+家庭版/个人版**。而这个 prefix 之前装的是 `O365ProPlusRetail`（企业应用版），
+两者不是一个产品，登录了也拿不到许可证。
+
+改用 `<Remove>` O365ProPlusRetail + `<Add>` O365HomePremRetail 重装，
+并同时装上 Excel、PowerPoint、Outlook。装完 `root` 4.4 GB，四个主程序齐备
+（Excel 78 MB、Outlook 47 MB）；`INTEGRATE_INSTALL` 仍失败（exit 106，待查），
+但 STREAM / STAGEREGISTRY / 损坏检查都通过。
+
+### 结果
+
+重跑一次 `/configure`，`SLInstallLicense` 被调用 57 次，注册了 17 个
+`Office16O365HomePremR_*` SKU。Word 启动后**不再有修复对话框**，
+出现的是 Office 自己的原生登录界面：
+
+```
+登录后即可开始使用 Word
+  使用工作、学校或个人 Microsoft 帐户信息
+  使用 Word、Excel、PowerPoint 和 Outlook 创建和协作
+  使用 OneDrive 云存储跨设备保存和共享文档
+  [登录或创建帐户]   我有产品密钥
+```
+
+Office 仍未激活，也没有任何许可证被签发——这只是让登录入口第一次可达。
