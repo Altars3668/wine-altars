@@ -7831,3 +7831,106 @@ select d.Name||'\'||p.Name, h.Size from Paths p
 
 （注意别拿真机的 761 条总数直接比：真机装的是整套 Office，这个 prefix 只装了 Word，
 其余全在 `ExcludedApps` 里。要比就按 `Word.*` 比。）
+
+## 虚拟注册表：是 `RtlValidRelativeSecurityDescriptor` 把答案反过来了
+
+追下去发现，`root\vreg` 那 15 个 hive 不是流式下载写坏的——**流式下载每次都把正确内容写对了**。
+`WINEDEBUG=+file` 的跟踪里，同一批暂存文件被写了两遍：
+
+```
+02c8: WriteFile <staging>\dcfmui...vreg.dat  16384  → SUCCESS(16384)   ← 正确内容，与包数据库一致
+...
+0374: 加载 OffReg.dll
+0374: ReadFile  <staging>\dcf...vreg.dat  524288 → SUCCESS(524288)     ← 读进来的也是对的
+0374: RtlValidRelativeSecurityDescriptor(..., 396, 0)  ×2
+0374: DeleteFileW <staging>\dcf...vreg.dat
+0374: CreateFileW <staging>\dcf...vreg.dat                             ← 删掉重建
+0374: WriteFile 4096 ×2                                                ← 写回 8192 字节空 hive
+0460: CreateHardLinkW root\vreg\dcf...dat ← <staging>\dcf...dat
+```
+
+`offreg.dll` 是微软的 **Offline Registry Library**（`OROpenHive`/`ORSaveHive`/…），
+C2R 用它处理 App-V 的虚拟注册表。写个几十行的探针（`tools/offregprobe`）直接调它，
+10 秒就复现：
+
+```
+OROpenHive  : 1017  <-- FAILED        (ERROR_BADDB，"注册表数据库损坏")
+```
+
+一个完全正常的 786,432 字节 Office hive，Wine 下**打不开**。
+
+`WINEDEBUG=+relay` 跟踪探针，失败点一目了然：
+
+```
+ntdll.RtlValidRelativeSecurityDescriptor(7ffffe9f1100, 0x18c, 0)
+fixme:ntdll:RtlValidRelativeSecurityDescriptor ...: semi-stub
+ntdll.RtlValidRelativeSecurityDescriptor() retval=00000000     ← FALSE
+（紧接着一路 free，OROpenHive 返回 1017）
+```
+
+Wine 的实现：
+
+```c
+BOOLEAN WINAPI RtlValidSecurityDescriptor( PSECURITY_DESCRIPTOR descriptor )
+{
+    SECURITY_DESCRIPTOR *sd = descriptor;
+    return sd && sd->Revision == SECURITY_DESCRIPTOR_REVISION;   /* BOOLEAN */
+}
+
+BOOLEAN WINAPI RtlValidRelativeSecurityDescriptor( ... )
+{
+    FIXME("...: semi-stub\n");
+    return RtlValidSecurityDescriptor(descriptor) == STATUS_SUCCESS;   /* 拿 BOOLEAN 比 0 */
+}
+```
+
+`STATUS_SUCCESS` 是 0。有效的描述符返回 TRUE，`TRUE == 0` 为假 → 判为无效；
+无效的返回 FALSE，`FALSE == 0` 为真 → 判为有效。**这个函数的每一个答案都是反的。**
+
+改成真正的实现：缓冲区要装得下 `SECURITY_DESCRIPTOR_RELATIVE`、`Revision` 正确、
+带 `SE_SELF_RELATIVE`，它声称的每个组件都得是合法 SID 或 ACL 且完全落在给定长度内，
+`info` 指名的组件必须存在。
+
+### 效果
+
+探针：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `OROpenHive` | 1017 ERROR_BADDB | 0 |
+| `REGISTRY\MACHINE\Software\Classes` | 打不开 | 86 个子键（`.doc` `.docm` `.dochtml` …） |
+| `ORSaveHive` | 8192 字节 | 708,608 字节 |
+
+真实安装（`setup.exe /configure`，EXIT=0，零崩溃）：
+
+| | 之前 | 现在 | 真机（全套 Office） |
+|---|---|---|---|
+| `root/vreg` 合计 | 122,880（15×8192） | **6,422,528** | 数 MB |
+| `word.x-none...vreg.dat` | 8192 | **786,432**（与包数据库一致） | 786,432 |
+| `ClickToRun\REGISTRY` 键 | 6 | **14,346** | 29,791 |
+| `HKLM\Software\Microsoft\Office` | 2,913 | **17,255** | 42,085 |
+
+15 个 hive 现在**每一个**都和 `operations.db` 里记录的大小分毫不差。
+
+### Word 现在到哪一步
+
+「很抱歉，此功能看似已中断，并需要修复」**不再出现**。Word 起来后是完整的：
+开始屏幕（新建模板、最近/收藏夹/与我共享）、完整功能区（文件/开始/插入/设计/布局/
+引用/邮件/审阅/视图/帮助）、字体段落样式组和实时样式预览、带页边距和光标的文档页，
+标题栏 `文档1 - Word (未经授权产品)`（未登录，符合预期）。**约 5 秒**到达可编辑窗口。
+
+但它撑不住：大约 20 秒内进程退出，有时先弹「很抱歉，Word 遇到错误，使其无法正常工作」。
+Word 自己也诊断到了——第三次启动时它问「最后两次启动时开始屏幕意外关闭。是否想要将其关闭？」。
+
+已排除的：
+
+- `winebus.sys+0x20f0` 那 17 次 `c0000005`（空指针读，偏移 0x628）是**既有噪音**：
+  空跑 `cmd /c ver` 一样有 17 次。
+- 抛出的 C++ 异常都是有类型、可捕获的：`AppvIsvSubsystems64` 抛
+  `windows_exception_impl<0>`，`Mso30win32client` 抛
+  `Roaming::RoamingCacheException`（未登录时漫游缓存失败），两者都不像致命的。
+- `msoxmlmf.dll` 加载失败是**注册路径写错**，不是文件缺失：包里有
+  `root\vfs\ProgramFilesCommonX64\Microsoft Shared\Office16\MSOXMLMF.DLL`（82,312 字节，
+  磁盘上也在），而注册表把 COM 类指向了 `Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll`。
+
+下一步是定位那个真正致命的失败。
