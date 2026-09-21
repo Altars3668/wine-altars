@@ -23,6 +23,17 @@
 # What it costs: the Office surfaces built on React Native do not appear.  They
 # do not work today either -- they take the whole application down with them.
 #
+# 2026-09-21: that last paragraph no longer holds on every build.  Measured on
+# ~/.wine-altars-office with Office 16.0.20208, disabling the host does not
+# leave Word with fewer features -- it leaves Word with no interface at all:
+# MSAA reports a single object and the screen keeps an empty frame with a
+# shadowed transparent edge.  React Native is load-bearing for the window
+# itself in that build, not an optional extra, so this is not a workaround
+# there and the override was undone again.
+#
+# What it is still useful for is telling the two apart: if disabling the host
+# changes nothing, React Native was not what was failing.
+#
 #     scripts/disable-office-reactnative.sh            # apply
 #     scripts/disable-office-reactnative.sh --undo     # put it back
 #
