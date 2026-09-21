@@ -24,6 +24,39 @@ DEFINE_GUID(IID_IHttpBaseProtocolFilter, 0x71c89b09,0xe131,0x4b54,0xa5,0x3c,0xeb
 DEFINE_GUID(IID_IHttpFilter,             0xa4cb6dd5,0x0902,0x439e,0xbf,0xd7,0xe1,0x25,0x52,0xb1,0x65,0xce);
 DEFINE_GUID(IID_IClosable,               0x30d5a829,0x7fa4,0x4026,0x83,0xbb,0xd7,0x5b,0xae,0x4e,0xa9,0x9e);
 DEFINE_GUID(IID_IAgileObject,            0x94ea2b94,0xe9cc,0x49e0,0xc0,0xff,0xee,0x64,0xca,0x8f,0x5b,0x90);
+DEFINE_GUID(IID_IStringable,             0x96369f54,0x8eb6,0x48f0,0xab,0xce,0xc1,0xb2,0x11,0xe6,0x27,0xc3);
+DEFINE_GUID(IID_IHttpMethod,             0x728d4022,0x700d,0x4fe0,0xaf,0xa5,0x40,0x29,0x9c,0x58,0xdb,0xfd);
+DEFINE_GUID(IID_IHttpMethodStatics,      0x64d171f0,0xd99a,0x4153,0x8d,0xc6,0xd6,0x8c,0xc4,0xcc,0xe3,0x17);
+DEFINE_GUID(IID_IHttpMethodFactory,      0x3c51d10d,0x36d7,0x40f8,0xa8,0x6d,0xe7,0x59,0xca,0xf2,0xf8,0x3f);
+DEFINE_GUID(IID_IHttpClient,             0x7fda1151,0x3574,0x4880,0xa8,0xba,0xe6,0xb1,0xe0,0x06,0x1f,0x3d);
+DEFINE_GUID(IID_IHttpClientFactory,      0xc30c4eca,0xe3fa,0x4f99,0xaf,0xb4,0x63,0xcc,0x65,0x00,0x94,0x62);
+
+/* IHttpMethod: one property after IInspectable. */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt; HRESULT (STDMETHODCALLTYPE *get_Method)(void *, HSTRING *); } MethodVtbl;
+typedef struct { const MethodVtbl *lpVtbl; } Method;
+/* IHttpMethodStatics: seven known methods, in this order. */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *Delete)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Get)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Head)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Options)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Patch)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Post)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Put)(void *, void **);
+} MethodStaticsVtbl;
+typedef struct { const MethodStaticsVtbl *lpVtbl; } MethodStatics;
+typedef struct { void *q,*a,*r,*gi,*gn,*gt; HRESULT (STDMETHODCALLTYPE *Create)(void *, HSTRING, void **); } MethodFactoryVtbl;
+typedef struct { const MethodFactoryVtbl *lpVtbl; } MethodFactory;
+typedef struct { void *q,*a,*r,*gi,*gn,*gt; HRESULT (STDMETHODCALLTYPE *Create)(void *, void *, void **); } ClientFactoryVtbl;
+typedef struct { const ClientFactoryVtbl *lpVtbl; } ClientFactory;
+
+static int method_is(void *m, const WCHAR *expect)
+{
+    HSTRING h = NULL;
+    Method *mm = m;
+    if (!m || FAILED(mm->lpVtbl->get_Method(mm, &h)) || !h) return 0;
+    return !wcscmp(WindowsGetStringRawBuffer(h, NULL), expect);
+}
 
 static int fails;
 static void check(int ok, const char *what)
@@ -119,6 +152,65 @@ int wmain(void)
     check(f->lpVtbl->get_CookieManager(f, &p) == E_NOTIMPL && !p, "CookieManager -> E_NOTIMPL 且置空");
     p = (void *)(ULONG_PTR)0xdeadbeef;
     check(f->lpVtbl->get_CacheControl(f, &p) == E_NOTIMPL && !p, "CacheControl -> E_NOTIMPL 且置空");
+
+    /* ---- Windows.Web.Http.HttpMethod ---- */
+    {
+        static const WCHAR mname[] = L"Windows.Web.Http.HttpMethod";
+        IActivationFactory *mf = NULL;
+        MethodStatics *st; MethodFactory *mkf;
+        HSTRING mcls = NULL, custom = NULL;
+        void *m = NULL;
+
+        printf("\nWindows.Web.Http.HttpMethod:\n");
+        WindowsCreateString(mname, (UINT32)(ARRAYSIZE(mname) - 1), &mcls);
+        hr = RoGetActivationFactory(mcls, &IID_IActivationFactory, (void **)&mf);
+        check(SUCCEEDED(hr) && mf, "拿到激活工厂");
+        if (SUCCEEDED(hr))
+        {
+            check(SUCCEEDED(IActivationFactory_QueryInterface(mf, &IID_IHttpMethodStatics, (void **)&st)) && st,
+                  "QI IHttpMethodStatics");
+            st->lpVtbl->Get(st, &m);    check(method_is(m, L"GET"), "HttpMethod.Get 是 GET");
+            st->lpVtbl->Post(st, &m);   check(method_is(m, L"POST"), "HttpMethod.Post 是 POST");
+            st->lpVtbl->Delete(st, &m); check(method_is(m, L"DELETE"), "HttpMethod.Delete 是 DELETE");
+            st->lpVtbl->Patch(st, &m);  check(method_is(m, L"PATCH"), "HttpMethod.Patch 是 PATCH");
+            check(SUCCEEDED(IActivationFactory_QueryInterface(mf, &IID_IHttpMethodFactory, (void **)&mkf)) && mkf,
+                  "QI IHttpMethodFactory");
+            WindowsCreateString(L"BREW", 4, &custom);
+            check(SUCCEEDED(mkf->lpVtbl->Create(mkf, custom, &m)) && method_is(m, L"BREW"), "自定义方法名往返");
+            check(mkf->lpVtbl->Create(mkf, NULL, &m) == E_INVALIDARG, "空方法名被拒绝");
+            check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)m, &IID_IStringable, &p)) && p,
+                  "HttpMethod 可 QI IStringable");
+        }
+    }
+
+    /* ---- Windows.Web.Http.HttpClient ---- */
+    {
+        static const WCHAR cname2[] = L"Windows.Web.Http.HttpClient";
+        IActivationFactory *cf = NULL;
+        IInspectable *client = NULL;
+        ClientFactory *ccf;
+        HSTRING ccls = NULL, rcn = NULL;
+        void *c2 = NULL;
+
+        printf("\nWindows.Web.Http.HttpClient:\n");
+        WindowsCreateString(cname2, (UINT32)(ARRAYSIZE(cname2) - 1), &ccls);
+        hr = RoGetActivationFactory(ccls, &IID_IActivationFactory, (void **)&cf);
+        check(SUCCEEDED(hr) && cf, "拿到激活工厂");
+        if (SUCCEEDED(hr))
+        {
+            check(SUCCEEDED(IActivationFactory_ActivateInstance(cf, &client)) && client, "默认构造");
+            check(SUCCEEDED(IInspectable_GetRuntimeClassName(client, &rcn)) && rcn &&
+                  !wcscmp(WindowsGetStringRawBuffer(rcn, NULL), cname2), "GetRuntimeClassName 正确");
+            check(SUCCEEDED(IInspectable_QueryInterface(client, &IID_IHttpClient, &p)) && p, "QI IHttpClient");
+            check(SUCCEEDED(IInspectable_QueryInterface(client, &IID_IClosable, &p)) && p, "QI IClosable");
+            check(SUCCEEDED(IInspectable_QueryInterface(client, &IID_IStringable, &p)) && p, "QI IStringable");
+            check(SUCCEEDED(IActivationFactory_QueryInterface(cf, &IID_IHttpClientFactory, (void **)&ccf)) && ccf,
+                  "QI IHttpClientFactory");
+            /* the filter made at the top of this run is the real argument */
+            check(SUCCEEDED(ccf->lpVtbl->Create(ccf, f, &c2)) && c2, "用 HttpBaseProtocolFilter 构造");
+            check(ccf->lpVtbl->Create(ccf, NULL, &c2) == E_INVALIDARG, "没有 filter 时被拒绝");
+        }
+    }
 
     printf("\n%s  失败 %d 项\n", fails ? "有问题" : "全部通过", fails);
     return fails != 0;
