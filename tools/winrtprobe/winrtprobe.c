@@ -32,6 +32,73 @@ DEFINE_GUID(IID_IHttpContent,        0x6b14a441,0xfba7,0x4bd2,0xaf,0x0a,0x83,0x9
 DEFINE_GUID(IID_IHttpStringContentF, 0x46649d5b,0x2e93,0x48eb,0x8e,0x61,0x19,0x67,0x78,0x78,0xe5,0x7f);
 DEFINE_GUID(IID_IHttpMultipart,      0x64d337e2,0xe967,0x4624,0xb6,0xd1,0xcf,0x74,0x60,0x4a,0x4a,0x42);
 DEFINE_GUID(IID_IStringable_,        0x96369f54,0x8eb6,0x48f0,0xab,0xce,0xc1,0xb2,0x11,0xe6,0x27,0xc3);
+DEFINE_GUID(IID_IPPMStatics,         0xc0bffc66,0x8c3d,0x4d56,0x88,0x04,0xc6,0x8f,0x0a,0xd3,0x2e,0xc5);
+DEFINE_GUID(IID_IPPMStatics2,        0xb68f9a8c,0x39e0,0x4649,0xb2,0xe4,0x07,0x0a,0xb8,0xa5,0x79,0xb3);
+DEFINE_GUID(IID_IPPManager,          0xd5703e18,0xa08d,0x47e6,0xa2,0x40,0x99,0x34,0xd7,0x16,0x5e,0xb5);
+DEFINE_GUID(IID_IPPManager2,         0xabf7527a,0x8435,0x417f,0x99,0xb6,0x51,0xbe,0xaf,0x36,0x58,0x88);
+DEFINE_GUID(IID_IUARManagerStatics,  0xc0392df1,0x224a,0x432c,0x81,0xe5,0x0c,0x76,0xb4,0xc4,0xce,0xfa);
+DEFINE_GUID(IID_IUARManager,         0x0c30be4e,0x903d,0x48d6,0x82,0xd4,0x40,0x43,0xed,0x57,0x79,0x1b);
+DEFINE_GUID(IID_IAddPackageOptions,  0x05cee018,0xf68f,0x422b,0x95,0xa4,0x66,0x67,0x9e,0xc7,0x7f,0xc0);
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *IsIdentityManaged)(void *, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *TryApplyProcessUIPolicy)(void *, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *ClearProcessUIPolicy)(void *);
+    HRESULT (STDMETHODCALLTYPE *CreateCurrentThreadNetworkContext)(void *, HSTRING, void **);
+    HRESULT (STDMETHODCALLTYPE *GetPrimaryManagedIdentityForNetworkEndpointAsync)(void *, void *, void **);
+    HRESULT (STDMETHODCALLTYPE *RevokeContent)(void *, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *GetForCurrentView)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *add1)(void *, void *, INT64 *);
+    HRESULT (STDMETHODCALLTYPE *rm1)(void *, INT64);
+    HRESULT (STDMETHODCALLTYPE *add2)(void *, void *, INT64 *);
+    HRESULT (STDMETHODCALLTYPE *rm2)(void *, INT64);
+    HRESULT (STDMETHODCALLTYPE *add3)(void *, void *, INT64 *);
+    HRESULT (STDMETHODCALLTYPE *rm3)(void *, INT64);
+    HRESULT (STDMETHODCALLTYPE *CheckAccess)(void *, HSTRING, HSTRING, int *);
+    HRESULT (STDMETHODCALLTYPE *RequestAccessAsync)(void *, HSTRING, HSTRING, void **);
+} PPMSVtbl;
+typedef struct { const PPMSVtbl *lpVtbl; } PPMS;
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *HasContentBeenRevokedSince)(void *, HSTRING, INT64, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *CheckAccessForApp)(void *, HSTRING, HSTRING, int *);
+    HRESULT (STDMETHODCALLTYPE *RequestAccessForAppAsync)(void *, HSTRING, HSTRING, void **);
+    HRESULT (STDMETHODCALLTYPE *GetEnforcementLevel)(void *, HSTRING, int *);
+    HRESULT (STDMETHODCALLTYPE *IsUserDecryptionAllowed)(void *, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *IsProtectionUnderLockRequired)(void *, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *addPC)(void *, void *, INT64 *);
+    HRESULT (STDMETHODCALLTYPE *rmPC)(void *, INT64);
+    HRESULT (STDMETHODCALLTYPE *get_IsProtectionEnabled)(void *, unsigned char *);
+} PPMS2Vtbl;
+typedef struct { const PPMS2Vtbl *lpVtbl; } PPMS2;
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *GetForCurrentView)(void *, void **);
+} UARSVtbl;
+typedef struct { const UARSVtbl *lpVtbl; } UARS;
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *add_UserActivityRequested)(void *, void *, INT64 *);
+    HRESULT (STDMETHODCALLTYPE *remove_UserActivityRequested)(void *, INT64);
+} UARVtbl;
+typedef struct { const UARVtbl *lpVtbl; } UAR;
+
+/* IAddPackageOptions：前八项是集合与两个对象属性，之后是 StubPackageOption 与一串开关 */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *get_DependencyPackageUris)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *get_TargetVolume)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *put_TargetVolume)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *get_OptionalPackageFamilyNames)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *get_OptionalPackageUris)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *get_RelatedPackageUris)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *get_ExternalLocationUri)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *put_ExternalLocationUri)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *get_StubPackageOption)(void *, int *);
+    HRESULT (STDMETHODCALLTYPE *put_StubPackageOption)(void *, int);
+    HRESULT (STDMETHODCALLTYPE *get_DeveloperMode)(void *, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *put_DeveloperMode)(void *, unsigned char);
+} APOVtbl;
+typedef struct { const APOVtbl *lpVtbl; } APO;
 
 /* IHttpContent：Headers 之后四个异步读，再是 TryComputeLength */
 typedef struct { void *q,*a,*r,*gi,*gn,*gt;
@@ -376,6 +443,94 @@ int wmain(void)
     }
     (void)get_factory(L"Windows.Web.Http.HttpBufferContent", "缓冲内容：拿到激活工厂");
     (void)get_factory(L"Windows.Web.Http.HttpStreamContent", "流内容：拿到激活工厂");
+
+    printf("\nWindows.Security.EnterpriseData.ProtectionPolicyManager:\n");
+    if ((f = get_factory(L"Windows.Security.EnterpriseData.ProtectionPolicyManager", "拿到激活工厂")))
+    {
+        PPMS *st = NULL; PPMS2 *st2 = NULL;
+        HSTRING id = NULL;
+        unsigned char b = 2; int r = -1;
+        void *obj = NULL, *p6 = NULL;
+        INT64 tok = 0;
+
+        WindowsCreateString(L"contoso.com", 11, &id);
+        check(SUCCEEDED(IActivationFactory_QueryInterface(f, &IID_IPPMStatics, (void **)&st)) && st,
+              "QI IProtectionPolicyManagerStatics");
+        check(SUCCEEDED(IActivationFactory_QueryInterface(f, &IID_IPPMStatics2, (void **)&st2)) && st2,
+              "QI IProtectionPolicyManagerStatics2");
+        if (st)
+        {
+            check(SUCCEEDED(st->lpVtbl->IsIdentityManaged(st, id, &b)) && !b, "没有身份被管理");
+            check(SUCCEEDED(st->lpVtbl->CheckAccess(st, id, id, &r)) && r == 0, "CheckAccess 为 Allowed");
+            check(SUCCEEDED(st->lpVtbl->TryApplyProcessUIPolicy(st, id, &b)) && !b, "不应用企业界面策略");
+            check(SUCCEEDED(st->lpVtbl->ClearProcessUIPolicy(st)), "清除界面策略成功");
+            check(SUCCEEDED(st->lpVtbl->RevokeContent(st, id)), "撤销内容成功（无内容可撤）");
+            check(SUCCEEDED(st->lpVtbl->CreateCurrentThreadNetworkContext(st, id, &obj)) && obj,
+                  "拿到线程网络上下文");
+            if (obj) check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)obj, &IID_IClosable_, &p6)) && p6,
+                           "网络上下文可 QI IClosable");
+            check(SUCCEEDED(st->lpVtbl->GetForCurrentView(st, &obj)) && obj, "GetForCurrentView 给出管理器");
+            if (obj)
+            {
+                check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)obj, &IID_IPPManager, &p6)) && p6,
+                      "QI IProtectionPolicyManager");
+                check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)obj, &IID_IPPManager2, &p6)) && p6,
+                      "QI IProtectionPolicyManager2");
+            }
+            check(SUCCEEDED(st->lpVtbl->add1(st, (void *)st, &tok)) && tok != 0, "事件注册给出非零 token");
+            check(SUCCEEDED(st->lpVtbl->rm1(st, tok)), "事件可注销");
+        }
+        if (st2)
+        {
+            check(SUCCEEDED(st2->lpVtbl->get_IsProtectionEnabled(st2, &b)) && !b, "保护未启用");
+            check(SUCCEEDED(st2->lpVtbl->GetEnforcementLevel(st2, id, &r)) && r == 0, "强制级别为 NoProtection");
+            check(SUCCEEDED(st2->lpVtbl->IsUserDecryptionAllowed(st2, id, &b)) && b, "允许用户解密");
+            check(SUCCEEDED(st2->lpVtbl->IsProtectionUnderLockRequired(st2, id, &b)) && !b, "不要求锁下保护");
+            check(SUCCEEDED(st2->lpVtbl->HasContentBeenRevokedSince(st2, id, 0, &b)) && !b, "没有内容被撤销");
+            check(SUCCEEDED(st2->lpVtbl->RequestAccessForAppAsync(st2, id, id, &obj)) && obj,
+                  "RequestAccessForAppAsync 给出异步操作");
+        }
+    }
+
+    printf("\nWindows.ApplicationModel.UserActivities.UserActivityRequestManager:\n");
+    if ((f = get_factory(L"Windows.ApplicationModel.UserActivities.UserActivityRequestManager", "拿到激活工厂")))
+    {
+        UARS *st = NULL; UAR *m = NULL;
+        void *obj = NULL, *p7 = NULL; INT64 tok = 0;
+        check(SUCCEEDED(IActivationFactory_QueryInterface(f, &IID_IUARManagerStatics, (void **)&st)) && st,
+              "QI IUserActivityRequestManagerStatics");
+        if (st && SUCCEEDED(st->lpVtbl->GetForCurrentView(st, &obj)) && obj)
+        {
+            check(1, "GetForCurrentView 给出管理器");
+            m = obj;
+            check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)obj, &IID_IUARManager, &p7)) && p7,
+                  "QI IUserActivityRequestManager");
+            check(SUCCEEDED(m->lpVtbl->add_UserActivityRequested(m, (void *)m, &tok)) && tok != 0,
+                  "注册请求处理器拿到 token");
+            check(m->lpVtbl->add_UserActivityRequested(m, NULL, &tok) == E_INVALIDARG, "拒绝空处理器");
+            check(SUCCEEDED(m->lpVtbl->remove_UserActivityRequested(m, tok)), "可注销");
+        }
+        else check(0, "GetForCurrentView 给出管理器");
+    }
+
+    printf("\nWindows.Management.Deployment.AddPackageOptions:\n");
+    if ((f = get_factory(L"Windows.Management.Deployment.AddPackageOptions", "拿到激活工厂")))
+    {
+        IInspectable *o = NULL; APO *a = NULL;
+        int so = -1; unsigned char dm = 2;
+        check(SUCCEEDED(IActivationFactory_ActivateInstance(f, &o)) && o, "构造选项对象");
+        if (o && SUCCEEDED(IInspectable_QueryInterface(o, &IID_IAddPackageOptions, (void **)&a)) && a)
+        {
+            check(1, "QI IAddPackageOptions");
+            check(SUCCEEDED(a->lpVtbl->get_StubPackageOption(a, &so)) && so == 0, "StubPackageOption 默认为 Default");
+            check(SUCCEEDED(a->lpVtbl->put_StubPackageOption(a, 2)) &&
+                  SUCCEEDED(a->lpVtbl->get_StubPackageOption(a, &so)) && so == 2, "StubPackageOption 往返");
+            check(a->lpVtbl->put_StubPackageOption(a, 9) == E_INVALIDARG, "拒绝非法 StubPackageOption");
+            check(SUCCEEDED(a->lpVtbl->put_DeveloperMode(a, 1)) &&
+                  SUCCEEDED(a->lpVtbl->get_DeveloperMode(a, &dm)) && dm, "DeveloperMode 往返");
+        }
+        else check(0, "QI IAddPackageOptions");
+    }
 
     printf("\n%s  失败 %d 项\n", fails ? "有问题" : "全部通过", fails);
     return fails != 0;
