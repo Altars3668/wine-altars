@@ -28,6 +28,39 @@ DEFINE_GUID(IID_IHttpRequestMessage, 0xf5762b3c,0x74d4,0x4811,0xb5,0xdc,0x9f,0x8
 DEFINE_GUID(IID_IHttpResponseMessage,0xfee200fb,0x8664,0x44e0,0x95,0xd9,0x42,0x69,0x61,0x99,0xbf,0xfc);
 DEFINE_GUID(IID_IMapSS,              0xf6d1f700,0x49c2,0x52ae,0x81,0x54,0x82,0x6f,0x99,0x08,0x77,0x3c);
 DEFINE_GUID(IID_IIterableKVSS,       0xe9bdaaf0,0xcbf6,0x5c72,0xbe,0x90,0x29,0xcb,0xf3,0xa1,0x31,0x9b);
+DEFINE_GUID(IID_IHttpContent,        0x6b14a441,0xfba7,0x4bd2,0xaf,0x0a,0x83,0x9d,0xe7,0xc2,0x95,0xda);
+DEFINE_GUID(IID_IHttpStringContentF, 0x46649d5b,0x2e93,0x48eb,0x8e,0x61,0x19,0x67,0x78,0x78,0xe5,0x7f);
+DEFINE_GUID(IID_IHttpMultipart,      0x64d337e2,0xe967,0x4624,0xb6,0xd1,0xcf,0x74,0x60,0x4a,0x4a,0x42);
+DEFINE_GUID(IID_IStringable_,        0x96369f54,0x8eb6,0x48f0,0xab,0xce,0xc1,0xb2,0x11,0xe6,0x27,0xc3);
+
+/* IHttpContent：Headers 之后四个异步读，再是 TryComputeLength */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *get_Headers)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *BufferAllAsync)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *ReadAsBufferAsync)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *ReadAsInputStreamAsync)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *ReadAsStringAsync)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *TryComputeLength)(void *, UINT64 *, unsigned char *);
+} ContentVtbl;
+typedef struct { const ContentVtbl *lpVtbl; } Content;
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *CreateFromString)(void *, HSTRING, void **);
+    HRESULT (STDMETHODCALLTYPE *CreateFromStringWithEncoding)(void *, HSTRING, int, void **);
+    HRESULT (STDMETHODCALLTYPE *CreateFromStringWithEncodingAndMediaType)(void *, HSTRING, int, HSTRING, void **);
+} StrContentFVtbl;
+typedef struct { const StrContentFVtbl *lpVtbl; } StrContentF;
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *Add)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *AddWithName)(void *, void *, HSTRING);
+} MultipartVtbl;
+typedef struct { const MultipartVtbl *lpVtbl; } Multipart;
+
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *ToString)(void *, HSTRING *);
+} StringableVtbl;
+typedef struct { const StringableVtbl *lpVtbl; } Stringable;
 
 /* IMap<HSTRING,HSTRING>：Lookup / Size / HasKey / GetView / Insert / Remove / Clear */
 typedef struct { void *q,*a,*r,*gi,*gn,*gt;
@@ -270,6 +303,79 @@ int wmain(void)
         }
         else check(0, "QI IHttpResponseMessage");
     }
+
+    printf("\nWindows.Web.Http 的 content 类:\n");
+    if ((f = get_factory(L"Windows.Web.Http.HttpStringContent", "字符串内容：拿到激活工厂")))
+    {
+        StrContentF *cf = NULL;
+        Content *c = NULL;
+        void *obj = NULL, *p4 = NULL;
+        HSTRING text = NULL, mt = NULL, back = NULL;
+        UINT64 len = 0; unsigned char ok = 0;
+
+        check(SUCCEEDED(IActivationFactory_QueryInterface(f, &IID_IHttpStringContentF, (void **)&cf)) && cf,
+              "QI IHttpStringContentFactory");
+        /* 4 个汉字 = UTF-16 四个码元，UTF-8 十二字节 */
+        WindowsCreateString(L"你好世界", 4, &text);
+        if (cf && SUCCEEDED(cf->lpVtbl->CreateFromString(cf, text, &obj)) && obj)
+        {
+            check(1, "从字符串构造");
+            c = obj;
+            check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)obj, &IID_IHttpContent, &p4)) && p4,
+                  "QI IHttpContent");
+            check(SUCCEEDED(c->lpVtbl->TryComputeLength(c, &len, &ok)) && ok && len == 12,
+                  "长度按 UTF-8 字节算（4 个汉字 = 12 字节）");
+            {
+                MapSS *h = NULL; HSTRING k = NULL;
+                WindowsCreateString(L"Content-Type", 12, &k);
+                if (SUCCEEDED(c->lpVtbl->get_Headers(c, (void **)&h)) && h)
+                    check(SUCCEEDED(h->lpVtbl->Lookup(h, k, &back)) && back &&
+                          wcsstr(WindowsGetStringRawBuffer(back, NULL), L"utf-8") != NULL,
+                          "默认 Content-Type 带 charset=utf-8");
+                else check(0, "默认 Content-Type 带 charset=utf-8");
+            }
+            {
+                Stringable *st = NULL;
+                if (SUCCEEDED(IInspectable_QueryInterface((IInspectable *)obj, &IID_IStringable_, (void **)&st)) && st)
+                    check(SUCCEEDED(st->lpVtbl->ToString(st, &back)) && back &&
+                          !wcscmp(WindowsGetStringRawBuffer(back, NULL), L"你好世界"),
+                          "ToString 给回原文");
+                else check(0, "ToString 给回原文");
+            }
+            WindowsCreateString(L"application/json", 16, &mt);
+            if (SUCCEEDED(cf->lpVtbl->CreateFromStringWithEncodingAndMediaType(cf, text, 0, mt, &obj)) && obj)
+            {
+                MapSS *h = NULL; HSTRING k = NULL;
+                c = obj;
+                WindowsCreateString(L"Content-Type", 12, &k);
+                if (SUCCEEDED(c->lpVtbl->get_Headers(c, (void **)&h)) && h)
+                    check(SUCCEEDED(h->lpVtbl->Lookup(h, k, &back)) && back &&
+                          !wcscmp(WindowsGetStringRawBuffer(back, NULL), L"application/json"), "指定媒体类型生效");
+                else check(0, "指定媒体类型生效");
+            }
+            else check(0, "指定媒体类型生效");
+            check(cf->lpVtbl->CreateFromStringWithEncoding(cf, text, 1, &obj) == E_NOTIMPL,
+                  "非 UTF-8 编码如实报未实现");
+        }
+        else check(0, "从字符串构造");
+    }
+    if ((f = get_factory(L"Windows.Web.Http.HttpMultipartFormDataContent", "多段内容：拿到激活工厂")))
+    {
+        IInspectable *mp = NULL;
+        Multipart *m = NULL;
+        void *p5 = NULL;
+        check(SUCCEEDED(IActivationFactory_ActivateInstance(f, &mp)) && mp, "构造多段内容");
+        if (mp)
+        {
+            check(SUCCEEDED(IInspectable_QueryInterface(mp, &IID_IHttpMultipart, (void **)&m)) && m,
+                  "QI IHttpMultipartFormDataContent");
+            check(SUCCEEDED(IInspectable_QueryInterface(mp, &IID_IHttpContent, &p5)) && p5,
+                  "多段内容本身也是 IHttpContent");
+            if (m) check(m->lpVtbl->Add(m, NULL) == E_INVALIDARG, "拒绝加入空内容");
+        }
+    }
+    (void)get_factory(L"Windows.Web.Http.HttpBufferContent", "缓冲内容：拿到激活工厂");
+    (void)get_factory(L"Windows.Web.Http.HttpStreamContent", "流内容：拿到激活工厂");
 
     printf("\n%s  失败 %d 项\n", fails ? "有问题" : "全部通过", fails);
     return fails != 0;
