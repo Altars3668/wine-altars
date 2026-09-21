@@ -24,6 +24,49 @@ DEFINE_GUID(IID_IWebSocketControl,   0x2ec4bdc3,0xd9a5,0x455a,0x98,0x11,0xde,0x2
 DEFINE_GUID(IID_IWebSocketControl2,  0x79c3be03,0xf2ca,0x461e,0xaf,0x4e,0x96,0x65,0xbc,0x2d,0x06,0x20);
 DEFINE_GUID(IID_IMsgWebSocketControl,0x8118388a,0xc629,0x4f0a,0x80,0xfb,0x81,0xfc,0x05,0x53,0x88,0x62);
 DEFINE_GUID(IID_IClosable_,          0x30d5a829,0x7fa4,0x4026,0x83,0xbb,0xd7,0x5b,0xae,0x4e,0xa9,0x9e);
+DEFINE_GUID(IID_IHttpRequestMessage, 0xf5762b3c,0x74d4,0x4811,0xb5,0xdc,0x9f,0x8b,0x4e,0x2f,0x9a,0xbf);
+DEFINE_GUID(IID_IHttpResponseMessage,0xfee200fb,0x8664,0x44e0,0x95,0xd9,0x42,0x69,0x61,0x99,0xbf,0xfc);
+DEFINE_GUID(IID_IMapSS,              0xf6d1f700,0x49c2,0x52ae,0x81,0x54,0x82,0x6f,0x99,0x08,0x77,0x3c);
+DEFINE_GUID(IID_IIterableKVSS,       0xe9bdaaf0,0xcbf6,0x5c72,0xbe,0x90,0x29,0xcb,0xf3,0xa1,0x31,0x9b);
+
+/* IMap<HSTRING,HSTRING>：Lookup / Size / HasKey / GetView / Insert / Remove / Clear */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *Lookup)(void *, HSTRING, HSTRING *);
+    HRESULT (STDMETHODCALLTYPE *get_Size)(void *, UINT32 *);
+    HRESULT (STDMETHODCALLTYPE *HasKey)(void *, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *GetView)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Insert)(void *, HSTRING, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *Remove)(void *, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *Clear)(void *);
+} MapSSVtbl;
+typedef struct { const MapSSVtbl *lpVtbl; } MapSS;
+
+/* IHttpRequestMessage：Content / Headers / Method / ... */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *get_Content)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *put_Content)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *get_Headers)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *get_Method)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *put_Method)(void *, void *);
+} ReqVtbl;
+typedef struct { const ReqVtbl *lpVtbl; } Req;
+
+/* IHttpResponseMessage：前四项 + 状态码 */
+typedef struct { void *q,*a,*r,*gi,*gn,*gt;
+    HRESULT (STDMETHODCALLTYPE *get_Content)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *put_Content)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *get_Headers)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *get_IsSuccessStatusCode)(void *, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *get_ReasonPhrase)(void *, HSTRING *);
+    HRESULT (STDMETHODCALLTYPE *put_ReasonPhrase)(void *, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *get_RequestMessage)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *put_RequestMessage)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *get_Source)(void *, int *);
+    HRESULT (STDMETHODCALLTYPE *put_Source)(void *, int);
+    HRESULT (STDMETHODCALLTYPE *get_StatusCode)(void *, int *);
+    HRESULT (STDMETHODCALLTYPE *put_StatusCode)(void *, int);
+} RespVtbl;
+typedef struct { const RespVtbl *lpVtbl; } Resp;
 
 /* IMessageWebSocket：Control / Information / 两个事件 */
 typedef struct { void *q,*a,*r,*gi,*gn,*gt;
@@ -164,6 +207,68 @@ int wmain(void)
                 check(ws->lpVtbl->ConnectAsync(ws, NULL, &p2) == E_INVALIDARG, "ConnectAsync 拒绝空 URI");
             }
         }
+    }
+
+    printf("\nWindows.Web.Http.HttpRequestMessage / HttpResponseMessage:\n");
+    if ((f = get_factory(L"Windows.Web.Http.HttpRequestMessage", "请求消息：拿到激活工厂")))
+    {
+        IInspectable *req = NULL;
+        Req *r = NULL; MapSS *h = NULL;
+        void *p3 = NULL;
+        HSTRING k = NULL, v = NULL, back = NULL;
+        UINT32 n = 0xcccc; unsigned char had = 2;
+
+        check(SUCCEEDED(IActivationFactory_ActivateInstance(f, &req)) && req, "构造请求消息");
+        if (req)
+        {
+            check(SUCCEEDED(IInspectable_QueryInterface(req, &IID_IHttpRequestMessage, (void **)&r)) && r,
+                  "QI IHttpRequestMessage");
+            check(SUCCEEDED(IInspectable_QueryInterface(req, &IID_IClosable_, &p3)) && p3, "QI IClosable");
+            if (r && SUCCEEDED(r->lpVtbl->get_Headers(r, (void **)&h)) && h)
+            {
+                check(1, "拿到 Headers 集合");
+                check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)h, &IID_IMapSS, &p3)) && p3,
+                      "Headers 是 IMap<HSTRING,HSTRING>");
+                check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)h, &IID_IIterableKVSS, &p3)) && p3,
+                      "Headers 可 QI IIterable");
+                WindowsCreateString(L"X-Probe", 7, &k);
+                WindowsCreateString(L"yes", 3, &v);
+                check(SUCCEEDED(h->lpVtbl->Insert(h, k, v, &had)) && had == 0, "插入一个头（新增）");
+                check(SUCCEEDED(h->lpVtbl->get_Size(h, &n)) && n == 1, "Size 为 1");
+                check(SUCCEEDED(h->lpVtbl->Lookup(h, k, &back)) && back &&
+                      !wcscmp(WindowsGetStringRawBuffer(back, NULL), L"yes"), "查回同一个值");
+                {
+                    HSTRING k2 = NULL; unsigned char has = 0;
+                    WindowsCreateString(L"x-PROBE", 7, &k2);
+                    check(SUCCEEDED(h->lpVtbl->HasKey(h, k2, &has)) && has, "头名不分大小写");
+                    check(SUCCEEDED(h->lpVtbl->Insert(h, k2, v, &had)) && had == 1, "同名再插入算替换");
+                    check(SUCCEEDED(h->lpVtbl->get_Size(h, &n)) && n == 1, "替换后 Size 仍为 1");
+                }
+                check(SUCCEEDED(h->lpVtbl->Remove(h, k)) && SUCCEEDED(h->lpVtbl->get_Size(h, &n)) && n == 0,
+                      "删除后为空");
+                check(h->lpVtbl->Remove(h, k) == E_BOUNDS, "删除不存在的头报 E_BOUNDS");
+            }
+            else check(0, "拿到 Headers 集合");
+        }
+    }
+    if ((f = get_factory(L"Windows.Web.Http.HttpResponseMessage", "响应消息：拿到激活工厂")))
+    {
+        IInspectable *resp = NULL;
+        Resp *r = NULL;
+        int code = -1; unsigned char ok = 2;
+
+        check(SUCCEEDED(IActivationFactory_ActivateInstance(f, &resp)) && resp, "构造响应消息");
+        if (resp && SUCCEEDED(IInspectable_QueryInterface(resp, &IID_IHttpResponseMessage, (void **)&r)) && r)
+        {
+            check(1, "QI IHttpResponseMessage");
+            check(SUCCEEDED(r->lpVtbl->get_StatusCode(r, &code)) && code == 200, "默认状态码 200");
+            check(SUCCEEDED(r->lpVtbl->get_IsSuccessStatusCode(r, &ok)) && ok, "200 算成功");
+            check(SUCCEEDED(r->lpVtbl->put_StatusCode(r, 404)) &&
+                  SUCCEEDED(r->lpVtbl->get_IsSuccessStatusCode(r, &ok)) && !ok, "404 不算成功");
+            check(SUCCEEDED(r->lpVtbl->put_StatusCode(r, 299)) &&
+                  SUCCEEDED(r->lpVtbl->get_IsSuccessStatusCode(r, &ok)) && ok, "299 也算成功（按 2xx 判定）");
+        }
+        else check(0, "QI IHttpResponseMessage");
     }
 
     printf("\n%s  失败 %d 项\n", fails ? "有问题" : "全部通过", fails);
