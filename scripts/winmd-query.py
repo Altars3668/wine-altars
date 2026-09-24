@@ -203,17 +203,19 @@ class WinMD:
         return out
 
     def guid_of_typedef(self, ti):
-        """The GuidAttribute blob on a TypeDef: prolog 0x0001 then 16 raw bytes."""
+        """The GuidAttribute blob on a TypeDef: prolog 0x0001, the 16 bytes of
+        the GUID, and no named arguments -- exactly 20 bytes.  Other attributes
+        on the same type start with the same prolog: ExclusiveToAttribute
+        carries a type name, and taking its first 16 bytes gives a "GUID" made
+        of the letters of Windows.Web.Http.... """
         tabs, bits = CODED['HasCustomAttribute']
         tag = tabs.index(0x02)
         want = ((ti+1) << bits) | tag
         for ca in self.tab.get(0x0C, []):
             if ca['Parent'] != want: continue
             b = self._blob(ca['Value'])
-            if len(b) >= 18 and b[0] == 1 and b[1] == 0:
-                g = b[2:18]
-                if len(g) == 16:
-                    return uuid.UUID(bytes_le=g)
+            if len(b) == 20 and b[0] == 1 and b[1] == 0 and b[18:20] == b'\0\0':
+                return uuid.UUID(bytes_le=bytes(b[2:18]))
         return None
 
 

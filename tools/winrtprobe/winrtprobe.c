@@ -39,6 +39,9 @@ DEFINE_GUID(IID_IPPManager2,         0xabf7527a,0x8435,0x417f,0x99,0xb6,0x51,0xb
 DEFINE_GUID(IID_IUARManagerStatics,  0xc0392df1,0x224a,0x432c,0x81,0xe5,0x0c,0x76,0xb4,0xc4,0xce,0xfa);
 DEFINE_GUID(IID_IUARManager,         0x0c30be4e,0x903d,0x48d6,0x82,0xd4,0x40,0x43,0xed,0x57,0x79,0x1b);
 DEFINE_GUID(IID_IAddPackageOptions,  0x05cee018,0xf68f,0x422b,0x95,0xa4,0x66,0x67,0x9e,0xc7,0x7f,0xc0);
+DEFINE_GUID(IID_IMapSO,              0x1b0d3570,0x0877,0x5ec2,0x8a,0x2c,0x3b,0x95,0x39,0x50,0x6a,0xca);
+DEFINE_GUID(IID_IPropertySet_,       0x8a43ed9f,0xf4e6,0x4421,0xac,0xf9,0x1d,0xab,0x29,0x86,0x82,0x0c);
+DEFINE_GUID(IID_IObservableMapSO,    0x236aac9d,0xfb12,0x5c4d,0xa4,0x1c,0x9e,0x44,0x5f,0xb4,0xd7,0xec);
 
 typedef struct { void *q,*a,*r,*gi,*gn,*gt;
     HRESULT (STDMETHODCALLTYPE *IsIdentityManaged)(void *, HSTRING, unsigned char *);
@@ -148,8 +151,23 @@ typedef struct { void *q,*a,*r,*gi,*gn,*gt;
     HRESULT (STDMETHODCALLTYPE *get_Headers)(void *, void **);
     HRESULT (STDMETHODCALLTYPE *get_Method)(void *, void **);
     HRESULT (STDMETHODCALLTYPE *put_Method)(void *, void *);
+    HRESULT (STDMETHODCALLTYPE *get_Properties)(void *, void **);
 } ReqVtbl;
 typedef struct { const ReqVtbl *lpVtbl; } Req;
+
+/* IMap<HSTRING, IInspectable *> */
+typedef struct { void *q,*a,*r,*gi;
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(void *, HSTRING *);
+    void *gt;
+    HRESULT (STDMETHODCALLTYPE *Lookup)(void *, HSTRING, IInspectable **);
+    HRESULT (STDMETHODCALLTYPE *get_Size)(void *, UINT32 *);
+    HRESULT (STDMETHODCALLTYPE *HasKey)(void *, HSTRING, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *GetView)(void *, void **);
+    HRESULT (STDMETHODCALLTYPE *Insert)(void *, HSTRING, IInspectable *, unsigned char *);
+    HRESULT (STDMETHODCALLTYPE *Remove)(void *, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *Clear)(void *);
+} MapSOVtbl;
+typedef struct { const MapSOVtbl *lpVtbl; } MapSO;
 
 /* IHttpResponseMessage：前四项 + 状态码 */
 typedef struct { void *q,*a,*r,*gi,*gn,*gt;
@@ -227,6 +245,7 @@ static IActivationFactory *get_factory(const WCHAR *name, const char *label)
 
 int wmain(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* a crash on Windows keeps what was printed */
     IActivationFactory *f;
     HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
     if (FAILED(hr)) { printf("RoInitialize 失败 0x%08lx\n", (unsigned long)hr); return 2; }
@@ -313,7 +332,7 @@ int wmain(void)
     if ((f = get_factory(L"Windows.Web.Http.HttpRequestMessage", "请求消息：拿到激活工厂")))
     {
         IInspectable *req = NULL;
-        Req *r = NULL; MapSS *h = NULL;
+        Req *r = NULL; MapSS *h = NULL, *hm = NULL;
         void *p3 = NULL;
         HSTRING k = NULL, v = NULL, back = NULL;
         UINT32 n = 0xcccc; unsigned char had = 2;
@@ -327,28 +346,72 @@ int wmain(void)
             if (r && SUCCEEDED(r->lpVtbl->get_Headers(r, (void **)&h)) && h)
             {
                 check(1, "拿到 Headers 集合");
-                check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)h, &IID_IMapSS, &p3)) && p3,
+                /* Windows hands out its typed header collection here, not the
+                 * IMap itself: go through the map interface explicitly. */
+                check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)h, &IID_IMapSS, (void **)&hm)) && hm,
                       "Headers 是 IMap<HSTRING,HSTRING>");
                 check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)h, &IID_IIterableKVSS, &p3)) && p3,
                       "Headers 可 QI IIterable");
+                if (hm)
+                {
                 WindowsCreateString(L"X-Probe", 7, &k);
                 WindowsCreateString(L"yes", 3, &v);
-                check(SUCCEEDED(h->lpVtbl->Insert(h, k, v, &had)) && had == 0, "插入一个头（新增）");
-                check(SUCCEEDED(h->lpVtbl->get_Size(h, &n)) && n == 1, "Size 为 1");
-                check(SUCCEEDED(h->lpVtbl->Lookup(h, k, &back)) && back &&
+                check(SUCCEEDED(hm->lpVtbl->Insert(hm, k, v, &had)) && had == 0, "插入一个头（新增）");
+                check(SUCCEEDED(hm->lpVtbl->get_Size(hm, &n)) && n == 1, "Size 为 1");
+                check(SUCCEEDED(hm->lpVtbl->Lookup(hm, k, &back)) && back &&
                       !wcscmp(WindowsGetStringRawBuffer(back, NULL), L"yes"), "查回同一个值");
                 {
                     HSTRING k2 = NULL; unsigned char has = 0;
                     WindowsCreateString(L"x-PROBE", 7, &k2);
-                    check(SUCCEEDED(h->lpVtbl->HasKey(h, k2, &has)) && has, "头名不分大小写");
-                    check(SUCCEEDED(h->lpVtbl->Insert(h, k2, v, &had)) && had == 1, "同名再插入算替换");
-                    check(SUCCEEDED(h->lpVtbl->get_Size(h, &n)) && n == 1, "替换后 Size 仍为 1");
+                    check(SUCCEEDED(hm->lpVtbl->HasKey(hm, k2, &has)) && has, "头名不分大小写");
+                    check(SUCCEEDED(hm->lpVtbl->Insert(hm, k2, v, &had)) && had == 1, "同名再插入算替换");
+                    check(SUCCEEDED(hm->lpVtbl->get_Size(hm, &n)) && n == 1, "替换后 Size 仍为 1");
                 }
-                check(SUCCEEDED(h->lpVtbl->Remove(h, k)) && SUCCEEDED(h->lpVtbl->get_Size(h, &n)) && n == 0,
+                check(SUCCEEDED(hm->lpVtbl->Remove(hm, k)) && SUCCEEDED(hm->lpVtbl->get_Size(hm, &n)) && n == 0,
                       "删除后为空");
-                check(h->lpVtbl->Remove(h, k) == E_BOUNDS, "删除不存在的头报 E_BOUNDS");
+                check(hm->lpVtbl->Remove(hm, k) == E_BOUNDS, "删除不存在的头报 E_BOUNDS");
+                }
             }
             else check(0, "拿到 Headers 集合");
+
+            /* Properties: the caller's own bag.  React Native keeps each
+             * request's arguments in it, so it has to work as a map. */
+            if (r)
+            {
+                MapSO *pm = NULL, *pm2 = NULL;
+                IInspectable *got = NULL;
+                HSTRING key = NULL, missing = NULL, cls = NULL;
+                HRESULT hr = r->lpVtbl->get_Properties(r, (void **)&pm);
+                unsigned char replaced = 2, has = 0;
+
+                check(SUCCEEDED(hr) && pm, "Properties 返回集合");
+                if (pm)
+                {
+                    check(SUCCEEDED(r->lpVtbl->get_Properties(r, (void **)&pm2)) && pm2 == pm,
+                          "Properties 两次拿到同一个对象");
+                    check(SUCCEEDED(IInspectable_QueryInterface((IInspectable *)pm, &IID_IMapSO, &p3)) && p3,
+                          "Properties 是 IMap<HSTRING,IInspectable>");
+                    printf("  [测量] QI IPropertySet -> %#lx, QI IObservableMap -> %#lx\n",
+                           IInspectable_QueryInterface((IInspectable *)pm, &IID_IPropertySet_, &p3),
+                           IInspectable_QueryInterface((IInspectable *)pm, &IID_IObservableMapSO, &p3));
+                    if (SUCCEEDED(pm->lpVtbl->GetRuntimeClassName(pm, &cls)) && cls)
+                        printf("  [测量] 运行时类名 %ls\n", WindowsGetStringRawBuffer(cls, NULL));
+                    else
+                        printf("  [测量] 运行时类名取不到\n");
+                    check(SUCCEEDED(pm->lpVtbl->get_Size(pm, &n)) && n == 0, "Properties 初始为空");
+                    WindowsCreateString(L"RequestArgs", 11, &key);
+                    WindowsCreateString(L"Missing", 7, &missing);
+                    check(SUCCEEDED(pm->lpVtbl->Insert(pm, key, req, &replaced)) && replaced == 0,
+                          "插入一个对象（新增）");
+                    check(SUCCEEDED(pm->lpVtbl->HasKey(pm, key, &has)) && has, "HasKey 找得到");
+                    check(SUCCEEDED(pm->lpVtbl->Lookup(pm, key, &got)) && got == req, "Lookup 查回同一个对象");
+                    check(SUCCEEDED(pm->lpVtbl->get_Size(pm, &n)) && n == 1, "Size 为 1");
+                    hr = pm->lpVtbl->Lookup(pm, missing, &got);
+                    printf("  [测量] Lookup 不存在的键 -> %#lx\n", hr);
+                    check(SUCCEEDED(pm->lpVtbl->Remove(pm, key)) && SUCCEEDED(pm->lpVtbl->get_Size(pm, &n)) && n == 0,
+                          "删除后为空");
+                }
+            }
         }
     }
     if ((f = get_factory(L"Windows.Web.Http.HttpResponseMessage", "响应消息：拿到激活工厂")))
