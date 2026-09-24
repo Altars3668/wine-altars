@@ -8599,3 +8599,89 @@ Windows 在显示器被拔掉时会把它上面的窗口搬到剩下的显示器
 
 复现里旧版的最大化窗口碰巧没丢，是 mutter 在中间一步已经把它挪到新主显示器上了；用户会话里
 丢的那个，是被 `max_pos` 拽回去的，这一条靠代码和现场数值确认，没有在复现里单独打出来。
+
+## 自动保存：三个互不相干、都不出声的缺口
+
+现象依次是：点"自动保存"开关，弹出"如何启用'自动保存'？"，上传位置列表是空的、旁边一个
+"登录"按钮；修好第一个后能选 OneDrive、能命名，但状态栏说"更改已保存，但因服务器忙而未能上传"；
+修好第二个后能上传，但关掉再打开这份文档 Word 就崩，下次启动 Word 自己去重开它时也崩。
+三处都没有一行报错，也没有 C++ 异常。
+
+### 1. 服务目录写不进缓存：`<o:Scope></o:Scope>` 读成了 NULL（`6b8b746`）
+
+Office 从 `odc.officeapps.live.com/odc/servicemanager/catalog` 取"可保存到哪里"的服务目录，
+用 WWSAPI 的 `WsReadType` 解析后写进 `HKCU\...\Common\ServicesManagerCache\ServicesCatalog`。
+在 Wine 里这个键一直是空的。Mso98 `CacheManager::WriteServicesCatalog` 在所有出口下断点，一次
+就看到它从 `IdentityNotReachedTag(0x100624b)` 退出——"ServicesCatalogResults.Auth should not
+have a null Scope"，出在第 16 个服务 `FP_EXCHANGE_MSA`，它的 XML 是 `<o:Scope></o:Scope>`。
+而且这个检查在 `ClearAllData` 之后，所以缓存被清空、再也写不进去。
+
+探针（`tools/wsemptyprobe`）在 Windows 上实测：可选 `WS_WSZ_TYPE` 字段遇到空元素，Windows 给
+`""`，Wine 给 NULL；`WS_STRING`/`WS_XML_STRING`/`WS_BYTES` 也是 Windows 给"长度 0、指针非空"，
+Wine 给空指针（Wine 自己的测试里早就有这几条 `todo_wine`）。改成空元素读作空值之后，五个
+`todo_wine` 变为通过，新加的结构体字段测试在 Windows 上也通过；目录写入 28 个服务，
+`CacheReady=1`，对话框里出现"OneDrive - 个人"。
+
+中间走过的弯路：`CloudStorage::AddServicesToCatalog` 返回 false 看起来像原因，其实调用处直接
+忽略返回值，而且没有注册第三方云存储时 Windows 上它同样返回 false。
+
+### 2. 上传被 503：信封里 `xmlns:s` 写了两遍（`5b4cf10`）
+
+`+winhttp` 看到 FSSHTTP 的 `POST .../_vti_bin/cellstorage.svc/CellStorageService` 得到
+`503 Service Unavailable`，响应头 `X-Azure-ExternalError: 0x80072efe,OriginConnectionAborted`：
+前端把请求转给源站，源站直接断了连接。请求头与 Windows 无异，于是在 `winhttp!WinHttpWriteData`
+下断点抓正文（`tools/bpdump`），第一行就是
+
+    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+
+`+xmllite` 给出 Office 的调用：`WriteStartElement(L"s", L"Envelope", uri)` 之后
+`WriteAttributeString(L"xmlns", L"s", NULL, uri)`。Wine 查"当前元素是否已有这个声明"时拿
+`"xmlns"` 当前缀去查，查不到就又登记一份并立即写出，元素自己那份在开始标签收尾时再写一次。
+`tools/xmlnsprobe` 在 Windows 上测了十几种写法（重复声明报 `WR_E_NSPREFIXDECLARED`、
+`xmlns` 前缀配 xmlns URI 合法、读者复制 `xmlns=""` 原样写出等），Wine 原来错一半以上，还会写出
+非法的 `xmlns:xmlns="..."`。修好后探针输出与 Windows 逐字相同；Wine 的 xmllite 测试 0 失败，
+新加的测试在 Windows 上也通过。之后 POST 返回 200，文件出现在 OneDrive，Word 弹出
+"自动保存：你无需再单击'保存'"。
+
+### 3. 重开即崩：ole32 在探测复合文件时 Flush 了 Csi 的流（`47edbea`）
+
+崩溃点是 `Csi::StreamOnIFileBranchBase::Stat`，`this+0x38`（文件分支）为 NULL；调用者是 Word 的
+`FcMacFn`（取文件长度），上游 `FnOpenFnmCore`。其间没有任何异常。`tools/bptrace` 在 Csi 的流对象
+初始化、提交、`Stat` 上记录 `this` 和 `[this+0x38]`，得到完整顺序：
+
+1. `PostInitIFileBranch` → `Init`：流建好，分支有效；
+2. `Stat` 被 **ole32 `StorageImpl_Construct`** 经 `ILockBytes_Stat` 调用——Word 对每个打开的文档
+   用 `StgOpenStorageOnILockBytes` 探测是不是复合文件；
+3. `CommitEx` → `CommitToBranchAndInvalidateStream`：分支被提交后置空；
+4. `FcMacFn` 再调 `Stat` → 崩溃。
+
+Wine 的 `StorageImpl_Construct` 失败时经 `IStorage_Release` → `StorageImpl_Destroy` →
+`StorageImpl_Flush` 无条件调用 `ILockBytes_Flush`，成功时也立刻 Flush 一次；Csi 的流把 Flush 当
+提交。`tools/lockbytesprobe` 在 Windows 上实测：非复合文件被拒（返回 `STG_E_FILEALREADYEXISTS`，
+Wine 是 `STG_E_INVALIDHEADER`）、只读或事务模式打开再释放，都**不调用** Flush；只有直接模式可写
+打开的存储在释放时 Flush 一次。改成"写过才 Flush、直接模式可写者释放时 Flush"，并做错误码映射后，
+探针除读取粒度外与 Windows 一致，ole32 的 storage32 测试 0 失败、新测试在 Windows 上通过。
+重新打开 AutoSave 文档不再崩溃，编辑后 `cellstorage` POST 返回 200，SignalR 以 WebSocket 建立，
+标题栏显示"已保存"。
+
+**陷阱**：改 ole32 的中途，storage32 测试里一条"文件不应变大"的 `todo_wine` 突然通过了。
+查下去是我在一个没有花括号的 `if` 下插了一行，`ILockBytes_SetSize` 变成无条件执行，文件被截短
+才"不变大"。`todo_wine` 突然通过，先找到机理再相信它。
+
+### 顺带：React Native 的请求（`970945b`）
+
+`HttpRequestMessage.Properties` 原来返回 `E_NOTIMPL`，Office 的 React Native 界面的请求连发都发
+不出去。现在返回一个惰性创建、此后复用的属性表（wintypes 的 PropertySet）；Windows 上实测它是
+普通的 `IMap<HSTRING,IInspectable>`，映射操作一致，但 Windows 的对象不支持 `IPropertySet` 和
+`IObservableMap`，这一点不同。AugLoop 的请求随后停在 `HttpMediaTypeHeaderValue`（未注册）。
+
+### 测试时的注意事项
+
+- 上传失败的文档留在 `%LOCALAPPDATA%\Microsoft\Office\16.0\OfficeFileCache` 里，Word 启动时会
+  自己去重开；在第 3 个修复之前，这意味着每次启动都崩。把这个目录挪开即可恢复测试。
+- 从 Bash 工具后台启动的调试器会随那次调用结束而消失；追踪器和界面操作要放进同一个脚本里跑。
+  `Csi.dll` 只在打开云文档时才加载，追踪器要在 `LOAD_DLL` 事件里按导出表名字认出它再布断点。
+- 杀掉仍布着 int3 的调试器，断点字节会留在目标里，下一次命中就崩。
+
+还没做的：`RoamingSoapService.svc` 的 POST 返回 `415 Unsupported Media Type`（漫游设置，与自动
+保存无关）；`HttpMediaTypeHeaderValue` 等 WinRT HTTP 类型、`SendRequestAsync` 仍未实现。
