@@ -22,6 +22,9 @@
 # On a bus of its own, which is not optional: see start_bus below.
 #
 #   eval "$(scripts/measure-desktop.sh start)"   # DISPLAY, XAUTHORITY, and the bus
+#   MEASURE_GEOM=2992x1440,1440x2992 scripts/measure-desktop.sh start
+#                               # one virtual monitor per size: switch between them with
+#                               # scripts/monitor-switch.py, as a remote desktop does
 #   scripts/measure-desktop.sh status
 #   scripts/measure-desktop.sh stop
 #
@@ -97,7 +100,8 @@ start)
             echo "could not start a private session bus" >&2; exit 1; }
         setsid env XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
             DBUS_SESSION_BUS_ADDRESS="$(cat "$BUS_ADDRFILE")" \
-            mutter --headless --virtual-monitor "$GEOM" >>"$LOG" 2>&1 &
+            mutter --headless $(for g in ${GEOM//,/ }; do printf -- '--virtual-monitor %s ' "$g"; done) \
+            >>"$LOG" 2>&1 &
         echo $! > "$PIDFILE"
         for _ in $(seq 1 20); do
             grep -q 'Using public X11 display' "$LOG" && break

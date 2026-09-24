@@ -8683,5 +8683,104 @@ Wine 是 `STG_E_INVALIDHEADER`）、只读或事务模式打开再释放，都**
   `Csi.dll` 只在打开云文档时才加载，追踪器要在 `LOAD_DLL` 事件里按导出表名字认出它再布断点。
 - 杀掉仍布着 int3 的调试器，断点字节会留在目标里，下一次命中就崩。
 
-还没做的：`RoamingSoapService.svc` 的 POST 返回 `415 Unsupported Media Type`（漫游设置，与自动
-保存无关）；`HttpMediaTypeHeaderValue` 等 WinRT HTTP 类型、`SendRequestAsync` 仍未实现。
+### 漫游设置的 415（`917db3d`）
+
+`RoamingSoapService.svc` 的 POST 一直返回 `415 Unsupported Media Type`。Office 用
+`WsCreateServiceProxyFromTemplate` 建代理：服务要求的东西（SOAP 1.1 信封、传输层寻址）写在模板的
+**描述**里，是从服务元数据生成的；模板值只带一个缓冲区大小。Wine 只看模板值，请求以 SOAP 1.2 加
+WS-Addressing 发出，SOAP 1.1 的服务对每一次写都回 415。
+
+`tools/wsproxyprobe` 在本机起一个监听，把 Content-Type、SOAPAction 和报文原样打出来，在 Windows
+上逐项实测：描述与模板值的通道属性合并使用；同一个属性两边都给就 `E_INVALIDARG`（值相同也不行）；
+TCP 模板同理。顺着同一条路径补齐：代理写出的请求按通道编码（二进制编码只配 SOAP 1.2，否则
+`E_INVALIDARG`，名字取静态字典，与 Windows 逐字节相同）；二进制报文标成
+`application/soap+msbin1`（会话编码为 `msbinsession1`），不带 charset 和 action；SOAP 1.2 只在
+传输层寻址时把 action 放进 Content-Type。写端还没有 UTF-16 和 MTOM 输出，这两种编码仍以 UTF-8
+文本发出并如实标注。
+
+还没做的：`HttpMediaTypeHeaderValue` 等 WinRT HTTP 类型、`SendRequestAsync` 仍未实现。
+
+## 窗口互相透视：阴影窗口、换屏后的错位和翻转的 Z 序
+
+用户报告：Word 的几个窗口之间、以及和其它原生程序的窗口之间"透视"——上层窗口上透出下层窗口的
+东西，尤其是每个窗口周围那一圈半透明的边框。查下来是五个彼此独立的缺陷，前一个是主因，后四个在
+换屏（手机远程转屏、换远程客户端）时叠上来。
+
+### 主因：阴影条是 override-redirect 窗口（`a25275c`）
+
+Office 窗口周围的软阴影是四个细长的分层工具窗口（类 `MSO_BORDEREFFECT_WINDOW_CLASS`，样式
+`WS_POPUP`，扩展样式 `WS_EX_LAYERED|WS_EX_TOOLWINDOW`，无 owner），Office 用
+`SetWindowPos(阴影, 主窗口, …)` 让它们在 Z 序里紧跟在自己窗口后面。winex11 把它们当成非托管窗口，
+也就是 override-redirect，而 mutter 把 override-redirect 窗口一律放在所有托管窗口之上：后面那个
+窗口的阴影压在前面窗口上，也压在别的程序上。
+
+现在"紧跟在我们某个托管窗口之后的、无标题栏的分层工具弹出窗口"改为托管窗口，`WM_TRANSIENT_FOR`
+指向那个窗口，类型 `_NET_WM_WINDOW_TYPE_UTILITY`，`WM_HINTS` input=False 且不声明
+`WM_TAKE_FOCUS`（mutter 不会给它焦点）。mutter 让 transient 紧贴在父窗口之上、随父窗口升降；不取焦点
+映射的窗口放在焦点窗口之下。为 ARGB 视觉重建 X 窗口时这个关系保留。虚拟桌面模式不受影响。
+
+托管窗口会被窗口管理器"挪回屏幕内"，而贴着屏幕边的窗口，它的阴影本来就有一部分在屏幕外。
+mutter 的约束没有全写在文档里，用 `tools/stripprobe/stripprobe`（在无头 mutter 上映射一条与阴影条
+属性相同的窗口，读回它最终的位置）量出来：
+
+| 要求的位置（屏幕 2560x1440） | mutter 放到 |
+|---|---|
+| 800x8 于 (192,-4) | (192,0)：上沿不许高于工作区 |
+| 8x600 于 (-8,192) | (0,192)：不足 10 像素厚的一维必须完整在内 |
+| 300x8 于 (2400,192) | (2260,192)：放得下的窗口首次映射时整体推回 |
+| 2600x8 于 (-20,-8) | (-20,0)：比屏幕还长的一维不推，上沿照推 |
+| 已映射后移到 (192,-4) | (192,0)：原本完整在内的窗口以后也被推回 |
+
+对应 mutter 的 `constrain_partially_onscreen`（上沿不外扩；每一维至少留 `clamp(尺寸/4,10,75)`
+在屏内）和 `constrain_fully_onscreen`（`require_fully_onscreen` 初值为真，此后等于"上次是否完整在内"）。
+winex11 据此判断：阴影条完整在工作区内，或放不下而又满足前一条约束时才映射，否则保持未映射——被挪
+开的阴影条比没有更糟，而 Windows 上屏幕外那一截本来也看不见。
+
+**测量陷阱：会话不活动时 mutter 不映射无边框窗口。** 第一次验证时所有阴影条都 `IsUnMapped`，一度
+以为是规则太严。用最小探针（`tools/stripprobe/undecorated`）复现：连一个只设了 `_MOTIF_WM_HINTS` decorations=0 的 400x300 窗口也不被
+映射，直到被激活（`_NET_ACTIVE_WINDOW`）或加上装饰。原因是用户的图形会话在后台（`loginctl` 里
+tty2 会话 `Active=no`，座位上活动的是 gdm；DP-1 已 DPMS off），舞台帧时钟不跑，mutter 的
+`CALC_SHOWING`/`SYNC_STACK` 延迟任务挂在帧时钟上，一直不执行；Word 主窗口能出来只是因为激活路径
+会同步刷新。之后所有验证都改在 `scripts/measure-desktop.sh` 那样的无头 mutter（独立总线）上做。
+
+验证（无头 mutter，Word 三个窗口）：`_NET_CLIENT_LIST_STACKING` 里每个窗口的四条阴影紧跟在自己之上、
+在更高的窗口之下，与 Win32 Z 序一致；截图里前窗右侧有渐变阴影，后窗阴影被前窗盖住；放一个纯红的
+原生窗口压在 Word 右缘上，阴影条那几列读回全是 (255,0,0)；激活后面的窗口，它和它的阴影一起上来；
+最大化时 Office 销毁阴影、还原时重建，新建的也正确挂接。
+
+### 换屏时的四个缺陷
+
+复现方法：无头 mutter 带两个虚拟显示器（`MEASURE_GEOM=2992x1440,1440x2992 scripts/measure-desktop.sh
+start`），用 `scripts/monitor-switch.py` 轮流只启用一个，等价于手机转屏时 GRD 换虚拟显示器。
+
+1. **被当成"移到屏外"的新位置（`82486d6`）。** 显示器被撤时 mutter 先把窗口挪到剩下的显示器上，
+   这时 Wine 还不知道新屏幕，新位置落在旧屏幕外，winex11 的 `is_offscreen` 把它当成窗口管理器故意
+   藏起来的：不告诉 Win32，并在之后每一次移动上叠加同样的偏移。转屏后 Word 的阴影条被放到屏幕底部、
+   窗口左边 600 像素处，Win32 随后也被告知它们在那里。现在只有窗口管理器给的位置在**当前**屏幕上
+   仍然在外时才保留偏移；换屏后所有可见窗口都与主机同步一次（原来只同步需要重新适配的窗口）。
+2. **重建的 X 窗口没有 `_NET_WM_USER_TIME`（`139afd2`）。** 不激活地映射的窗口带 user time 0，告诉
+   mutter 别给焦点、别放到焦点窗口之上。这个值缓存在窗口数据里，X 窗口为换视觉重建后没有再设，新
+   窗口就没有这个属性，mutter 把它放到最顶：后面窗口的阴影横在前窗上。
+3. **Expose 被当成"露在最上面"（`4be87be`）。** 窗口某部分收到 Expose 时，winex11 请服务器把它挪到
+   Win32 里盖着那部分的窗口之上（`update_window_zorder`）。在合成管理器下每个窗口有自己的像素图，
+   映射或变大时就有 Expose，与是否被别的窗口挡着无关。换屏时所有窗口一起改尺寸，逐个"挪到上面"，
+   Win32 Z 序被整个翻过来：前台窗口在屏幕上最上面，在 Win32 里却在最下面。用 `tools/zorder/zwatch.exe`（每 20ms
+   采样一次 Z 序）配合 `+timestamp` 把变化钉在一次只带 `SWP_NOZORDER` 的移动上，才找到这条旁路。
+   现在合成管理器存在时（`_NET_WM_CM_Sn` 有属主，Xwayland 总是如此）Expose 只重绘。
+4. **还没接上桌面的输出被当成屏幕（`7c83b5e`）。** 切换的那一刻主机已经报出新输出，但它的 source
+   还没接入桌面（`state_flags 0`）、显示器矩形是空的。已有的"一刻没有显示器就不写下"只数显示器个数，
+   这个中间态被提交，读回时没有主 source，读到的进程统统退到 1024x768 的替身显示器。现在只有接入
+   桌面、有位置的显示器才算数。三轮横竖屏来回切换：回退 0 次，跳过中间态 1 次。
+
+回归：user32 的 `win`、`msg`、`monitor`、`sysparams` 在同一无头显示上各跑改动前后两版。`msg`
+（238）和 `monitor`（177，全是 Xwayland 下改分辨率不生效）失败集合逐条相同；`sysparams` 0 失败；
+`win` 只有已知不稳定的 `test_activateapp` 焦点时序差异，重跑不再出现。
+
+### 没能复现的：只重绘了上半截
+
+用户会话里见过一次：竖屏手机上两个 Word 窗口同在 (143,0)、1452x1548，上面那个只有 y<774 的部分
+是自己的内容，下面露出的是另一个文档的页面（像素逐行读出来确认过）。在无头环境里，窗口高度从
+1444 变到 2992 的最大化转屏、普通窗口转屏，重绘都完整。那次正好处于上面第 4 条的回退窗口期
+（窗口原来是 1440x774，774 恰是 1548 的一半），可能是 Office 按替身显示器布局过一次；修掉第 4 条后
+没再能构造出来。再遇到时要抓：`tools/zorder/zorder.exe` 的 Z 序、`xwin-pixels.py` 读该 X 窗口本身的像素（区分
+是 Word 没画还是合成器没更新）、以及当时日志里有没有 `Failed to read display config`。
