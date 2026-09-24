@@ -8465,3 +8465,76 @@ fixme:font:get_nearest_charset returning DEFAULT_CHARSET ...
 诊断已经能在死锁瞬间打印两条栈，并记下「哪个字形请求没回来」
 （`glyph_in_flight`）。在 `:77` 上人工滚动字体列表 80 次没能复现，
 用户的真实会话能稳定复现，下一步靠那边的现场取这条记录。
+
+## 手机远程转屏后 Word 被关在旧尺寸里，后来又被截成 1024x768
+
+用户从手机上的 Windows App 连 gnome-remote-desktop（远程登录，会话是无头的，
+唯一的显示器是 GRD 给的虚拟显示器 `Meta-0`）。竖屏转横屏后 Word 的窗口变大了，
+内容却停在旧分辨率的框里；修过一轮之后，又变成整个会话都被截成一个小窗。
+
+### 第一轮：时序和通知（`a8bf297`）
+
+- mutter **先**改 X 窗口大小，这时 Wine 的显示配置还是旧的；Office 在
+  `WM_NCCALCSIZE` 里按 `GetMonitorInfo` 的工作区算客户区，算出的是旧显示器。
+- Wine 不给普通窗口发主机侧的 `WM_DISPLAYCHANGE`，也不重新最大化已最大化的窗口，
+  所以 Office 再也没有机会重算。
+- GRD 换屏时先撤旧输出再上新输出，枚举到零个显示器的那一刻被写进了注册表。
+
+改成桌面进程独占显示配置、整体提交、零显示器的枚举不提交、变化后广播并重新最大化。
+在无头 mutter 里**旋转同一个输出**的测试通过——但真实会话仍然不对。
+
+### 第二轮：真正的根因是一条改不动的注册表链接（`a17547a`）
+
+在用户会话里量到的：
+
+| 问谁 | 答案 |
+|---|---|
+| `xrandr`（:0） | `Meta-0` 1920x1080，输出 ID `0x6d1` |
+| `tools/monprobe`（同一 Wine 会话） | `SM_CXSCREEN` 1024x768，唯一显示器叫 `WinDisc` |
+| Word 的日志 | 反复出现 `find_monitor_from_path Failed to find monitor with path "DISPLAY\Default_Monitor\0001&0000"`，随后 `Failed to read display config, using a virtual monitor` |
+| `DEVICEMAP\VIDEO` | 只有 `\Device\Video0` → `...\Control\Video\{guid}\0000` |
+| `...\Video\{guid}\0000` 读出来的内容 | `MonitorID0 = 0001&0000`、`StateFlags 0x1`——这是**旧输出 `Sources\06bb`** 的内容 |
+| `Sources\06bb`、`Sources\06ce` | 各多出一个本该写在链接键上的 `SymbolicLinkValue` |
+
+本会话里 GRD 已经换过三个输出（`06bb`、`06ce`、`06d1`）：Xwayland 给每个新
+wl_output 一个新的 RandR 输出 ID，GRD 在客户端重连或转屏时换新的虚拟显示器。
+
+win32u 把每个 source 的设置存在按驱动 source 名（这里就是输出 ID）命名的
+`Sources\<name>` 键里，再用按枚举顺序命名的链接键 `...\Video\{guid}\%04x`
+指过去。链接已存在时，旧代码用 `REG_OPTION_OPEN_LINK` 按名字打开它来改指向——
+但这个选项**不会**打开链接本身（Wine 自己的 `ntdll/tests/reg.c` 在 Windows 上
+验证过："REG_OPTION_OPEN_LINK flag doesn't matter"，只有 `OBJ_OPENLINK` 才行），
+名字被解析到旧目标，新目标作为普通值写进了旧目标键，链接纹丝不动。
+
+后果分两级：
+
+1. 只换过输出：读回的是旧输出的模式——显示器还是旧尺寸（转屏后被关在旧框里）。
+2. 换屏的瞬间新旧两个输出并存过：旧输出那次被排成非主 source（id 1），它的键里
+   写下了 `0001&0000`；之后链接一直指着它，而这个显示器早已不存在 → 读配置失败 →
+   整个会话用 1024x768 的 `WinDisc` 兜底，直到 wineserver 退出（这些键是 volatile 的）。
+
+修法：链接已存在时用 `OBJ_OPENLINK` 打开链接本身再设 `SymbolicLinkValue`。
+
+### 怎么在没有手机的情况下复现
+
+无头 mutter，两个虚拟显示器，用 `ApplyMonitorsConfig` 轮流只启用其中一个——
+每次启用 Xwayland 都会给新的输出 ID（实测 `0x21` → `0x360` → `0x362`），
+和 GRD 换屏一样。测试窗口模仿 Office：在 `WM_NCCALCSIZE` 里按 `GetMonitorInfo`
+算最大化客户区。
+
+| 步骤 | X | 旧版 Wine | 新版 Wine |
+|---|---|---|---|
+| 只 Meta-0 | 1080x2340 | 1080x2340 | 1080x2340 |
+| 换成 Meta-1 | 2340x1080 | **1080x2340**，客户区 1080x1071（被截） | 2340x1080，客户区 2340x1071 |
+| 两个都开 | 3420x2340 | 两台，正确 | 两台，正确 |
+| 只剩 Meta-1 | 2340x1080 | **1080x2340** | 2340x1080 |
+
+**教训**：第一轮只测了「同一个输出转方向」，这条路径上链接永远指向同一个键，
+所以测不出来。测试要复现真实客户端的**行为**（换输出），而不只是它的**结果**
+（分辨率变了）。
+
+### 部署后在用户会话里量到的
+
+重启会话后 `monprobe`：1920x1080，工作区 (0,0)-(1920,1032)；Word 最大化后窗口
+(0,0)-(1920,1032)、客户区 1912x1024，截图里功能区、标题栏、状态栏完整；日志里
+不再有 `Failed to read display config`。真实转屏仍待用户在手机上确认。
