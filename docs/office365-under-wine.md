@@ -8867,3 +8867,84 @@ Win10 2004–22H2 对应 UniversalApiContract 10）之后，Word 的 AirSpace �
 **决定：保持新路径，不再靠“回答没有”把 Word 引回旧路径。**在 Wine 的 dcomp 里实现一个进程内的
 Composition 引擎：用 D3D11/D2D 渲染视觉树，提供 HWND 目标和 DirectComposition 设备，并按 Office
 实际用到的部分逐项对照 Windows。在它能用之前，Word 会一直卡在这个断言上。
+
+## Windows.UI.Composition：dcomp 里的合成引擎
+
+上一节的决定落地了：Wine 的 dcomp.dll 现在带着一个进程内的 Composition 引擎。合约如实回答时，
+Word 通过它启动，窗口、功能区、各个窗格、“文件”后台视图和按键提示都能正常画出来。
+
+### 引擎（`14b2c41`、`2024884`）
+
+- **合成器**：只能在有 DispatcherQueue 的线程上创建。它不是 CompositionObject，是 agile 的。
+  CompositorController 的合成器只在调用 Commit 时绘制，有改动时在自己的线程上异步触发 CommitNeeded；
+  普通 Compositor 在改动后很快自动提交。
+- **目标**：一个窗口最多一个 DesktopWindowTarget。提交时，每个目标的视觉树用 Direct2D 画进这个窗口上的
+  一条交换链，使用树里所显示表面所在的 D3D 设备。
+- **绘图表面**：在 D3D 纹理里保存像素，虚拟表面按 512 像素分块。BeginDraw 的更新矩形如果落在一块之内就原地绘制，
+  否则画到一张暂存纹理上，EndDraw 时再拷回各块。
+- **表达式**：解析一次成树，之后每帧求值。支持 C 的运算符、各种向量/矩阵/四元数类型、swizzle、`this.*`，
+  以及 Windows 文档列出的函数。
+- **动画**：表达式动画和关键帧动画可以挂在视觉对象、画刷、裁剪、属性集、InteractionTracker 和
+  VisualInteractionSource 的属性上，包括 `Offset.X` 这样的分量。关键帧按时间推进，有关键帧动画运行时，
+  由 DispatcherQueueTimer 每 16ms 在合成器线程上画一帧；ScopedBatch 和 CommitBatch 报告动画何时结束。
+- **InteractionTracker**：Office 用表达式按内容大小算出 MaxPosition，位置按动画后的边界钳制。
+  输入还不会驱动它。
+
+每个对象创建时的样子、各个错误码、StartAnimation 接受什么，都按 Windows 桌面会话里的 probe 实测
+（`tools/compprobe`、`tools/animprobe`、`tools/interactprobe`）。几条出乎意料的：
+
+- 关键帧动画默认 Duration 是 250ms，StopBehavior 是 LeaveCurrentValue。
+- 类型检查是严格的：`1` 不能给布尔属性，标量也不能给 Vector3。
+- VisualInteractionSource 的两个 Rails 默认为真，Scale 默认为 0；一个视觉对象只能有一个源。
+- 属性集的名字不区分大小写，名字一旦定了类型就不能改。
+- RedirectVisual 在自己的原点重画它的源，源自身的 Offset 不计入（这一条是用 PrintWindow 读像素确认的）。
+
+`dlls/dcomp/tests` 在 Windows 桌面会话里 401 项全部通过。Wine 下只剩经 PrintWindow 读合成像素的检查是
+todo，那几处像素改用 mutter 截屏核对过。
+
+### 一个一个补上 AirSpace 要的东西
+
+办法是：部署 dcomp，带 `warn+dcomp,fixme+dcomp,warn+seh` 启动 Word，看 AirSpace 线程在 ShipAssert
+（对地址 0 的写入）之前最后一条 FIXME 是什么，那就是下一个缺口。依次是：
+
+1. VisualInteractionSource；
+2. `Offset.X` 上的表达式（tracker 缺 IsPositionRoundingSuggested）；
+3. CompositionConditionalValue；
+4. VisualInteractionSource 的 Rails 要能被动画；
+5. NineGridBrush；
+6. VisualCollection 的 `IIterable<Visual>`；
+7. 打开恢复文档时才用到的 DropShadow 和 RedirectVisual。
+
+### 功能区空白、文字乱码：d2d1 的命令列表（`775f583`）
+
+每个缺口都补完之后，功能区的图标、选项卡和恢复窗格仍然是空的。日志里 259 次
+`d2d_device_context_EndDraw: Unimplemented for command list target`：NetUI 先把界面元素录进
+ID2D1CommandList，再用 DrawImage 画到表面上，而 Wine 的 d2d1 只会录制，不会回放。现在 DrawImage 通过一个
+内部的 command sink 回放已关闭的列表，EndDraw 返回上下文自己的错误码。
+
+回放之后，文字变成了错字和方框，选项卡标签也串了位。根因是：录制时，字形索引、advance、偏移、run 描述，
+以及位图、图像的矩形，都以**绝对指针**的形式存进列表自己的缓冲区，而缓冲区随着列表增长会 realloc，
+之前那些命令的指针就全部悬空了。改成相对命令起点的偏移之后，文字就正确了。新测试专门录制一个会迫使列表
+扩容的序列；它在 Windows 上通过，拿掉这个修复在 Wine 上失败。
+
+### DispatcherQueue：定时器、专用线程和关闭（`4566ae2`）
+
+合成的逐帧渲染需要 DispatcherQueueTimer，于是连同同一模块里相邻的缺口一起补齐：CreateTimer、
+DQTYPE_THREAD_DEDICATED 真正的专用线程、ShutdownQueueAsync，以及 ShutdownStarting（带 deferral）和
+ShutdownCompleted 两个事件。上游现有的测试去掉 todo 之后全部通过，新加的定时器测试在 Windows 上也通过。
+
+### 测不到的
+
+参照机 winref 的桌面会话看起来处于锁屏或断开状态：DWM 按需合成（PrintWindow 能用），但不走帧。
+InteractionTracker 从不回调，EnsurePreviousCommitCompletedAsync 一直是 Started。
+所以跟时间有关的合成行为在那台机器上测不出来，只能按文档语义实现；同步的 getter 和错误码照常能测。
+
+### 还没做的
+
+- 输入驱动 InteractionTracker（触摸板、滚轮、惯性）。
+- 真正的模糊：阴影现在是几层矩形近似。
+- d2d1 的图层（PushLayer 在 Wine 里是桩），所以组不透明度和非矩形裁剪都只是近似。
+- Effect/Backdrop 画刷和 ShapeVisual。
+- DirectComposition 设备（`DCompositionCreateDevice*`）。
+- PrintWindow 的 PW_RENDERFULLCONTENT 和 WS_EX_NOREDIRECTIONBITMAP。
+- 手动提交模式下，动画帧画的是当前的树，不是上次提交的那一版。

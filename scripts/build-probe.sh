@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-probe.sh <src.c> <out.exe> <import dll>...
+# build-probe.sh <src.c> <out.exe> <import dll | resource.res>...
 #
 # Builds a single-file probe against the tree's own headers and import libraries, as a
 # Wine test is built, giving a PE that runs both on Windows and under Wine: run it on
@@ -13,6 +13,7 @@ FLAGS="-Iinclude -I../include -I../include/msvcrt -I$(dirname "$src") -D_UCRT -D
 x86_64-w64-mingw32-gcc -c -o "$out.o" "$src" $FLAGS
 libs=
 for d in "$@"; do
+    case "$d" in *.res) libs="$libs $(realpath "$OLDPWD/$d" 2>/dev/null || realpath "$d")"; continue;; esac
     f=dlls/$d/x86_64-windows/lib$d.a
     [ -f "$f" ] || f=libs/$d/x86_64-windows/lib$d.a
     [ -f "$f" ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | head -1)
