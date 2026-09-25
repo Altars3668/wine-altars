@@ -5,7 +5,7 @@
 ## `wine/altars-cx-series.patch` —— 权威状态
 
 从 CrossOver 26.3.0 的源码（`wine-src` 的 `crossover-26.3` 分支）到当前
-`altars-cx` 分支的全部改动，`git format-patch` 导出的 159 个提交，369 个文件。
+`altars-cx` 分支的全部改动，`git format-patch` 导出的 166 个提交，381 个文件。
 
 要重建这棵树，用这个：
 

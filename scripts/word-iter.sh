@@ -32,12 +32,17 @@ for dll in "${dlls[@]}"; do
         src=$build/dlls/$dll/$arch-windows/$dll.dll; dst=$wine/lib/wine/$arch-windows/$dll.dll
         cp "$src" "$dst.new" && mv -f "$dst.new" "$dst"
     done
+    # a module with a Unix side, ntdll and win32u among them, has that to go too
+    if [ -f "$build/dlls/$dll/$dll.so" ]; then
+        dst=$wine/lib/wine/x86_64-unix/$dll.so
+        cp "$build/dlls/$dll/$dll.so" "$dst.new" && mv -f "$dst.new" "$dst"
+    fi
 done
 # The wineserver, and the session's explorer with it, take their display from
 # whoever starts them: start them on :2 too, or the desktop, the clipboard and
 # the screen size Wine believes in all come from some other display.
 xauth=$(pgrep -a Xwayland | awk '$3 == ":2" { for (i = 1; i <= NF; i++) if ($i == "-auth") print $(i + 1) }' | head -1)
-DISPLAY=:2 XAUTHORITY=$xauth WINEPREFIX=$prefix WINEDEBUG=-all timeout 90 $wine/bin/wine regsvr32 /s dcomp.dll
+DISPLAY=:2 XAUTHORITY=$xauth WINEPREFIX=$prefix WINEDEBUG=-all timeout 90 $wine/bin/wine regsvr32 /s dcomp.dll twinapi.dll
 cd "$here"
 OFFICE_DEBUG_DISPLAY=2 scripts/office-debug.sh start "$debug" "$log" >/dev/null
 for i in $(seq 1 60); do

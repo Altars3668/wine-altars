@@ -9013,6 +9013,52 @@ Wine 原来的结果取决于 GL 上一次留下什么：清屏会重置裁剪�
 就只剩 1080 行。**启动 wineserver 的那个进程决定整个会话的显示**，会话里的所有进程必须用同一个 DISPLAY。
 `scripts/word-iter.sh` 现在也在 :2 上启动这一步。
 
+### 缩放时的 d2d1：Flush、绘制状态和交换链（`2e4d6ca`、`6599737`）
+
+Ctrl+滚轮缩放时，Word 每秒几十次调用 ID2D1DeviceContext::Flush，而它原来是个桩：先 Present 目标，再返回
+E_NOTIMPL。`tools/d2dflushprobe` 用 DC 渲染目标（硬件、软件两种）在 Windows 上测清楚了：
+
+- **不 Present**：Flush 不交付像素，DC 要到 EndDraw 才拿到像素。
+- **绘制之中**：返回至今的第一个错误及出错时的标签，并清掉它。
+- **绘制之外**：Flush 和 EndDraw 都返回 D2DERR_WRONG_STATE，带的是当前标签。
+- **错误的生命周期**：第一个错误一直保留到 Flush 或 EndDraw 报出为止，出错后的绘制不执行。
+  BeginDraw 不清错误，所以在 BeginDraw 之外画一笔，下一个 EndDraw 会报出来；嵌套的 BeginDraw 也一样。
+- **Push/Pop 不配对**：没有 push 就 pop，或者 EndDraw 时还有未 pop 的，是 D2DERR_PUSH_POP_UNBALANCED；
+  pop 的种类不对（压的是裁剪，弹的是图层）是 D2DERR_POP_CALL_DID_NOT_MATCH_PUSH。
+- **Present 失败**：不带标签。
+
+现在上下文记录自己是否在绘制之中，维护一个裁剪与图层共用的 push 栈，只保留第一个错误；上游一个
+`todo_wine`（绘制中 BindDC 应失败）也随之通过。
+
+另一个问题：d2d1 每次绘制都会换入自己的 D3D 设备上下文状态，把目标的 RTV 绑在里面，之后从不解绑。
+于是窗口改尺寸时，交换链的旧后备缓冲还被引用着，wined3d 报 `Something's still holding back buffer 0`，
+旧缓冲也泄漏了。Word 启动时这条 ERR 出现 27 次。现在切换目标时清掉这个状态，这条 ERR 不再出现。
+
+### PrintWindow：让窗口自己重绘（`d216875`）
+
+Word 画每一帧都要问 `IsWindowRedirectedForPrint`：被打印时它改用 GDI 画，而不走合成。`tools/printredirectprobe`
+在 Windows 11 上测到：
+
+- **消息**：PrintWindow 根本不发 WM_PRINT。窗口和它的子窗口照常重绘，WM_PAINT 在前，WM_NCPAINT 和
+  WM_ERASEBKGND 由 BeginPaint 发出；从别的线程调用也一样。
+- **重定向标志**：重绘期间 `IsWindowRedirectedForPrint` 只对被打印的那个窗口返回 -1，子窗口返回 0；
+  带 PW_RENDERFULLCONTENT 时也会重绘，但返回 0。
+- **错误**：窗口无效时返回 ERROR_INVALID_WINDOW_HANDLE；DC 为 NULL 时照样返回 TRUE，错误为 ERROR_INVALID_HANDLE。
+
+Wine 原来发 WM_PRINT。现在的做法：给被打印的窗口加一个窗口属性（跨进程也看得见），立即重绘，
+再把窗口（或客户区）的内容拷出来。交换链里 D3D 画的内容还不在拷贝结果里。
+
+### 其他 Word 启动时撞到的缺口
+
+- **GetFileInformationByHandleEx**（`2cacc70`、`d1b0398`）：Word 打开文件时要 FileStorageInfo，另外还有
+  FileCaseSensitiveInfo、FileNormalizedNameInfo、FileRemoteProtocolInfo，原来都返回 ERROR_CALL_NOT_IMPLEMENTED。
+  `tools/fileinfoprobe` 测了 Windows 的回答。扇区大小、有无寻道惩罚、是否支持 TRIM、分区是否对齐，
+  都取自文件所在块设备在 sysfs 里的描述；btrfs 这类文件系统则从挂载信息找到源设备。缺的几个结构体一并加进了头文件。
+- **VirtualDesktopManager**（`79ed618`）：Word 用它问窗口是否在当前虚拟桌面上。按 `tools/vdmprobe` 测到的
+  Windows 行为，在"只有一个桌面"的前提下实现；桌面 ID 存在 explorer 存它的注册表位置。
+- **xmllite 的 IsDefault**（`e3b1eaf`）：Wine 不解析 DTD 内部子集，所以不会有来自 DTD 默认值的属性，
+  如实返回 FALSE，不再每次启动刷一万两千条 FIXME。
+
 ### 还没做的
 
 - 输入驱动 InteractionTracker（触摸板、滚轮重定向、触摸）：状态机和惯性已经有了，但还没有输入接进来；
@@ -9021,5 +9067,6 @@ Wine 原来的结果取决于 GL 上一次留下什么：清屏会重置裁剪�
 - d2d1 的图层（PushLayer 在 Wine 里是桩），所以组不透明度和非矩形裁剪都只是近似。
 - Effect/Backdrop 画刷和 ShapeVisual。
 - DirectComposition 设备（`DCompositionCreateDevice*`）。
-- PrintWindow 的 PW_RENDERFULLCONTENT 和 WS_EX_NOREDIRECTIONBITMAP。
+- PrintWindow 拷不到交换链里的内容（PW_RENDERFULLCONTENT），以及 WS_EX_NOREDIRECTIONBITMAP。
+- Windows 拼写检查 API（ISpellCheckerFactory），Word 会尝试创建它。
 - 手动提交模式下，动画帧画的是当前的树，不是上次提交的那一版。

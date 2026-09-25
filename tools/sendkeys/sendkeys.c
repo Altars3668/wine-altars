@@ -14,7 +14,8 @@
  * A key is a chord such as ctrl+p, alt+f, shift+tab, esc, enter, f10, or
  * text:some words to type literally.  move:x,y puts the pointer at a screen
  * position, and wheel:n turns the wheel n notches (negative scrolls down),
- * where the pointer is.  With -w, the first visible top-level
+ * where the pointer is.  down:key and up:key press and let go of one key on
+ * its own, so that down:ctrl wheel:1 up:ctrl zooms.  With -w, the first visible top-level
  * window whose class contains the substring is brought to the foreground
  * first.  -d sets the pause between keys (default 150 ms).  -close posts
  * WM_CLOSE to that window instead, which closes an Office application the
@@ -96,6 +97,16 @@ static void turn_wheel(int notches)
     SendInput(1, &in, sizeof(in));
 }
 
+static void press_key(const char *name, BOOL up)
+{
+    INPUT in = {0};
+
+    if (!(in.ki.wVk = key_code(name))) return;
+    in.type = INPUT_KEYBOARD;
+    if (up) in.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &in, sizeof(in));
+}
+
 static void type_text(const char *text)
 {
     WCHAR buf[512];
@@ -148,6 +159,8 @@ int main(int argc, char **argv)
         if (!strncmp(argv[i], "text:", 5)) type_text(argv[i] + 5);
         else if (!strncmp(argv[i], "move:", 5)) move_pointer(argv[i] + 5);
         else if (!strncmp(argv[i], "wheel:", 6)) turn_wheel(atoi(argv[i] + 6));
+        else if (!strncmp(argv[i], "down:", 5)) press_key(argv[i] + 5, FALSE);
+        else if (!strncmp(argv[i], "up:", 3)) press_key(argv[i] + 3, TRUE);
         else press_chord(chord);
         printf("sent %s\n", argv[i]);
         Sleep(delay);
