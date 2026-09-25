@@ -8784,3 +8784,86 @@ start`），用 `scripts/monitor-switch.py` 轮流只启用一个，等价于手
 （窗口原来是 1440x774，774 恰是 1548 的一半），可能是 Office 按替身显示器布局过一次；修掉第 4 条后
 没再能构造出来。再遇到时要抓：`tools/zorder/zorder.exe` 的 Z 序、`xwin-pixels.py` 读该 X 窗口本身的像素（区分
 是 Word 没画还是合成器没更新）、以及当时日志里有没有 `Failed to read display config`。
+
+## React Native 的实时通道：WebSocket 的关闭语义、co_await 的回程，以及如实回答合约之后
+
+Word 里 React Native 的 AugLoop 通道要一条 WebSocket（`Windows.Networking.Sockets.MessageWebSocket`）。
+从“能连上”到“会话真正跑起来”，经过了三层：WinHTTP 的 WebSocket 语义、MessageWebSocket 的 WinRT
+外壳，以及 C++/WinRT 在 `co_await` 之后回到原线程的那一步。第三层修好之后又引出了第四件事：Wine 回答
+“有哪些 API 合约”的方式。
+
+### WinHTTP：关闭、失败和协议检查（`01cd3ea`）
+
+全部用进程内服务器逐字节构造帧，在 Windows 与 Wine 上对照（`tools/wsprobe/probe_winhttp_ws.c`）：
+
+- 对端的 close 帧只关它那一侧：本端直到自己 shutdown 前都还能发送。Wine 原来在收到 close 帧后就拒绝发送。
+- 1005 表示“没有状态码”，发出的是空 close 帧；收到空 close 帧时报 1005。只有 close 帧可以携带的
+  状态码（1000–1003、1007–1011、3000 以上）才能发出，其余一律 `ERROR_INVALID_PARAMETER`：被拒的
+  shutdown 照样把本端关掉、但什么也不发；被拒的 close 则不改变 socket 的任何状态。
+- 服务器违反协议即判连接失败：close 状态码非法、close reason 或文本消息不是合法 UTF-8（过长编码、
+  代理区都算；序列跨分片可以，停在序列中途则不行）、控制帧分片或超过 125 字节、没有开头的续帧、
+  上一条消息还没完又开新消息。这些情况返回 12152，并**立即断开连接**；连接自行结束则返回 12030。
+  之后对这个 socket 的任何调用都以同一个错误失败，`QueryCloseStatus` 报 4317。
+- ping 的负载要原样放进 pong 回传。Wine 原来既不读取也不回传，负载字节留在流里，被当成下一帧的帧头。
+- 在另一个线程里阻塞着的同步接收：关句柄会取消它（12017）并重置连接；调用 `WebSocketClose` 则让它
+  让路，由 close 自己去读 close 帧。
+- 所有函数都先检查句柄，再检查参数。
+
+### MessageWebSocket（`c25d94c`，测试 `ee9d50b`）
+
+同样逐项对照 Windows（`tools/wsprobe/probe_ws.c`）：控制对象的默认值；握手请求带
+`Cache-Control: no-cache`；Information 和 OutputStream 从一开始就存在、始终是同一个对象；多次写按
+调用顺序逐帧发出（原来在线程池里并行，共用 winhttp 的同一个帧缓冲）。关闭方面：`Close` 之后写入和连接
+立即返回 `RO_E_CLOSED`；非法状态码或超过 123 字节的 reason 返回 `E_INVALIDARG` 且不改变任何状态。
+连接因断开或协议错误而失败时**不触发 Closed**，而是再来一次 MessageReceived，读取数据时返回
+0x80072efe 或 0x80072f78，并且不写出参；之后的写入先返回成功、再异步失败；调用 Close 时什么也不发，
+在返回之前同步触发一次 `Closed(1006)`。react-native-windows 正是靠这几条判断连接状态的。
+
+### co_await 回不来：`IContextCallback::ContextCallback` 是桩（`8e683bc`）
+
+上面都修好之后，AugLoop 仍然在头几分钟里连了 16 条 WebSocket。`+combase` 里每次连接后都有一条
+`RoOriginateLanguageException(E_NOTIMPL)`，前面紧跟着 `thread_context_callback_ContextCallback` 的
+FIXME，调用参数是 `ICallbackWithNoReentrancyToApplicationSTA` 的第 5 号方法。C++/WinRT 在
+`co_await` 一个 WinRT 异步操作时会记下当前的对象上下文；操作在线程池里完成后，要通过
+`ContextCallback` 把协程的剩余部分送回那个上下文执行。Wine 这里一律返回 E_NOTIMPL，于是每一次
+`co_await` 都抛异常，不管操作本身成功与否。
+
+对照 Windows（`tools/ctxprobe/probe_ctx.c`）实现后：
+
+- 上下文按套间而不是按线程划分：MTA 的所有线程（包括 implicit MTA）共用一个上下文，每个 STA 各有一个。
+- 回调总是在上下文所属的套间里执行：本套间内直接调用；进入 MTA 时，由一个进入 MTA 的线程执行；
+  进入 STA 时，经该套间的窗口投递，与一次入站调用走同样的路径。
+- 套间已经销毁时返回 `RPC_E_DISCONNECTED`。
+
+探针在 Wine 上的输出与 Windows 逐行相同。部署之后，AugLoop 只建了 4 条连接，收发各约八十条消息，
+会话建立起来了。
+
+### 顺手补上的
+
+- `Windows.System.Profile.SharedModeSettings`（`b21cb2a`）：共享 PC 模式关闭。与之相邻的 `RetailInfo`
+  工厂也按 Windows 修正了类名、信任级别和 `GetIids`。
+- `CLSID_AppVisibility`（`39dbf3c`，新的 twinapi.dll）：Word 主线程启动时要创建它两次。在 Windows 上，
+  这个类在 ssh 会话里拒绝创建（0xc0000022），只能在桌面会话里测。为此给 `scripts/winrun.sh` 加了
+  `--desktop`，通过一次性计划任务在已登录用户的桌面会话里运行探针。
+- `CreateFile2` 漏传了 `dwSecurityQosFlags`，而且对任何扩展参数都报“忽略”，每次启动约 900 条（`8d0a88e`）。
+
+### 如实回答合约之后：Office 改走 Windows.UI.Composition
+
+Word 启动时会依次查询 `RoIsApiContractMajorVersionPresent("Windows.Foundation.UniversalApiContract",
+7..15)`。Wine 的这个函数原来是桩，一律回答“没有”，Word 于是以为自己跑在 1809 之前的 Windows 10 上。
+`RoIsApiContractPresent` 甚至没有导出。改为与 `ApiInformation` 共用同一张表（`76a6f19`，Wine 报的
+Win10 2004–22H2 对应 UniversalApiContract 10）之后，Word 的 AirSpace 动画线程开始激活
+`Windows.UI.Composition.Core.CompositorController`。激活失败，ShipAssert 标签 0x23ca613 对地址 0
+写入，故意让线程崩溃；下一次启动便弹出“是否以安全模式启动”。
+
+定位方法：`+seh` 抓到对地址 0 的写入，`rcx` 是一个 6 位十六进制数，那就是断言标签。在 Mso40UI 的
+.text 中检索它的小端字节，前一字节 `ba` 即 `mov edx, imm32`。往前反汇编，找到失败的调用和它读取的
+48 字符 HSTRING 字面量，也就是这个类名。
+
+按 winmd 里的 IID 检索，Mso40UI 共引用 64 个 Composition 接口：视觉树、画刷、绘图表面、关键帧动画、
+裁剪、阴影、形状、效果和背景画刷、InteractionTracker，以及手动提交用的 CompositorController；此外还有
+`DCompositionCreateDevice3`。在 Windows 上，这些类全部注册在 dcomp.dll 里；Wine 的 dcomp 只有一个 47 行的桩。
+
+**决定：保持新路径，不再靠“回答没有”把 Word 引回旧路径。**在 Wine 的 dcomp 里实现一个进程内的
+Composition 引擎：用 D3D11/D2D 渲染视觉树，提供 HWND 目标和 DirectComposition 设备，并按 Office
+实际用到的部分逐项对照 Windows。在它能用之前，Word 会一直卡在这个断言上。
