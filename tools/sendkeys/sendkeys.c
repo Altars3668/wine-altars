@@ -12,7 +12,9 @@
  *   sendkeys [-w class-substring] [-d ms] [-close] key...
  *
  * A key is a chord such as ctrl+p, alt+f, shift+tab, esc, enter, f10, or
- * text:some words to type literally.  With -w, the first visible top-level
+ * text:some words to type literally.  move:x,y puts the pointer at a screen
+ * position, and wheel:n turns the wheel n notches (negative scrolls down),
+ * where the pointer is.  With -w, the first visible top-level
  * window whose class contains the substring is brought to the foreground
  * first.  -d sets the pause between keys (default 150 ms).  -close posts
  * WM_CLOSE to that window instead, which closes an Office application the
@@ -71,6 +73,29 @@ static void press_chord(char *chord)
     SendInput(count, in, sizeof(in[0]));
 }
 
+static void move_pointer(const char *where)
+{
+    INPUT in = {0};
+    int x = 0, y = 0;
+
+    sscanf(where, "%d,%d", &x, &y);
+    in.type = INPUT_MOUSE;
+    in.mi.dx = MulDiv(x, 65535, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
+    in.mi.dy = MulDiv(y, 65535, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
+    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    SendInput(1, &in, sizeof(in));
+}
+
+static void turn_wheel(int notches)
+{
+    INPUT in = {0};
+
+    in.type = INPUT_MOUSE;
+    in.mi.mouseData = notches * WHEEL_DELTA;
+    in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    SendInput(1, &in, sizeof(in));
+}
+
 static void type_text(const char *text)
 {
     WCHAR buf[512];
@@ -121,6 +146,8 @@ int main(int argc, char **argv)
 
         lstrcpynA(chord, argv[i], sizeof(chord));
         if (!strncmp(argv[i], "text:", 5)) type_text(argv[i] + 5);
+        else if (!strncmp(argv[i], "move:", 5)) move_pointer(argv[i] + 5);
+        else if (!strncmp(argv[i], "wheel:", 6)) turn_wheel(atoi(argv[i] + 6));
         else press_chord(chord);
         printf("sent %s\n", argv[i]);
         Sleep(delay);

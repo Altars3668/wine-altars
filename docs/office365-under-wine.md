@@ -8939,9 +8939,84 @@ ShutdownCompleted 两个事件。上游现有的测试去掉 todo 之后全部�
 InteractionTracker 从不回调，EnsurePreviousCommitCompletedAsync 一直是 Started。
 所以跟时间有关的合成行为在那台机器上测不出来，只能按文档语义实现；同步的 getter 和错误码照常能测。
 
+### 滚轮滚不动：InteractionTracker 的状态机（`c6024d3`）
+
+Word 文档用滚轮滚不动，只有滚动条在动。开 `+dcomp` 一看就明白了：Word 的文档画布用一个
+InteractionTracker 做平移和缩放。`TryUpdateScale(0.99)` 就是状态栏上的 99%。翻页走的是
+`TryUpdatePositionWithOption`，一直是好的；滚轮的平滑滚动则把一个 Vector3 关键帧动画交给
+`TryUpdatePositionWithAnimation`，动画只有 1.0 处一个关键帧，时长 267ms。这个方法原来是桩，位置原地不动。
+
+现在 tracker 是文档里写的那个状态机：Idle、CustomAnimation、Inertia，以及只有输入才能进入的 Interacting。
+
+- **请求 ID 与回调**：每个 Try* 请求先取下一个请求 ID，Interacting 时被忽略。进入新状态时告诉 owner，
+  带上把它带进去的那个请求的 ID；每帧变了的值也用这个 ID 报。
+- **自定义动画**：作为一个 "motion" 运行，即由 tracker 自己在自己的值上跑的动画，而不是挂在属性上。
+  它和 StartAnimation 一样校验、一样复制、一样计入批次。每帧读出后夹在上下界之内，文档说自定义动画总是被钳制。
+  缩放动画绕给定的中心点进行。所有动画结束后回到 Idle，报的是启动它的那个请求。
+- **立即更新**：`TryUpdatePosition`、`TryUpdatePositionBy`、`TryUpdateScale` 结束当前的一切运动。
+  PositionUpdateOption 允许时，缩放动画可以继续。
+- **惯性**：速度请求让它惯性滑行。每根轴每秒损失同一比例的速度，即衰减率，未设置时为 0.95；最后停在自然终点，
+  或者第一个条件成立的惯性修饰器给出的位置，都在上下界之内。缩放在对数域里按同样的方式滑行。
+  InertiaStateEntered 报告自然终点、修饰后的终点和初速度；中心点修饰器移动缩放惯性所围绕的点。
+  Motion 修饰器还不执行。
+
+同步能测的部分在 Windows 桌面会话里实测（`tools/trackerprobe`，Windows 11 build 29671）：
+
+- 类型不对的动画（Vector2 或标量表达式给位置）返回 E_INVALIDARG，照样消耗一个请求 ID，但不写回。
+- 越界的 ClampingOption/PositionUpdateOption 先写回 ID，再返回 E_INVALIDARG。
+- StartAnimation 可以挂在 tracker 的上下界上，但不能挂在 Position、Scale、自然终点和速度上。
+- 往结果指针传 NULL，Windows 直接崩溃。
+
+那台机器的会话是锁屏的，合成器不出帧，所以随时间变化的部分只能照文档实现。对应的测试在没有帧的地方跳过：
+dcomp 测试在 Windows 上 431 项通过、1 项跳过，在 Wine 上 474 项全部通过。
+
+### 普通 Compositor 从不提交（`3e3e74d`）
+
+写上面的测试时发现，直接激活的 `Windows.UI.Composition.Compositor`（不是 CompositorController 的那种）
+从来没有提交过。新合成器按 Windows 的语义一开始就是"有改动"，而自动提交只在"没改动 → 有改动"时才排队，
+于是它什么都没画过，动画也从没跑过，因为逐帧循环要从一次提交开始。现在创建时就把第一次提交排上。
+AirSpace 的窗口用的是 CompositorController，所以 Word 的主界面一直没受影响。
+
+### 另一台设备画的表面（`4cac468`）
+
+普通合成器开始提交后，Word 启动时的一个窗口冒出 40 条 `render_surface ... is on another device`。
+一个窗口目标用它的树里第一个表面所在的设备来画，其他设备上的表面此前一律被跳过。
+而在 Windows 上，DWM 会把各个设备画的东西合成到一起。
+
+现在的做法：
+
+- **跨设备拷贝**：每个图块记录自己像素的版本，在目标的设备上保留一份镜像；版本变了，就经 CPU 从原设备读回再上传。
+- **加锁**：一帧开始前，先拿到树里所有表面所在设备的锁，再拿合成器的锁。
+- **迟到的表面**：加锁之后才挂进树的表面等下一帧再画。
+
+用 Ctrl+W 触发的“保存对此文件所做的更改？”对话框完整画了出来。
+
+### 滚动时的 GL 报错：颠倒的裁剪矩形（`9ba5d82`、`da08093`）
+
+滚轮能滚之后，每次滚动都会刷出几百条 `GL_INVALID_VALUE in glScissorArrayv: width or height < 0`。
+AirSpace 在滚动时设置了下边在上边之上的裁剪矩形，wined3d 把负高度原样交给了 OpenGL。
+`tools/scissorprobe` 在 Windows 上用 WARP 和硬件驱动、D3D11 和 D3D10 各测了一遍：
+
+- 只要有一个矩形颠倒，整次 RSSetScissorRects 就被丢弃，同一次调用里的正常矩形也一起丢掉；
+  RSGetScissorRects 读回的仍是之前的，绘制也按之前的裁剪。
+- 空矩形（left 等于 right）会被保留，并把一切都裁掉。
+
+Wine 原来的结果取决于 GL 上一次留下什么：清屏会重置裁剪，所以清屏之后的那次绘制根本没被裁剪。
+现在按 Windows 的方式丢弃这次调用，探针在 Wine 上的输出与 Windows 逐字一致。
+顺带发现 D3D10 的 RSGetScissorRects 在 rects 非空时不回写 count，而 Windows 会回写成实际数量，也一并改了。
+
+### 测量环境的坑：会话的 DISPLAY
+
+最大化的 Word（1440x2992）只画到第 1080 行，下面露出桌面。原因在测量脚本：它先用 regsvr32 注册 dcomp，
+这一步继承了 shell 的 `DISPLAY=:77`（一个 1920x1080 的 Xvfb），于是这个 Wine 会话的 wineserver 和 explorer
+桌面都在 :77 上，屏幕尺寸也取自 :77，而 Word 的窗口在 :2 上。winex11 把窗口表面裁到它认定的虚拟屏幕以内，
+就只剩 1080 行。**启动 wineserver 的那个进程决定整个会话的显示**，会话里的所有进程必须用同一个 DISPLAY。
+`scripts/word-iter.sh` 现在也在 :2 上启动这一步。
+
 ### 还没做的
 
-- 输入驱动 InteractionTracker（触摸板、滚轮、惯性）。
+- 输入驱动 InteractionTracker（触摸板、滚轮重定向、触摸）：状态机和惯性已经有了，但还没有输入接进来；
+  惯性的 Motion 修饰器和 NaturalMotion 也还不执行。
 - 真正的模糊：阴影现在是几层矩形近似。
 - d2d1 的图层（PushLayer 在 Wine 里是桩），所以组不透明度和非矩形裁剪都只是近似。
 - Effect/Backdrop 画刷和 ShapeVisual。
