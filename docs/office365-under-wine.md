@@ -9151,3 +9151,147 @@ x64 上 mingw/MSVC 从右往左求值。sysprobe 和 powersettingprobe 因此把
 请求编号变了时（新增请求插在中间），所有直接发请求的模块也要换：`ntdll.so`、`win32u.so`、`winex11.so`、
 `winewayland.so`、`nsiproxy.so`，以及 PE 的 `ntoskrnl.exe`、`nsiproxy.sys`、`winex11.drv`、`winewayland.drv`。
 `scripts/word-iter.sh` 只换列出的 DLL，这些要先手工换好。
+
+## Word 启动时的第二批：加密、账户全名、MSXML 的解析设置、语言与进程策略
+
+上一批之后，Word 启动日志里的 FIXME 从 800 多条降到 509 条。这一批补的是剩下的大头：它们大多不影响 Word
+能不能起来，但每个都答错了，有的每次启动要错几百次。和上一批一样，每一项都先用探针在 Windows 11 上量
+（`tools/oidfuncprobe`、`usernameprobe`、`bcryptobjectprobe`、`msxmlpropprobe`、`saxdtdprobe`、
+`languageprobe`、`procpolicyprobe`、`rtclassprobe`、`exportnameprobe`），再逐条对照 Wine 实现；新写的 Wine 测试也都拿回 Windows 跑过。
+
+### crypt32：找到了解码器，却说没有（`f8c4a86`）
+
+Word 解码 `SPC_INDIRECT_DATA_OBJID`，而 wintrust 只在 `CryptDllDecodeObject` 函数集下注册了它的解码器。
+`CryptDecodeObjectEx` 在那里找到并解开了，但之前先说了 "Unsupported decoder"，还把在另一个函数集里没找到时的
+`ERROR_FILE_NOT_FOUND` 留成了这次成功调用的 last error；编码一侧更早，对 crypt32 没有内建的每个结构都先这么说，
+一个 DLL 都还没查。
+
+现在两个函数集都没有时才说；在另一个集里找到的函数会清掉错误码——Windows 成功后是 0（两个函数集都是）。
+谁都不认识的结构，四个调用都以 `ERROR_FILE_NOT_FOUND` 失败，和 Windows 一样。
+
+### 账户的全名（`65b0ecb`、`4573d8d`）
+
+Word 向 `GetUserNameExW` 要 `NameDisplay`、`NameUserPrincipal` 和 `NameDnsDomain`，每次都打印 not implemented。
+`tools/usernameprobe` 在 Windows 11 上测了一个不在域里的用户（探针只打印名字的形状，不打印名字本身）：
+
+- `NameDisplay` 是账户的全名；不给缓冲区时以 `ERROR_MORE_DATA` 失败，并给出含结尾 0 的大小。没有全名的账户映射不到。
+- 域账户才有的名字（用户主体名、DNS 域在内）以 `ERROR_NONE_MAPPED` 失败——不在域里时这就是正确答案，不再是 FIXME。
+- 格式号之间的空号（4、5、11）也映射不到，Wine 原来答 `ERROR_INVALID_PARAMETER`；`NameSurname` 之后才是参数错误。
+
+全名从哪来：Windows 为本地账户保存全名，Unix 账户的全名是 GECOS 的第一栏。从 Unix 启动的第一个进程用
+其余 `WINE*` 变量所描述的账户查一次，放进 `WINEUSERFULLNAME`，它启动的进程都继承；没有全名的账户就没有这个变量。
+`NetUserGetInfo` 的 level 10 对当前用户给同一个全名。Windows 还会把全名拆成 `NameGivenName` 和 `NameSurname`，
+这里不知道怎么拆，映射不到。
+
+### bcrypt 的对象缓冲区（`0fa9481`）
+
+Office 给每个哈希和密钥都传一块对象缓冲区，Word 启动时打印 270 次 "ignoring object buffer"。
+`tools/bcryptobjectprobe` 测到 Windows 把对象放在这块缓冲区里，返回的句柄就指向缓冲区内部；Wine 把对象另外存放，
+除了句柄指向哪里，调用者看不出区别。Windows 检查的，现在 `BCryptCreateHash`、`BCryptDuplicateHash`、
+`BCryptGenerateSymmetricKey`、`BCryptImportKey`、`BCryptDuplicateKey` 同样检查：
+
+- 长度为 0 的缓冲区：`STATUS_BUFFER_TOO_SMALL`；
+- 给了长度却没给缓冲区：`STATUS_INVALID_PARAMETER`。
+
+比 `BCRYPT_OBJECT_LENGTH` 短的缓冲区仍然收下。Windows 对哈希最多允许短 22 字节，对 AES 密钥 30 字节——这是它为对齐
+留的余量——再短就拒绝。也和 Windows 一样，算法没以 HMAC 打开时，`BCryptCreateHash` 拒绝 secret，长度为 0 也拒绝。
+
+### MSXML 的解析设置：ProhibitDTD 与 MaxElementDepth（`f30fb50`、`20b94d4`）
+
+Word 给文档设 `ProhibitDTD` 和 `MaxElementDepth`，给 SAX 读取器打开 `prohibit-dtd`。msxml 原来忽略这两个和同类的
+另外六个设置，也不把值交回；SAX 读取器存下了值，被问时却说不认识这个特性，照样解析 DTD。
+`tools/msxmlpropprobe` 和 `tools/saxdtdprobe` 在 Windows 11 上测到：
+
+- 默认值：MSXML 6 禁止 DTD、允许 256 层，不允许 XSLT 脚本和 `document()`；MSXML 3 允许 DTD、5000 层，两者都允许。
+  `MaxXMLSize` 都是 0；`ResolveExternals`、`NewParser`、`NormalizeAttributeValues`、`UseInlineSchema` 在 6 里关着，
+  3 则根本不回答（`E_FAIL`）。
+- 值会转换：`VT_I4` 的 1 变成 `VARIANT_TRUE`，字符串 `"5"` 变成 5；负的深度是 `E_INVALIDARG`。
+- 禁止 DTD 时出现文档类型声明（不论声明了什么），加载失败：MSXML 3 是 `0xc00ce556`，6 是 `0xc00ce584`；
+  嵌套超过限制：3 是 `E_ABORT`，6 是 `0xc00ce586`。0 表示不限。
+- SAX 的 `prohibit-dtd` 在 MSXML 3 默认关、6 默认开。打开时遇到文档类型声明（有没有内部子集都一样）解析就停：
+  错误处理器收到 fatal error，`parse` 返回同一个码——MSXML 3 是 `0xc00ce556`，位置在名字处；6 是 `0xc00cee4e`，
+  位置在 `DOCTYPE` 关键字末尾。
+
+现在这些设置都保存，按 Windows 的方式交回；决定文档能是什么样的那两个，在解析器的回调里执行。MSXML 允许的层数
+高于 libxml2 自己的 256 层上限时，解除后者（`XML_PARSE_HUGE`）。解析错误目前只给错误码，没有原因文字。
+原来标着 todo 的 `NormalizeAttributeValues`、`MaxElementDepth` 测试现在通过。
+
+### 把文档当输出流（`7c7f2b7`）
+
+`f404cd6` 让文档可以当流来写、提交或释放时加载写进去的内容，并让 `MXXMLWriter` 在文档结束时提交输出流。
+测试里暴露了两个后果：输出目标是文档的 XSL 处理器往文档的流里写了，却从不提交，于是 `transform()` 之后文档是空的，
+而 Windows 里文档拿到了结果；`MXXMLWriter` 提交所有输出流，Windows 一个都不提交——调用者自己的流被 `Commit` 了六次。
+现在处理器和写入器只告诉文档自己的流"输出完了"（按它是什么认出来），别的流一概不碰。
+
+### webservices 的结构选项（`cc8233a`）
+
+Office 写的结构用 `WS_STRUCT_IGNORE_TRAILING_ELEMENT_CONTENT` 和 `WS_STRUCT_IGNORE_UNHANDLED_ATTRIBUTES` 描述，
+Word 启动时 154 次写入每次都说不支持这两个选项。两者都只说读取时跳过什么，不改变写出的内容；读取本来就会跳过
+没有字段描述的属性，也就是第二个选项要的。
+
+### Language 的静态方法（`8e5778b`）
+
+Word 向 `Windows.Globalization.Language` 的工厂要 `ILanguageStatics`，原来没有。`tools/languageprobe` 测到：
+
+- `IsWellFormed` 按 BCP 47 的语法判断，grandfathered 标签整体接受，不分大小写。Windows 自己多两条：4 到 8 个字母的
+  语言子标签不接受；同一个单字母扩展出现两次不合格式，而重复的变体可以。`NULL` 不合格式，但不是错误。
+- `CurrentInputMethodLanguageTag` 是线程当前键盘布局的语言，写成语言标签；中文带上文字子标签：locale 是 `zh-CN` 时
+  答 `zh-Hans-CN`。
+
+`ILanguageStatics2` 的 `TrySetInputMethodLanguageTag` 把线程切到该语言已安装的键盘布局，没有这样的布局就答否。
+
+### 进程的缓解策略、电源节流与堆（`ccb27bd`、`73903f1`、`8ac455a`）
+
+Word 查询自己和它启动的进程的缓解策略，设置其中两个，并设置自己的电源节流状态。原来查询返回 TRUE 却什么都不写，
+设置什么也没做就返回成功，`GetProcessInformation` 不认识电源节流这个类。`tools/procpolicyprobe` 在 Windows 11 上测到：
+
+- 64 位进程一开始就有 ASLR（bottom-up、高熵），shadow stack 的 API 不在进程内提供；其余策略一开始都关着。
+  ASLR 运行中不能改（拒绝访问）；其余策略只能加，不能撤（拒绝访问）。
+- 一个 DWORD 大小的策略就用一个 DWORD 查询和设置；DEP 用它自己的结构大小，64 位进程设置 DEP 时答不支持。
+- 电源节流状态按版本查询，只能查本进程（别的进程是参数错误），答的是最后一次设置的值。
+
+ntdll 的 `ProcessMitigationPolicy`、`ProcessPowerThrottlingState` 现在为本进程保存并回答这些；别的进程答它启动时的值。
+策略只记录，不执行；缓解选项的掩码不知道该是什么。
+
+`HeapEnableTerminationOnCorruption` Word 也问，Wine 原来答这个类没实现。它对整个进程生效：64 位进程从一开始就有，
+任何进程都可以用 `HeapSetInformation` 打开；Windows 答一个 ULONG 的 TRUE，现在一样。堆损坏在 Wine 里仍然只报告，
+不结束进程。
+
+### GetGuiResources（`9ddb247`）
+
+原来是返回 0、错误码 `ERROR_CALL_NOT_IMPLEMENTED` 的桩；Word 用它查自己的 GDI 对象数。现在和 Windows 一样由
+`NtUserGetGuiResources` 实现：数本进程句柄表里的 GDI 对象（不含库存对象），会话表里本进程的 USER 对象，
+`GR_GLOBAL` 时是整个会话的；峰值是数到过的最大值。和 Windows 一样，进程为 NULL 是 `ERROR_INVALID_PARAMETER`，
+不认识的 flag 返回 0 且不动 last error。别的进程的 GDI 对象这里看不到。
+
+### AppPolicy（`5c38bf1`）
+
+这里的进程从不属于某个包，每个 `AppPolicyGet*` 回答的正是 Windows 给桌面进程的值：不做线程初始化、用 `ExitProcess`
+结束、经典桌面窗口模型。只是去掉了 FIXME。
+
+### 名字带点的内置 DLL 找不到自己（`184e8e1`）
+
+改好的 `ILanguageStatics` 进不了 Word：`WINEDEBUG=+module` 显示加载器找的是 `"windows.globalization"`，
+找不到内置库，于是映射了前缀 `system32` 里的那份副本——它和前缀上一次更新一样旧。
+
+前缀里的内置 DLL 副本只是个"指针"：加载器读它导出目录里的名字，再去 Wine 的安装目录（或构建目录）里找同名的内置库，
+所以只换 `/opt` 里的 DLL 就能生效。可 winebuild 从 spec 文件取模块名，只在名字里**没有点**时才补 `.dll`：
+`windows.globalization.spec` 于是成了 `windows.globalization`，安装目录里没有这个文件。
+`tools/exportnameprobe` 读了 Windows 上这些文件的导出名：`Windows.Globalization.dll`、`twinapi.appcore.dll`、
+`WINSPOOL.DRV`、`ntoskrnl.exe`……都带扩展名。受影响的正好是名字里带点的 33 个模块：32 个 `windows.*` 加上 `twinapi.appcore`；装好的文件里，别的模块导出名都和文件名一致。
+
+现在 winegcc 在输出文件名正是 spec 名加扩展名时，把输出文件名交给 winebuild 作模块名；显式给了名字的（kernel32 的
+`-Wb,-F,KERNEL32.dll`）照旧。重新链接后逐个比对了全部 1341 个有导出目录的模块：变了的正好是这 33 个的两种架构，
+和 Windows 只差大小写（Wine 的文件名一律小写）。
+已有的前缀在下一次更新（`wineboot -u`，换了 Wine 版本时会自动做）时拿到新副本；在那之前，或者像这里只换 DLL 的部署，
+要把这些模块的副本也复制进前缀的 `system32`/`syswow64`。这以后，它们和别的内置 DLL 一样，只换安装目录就能生效。
+
+### 还没做的
+
+这一批之后 Word 启动打印 502 条 FIXME（上一批之后 509 条，每次启动因渲染次数不同略有出入）。按条数排：
+
+- `d3d11_device_context_Map` 忽略 `D3D11_MAP_FLAG_DO_NOT_WAIT`（57）：要知道 GPU 是否还在用这个资源，得靠 wined3d 的命令流。
+- xmllite 的 `MultiLanguage` 属性（35）、`RoGetActivationFactory` 不看线程模型和激活方式（每个类都打印一次）。
+- ETW：`EventRegister` 发的是假句柄，`EventSetInformation`、`EnableTraceEx2`、`StartTraceW` 都是桩，Word 注册了 15 个提供者。
+- `get_dummy_preferred_ui_language`（18）、msctf 的组合与输入范围、`IShellItem2::GetPropertyStore`、`Wer*` 注册、
+  netprofm、appx 和 useractivities 各缺一个接口、dwmapi 的属性 21 和 33，以及一串一两次的。
