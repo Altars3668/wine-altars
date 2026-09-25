@@ -9070,3 +9070,84 @@ Wine 原来发 WM_PRINT。现在的做法：给被打印的窗口加一个窗口
 - PrintWindow 拷不到交换链里的内容（PW_RENDERFULLCONTENT），以及 WS_EX_NOREDIRECTIONBITMAP。
 - Windows 拼写检查 API（ISpellCheckerFactory），Word 会尝试创建它。
 - 手动提交模式下，动画帧画的是当前的树，不是上次提交的那一版。
+
+## Word 启动时的系统调用：电源通知、周期计数、DPI 托管与挂起的 I/O
+
+合成引擎之后，Word 启动日志里剩下的 FIXME 多是一批"小"系统调用：它们返回了什么都不影响 Word
+能不能起来，但每个都答错了。`tools/sysprobe`、`tools/powersettingprobe`、`tools/cycleprobe`、
+`tools/dpihostprobe`、`tools/iopendingprobe` 在 Windows 11（build 29671）上测了它们的回答，
+Wine 实现逐条对照；新加的 Wine 测试都在 Windows 上跑过。
+
+### 电源设置通知（`a1de13b`、`3a0296e`、`6b0cdfe`）
+
+Word 启动时为六个电源设置注册窗口，Wine 原来返回 `0xdeadbeef` 且什么也不说。Windows 的做法：
+
+- 注册后很快、从**另一个线程**把当前值告诉注册者——窗口收到**发送**的 `WM_POWERBROADCAST` /
+  `PBT_POWERSETTINGCHANGE`，`DEVICE_NOTIFY_CALLBACK` 的回调被调用——之后每次变化再告诉一次。
+- 值：电源来源、电池电量（笔记本才有）、当前方案与其"性格"（都是 Balanced
+  `{381b4222-…}`，这台机器只有这一个方案）、显示器和控制台显示（会话锁着时为 0）、节能模式、
+  空闲后台任务（DWORD 2，文档说它没有意义）。离开模式没开时什么都不发，不认识的设置也一样。
+- 注册成功把 last error 置 0；`Unregister*(NULL)` 失败并置 `ERROR_INVALID_PARAMETER`；
+  flags 只认 0/1/2；服务句柄不属于本进程时是 `ERROR_SERVICE_NOT_IN_EXE`；挂起/恢复注册不接受服务句柄。
+
+Wine 现在在 user32 里维护真正的注册表：值来自 `NtPowerInformation`，只有一个 Balanced 方案；
+电源来源和电量有人注册时每 5 秒看一次，变了就告诉。powrprof 的 `PowerSettingRegisterNotification`、
+`PowerRegisterSuspendResumeNotification` 只收回调，交给 user32；`PowerRegisterForEffectivePowerModeNotifications`
+从另一线程告诉 Balanced，补上了缺失的 `PowerUnregisterFromEffectivePowerModeNotifications`；
+`PowerGetActiveScheme`、按方案的 `PowerEnumerate` 和 `PowerReadFriendlyName` 如实描述那一个方案。
+`PowerDeterminePlatformRoleEx` 读 SMBIOS 机箱类型（`3a0296e`）。
+
+没做的：服务收不到通知（还没有投递到服务控制处理函数的路径，未知的服务句柄也照样接受）；Wine 看不到系统挂起，挂起/恢复注册
+永远不会被通知；会话锁定/解锁同理（`WTSRegisterSessionNotification` 只做了参数检查，`1cc1ffa`）。
+
+顺带修了 ntdll 读电池（`13cd9f4`）：很多笔记本的电池在 sysfs 里只有 `energy_*`/`power_now`（μWh、μW），
+Wine 只读 `charge_*`，于是容量为 0，`GetSystemPowerStatus` 永远报 100%。
+
+### 周期计数与别的进程的 CPU 时间（`3f198ac`）
+
+Word 启动时查几百次 `ProcessCycleTime`（原来是返回 0 的桩），也查 `QueryThreadCycleTime`（原来不实现）。
+`tools/cycleprobe` 测到：Windows 的计数是线程运行期间走过的时间戳计数器（TSC）周期——对着线程的内核+用户
+时间看，自旋 0.3 秒和 3.3 秒的线程都是每 100ns 约 281 个周期；两次查询计数必然增长；
+`CurrentCycleCount` 对非当前线程就是查询那一刻的 rdtsc。
+
+Wine 的实现：运行时间取系统能给的最细粒度——本线程/本进程用 `CLOCK_THREAD_CPUTIME_ID`/`CLOCK_PROCESS_CPUTIME_ID`，
+别的线程读 `/proc/<pid>/task/<tid>/schedstat`（纳秒），别的进程用 `clock_getcpuclockid`——乘以 TSC 频率
+（进程内对着单调时钟校准一次，2ms）。注意 TSC 频率不是睿频上限：这台 Ryzen 9 5900X 的
+`cpuinfo_max_freq` 是 4.95 GHz，TSC 是 3.7 GHz。
+
+同一个函数里 `ProcessTimes` 对任何进程都返回**本进程**的时间（原注释 "user/kernel times only work for current
+process"）。新增的 `get_process_times` 请求（与 `get_thread_times` 对称）交回仍在运行的进程的 Unix pid，
+从 `/proc` 读它的时间；本进程改用 `getrusage()`，精度从时钟滴答（10ms）到微秒。这改了服务器协议（1812）。
+
+### DPI 托管行为与非客户区缩放（`d2a2350`、`c8a9043`）
+
+- `SetThreadDpiHostingBehavior` 记在线程信息里并返回旧值；非法值返回 `DPI_HOSTING_BEHAVIOR_INVALID` 并置
+  `ERROR_INVALID_PARAMETER`。窗口记住创建时线程的行为，`GetWindowDpiHostingBehavior` 如实回答。
+- `EnableNonClientDpiScaling` 只在按显示器感知线程创建的那个窗口的 `WM_NCCREATE` 里成功；PMv1 还把 last error
+  置 0，PMv2（本来就自己缩放边框）连错误码都不碰；其余情况不说原因地失败，NULL 窗口是 `ERROR_INVALID_WINDOW_HANDLE`。
+- 测这个时发现 wineserver 给按显示器感知线程创建的顶层窗口一律存 PMv1（0x12），Windows 是 0x22。窗口过程在
+  窗口的感知上下文里运行，于是 PMv2 窗口在自己的 `WM_NCCREATE` 里也以为自己是 v1。现在版本号来自线程。
+
+### 其余几个
+
+- **`ThreadIsIoPending`**（`20cdaee`）：线程池退役线程前要问——Windows 把线程发起的 I/O 挂在线程上，线程退出就取消。
+  服务器现在在 `get_thread_info` 里说线程有没有还没完成的 async：重叠读挂起（绑不绑完成端口都算）、
+  同步读阻塞中为 TRUE，完成或取消后为 FALSE；需要 `THREAD_QUERY_INFORMATION`。协议 1813。
+- **`TokenUIAccess`**（`3f64ea2`）：原来答 1。只有为 UI 访问启动、签名且装在受信任位置的进程才有，普通进程是 0。
+- **`RegisterTouchHitTestingWindow`、`ChangeWindowMessageFilterEx`**（`aafc0a6`）：没有触摸输入、没有 UIPI，
+  但检查与回报按 Windows：自己的窗口什么值都接受，NULL 是 1400，别的进程的窗口是 5；消息过滤记在窗口属性里，
+  `ExtStatus` 说明是否已放行/已拦截，重置会忘掉。
+
+### 测量上的一个坑：printf 实参里的 GetLastError
+
+`printf("... %p error %lu", Call(), GetLastError())` 测出来的是**调用之前**的错误码：C 不规定实参求值顺序，
+x64 上 mingw/MSVC 从右往左求值。sysprobe 和 powersettingprobe 因此把"置 87""置 0"测成了"不改错误码"，
+并被写进了 Wine 测试——在 Wine 上照样通过，直到把测试拿回 Windows 跑才暴露（四处）。探针现在每个调用单独一句，
+结果和错误码先存进局部变量。**写完 Wine 测试一定要回 Windows 跑一遍**，这是唯一能发现探针自身错误的环节。
+
+### 部署：协议号变了
+
+这一批两次改了服务器协议。协议号一变，`/opt/wine-altars` 里的 `wineserver` 必须和 `ntdll` 一起换；
+请求编号变了时（新增请求插在中间），所有直接发请求的模块也要换：`ntdll.so`、`win32u.so`、`winex11.so`、
+`winewayland.so`、`nsiproxy.so`，以及 PE 的 `ntoskrnl.exe`、`nsiproxy.sys`、`winex11.drv`、`winewayland.drv`。
+`scripts/word-iter.sh` 只换列出的 DLL，这些要先手工换好。
