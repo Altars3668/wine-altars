@@ -9295,3 +9295,53 @@ ntdll 的 `ProcessMitigationPolicy`、`ProcessPowerThrottlingState` 现在为本
 - ETW：`EventRegister` 发的是假句柄，`EventSetInformation`、`EnableTraceEx2`、`StartTraceW` 都是桩，Word 注册了 15 个提供者。
 - `get_dummy_preferred_ui_language`（18）、msctf 的组合与输入范围、`IShellItem2::GetPropertyStore`、`Wer*` 注册、
   netprofm、appx 和 useractivities 各缺一个接口、dwmapi 的属性 21 和 33，以及一串一两次的。
+
+## Word 启动时的第三批：界面语言列表与 XML 字符编码
+
+第二批里的两个高频 FIXME 不是同一类问题：`get_dummy_preferred_ui_language` 把资源回退列表缩成一个
+locale；xmllite 虽然把 `XmlReaderProperty_MultiLanguage` 保存下来，却不使用它，也没有按 XML 声明切换编码。
+在 Windows 11 实测时，先分开问“名单是什么”和“字节怎样解码”，再分别实现。
+
+### 首选界面语言不是当前 locale 的别名（`907521e`、`d60a799`）
+
+`tools/uilangprobe` 下的探针分别询问 user、system、process、thread 列表，设置线程/进程语言后重问，
+还按语言检查父级、过滤器和缓冲区。Windows 上，用户和系统各有 UI 语言与回退的 `en-US`；线程的合并名单
+先有自己设置的语言，再有进程名单，再有用户语言和它的 `LOCALE_SPARENT` 父链。以中文为例，
+`zh-CN` 的父级依次为 `zh-Hans`、`zh`。`MUI_MERGE_SYSTEM_FALLBACK` 为每一项加入父链，
+`MUI_THREAD_LANGUAGES` 则只答线程自己的名单。线程与进程各自最多保存五项，合并结果可以更长；名单按顺序去重，不认识的语言名被略过。
+
+现在 ntdll 分别保存线程和进程名单，在查询时依标志合并；线程退出时释放自己的名单。控制台与复杂文字过滤器
+会从线程名单排掉不能用的语言，并在它自己的名单末尾放入回退的 `en-US` 或可用的控制台语言；合并名单则先接
+上用户语言，再接被过滤项的替代。`GetThreadUILanguage` 读第一项，`SetThreadUILanguage` 更新线程名单，
+不再“返回成功但什么都不记”。参数、计数、两层 NUL 与缓冲区不足时的行为都由探针覆盖。
+
+边界：Wine 自带的 locale 数据与这台 Windows 的部分语言文字分类并不完全相同（例如 `sa-IN`），而且这里
+还没有从 Windows 式用户语言设置维护一份独立于 Unix locale 的持久首选语言列表。旧的 kernel32 `thread`
+测试中 `ThreadIsIoPending` 的 `todo_wine` 已经不再需要（`d60a799`）。`locale` 测试在 Wine 的 zh_CN 与 en_US
+环境都没有失败；原生测试里的既有环境失败与新增断言分开核过。
+
+### XML 声明决定真正的解码方式（`efd7c40`）
+
+`tools/xmlmlangprobe` 在 Windows 上以同一段字节试 `windows-1252`、ISO-8859、GB2312、Shift_JIS 等声明，
+分别给不给读取器 `IMultiLanguage2`。xmllite 本身懂 UTF-8、US-ASCII、Windows 1250–1258 与
+ISO-8859-1–9；其它名字向传入的 MultiLanguage 对象查询。声明要求 UTF-16 一类宽字符但流是字节，
+或宽字符流却声明字节编码，返回 `MX_E_ENCODINGSWITCH`；不认识的编码在没有对象时返回
+`MX_E_ENCODINGSIGNATURE`，对象也不认识时返回 `MX_E_ENCODING`。
+
+读取器现在解析完声明再决定码页，保留跨读取块的多字节字符；无效 UTF-8 字节不再无声地被替换成普通文本，
+而是令 XML 字符检查失败。`MultiLanguage` 属性仍按 COM 引用计数保存与交回，但现在也参与转换。
+已有 reader/writer 测试和新增声明编码测试在 Wine 上均无失败，新增测试在 Windows 上也无失败。
+**未解决：** `CreateXmlReaderInputWithEncodingName` 强制指定编码的路径，在那台 Windows 上有一处与
+XML 声明路径不同的解码行为；现阶段没有把它混进已经确认的声明规则里。
+
+### mlang 的两代字符集查询不能混为一谈（`9443b55`）
+
+`tools/charsetprobe` 同时调用 `IMultiLanguage::GetCharsetInfo` 与 `IMultiLanguage2::GetCharsetInfo`。
+后者的名称/家族码页/互联网编码表（包括 `latin1`、`ISO_8859-1`、`UTF-16` 等别名）已按 Windows 实测
+补入；前者主要查 MIME 注册表，同一个名字可能给不同码页，不能简单转发到后者。Wine 也在 MIME 注册表
+补上 `x-user-defined`。新接口的探针输出逐行匹配；旧接口的少数别名与 Windows 仍有差别，不能说它已
+完全相同。新增 mlang 测试在 Wine、Windows 上均无失败。
+
+重装这三项模块并启动 Word 后，中文界面、恢复窗格与文档正文均正常绘制；这次启动的 FIXME 中不再出现
+`get_dummy_preferred_ui_language` 和 `Ignoring MultiLanguage`。ETW 的提供者注册与会话本身是下一项，
+不能因相关日志变少就把事件追踪称作已实现。
