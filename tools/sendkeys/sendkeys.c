@@ -13,8 +13,9 @@
  *
  * A key is a chord such as ctrl+p, alt+f, shift+tab, esc, enter, f10, or
  * text:some words to type literally.  move:x,y puts the pointer at a screen
- * position, and wheel:n turns the wheel n notches (negative scrolls down),
- * where the pointer is.  down:key and up:key press and let go of one key on
+ * position, click presses the left mouse button there, and wheel:n turns
+ * the wheel n notches (negative scrolls down), where the pointer is.
+ * down:key and up:key press and let go of one key on
  * its own, so that down:ctrl wheel:1 up:ctrl zooms.  With -w, the first visible top-level
  * window whose class contains the substring is brought to the foreground
  * first.  -d sets the pause between keys (default 150 ms).  -close posts
@@ -25,6 +26,7 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *want_class;
@@ -97,6 +99,16 @@ static void turn_wheel(int notches)
     SendInput(1, &in, sizeof(in));
 }
 
+static BOOL click_pointer(void)
+{
+    INPUT in[2] = {0};
+
+    in[0].type = in[1].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    return SendInput(2, in, sizeof(in[0])) == 2;
+}
+
 static void press_key(const char *name, BOOL up)
 {
     INPUT in = {0};
@@ -158,6 +170,10 @@ int main(int argc, char **argv)
         lstrcpynA(chord, argv[i], sizeof(chord));
         if (!strncmp(argv[i], "text:", 5)) type_text(argv[i] + 5);
         else if (!strncmp(argv[i], "move:", 5)) move_pointer(argv[i] + 5);
+        else if (!strcmp(argv[i], "click"))
+        {
+            if (!click_pointer()) { fprintf(stderr, "mouse click failed: %lu\n", GetLastError()); return 1; }
+        }
         else if (!strncmp(argv[i], "wheel:", 6)) turn_wheel(atoi(argv[i] + 6));
         else if (!strncmp(argv[i], "down:", 5)) press_key(argv[i] + 5, FALSE);
         else if (!strncmp(argv[i], "up:", 3)) press_key(argv[i] + 3, TRUE);

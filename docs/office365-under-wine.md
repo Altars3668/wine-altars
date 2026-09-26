@@ -9360,6 +9360,38 @@ XML 声明路径不同的解码行为；现阶段没有把它混进已经确认�
 类别计数大于零而类别数组或类别 GUID 为空会使 Windows 测试进程崩溃，不能把它们写成应返回参数错误的断言。
 
 **边界：**这里仅实现“没有会话监听”时的提供者侧状态。`StartTrace`、`EnableTraceEx2`、
-`GetTraceLoggerHandle` 和实际投递尚未实现；MOF 路径被接收但不会加载文件。这一批尚未重装到 Office
-前缀，也没有证据表明 Word 行为因此改变。`scripts/winrun.sh` 已改为传回远端进程的退出码：以前即使
-Windows 测试报告失败，脚本也固定退出 0；往后仍要读取测试输出里的失败数，不能只看包装器状态。
+`GetTraceLoggerHandle` 和实际投递尚未实现；MOF 路径被接收但不会加载文件。重装三份 ntdll
+（两种 PE 架构及 unix 侧）并在 `:2` 重启 Word 后，功能区与文档正文仍正常显示；这只能排除
+显眼的启动回归，不能证明真实 ETW 会话可用。`scripts/winrun.sh` 已改为传回远端进程的退出码：
+以前即使 Windows 测试报告失败，脚本也固定退出 0；往后仍要读取测试输出里的失败数，不能只看包装器状态。
+
+## winref 的最新 Windows 合约：版本号必须和能力一起推进
+
+`tools/contractprobe` 在 winref 的 Windows build 29671 上测得 `UniversalApiContract` 上限为 **20**，
+`FoundationContract` 为 4，`WwanContract` 为 3。Wine 当前只报告 Universal 10：这不是
+“已等同 Windows 11”的证明。旧探针传空合约名时在原生系统中途异常退出；新版不再把危险的
+无效输入混入正常覆盖，完整运行并保存了原生输出。
+
+将 Wine 的 Universal 上限**临时**改为 20 后，Word 会在版本 15 返回真时停下版本探测，
+且向 compositor 查询合约 13 才有的 `ICompositorWithBlurredWallpaperBackdropBrush`；Wine
+目前返回 `E_NOINTERFACE`。窗口、功能区和文档页仍能绘出，说明 Word 对这次查询有回退，
+**不说明合约 20 的所有接口已实现**。实验后已把源码和安装版恢复到 10 并复测 Word，
+没有把仅改数字的诊断当成兼容性修复。
+
+### Click-to-Run 的 COM 类在包里，却没投射到 Wine 注册表
+
+`~/.wine-c2r-test` 中的 `Word.Application`、`Excel.Application` 等 ProgID 原先查不到，
+虽然四个 EXE 都在，安装器产生的 `root/vreg/*.vreg.dat` 也保存了它们的真实 CLSID 与
+`LocalServer32`。winref Windows 的同名 ProgID 都已注册；差的是 App-V 虚拟注册表叠加/发布，
+不是 Office 二进制缺失。用本机 Office 蜂巢（不是从另一台机器复制身份或授权）投射
+Word 的实际注册后，`CreateObject("Word.Application")` 能新建文档、编辑正文、保存
+并关闭；生成的 DOCX 是完整 ZIP/OOXML，正文与输入相符。
+
+`export-office-registry.py --automation-only` 从各应用自己的 App-V hive **读取** CLSID，
+只导出 Word、Excel、PowerPoint、Outlook 的 Application ProgID 与本地服务器注册，
+不凭空编 GUID；`apply-office-registry.sh` 现在识别这种 `31-automation-*.reg` 导出，
+且空目录会失败而非假报成功。三款其余应用的 ProgID 已按本机安装元数据投射并与
+winref 上的 GUID 对照；**这只证明类可找到，不证明应用完成启动**。Excel 已能被 COM
+激活并显示窗口，但 `Workbooks.Add` 阻塞、窗口空白，必须继续追踪；PowerPoint 与
+Outlook 尚未做端到端调用，也没有发送邮件。`office-debug.sh run` 已修复隐藏 Wine
+非零退出码的问题，避免把这一类失败误写成通过。

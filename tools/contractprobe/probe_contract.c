@@ -27,7 +27,6 @@ int main(void)
         L"windows.foundation.universalapicontract",
         L"Windows.Foundation.UniversalApiContract ",
         L"Windows.Foundation",
-        L"",
     };
     HMODULE combase = LoadLibraryW(L"combase.dll"), wintypes = LoadLibraryW(L"wintypes.dll");
     major_fn major = (major_fn)GetProcAddress(wintypes, "RoIsApiContractMajorVersionPresent");
@@ -40,8 +39,8 @@ int main(void)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     get_version(&info);
-    printf("os %lu.%lu.%lu; combase %p wintypes %p, major %p full %p\n", info.dwMajorVersion, info.dwMinorVersion,
-           info.dwBuildNumber, combase, wintypes, major, full);
+    printf("os %lu.%lu.%lu; combase %d wintypes %d, major %d full %d\n", info.dwMajorVersion, info.dwMinorVersion,
+           info.dwBuildNumber, !!combase, !!wintypes, !!major, !!full);
     if (!major || !full) return 1;
 
     for (i = 0; i < ARRAY_SIZE(names); i++)
@@ -79,11 +78,6 @@ int main(void)
         }
         printf("\n");
     }
-    present = 2;
-    hr = major(NULL, 1, &present);
-    printf("NULL name: %#lx %d\n", hr, present);
-    hr = full(NULL, 1, 0, &present);
-    printf("NULL name (full): %#lx %d\n", hr, present);
     printf("done\n");
     return 0;
 }

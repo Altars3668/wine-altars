@@ -66,6 +66,7 @@ run() {
     local exe
     exe=$(tool "$1"); shift
     env -i "${helper_env[@]}" "$wine" "$exe" "$@" 2>/dev/null | tr -d '\r'
+    return "${PIPESTATUS[0]}"
 }
 
 word_pid() { pgrep -f 'Office16\\WINWORD.EXE' | head -1; }
