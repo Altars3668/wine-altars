@@ -2,10 +2,11 @@
 
 这里有两类东西，用途不同。
 
-## `wine/altars-cx-series.patch` —— 权威状态
+## `wine/altars-cx-series.patch` —— 截至 `9443b55` 的可重放快照
 
-从 CrossOver 26.3.0 的源码（`wine-src` 的 `crossover-26.3` 分支）到当前
-`altars-cx` 分支的全部改动，`git format-patch` 导出的 197 个提交，451 个文件。
+从 CrossOver 26.3.0 的源码（`wine-src` 的 `crossover-26.3` 分支）到
+`altars-cx` 的 `9443b55` 为止，`git format-patch` 导出的 197 个提交，451 个文件。
+后续 ETW 提交还没有进入这个文件；它目前**不能**重建最新的 `altars-cx`。
 
 要重建这棵树，用这个：
 
@@ -15,7 +16,8 @@ git checkout -b my-altars crossover-26.3
 git am ../patches/wine/altars-cx-series.patch
 ```
 
-验证过它能干净应用到 `crossover-26.3`，应用后整棵树与 `altars-cx` 逐字节一致（`git diff --quiet altars-cx`）。
+验证过它能干净应用到 `crossover-26.3`，应用后整棵树与 `9443b55` 逐字节一致；
+ETW 补丁未纳入前，不应再用当前 `altars-cx` 作这一比较。
 
 ## `office/NNNN-*.patch` —— 发现过程
 

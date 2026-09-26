@@ -9345,3 +9345,21 @@ XML 声明路径不同的解码行为；现阶段没有把它混进已经确认�
 重装这三项模块并启动 Word 后，中文界面、恢复窗格与文档正文均正常绘制；这次启动的 FIXME 中不再出现
 `get_dummy_preferred_ui_language` 和 `Ignoring MultiLanguage`。ETW 的提供者注册与会话本身是下一项，
 不能因相关日志变少就把事件追踪称作已实现。
+
+## ETW 提供者注册：句柄、traits 与 ANSI 入口（`26c3a97`、`2b06b12`）
+
+`tools/etwprobe` 中的三个探针分别测现代提供者、traits 和经典提供者的 ANSI/Unicode 入口；
+同一 PE 在 Windows 11 和 Wine 上逐行比对。`EventRegister` 不再给所有提供者同一个假句柄，注销后也不再
+把写入和设置 traits 当作成功；traits 的编号、长度检查与“只能成功设置一次”按原生测量处理。
+`RegisterTraceGuidsW/A` 都分配可注销的提供者句柄，填充类别句柄；A 入口把可选 MOF 字符串按 ANSI 码页
+转成 Unicode，再走 W 的注册路径。注册失败时的返回值、输出是否改动和 `LastError` 都由原生探针覆盖。
+
+原生测试曾把 `RegisterTraceGuids` 的注册句柄交给 `GetTraceEnableFlags`，并从此前调用留下的错误码推断规则；
+它实际要的是控制回调得到的 logger 句柄。那条断言已删，修正后的新增测试段在 Windows 和 Wine 上都没有
+失败。Windows 的 eventlog 整套测试仍有原有测试段的环境相关失败，不能称整套原生通过。探针还显示
+类别计数大于零而类别数组或类别 GUID 为空会使 Windows 测试进程崩溃，不能把它们写成应返回参数错误的断言。
+
+**边界：**这里仅实现“没有会话监听”时的提供者侧状态。`StartTrace`、`EnableTraceEx2`、
+`GetTraceLoggerHandle` 和实际投递尚未实现；MOF 路径被接收但不会加载文件。这一批尚未重装到 Office
+前缀，也没有证据表明 Word 行为因此改变。`scripts/winrun.sh` 已改为传回远端进程的退出码：以前即使
+Windows 测试报告失败，脚本也固定退出 0；往后仍要读取测试输出里的失败数，不能只看包装器状态。

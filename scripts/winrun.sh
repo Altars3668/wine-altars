@@ -26,7 +26,7 @@ scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$exe" "$USERNAME@$HOST:
 
 if [ "$desktop" = 0 ]; then
     "${SSH[@]}" "cd /d %TEMP% && $name $*" 2>&1 | tr -d '\r'
-    exit 0
+    exit "${PIPESTATUS[0]}"
 fi
 
 ps1=$(mktemp --suffix=.ps1)
