@@ -29,14 +29,26 @@ if [ "$desktop" = 0 ]; then
     exit "${PIPESTATUS[0]}"
 fi
 
+tag="WineAltarsProbe_$(date +%s)_$RANDOM"
 ps1=$(mktemp --suffix=.ps1)
 printf '%s\r\n' "\$exe = Join-Path \$env:TEMP \"$name\"" \
-    "& \$exe $* 2>&1 | Out-File -Encoding ascii (Join-Path \$env:TEMP \"$name.out\")" > "$ps1"
-scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$ps1" "$USERNAME@$HOST:$TEMP/$name.ps1"
+    "& \$exe $* 2>&1 | Out-File -Encoding ascii (Join-Path \$env:TEMP \"$tag.out\")" \
+    "Set-Content -Encoding ascii -Path (Join-Path \$env:TEMP \"$tag.exit\") -Value \$LASTEXITCODE" > "$ps1"
+scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$ps1" "$USERNAME@$HOST:$TEMP/$tag.ps1" || { rm -f "$ps1"; echo "desktop task upload failed" >&2; exit 2; }
 rm -f "$ps1"
-"${SSH[@]}" "schtasks /create /tn WineAltarsProbe /tr \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\$USERNAME\\AppData\\Local\\Temp\\$name.ps1\" /sc once /st 23:59 /it /f >nul & schtasks /run /tn WineAltarsProbe >nul" >/dev/null 2>&1
-for i in $(seq 1 60); do
+"${SSH[@]}" "schtasks /create /tn $tag /tr \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\$USERNAME\\AppData\\Local\\Temp\\$tag.ps1\" /sc once /st 23:59 /it >nul && schtasks /run /tn $tag >nul" >/dev/null 2>&1 || { echo "desktop task start failed" >&2; exit 2; }
+completed=0
+for i in $(seq 1 180); do
+    result=$("${SSH[@]}" "if exist %TEMP%\\$tag.exit (echo done) else (echo waiting)" 2>/dev/null | tr -d '\r') || { echo "desktop task polling failed" >&2; exit 2; }
+    if [ "$result" = done ]; then completed=1; break; fi
     sleep 2
-    "${SSH[@]}" "if exist %TEMP%\\$name.out (tasklist /fi \"imagename eq $name\" | find /i \"$name\" >nul || echo done)" 2>/dev/null | tr -d '\r' | grep -q done && break
 done
-"${SSH[@]}" "type %TEMP%\\$name.out & schtasks /delete /tn WineAltarsProbe /f >nul 2>&1 & del /q %TEMP%\\$name.out %TEMP%\\$name.ps1 2>nul" 2>&1 | tr -d '\r'
+[ "$completed" = 1 ] || { echo "desktop task timed out; leaving its files for inspection" >&2; exit 124; }
+"${SSH[@]}" "type %TEMP%\\$tag.out" 2>&1 | tr -d '\r'
+output_status=${PIPESTATUS[0]}
+result=$("${SSH[@]}" "type %TEMP%\\$tag.exit" 2>/dev/null | tr -d '\r\n') || { echo "desktop task exit status unavailable" >&2; exit 2; }
+[ "$output_status" = 0 ] || { echo "desktop task output unavailable" >&2; exit 2; }
+case "$result" in ''|*[!0-9]*) echo "invalid desktop task exit status" >&2; exit 2 ;; esac
+"${SSH[@]}" "schtasks /delete /tn $tag /f >nul 2>&1 & del /q %TEMP%\\$tag.out %TEMP%\\$tag.exit %TEMP%\\$tag.ps1 2>nul" >/dev/null 2>&1 || echo "desktop task cleanup failed" >&2
+printf 'remote_exit_code=%s\n' "$result" >&2
+[ "$result" = 0 ]

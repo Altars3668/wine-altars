@@ -9391,7 +9391,45 @@ Word 的实际注册后，`CreateObject("Word.Application")` 能新建文档、�
 只导出 Word、Excel、PowerPoint、Outlook 的 Application ProgID 与本地服务器注册，
 不凭空编 GUID；`apply-office-registry.sh` 现在识别这种 `31-automation-*.reg` 导出，
 且空目录会失败而非假报成功。三款其余应用的 ProgID 已按本机安装元数据投射并与
-winref 上的 GUID 对照；**这只证明类可找到，不证明应用完成启动**。Excel 已能被 COM
-激活并显示窗口，但 `Workbooks.Add` 阻塞、窗口空白，必须继续追踪；PowerPoint 与
-Outlook 尚未做端到端调用，也没有发送邮件。`office-debug.sh run` 已修复隐藏 Wine
-非零退出码的问题，避免把这一类失败误写成通过。
+winref 上的 GUID 对照；**仅有注册键不能证明应用能用**。后来 Word、Excel、PowerPoint
+各自在真实应用的 COM 路径下新建、修改并保存了本地 DOCX/XLSX/PPTX，均解包核对内容；
+Excel 另外经 GUI 点击空白工作簿，功能区与网格实际绘出。Outlook 尚未启动或访问邮箱，
+没有发送邮件或打印任务。`office-debug.sh run` 已修复隐藏 Wine 非零退出码的问题，
+避免把这一类失败误写成通过。
+
+### Excel 新建工作簿：不是 COM 注册失败，是旧交互源占住了 Visual（`a0fe160`、`f7081fd`、`fb62cc5`）
+
+补上包里已有的 ProgID 后，Excel COM 激活和 `Visible` 成功，`Workbooks.Add` 却永不返回；
+直接从 Excel 开始页点空白工作簿，标题变为「工作簿1」，界面仍停在开始页。
+起初 `tracker_statics2_SetBindingMode` 的八次 `S_OK` 只是桩，确实不绑定：winref 上
+`tools/trackerbindingprobe` 测得同一 Tracker 可按 X/Y/Scale 分别绑定**不同伙伴**，
+同一对重设模式会取代旧值，跨 Compositor 返回 `E_ACCESSDENIED`。Wine 现在按轴建立关系，
+传递选定轴的即时/惯性/自定义动画值；本地和 winref 的同步状态测试通过。winref 桌面锁屏，
+没有帧推进，**动画的时间行为尚不能直接与原生逐帧比对**。但修完这项，Excel 白屏仍在——
+不能因为找到一个真缺口就把它冒充白屏根因。
+
+真正的断点来自 Excel `+seh` 的一次 `c0000005`：对地址 0 写入，Office 标签
+`0x1e440099`、失败 HRESULT `E_INVALIDARG`。在 `Mso40UIwin32client.dll` 里按小端字节找
+标签，追到 `VisualInteractionSource` 的静态 `Create`（IID
+`{369965e1-8645-4f75-ba00-6479cd10c8e6}`）。`+dcomp` 把同一个 Visual 的调用串起来：
+
+```
+Create(visual) → InteractionSources.Add(old) → InteractionSources.RemoveAll()
+               → Create(同一 visual) → E_INVALIDARG → Office 主动 fail-fast
+```
+
+Wine 的旧源还有 Office 的外部引用，所以 `source_destroy` 没运行，`visual->interaction_source`
+仍指着它。`tools/interactionsourceprobe` 在 winref 测到恰好的区别：**RemoveAll 后即使旧对象仍活着，
+同一 Visual 可再 Create；单个 Remove 后仍不可再 Create**。只在 `sources_RemoveAll` 对本实现
+的源解除 Visual 的旧预留，照旧释放集合引用，别把 `Remove` 改成同样行为；新源设置后，
+旧源销毁时已有的相等守卫也不会误清它。同一探针 Wine 输出逐行匹配原生，新增 dcomp 测试
+先红后绿，Wine 和 winref 的完整 `composition` 测试均无失败（原生锁屏帧项跳过）。
+
+部署新版 dcomp 并重启专用前缀后，Word 的正文仍正常绘出；Excel 自动化探针终于执行到
+工作簿新建、A1 写入、XLSX 本地保存与关闭，XML 中 A1 确为写入文字。Excel GUI 的开始页
+点空白工作簿也显示出真实功能区与表格网格。PowerPoint 的标题幻灯片与 PPTX 保存亦已
+核验；这些是具体的端到端路径，不应外推成 Office 全功能或 Windows 合约 20 完成。
+
+`winrun.sh --desktop` 此轮也修掉了长测试尚未结束就读取空输出、误报 0 的竞态：
+为每次运行使用独立任务/输出名，PowerShell 写完成标记与进程退出码后才读回；用实际
+返回 0 与返回 7 的小程序分别验了成功/失败路径。测试汇总中的失败数仍要另查。
