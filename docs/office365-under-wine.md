@@ -9772,11 +9772,43 @@ D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回�
 
 **普查中发现、尚未处理的：**
 
-- d3d11 的 `test_shared_resource` 有 336 条失败，来自早先的共享资源实现与 Windows 行为不一致：
-  - 没有 KEYEDMUTEX 标志的纹理也能 QI 到 `IDXGIKeyedMutex`；
-  - NT 句柄资源的 `GetSharedHandle` 返回了句柄；
-  - `OpenSharedResource` 返回 `E_NOTIMPL`。
 - 前缀没有 wine-mono/.NET：OfficePLUS 服务（.NET 程序集）启动失败；VSTO 加载项与 Excel 的
   Power Query 同样依赖 .NET。
 - ETW：Office 启动 ETW 跟踪会话（`StartTraceW` 桩），C2R 用 `wevtutil im` 安装清单（桩）。
 - Excel、PowerPoint 读写计划任务时 taskschd 有大量 FIXME。
+
+
+### 共享句柄与 keyed mutex 按 Windows 语义（Wine `4a064df`、`2fd34b5`）
+
+早先为 Office AirSpace 做的跨设备共享表面（在 keyed mutex 交接时经系统内存搬运内容）能用，但 API
+语义与 Windows 不符：d3d11 的 `test_shared_resource` 有 336 条失败、`test_keyed_mutex` 有 13 条。
+
+- **句柄（`4a064df`）**：每个共享资源现在是一个 D3DKMT 资源，用 Wine 11 的 win32u 已有支持
+  （`D3DKMTCreateAllocation2` 的已有系统内存标准分配、`D3DKMTShareObjects`）。
+  - 普通共享或 keyed mutex 共享：给全局句柄（KMT）。它不是进程句柄，`CloseHandle` 与
+    `DuplicateHandle` 都会拒绝；`OpenSharedResource` 接受它。
+  - NT 句柄共享：`GetSharedHandle` 返回 `E_INVALIDARG`；`CreateSharedHandle` 每次给一个
+    `DxgkSharedResource` 类型的新 NT 句柄，要求命名时放在会话的 BaseNamedObjects 目录；
+    `OpenSharedResource1` 与 `OpenSharedResourceByName` 接受它。
+  - 不共享的资源：`GetSharedHandle` 返回 `S_OK` 与 NULL。
+  - D3DKMT 资源的私有运行时数据记录进程号与序号，用来在本进程中找回资源；
+    其他进程的资源不能打开（存储本来就不共享）。
+  - 创建校验：两种共享方式同时要求、只有 NT 句柄标志、特性级别低于 10.0，都按 Windows 拒绝。
+  - 仍有的偏差：打开方的纹理副本报告与原资源相同的标志，但 `GetSharedHandle` 不给句柄
+    （Windows 给原资源的句柄）。dxgi 层对缓冲区等非纹理资源仍无条件给出 `IDXGIKeyedMutex`。
+- **keyed mutex（`2fd34b5`）**：原来只记录“是否被持有”。现在记录持有者：
+  - 重复获取、释放自己未持有的锁返回 `DXGI_ERROR_INVALID_CALL`；
+  - 持有者被销毁后，其他参与者一律得到 `WAIT_ABANDONED`；
+  - 只有带 `SHARED_KEYEDMUTEX` 标志的纹理提供 `IDXGIKeyedMutex`。
+- **验证**：
+  - d3d11 全套在 GL 下只剩 10 条原有失败（修改前 416 条），
+    `test_shared_resource`、`test_keyed_mutex` 与新增的 `test_shared_resource_nt_handle` 全部通过。
+    新测试未在 Windows 上运行。
+  - Vulkan 下另有随机波动的 `test_texture` 与 21072 行失败，修改前的构建同样出现。
+  - 可见的 Word 启动后功能区、文档恢复窗格完整绘制；带 `warn+d3d11` 运行时，
+    没有任何参与者越权获取或释放，也没有内容等待。三应用保存探针通过。
+- **普查中另见**：
+  - Word 启动时，d3d11 对 `ID3D11Buffer` 被 QI 为 `ID3D11Texture2D` 约 140 万次
+    （Office 判断资源类型，失败是正确结果）。
+  - `scissor_rects_valid Ignoring inverted scissor rect` 数千次：Office 设了上下颠倒的裁剪矩形。
+    这与 Windows 一致，早先已按实测处理（`9ba5d82`：整次调用作废，之前的裁剪矩形保留），只是 WARN 较多。
