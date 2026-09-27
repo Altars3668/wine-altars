@@ -9533,8 +9533,26 @@ IID_ICompositionEffectSourceParameterFactory)` 返回类未注册，随后 Offic
 `+dcomp` 中读取 Office 实际传入的 `IGraphicsEffect::Name`，得到 **`Crossfade`**；
 其 `GetRuntimeClassName`、`GetIids` 都返回 `E_NOTIMPL`，不能凭类名推断它的全部
 图结构。测量后已撤销诊断代码，并重新以新 inode 安装与提交一致的生产版 dcomp。
-本机 SDK 有 `CLSID_D2D1CrossFade` 和 weight 属性声明，但现有 Wine `dlls/d2d1`
-没有 CrossFade 效果实现。下一步必须测清实际 graph/source/animatable property，
-再按 brush 源和渲染语义实现 effect factory/brush 及所需 D2D 后端；
-不能给 `CreateEffectFactoryWithProperties` 返回不会绘制的假成功。
+随后只在另一版临时诊断 DLL 中枚举本次实际传入的 `animatableProperties`：
+**`Crossfade.Source1Amount`** 和 **`Crossfade.Source2Amount`**。这不是 SDK
+`CLSID_D2D1CrossFade` 的单个 weight 属性，不能仅凭同名 Crossfade 把它绑定到
+那个效果。随后根据微软公开的 [Graphics Effects interop 头文件](https://raw.githubusercontent.com/microsoft/win32metadata/main/generation/WinSDK/RecompiledIdlHeaders/winrt/windows.graphics.effects.interop.h)
+只在临时诊断 DLL 中查询真实的 `IGraphicsEffectD2D1Interop`：Office 对象确实支持
+IID `{2fc57384-a068-44d7-a331-30982fcf7177}`，其 `GetEffectId` 给的是
+**`CLSID_D2D1ArithmeticComposite`** `{fc151437-049a-4784-a24a-f1c4daf20987}`；
+`GetSourceCount=2`，两个来源恰为已创建的 `source1`、`source2`。
+`GetProperty(0)` 是四个 float 的系数 `[0, 1, 0, 0]`，`GetProperty(1)` 是 false 的
+ClampOutput；两个动画属性都映射到系数属性索引 0，分别映射 `VECTORY` 与 `VECTORZ`，
+即独立调节来源 1、2 的贡献。`GetPropertyCount=4`，但本次索引 2/3 的查询返回
+`E_INVALIDARG`，不得据数量编造属性值。这些是**本轮 Wine 内运行的 Office 对象调用**，
+不是 winref 原生探针。
+
+现有 Wine `dlls/d2d1` 虽已注册 ArithmeticComposite effect，却在
+`ID2D1DeviceContext::DrawImage` 收到 effect 图像时仅处理 bitmap/command list，
+其余报 `Unhandled image`；`SetPrimitiveBlend(ADD)` 也未进入实际 bitmap GPU blend state。
+先前窗口截图中幻灯片仍是空白，尽管保存的 PPTX 里有预期文字；文件内容通过不能充当
+真实屏幕渲染通过。所以完整修复至少同时涉及 WinUI effect factory/brush 的来源绑定、动画属性与最终
+D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回不会绘制的假成功。
+本轮临时诊断代码已撤销，安装版恢复为回归测试通过的生产 DLL；只有一次加大量
+`+dcomp` 输出的诊断在幻灯片创建后超时，不据此断言原生保存或关闭行为变化。
 本轮 winref 仍不可解析，没有将新增类的边界情况冒称原生测量，也未打印或访问 Outlook 邮箱。
