@@ -9433,3 +9433,23 @@ Wine 的旧源还有 Office 的外部引用，所以 `source_destroy` 没运行�
 `winrun.sh --desktop` 此轮也修掉了长测试尚未结束就读取空输出、误报 0 的竞态：
 为每次运行使用独立任务/输出名，PowerShell 写完成标记与进程退出码后才读回；用实际
 返回 0 与返回 7 的小程序分别验了成功/失败路径。测试汇总中的失败数仍要另查。
+
+### D3D11 的 `DO_NOT_WAIT` 不能静默变成阻塞 Map（`ba6a991`）
+
+Word 启动时几十次带 `D3D11_MAP_FLAG_DO_NOT_WAIT` 的 `Map` 原来一律被忽略，
+既可能无声地等完 GPU 操作，也无法按 Windows 报 `DXGI_ERROR_WAS_STILL_DRAWING`。
+`tools/d3dmapprobe` 同一 PE 在 winref Windows build 29671 的 WARP 与 Wine 软件后端实测：
+动态缓冲的 `WRITE_DISCARD`/`WRITE_NO_OVERWRITE` 搭配该标志是 `E_INVALIDARG`，
+未知 bit 2 也是参数错误，输出指针归零；空闲 staging 纹理的 READ/WRITE/READ_WRITE
+可以直接映射；紧跟 GPU Copy 的 READ/DO_NOT_WAIT 在 winref 本轮返回“仍在绘制”。
+
+`dlls/d3d11` 现在检查标志与写入方式，把 DO_NOT_WAIT 传给 `wined3d`；命令流在该资源
+仍有排队操作时直接答忙而不等待，忙时不触碰映射状态。确定性探针行与 Windows 一致；
+紧跟 Copy 的 busy/ready 次数取决于两端工作线程与 GPU 时序，不拿它作逐行相等的断言。
+受测 Wine 软件后端的成功 Map 在高精度测量中未出现长时间阻塞，但**命令流尾部前进不等于
+硬件 GPU fence 已完成**：尚未对每个 GL/Vulkan 后端证实严格非阻塞，不称完整实现。
+
+专门的 `d3d11 --map-do-not-wait` Wine/winref 测试各六项、0 失败；一次普通 D3D11 全套
+单线程测试到 480 秒仍未结束，不能称全套通过。重装 d3d11、wined3d 两架构 DLL 后，
+Word 功能区及正文仍绘出，Excel 的 COM 新建、编辑、保存 XLSX 仍通过；原来那条
+`Ignoring map_flags` FIXME 不再出现。此项是局部合约推进，不等于 Windows 20 全面支持。
