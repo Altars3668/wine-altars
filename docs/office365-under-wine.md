@@ -9570,3 +9570,91 @@ D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回�
 本轮临时诊断代码已撤销，安装版恢复为回归测试通过的生产 DLL；只有一次加大量
 `+dcomp` 输出的诊断在幻灯片创建后超时，不据此断言原生保存或关闭行为变化。
 本轮 winref 仍不可解析，没有将新增类的边界情况冒称原生测量，也未打印或访问 Outlook 邮箱。
+
+### Direct2D 效果图与 WinUI 效果画刷：PowerPoint `Presentation.Close` 通过（Wine `4b42eb3`、`70ea39d`、`c8d9f9a`、`9774404`、`2835e35`）
+
+**先分清谁在画。** 这两类效果都不是 Office 自己画的：
+
+- **PowerPoint 直接用 D2D 的部分**（`CreateEffect` Shadow、2DAffineTransform 后调用 `DrawImage`）：由
+  Direct2D 在 GPU 上算。微软 [Effects overview](https://learn.microsoft.com/en-us/windows/win32/direct2d/effects-overview)
+  写明：每个效果建立内部 transform graph，每个 transform 容纳逐像素执行的着色器；
+  “内置效果和自定义效果都这样工作”，自定义效果框架“就是用来创建 D2D 内置效果的同一框架”。
+- **关闭演示文稿时的 Crossfade**：PowerPoint 不调用 D2D，只把 `IGraphicsEffect` 描述交给
+  `Compositor.CreateEffectFactory` 编译，再用 `CompositionEffectBrush` 绑定来源、驱动动画。
+  [Visual layer](https://learn.microsoft.com/en-us/windows/uwp/composition/visual-layer) 文档把
+  app 里的 Visual 称为“合成器中视觉状态的代理”，效果与动画独立于 UI 线程渲染。Windows 上
+  这是进程外的系统合成器（DWM），其内部实现未公开，本文不作猜测。
+- **Wine 的对应做法**：Wine 没有 DWM，dcomp 本来就在进程内用 D2D 画视觉树，因此让 dcomp
+  把效果描述翻译成 D2D 效果图，是复用同一套实现，不代表 Windows 的合成效果经过 app 进程的 d2d1。
+
+**d2d1（`4b42eb3`）：按原生结构实现效果图渲染。** 起初写的“单个超级着色器按 CLSID 分支”
+方案已放弃：它画得出几个内置效果，却让应用自注册的自定义效果永远画不出来。现在的结构是：
+
+- **通用渲染器**：`effect_render.c` 只通过 transform 的公开接口，从输出往回走：
+  `MapOutputRectToInputRects` 算出每个输入要提供的区域；bitmap、command list 或嵌套 effect
+  先画进中间纹理；再运行每个 draw transform 的像素着色器。
+  - 顶点着色器按自定义效果的约定提供 `SCENE_POSITION`，以及 `TEXCOORDn`（uv 与一个效果像素的 uv 尺寸）。
+  - offset、bounds adjustment、border、blend transform 都能画。
+  - 只渲染裁剪区或目标可见的部分，最后按 DrawImage 的合成模式画到目标上。
+- **draw info 与准备顺序**：`ID2D1DrawInfo` 真正保存输入描述、输出缓冲和常量。
+  `PrepareForRender` 在首次绘制前、以及属性、图或 DPI 变化后调用，`SetDrawInfo` 先于它执行。
+- **内置效果**：Flood、ArithmeticComposite、Composite、Crop、2DAffineTransform、GaussianBlur、
+  Shadow、Grayscale 实现为真正的 `ID2D1EffectImpl` 加 transform 与各自的 HLSL；
+  `GetImageLocalBounds` 支持效果。
+
+**d2d1 的测量与坑：**
+
+- **Windows 实测期望转为通过**：Wine 测试中由 Windows 实测写成的一批期望原先是 todo_wine，现在全部通过。
+  包括 2D 仿射的 6 组边界与像素图形、Crop 边界、Flood 边界与整面 hash、Grayscale、
+  自定义像素着色器（`0x661a334c`），以及 SetOutputBuffer 校验。
+  - 2D 仿射的输出边界规则：输入外扩半像素后做变换，取变换结果的包围盒，输出是像素中心落在盒内的所有像素。
+- **新增公式测试**：`test_effect_rendering` 只取文档公式能推出的值（算术合成、合成模式、嵌套效果、
+  `image_rect` 偏移、阴影上色、模糊、command list 输入），**未在 Windows 上运行**。
+- **测试结果**：d2d1 全量在 GL、Vulkan 下各 **17641 项/0 失败**。
+- **坑：SRV/RTV 冲突**。刚被 D2D 画入的纹理（例如 command list 回放的目标）仍作为 RTV 绑定在
+  D2D 自己的状态里。先绑 SRV 会被 D3D11/wined3d 强制置空，读到全透明。每个 pass 必须先绑输出再绑输入。
+- **坑：无限边界的表示**。无限边界用 `LONG_MIN/LONG_MAX` 并做饱和运算；Windows 上 Flood 报 `±(float)INT_MAX`。
+- **坑：IGNORE 透明度的输入**。IGNORE alpha 的 bitmap 作为效果输入时，保留其中存储的 alpha（Windows Grayscale 测试可证）。
+- **附带修复（`70ea39d`）**：`SetInput(NULL)` 原来会解引用空指针。Win2D 用它清除输入，Windows 也接受。
+
+**dcomp（`c8d9f9a`、`9774404`、`2835e35`）：**
+
+- **接口声明**：新增 `windows.graphics.effects.interop.idl`，按 SDK 声明 `IGraphicsEffectD2D1Interop`。
+- **效果工厂**：在创建时整体取下效果图，包括各节点的 CLSID、属性值和来源（参数名或嵌套效果）。
+  - 可动画名经 `GetNamedPropertyMapping` 解析；查不到的效果名或属性名一律拒绝。
+  - `LoadStatus=Success`。
+- **效果画刷**：按参数名保存来源画刷；可动画属性是画刷自己的值，也能来自它的属性集并参与动画。
+  - 带点号的名字（`Effect.Property`）若整体就是对象的属性，便不再拆成“属性.成员”。
+  - 开始、停止动画与表达式求值三处都遵循这一规则。
+- **绘制**：在目标的 context 上建 D2D effect，并套用当前属性值。各来源画刷先在独立 context 上
+  画成与 visual 同尺寸的 bitmap，以免带入目标的裁剪。不透明度用两个输入都接输出的 ArithmeticComposite 实现。
+
+**PowerPoint 的实际用法（本轮 `+dcomp` 实测）：**
+
+- 两个来源都是 surface brush。
+- 另建表达式 `1-CompObj.Crossfade.Source2Amount`，CompObj 是画刷本身，并启动在
+  `Crossfade.Source1Amount` 上。
+- `2835e35` 之前，这个表达式因为 `Crossfade.Source2Amount` 被拆成两段而无法求值，
+  `StartAnimation` 静默返回 `E_INVALIDARG`（PowerPoint 不报错）；修后两个画刷上都正常 started。
+- composition 测试 **574 项/0 失败**。其中这条表达式测试做过红绿验证：撤掉修复即以 `0x80070057` 失败。
+
+**结果：**
+
+- 两架构 d2d1、dcomp 已用新 inode 部署。
+- PowerPoint 探针依次到达 `presentation closed`、`application quit`、`closed`，
+  **退出码 0**（此前固定为 4）。PPTX 幻灯片文字正确。
+- Word、Excel COM 本地保存与 OOXML 内容回归通过。
+
+**遗留问题：**
+
+- **关闭阶段的 GL 错误**：表达式动画持续运行后，关闭阶段合成器会再向正在销毁的窗口呈现一帧，
+  出现一次 `swapchain_blit_gdi Failed to blit`，之后每释放一个 CompositionDrawingSurface 就报一次
+  `wglSetPixelFormatWINE ... device context 0`（185 条，与 184/185 个表面、画刷释放数一致）。
+  - 进程仍正常退出。
+  - 不直接改成“隐藏窗口不呈现”，原因是应用可能在显示窗口前就提交了唯一一帧，那样会变成空白；
+    需要先做窗口生命周期的正确处理。
+- **性能与质量**：效果图每帧重算，没有缓存；中间纹理按 1:1 DIP 分辨率，缩放时会糊。
+- **尚未实现的内置效果**：ColorMatrix、Blend、Saturation 等仍无渲染。2D 仿射的 hard 边框
+  按 soft 处理，三次插值按线性近似。PushLayer 仍是存根。
+- **屏幕渲染**：屏幕上 PowerPoint 幻灯片空白的问题尚未调查。
+- **原生对照**：winref 本轮仍不可达，以上结论均未与原生机器做对照测量。
