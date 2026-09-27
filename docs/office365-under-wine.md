@@ -9717,3 +9717,66 @@ D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回�
 - 图层的 `IGNORE_ALPHA` 未实现；不透明度画刷与遮罩变换同时使用时是近似。
 - 曾有一次 GL 下的全量测试在无汇总行的情况下提前结束（退出码 5，疑为 0xC0000005 截断）；
   开启异常日志后五次都未复现，原因未知。
+
+### 线条连接、GL 上下文的悬垂交换链与共享句柄死锁（Wine `89a0f91`、`8f9cc9f`、`ba6fad0`、`a3d7408`）
+
+本轮先用 `err+all,fixme+all` 对 Word、Excel、PowerPoint 的保存探针做了一次普查，再逐条追查。
+
+**d2d1 的线条连接（`89a0f91`）。** 普查里 PowerPoint 报 `Line join 0x2 is drawn as a miter`（0x2 即 ROUND）。
+
+- Wine 的描边轮廓按几何对象只建一次，与线型无关；连接处是 4 个顶点的斜接楔形，顶点着色器按
+  prev/next 方向外扩。连接方式是绘制时参数，所以放在着色器里裁：
+  - 斜角与 MITER_OR_BEVEL：楔形尖点与对侧内点的偏移长度 $|q| = 1/\sin(\tfrac{1}{2}\theta)$
+    （$\theta$ 为两段的夹角），超过斜接限度就收回到斜角边上，位置是 $q/|q|^2$。
+  - 圆角：像素着色器丢弃离连接点超过 $w/2$ 的像素。外侧偏移线正好在两段的外角处与该圆相切，
+    所以楔形与圆盘的交集就是圆角扇形。
+- 顺带修了一个旧缺陷：路径正好直行穿过的顶点原来也生成“连接”，沿下一段多画 25 个单位；
+  下一段更短时会越过终点。
+- 测试：直角拐角（线宽 10）三处像素区分斜接、斜角与圆角，另测共线顶点不越过终点。
+  红测 20 项失败；d2d1 全量在 GL、Vulkan 下各 **18627 项/0 失败**。期望按几何推出，未在 Windows 上运行。
+- 仍未做：MITER 超过限度时 D2D 会截断尖角，这里仍画完整尖角；正好掉头的顶点在斜角模式下仍多画 25 个单位。
+
+**GL 上下文的悬垂交换链（`ba6fad0`、`a3d7408`）。** PowerPoint 的普查日志里，有一次出现了 1926 条
+`wined3d_context_gl_set_gl_context Fallback to backup window ... failed too`，此后 10 次里再没出现。
+带 `warn+d3d` 重跑时抓到了线索：回退前上下文用的“DC”是 `0034006B00300064`，按 UTF-16 解码是文本 “d0k4”。
+
+- 根因（Wine 11.0 上游代码，上游 master 相同）：GL 后端一个设备每个线程只有一个上下文，由各交换链共用。
+  上下文在 Present 时跟着切到那个交换链，但交换链销毁时没有代码把它移开，于是
+  `wined3d_context_gl_update_window` 每次激活都从已释放的内存读窗口和 DC。
+- 修复：交换链销毁时，在命令流线程上把指向它的上下文移到设备的隐式交换链。
+  另一处：上下文已为某个窗口退到备用 DC 后，不再每次激活都换回那个失效的 DC 重试。
+- 效果：PowerPoint 运行中的回退从每次 173 次（修第一处后仍有一次 755 次，是那个失效窗口的循环）
+  降到 1 次（一个窗口先于其交换链销毁的正常情形），不再出现垃圾 DC。
+- 那次 1926 条“failed too”没有带追踪复现过，只能推断与此有关。以前记录的关闭阶段 185 条
+  `wglSetPixelFormatWINE` 错误，今天修复前的几次运行里本来就没有出现，也不能归因于这次修复。
+- 回归：d3d9（d3d9ex、device、visual）与 d3d11 在 GL 下，修复前后的失败集合完全相同。
+  新增的 d3d11 测试（设备在随后退出的线程上创建）修复前后都通过，本身不能区分修复与否；
+  修复效果靠 `+d3d` 追踪确认。
+
+**共享句柄表的死锁（`8f9cc9f`）。** 为了查上面的回归，把 d3d11 全套在 GL 下跑到了底，结果它在
+`test_multisample_resolve` 永远卡住。winedbg 的调用栈：
+
+- 主线程在 `Map` 里持有 wined3d 互斥锁，在 `wined3d_resource_wait_idle` 里等命令流线程空闲；
+- 命令流线程在 blit 里释放一张临时纹理，经 `resource_cleanup` 进入早先 altars 加的
+  `wined3d_resource_release_shared_handle`，要拿同一把互斥锁。
+- 共享句柄表改用独立的临界区后，d3d11 全套在 GL 下 15 秒内跑完（563041 项）。
+  Office 的读回若恰好遇上这种 blit，也会以同样方式冻结，所以这一条同样关系到 Office。
+
+**顺带确认、无需修的：**
+
+- `marshal_object ... {a6ef9860-...}`（IDispatchEx）与 `{fc4801a3-...}`（IObjectWithSite）：
+  代理/存根都在，失败的是 `CreateStub` 对对象本身的 QI——cscript 在探测 Office 对象是否支持
+  IDispatchEx，对象不支持，返回失败是正确行为，只是 Wine 用 ERR 打印。
+- `GetLongPathNameW` 对 `\\?\C:\windows` 等路径原样返回，这些路径本来就是长名，结果与 Windows 相同。
+- `SecManagerImpl_ProcessUrlAction Unsupported arguments`：只是对 UI 相关标志打 FIXME，照常执行。
+
+**普查中发现、尚未处理的：**
+
+- d3d11 的 `test_shared_resource` 有 336 条失败，来自早先的共享资源实现与 Windows 行为不一致：
+  - 没有 KEYEDMUTEX 标志的纹理也能 QI 到 `IDXGIKeyedMutex`；
+  - NT 句柄资源的 `GetSharedHandle` 返回了句柄；
+  - `OpenSharedResource` 返回 `E_NOTIMPL`。
+- 前缀没有 wine-mono/.NET：OfficePLUS 服务（.NET 程序集）启动失败；VSTO 加载项与 Excel 的
+  Power Query 同样依赖 .NET。
+- ETW：Office 启动 ETW 跟踪会话（`StartTraceW` 桩），C2R 用 `wevtutil im` 安装清单（桩）。
+- Excel、PowerPoint 读写计划任务时 taskschd 有大量 FIXME。
