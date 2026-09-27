@@ -9502,3 +9502,31 @@ Excel XLSX 也重新创建并保存，四个文件的预期文本均经 ZIP/OOXM
 两次 PowerPoint 都只留下 `saved` 而无 `closed` 标记；
 它的退出/回调语义仍未证明。winref 暂不可解析，本探针尚未在原生 Windows 测精确错误码；
 此修复不代表全部 Office 或 Windows 最新合约已完成，也没有打印或访问 Outlook 邮箱。
+
+### PowerPoint `Presentation.Close` 暴露下一层 WinUI Composition 缺口（`6f44b44`）
+
+在 `powerpoint-save.vbs` 的保存、关闭、退出各调用前后加入进度标记，并对关闭错误单独
+记录。重启 RPCSS 后 PPTX 实际保存且 OOXML 内含目标文本，但 `Presentation.Close`
+可能卡住，另一次返回 VB **462**（远程服务器不可用）；此前仅凭 `saved` 误以为完整
+自动化成功。`+ole,+seh` 证实 462 来自 PowerPoint 进程崩溃后 COM RPC 返回
+`0x800706ba`，**不是**保存格式或注册表项的问题。
+
+同一线程的崩溃前紧邻调用是
+`RoGetActivationFactory("Windows.UI.Composition.CompositionEffectSourceParameter",
+IID_ICompositionEffectSourceParameterFactory)` 返回类未注册，随后 Office 以内部标签
+`0x0269c61b` 故意触发空指针异常。该 WinRT 类的接口本来就在
+`windows.ui.composition.idl`，但 dcomp 没有注册或实现。Wine `6f44b44` 实现真实
+的名字持有/复制、`ICompositionEffectSourceParameter::get_Name`、
+`IGraphicsEffectSource` QueryInterface、对象引用计数及 WinRT 激活工厂，
+并将它注册到 `classes.idl`，不是只改合约版本数字或返回假对象。
+独立 dcomp 测试修复前 **520 项/1 失败**；更新隔离前缀 WinRT 类注册后
+**530 项/0 失败、0 跳过**。两架构 dcomp 编译、备份并以新 inode 部署，Office 前缀执行
+`wineboot -u` 后的注册项指向真正的 `dcomp.dll`。Word/Excel 的 COM 本地保存与 OOXML
+内容复测通过，PowerPoint 的 PPTX 仍能保存。
+
+**PowerPoint 关闭仍未修复**：新日志证实 Office 真正创建 `source1`/`source2` 并
+查询它们的 `IGraphicsEffectSource`，接着调用尚为 `E_NOTIMPL` 的
+`ICompositor::CreateEffectFactoryWithProperties`，马上发生另一处空地址异常；
+测试脚本准确记录 `presentation close failed: 462`，退出码 4。下一步必须按真实效果图、
+brush 源与渲染语义实现 effect factory/brush；不能给它返回不会绘制的假成功。
+本轮 winref 仍不可解析，没有将新增类的边界情况冒称原生测量，也未打印或访问 Outlook 邮箱。

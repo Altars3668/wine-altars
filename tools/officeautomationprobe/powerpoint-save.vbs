@@ -29,7 +29,23 @@ slide.Shapes.Title.TextFrame.TextRange.Text = "wine-altars PowerPoint automation
 mark "slide edited"
 presentation.SaveAs destination, 24
 mark "saved"
+mark "closing presentation"
+On Error Resume Next
 presentation.Close
+If Err.Number <> 0 Then
+    mark "presentation close failed: " & Err.Number
+    WScript.Quit 4
+End If
+On Error GoTo 0
+mark "presentation closed"
+mark "quitting application"
+On Error Resume Next
 app.Quit
+If Err.Number <> 0 Then
+    mark "application quit failed: " & Err.Number
+    WScript.Quit 5
+End If
+On Error GoTo 0
+mark "application quit"
 mark "closed"
 WScript.Echo "saved local PPTX"
