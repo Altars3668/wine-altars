@@ -9453,3 +9453,28 @@ Word 启动时几十次带 `D3D11_MAP_FLAG_DO_NOT_WAIT` 的 `Map` 原来一律�
 单线程测试到 480 秒仍未结束，不能称全套通过。重装 d3d11、wined3d 两架构 DLL 后，
 Word 功能区及正文仍绘出，Excel 的 COM 新建、编辑、保存 XLSX 仍通过；原来那条
 `Ignoring map_flags` FIXME 不再出现。此项是局部合约推进，不等于 Windows 20 全面支持。
+
+### 后端 BO GPU fence 的非阻塞 Map（`c95e723`，继 `ba6a991` 之后）
+
+命令流已消费并不代表 GPU 已完成。沿 `wined3d` 的实际 BO 映射链检查后，GL 原先会在
+`wined3d_bo_gl_map()` 内等待 command fence，Vulkan 会在
+`adapter_vk_map_bo_address()` 内等待 command buffer；两者都没有处理
+`WINED3D_MAP_DONOTWAIT`。现在 GL 在 fence 尚未完成时提交/flush 并零超时查询，
+Vulkan 在必要的 HOST_READ barrier 提交后调用 `vkGetFenceStatus`；若仍忙则向 D3D11
+返回 `DXGI_ERROR_WAS_STILL_DRAWING`，不把失败映射记为已映射、也不提前将纹理位置
+标记为脏。Vulkan 的每个 BO 记录 HOST_READ barrier 所属 command-buffer id，以免每次
+重试都再提交一个新的 barrier，形成无法完成的重试循环；非 coherent 内存的 invalidate
+移到 GPU 等待及映射之后。
+
+两架构 `wined3d` 已编译，本机数轮 `d3d11 --map-do-not-wait` 在 GL 为 21 项、
+Vulkan 为 13～21 项，均 0 失败、0 跳过（次数随异步忙碌/重试变化）；Vulkan `+d3d` trace
+确实记录了一次 `VK_NOT_READY` 的 GPU fence 忙碌返回。相同 PE 的旧探针在两后端
+均执行完毕。替换 `/opt/wine-altars` 两架构 DLL（先关 Office，再用新 inode 替换）
+之后，Word 新建空文档并切换插入功能区正常绘出；Word DOCX、Excel XLSX、PowerPoint
+PPTX 的本地 COM 创建/编辑/保存和 OOXML 文本校验均通过。PowerPoint 仍只记录到
+`saved`，没有 `closed` 进度标记，不能称其退出回调已验证。没有打印或读取 Outlook 邮箱。
+
+本轮 winref 名称解析失败，没有跑新增的原生测试；之前六项 winref 基线不是这组扩展测试的
+新结果。GL GPU-fence 忙碌分支未在本机复现；非 BO 映射之前的纹理位置加载、buffer
+位置转移、共享 GL 分配块、无 fence 的驱动仍可能阻塞。不要把这次
+局部推进说成所有 GPU 后端、Office 流程或 Windows 合约 20 已全部完成。
