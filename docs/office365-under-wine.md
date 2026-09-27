@@ -9478,3 +9478,27 @@ PPTX 的本地 COM 创建/编辑/保存和 OOXML 文本校验均通过。PowerPo
 新结果。GL GPU-fence 忙碌分支未在本机复现；非 BO 映射之前的纹理位置加载、buffer
 位置转移、共享 GL 分配块、无 fence 的驱动仍可能阻塞。不要把这次
 局部推进说成所有 GPU 后端、Office 流程或 Windows 合约 20 已全部完成。
+
+### PowerPoint 重启后的 COM 类对象失效（Wine `044f721`）
+
+最终版 D3D DLL 部署后再跑 Office COM：Word DOCX、Excel XLSX 通过，PowerPoint
+`CreateObject("PowerPoint.Application")` 却返回 VB 429。注册表中真实的 ProgID、CLSID、
+`LocalServer32` 仍在；`+ole,+seh` 显示 `rpc_get_local_class_object()` 从 RPCSS 取得一个
+旧的本地服务器对象，`CoUnmarshalInterface` 因服务器已退出返回 `0x800706ba`。
+此前 PowerPoint 首次保存 PPTX 后没写 `closed` 标记，单次成功不能证明服务器注销类对象。
+
+`tools/comclassprobe` 用不依赖 Office 的独立 PE 重现：子进程注册可多次使用的类对象，
+父进程跨进程取得一次后直接结束子进程，再查同一 CLSID。旧 RPCSS 返回
+`0x800706ba`（退出码 6）；新 RPCSS 连续两轮返回 `0x80040154`（退出码 0），说明
+失效类不再当作活服务器提供。`programs/rpcss/rpcss_main.c` 注册类时从本机 RPC
+绑定取得服务器 PID，持有 `SYNCHRONIZE` 进程句柄；查类时以零超时检查其退出状态，
+删除失效项后继续找其它同 CLSID 注册。未取得进程句柄时保留既有行为并警告，
+没有把异常伪装成成功。
+
+仅 64 位 `rpcss.exe` 是该 WOW64 构建的实际服务目标，已编译、备份并以新 inode
+替换安装版，重启 Office 测试前缀使新服务生效。同一 RPCSS 生存期里，探针连续两次
+通过；PowerPoint 连续两次 COM 激活、创建并保存本地 PPTX。新服务下 Word DOCX、
+Excel XLSX 也重新创建并保存，四个文件的预期文本均经 ZIP/OOXML 验证。
+两次 PowerPoint 都只留下 `saved` 而无 `closed` 标记；
+它的退出/回调语义仍未证明。winref 暂不可解析，本探针尚未在原生 Windows 测精确错误码；
+此修复不代表全部 Office 或 Windows 最新合约已完成，也没有打印或访问 Outlook 邮箱。
