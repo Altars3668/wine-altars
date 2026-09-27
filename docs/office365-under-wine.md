@@ -9812,3 +9812,41 @@ D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回�
     （Office 判断资源类型，失败是正确结果）。
   - `scissor_rects_valid Ignoring inverted scissor rect` 数千次：Office 设了上下颠倒的裁剪矩形。
     这与 Windows 一致，早先已按实测处理（`9ba5d82`：整次调用作废，之前的裁剪矩形保留），只是 WARN 较多。
+
+### PowerPoint 的形状与图片效果：两处崩溃、一处堆破坏与 ColorMatrix（Wine `7b34517`、`1868358`、`89b2615`、`bb104cd`、`86eb48e`）
+
+新探针 `powerpoint-effects.vbs` 依次施加渐变、阴影、发光、柔化边缘、映像、三维棱台、图片重新着色、文字效果。
+起初第二步（阴影）就让 PowerPoint 崩溃，其后各步都以 462 失败。逐层查下去是三个互不相干的缺陷：
+
+- **wintypes：数组属性值的所有权（`7b34517`）。** `warn+heap` 报出重复释放，发生在 PowerPoint 经
+  `CompositionEffectSourceParameter` 组装合成效果的线程上。
+  - 根因：`IPropertyValue::GetXxxArray` 把值内部的存储直接交给调用者。按 WinRT ABI，返回的数组应是
+    调用者用 `CoTaskMemFree` 释放的副本，于是调用者一释放，值析构时又释放一次。
+  - `GetStringArray` 更糟，它把字符串就地复制进值自己的数组。dcomp 读取效果颜色（浮点数组）时正按 ABI 释放。
+  - 修复：返回 `CoTaskMemAlloc` 副本，字符串数组在副本上复制。上游 master 同样有此缺陷。
+  - 测试：每种数组取两次，应得到两个不同的数组（修复前 18 种都返回同一个），再加字符串数组的所有权测试。
+- **d2d1：命令列表指回已释放的上下文（`1868358`）。** 堆修好后，阴影一步在 `ID2D1CommandList::Close`
+  里读到 `0xFEEEFEEEFEEEFEEE`（已释放内存的填充值）。
+  - 根因：早先 altars 让命令列表记住把它设为目标的上下文，以便 `Close` 时解除目标；上下文销毁时却没有清掉这个指针。
+    PowerPoint 正是先释放上下文、再关闭命令列表。
+  - 新测试在 `warn+heap` 下能复现同一崩溃地址（d2d1 `+0x1F507`）。
+- **d2d1：`SetDrawInfo` 的时机（`89b2615`）。** 发光一步在 gfx.dll 里读空指针。
+  - 用 `+d2d` 追踪与反汇编确认：Office 自注册的发光效果在 `Initialize` 里先 `SetSingleTransformNode(this+8)`，
+    再加载着色器，并立即经 `this+0x10` 处保存的 draw info 调 `SetPixelShader`（vtable 第 10 项）。
+  - 也就是说，Windows 在 draw transform 加入变换图时就同步调用了 `SetDrawInfo`；Wine 原来是在 `Initialize` 返回后才调。
+  - 修复：节点加入即调用；失败时留到绘制时重试并报告（文档说 `SetDrawInfo` 的失败从 `EndDraw` 返回）。
+  - 这一时序是从 gfx.dll 在 Windows 上能工作推断的，没有在 Windows 上直接测量。
+- **d2d1：ColorMatrix（`86eb48e`，`bb104cd` 让 FIXME 打印 CLSID 以便定位）。** 图片的灰度、亮度对比度
+  都经 ColorMatrix 实现，原来它只有属性、没有渲染，图片整个不显示。
+  - 现在是像素着色器：`[r g b a 1]` 乘 5×4 矩阵；预乘模式（默认）作用于去预乘后的颜色，再重新预乘；
+    直通模式直接作用于输入；按 ClampOutput 钳制。
+  - transform 常量上限从 64 字节提到 128 字节。
+  - 测试按文档推出，未在 Windows 上运行。
+
+**结果：**
+
+- 效果探针全部步骤通过并保存，截图中阴影、红色发光、柔化边缘、渐隐映像、棱台高光、灰度并提亮的图片、
+  文字的发光/阴影/映像都正确绘制。
+- 图片的模糊艺术效果看不出来，原因未查（可能是所用枚举值不是模糊，也可能 Office 在 CPU 端处理）。
+- d2d1 全量在 GL、Vulkan 下各 **18749 项/0 失败**；wintypes 1725 项/0 失败；三应用保存探针通过。
+- GL 下 d2d1 全量偶尔仍会以退出码 5 提前结束（这次 5 次中 1 次，无汇总行），与以前记录的现象相同，原因未明。

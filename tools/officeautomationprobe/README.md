@@ -11,3 +11,6 @@
 `powerpoint-show.vbs` 打开已有演示文稿、显示指定秒数后关闭（参数：演示文稿、进度日志、可选秒数），用于在 PowerPoint 真实显示时截取窗口。在无根 Xwayland 上根窗口不能读取像素，应按窗口 ID 截取 PowerPoint 顶层窗口；:2 这类竖屏显示器上幻灯片位于编辑区的中下部，只截上半部分会误以为幻灯片空白。
 
 `word-save.vbs` 只退出自己启动的 Word（`GetObject` 接到的已运行实例不动）；早先版本不调用 `Quit`，自动化启动的 Word 会在脚本结束后一直驻留。`scripts/office-regress.sh [word] [excel] [powerpoint]` 依次运行三个保存探针，报告退出码、文件是否为含目标部件的合法 OOXML，以及探针到达的步骤；它等待各应用进程退出，而不是 `wineserver -w`（Click-to-Run 服务常驻，wineserver 不会退出）。
+
+`powerpoint-effects.vbs <输出.pptx> <进度日志> <图片> [秒数]` 在一张空白幻灯片上依次施加 PowerPoint 经 Direct2D 绘制的效果：渐变、阴影、发光、柔化边缘、映像、三维棱台、图片（灰度、亮度对比度、模糊艺术效果）、文字的发光/阴影/映像。每一步单独容错并记录结果，保存后保持显示若干秒供截图，再退出。某一步让 PowerPoint 崩溃时，其后各步都会以 462（`1CE`）失败，第一条失败即是崩溃点。
+
