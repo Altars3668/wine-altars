@@ -9527,6 +9527,14 @@ IID_ICompositionEffectSourceParameterFactory)` 返回类未注册，随后 Offic
 **PowerPoint 关闭仍未修复**：新日志证实 Office 真正创建 `source1`/`source2` 并
 查询它们的 `IGraphicsEffectSource`，接着调用尚为 `E_NOTIMPL` 的
 `ICompositor::CreateEffectFactoryWithProperties`，马上发生另一处空地址异常；
-测试脚本准确记录 `presentation close failed: 462`，退出码 4。下一步必须按真实效果图、
-brush 源与渲染语义实现 effect factory/brush；不能给它返回不会绘制的假成功。
+测试脚本先后记录过 `presentation close failed: 462` 与
+`presentation close failed: -2147023170`（`0x800706be`），均以退出码 4 报告，
+不再把「已保存」误报为整套自动化通过。只在临时诊断 DLL 的
+`+dcomp` 中读取 Office 实际传入的 `IGraphicsEffect::Name`，得到 **`Crossfade`**；
+其 `GetRuntimeClassName`、`GetIids` 都返回 `E_NOTIMPL`，不能凭类名推断它的全部
+图结构。测量后已撤销诊断代码，并重新以新 inode 安装与提交一致的生产版 dcomp。
+本机 SDK 有 `CLSID_D2D1CrossFade` 和 weight 属性声明，但现有 Wine `dlls/d2d1`
+没有 CrossFade 效果实现。下一步必须测清实际 graph/source/animatable property，
+再按 brush 源和渲染语义实现 effect factory/brush 及所需 D2D 后端；
+不能给 `CreateEffectFactoryWithProperties` 返回不会绘制的假成功。
 本轮 winref 仍不可解析，没有将新增类的边界情况冒称原生测量，也未打印或访问 Outlook 邮箱。
