@@ -9555,9 +9555,15 @@ GPU blend state。Wine `2a20837` 为 ADD 建立真正的 D3D11 加法 blend stat
 primitive blend 选择，并在重置 target/销毁 context 时释放。半透明红、蓝图元
 重叠的像素测试原来 **29 项/1 失败**（加法结果错误），修后本机 GL、Vulkan
 各 **29 项/0 失败、0 跳过**；两架构 d2d1 已备份、用新 inode 部署。
-此项只是构建真实两源合成所需的一个前提，不等于 effect image 已能画。
-部署后 Word、Excel 的 COM 本地保存和 OOXML 内容验证通过，PowerPoint PPTX
-也实际保存，但其 `Presentation.Close` 仍报 RPC 错误并以退出码 4 结束。
+紧接着测到 `ID2D1DeviceContext::DrawImage(bitmap, ..., D2D1_COMPOSITE_MODE_PLUS)`
+也把模式忽略，仍画成 source-over：扩展像素测试修前 **37 项/1 失败**。
+Wine `e903728` 只对真正的 bitmap 图像按 PLUS/SOURCE_OVER 临时选择对应 GPU
+blend state，绘制后恢复外层 primitive blend；GL、Vulkan 最新专项测试各
+**45 项/0 失败、0 跳过**。这不是对 effect image 的假支持：后者的 `DrawImage`
+仍然打印 `Unhandled image`。两架构新 DLL 用新 inode 部署后，Word、Excel
+COM 本地保存及 OOXML 内容验证通过，PowerPoint PPTX 也实际保存，但它的
+`Presentation.Close` 仍报 RPC 错误、测试退出码为 4。上述修复只是构建真实
+两源合成所需的前提，不等于 effect image 已能画。
 先前窗口截图中幻灯片仍是空白，尽管保存的 PPTX 里有预期文字；文件内容通过不能充当
 真实屏幕渲染通过。所以完整修复至少还涉及 WinUI effect factory/brush 的来源绑定、动画属性与最终
 D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回不会绘制的假成功。
