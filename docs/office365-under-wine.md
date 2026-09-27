@@ -9549,9 +9549,17 @@ ClampOutput；两个动画属性都映射到系数属性索引 0，分别映射 
 
 现有 Wine `dlls/d2d1` 虽已注册 ArithmeticComposite effect，却在
 `ID2D1DeviceContext::DrawImage` 收到 effect 图像时仅处理 bitmap/command list，
-其余报 `Unhandled image`；`SetPrimitiveBlend(ADD)` 也未进入实际 bitmap GPU blend state。
+其余报 `Unhandled image`。另一项确实相关、可独立验证的缺口是
+`D2D1_PRIMITIVE_BLEND_ADD` 只保存状态，实际 bitmap/几何绘图仍绑定 source-over
+GPU blend state。Wine `2a20837` 为 ADD 建立真正的 D3D11 加法 blend state，按当前
+primitive blend 选择，并在重置 target/销毁 context 时释放。半透明红、蓝图元
+重叠的像素测试原来 **29 项/1 失败**（加法结果错误），修后本机 GL、Vulkan
+各 **29 项/0 失败、0 跳过**；两架构 d2d1 已备份、用新 inode 部署。
+此项只是构建真实两源合成所需的一个前提，不等于 effect image 已能画。
+部署后 Word、Excel 的 COM 本地保存和 OOXML 内容验证通过，PowerPoint PPTX
+也实际保存，但其 `Presentation.Close` 仍报 RPC 错误并以退出码 4 结束。
 先前窗口截图中幻灯片仍是空白，尽管保存的 PPTX 里有预期文字；文件内容通过不能充当
-真实屏幕渲染通过。所以完整修复至少同时涉及 WinUI effect factory/brush 的来源绑定、动画属性与最终
+真实屏幕渲染通过。所以完整修复至少还涉及 WinUI effect factory/brush 的来源绑定、动画属性与最终
 D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回不会绘制的假成功。
 本轮临时诊断代码已撤销，安装版恢复为回归测试通过的生产 DLL；只有一次加大量
 `+dcomp` 输出的诊断在幻灯片创建后超时，不据此断言原生保存或关闭行为变化。
