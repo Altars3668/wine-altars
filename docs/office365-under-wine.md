@@ -10465,3 +10465,30 @@ over-the-spot，预编辑与候选都由它画在 `XNSpotLocation` 处；ibus �
 同一轮普查（三个应用各存一次文件，FIXME 与 ERR 按消息归并）另修了 `GetLongPathNameW` 对 `\\?\C:\…` 原样返回的问题（`a4c1a79`，C2R 服务
 每次启动问五个这样的目录；原来 1024 字符的栈缓冲在长路径下还会越界），并确认 ClickToRun 目录里的 `msoxmlmf.dll` 在 winref 上同样不存在。
 OfficePLUS（中国版的模板与美化加载项）是 VSTO 加载项，服务也是 .NET 程序，需要 .NET Framework 4.x 与 VSTO 运行时，前缀里都没有，尚未处理。
+
+## Word 功能普查：单文件网页、图表、XML 文档与 AI 组件的线程池（wine-src `d9f12b3`、`ef0a28b`、`aaa4324`、`7d3052f`，外层 `87b2ff0`）
+
+`tools/officeautomationprobe/word-sweep.vbs` 逐项跑一遍依赖 Windows 组件的 Word 功能：标题样式与目录、脚注尾注、批注、修订、表格样式、
+目录里每种格式的图片、图表、SmartArt、艺术字、文本框、超链接、页码、通配符查找、Word 自己能写的每种格式（docx、doc、rtf、txt、htm、mht、
+odt、dotx、xml）、导出 PDF 与 XPS、加密保存后再用密码打开（错误密码被拒）、比较文档、限制编辑。每项记下结果或错误，一项失败不影响
+后面的。第一次跑有三项失败，修好后现在只剩 WebP 图片（windowscodecs 没有 WebP 解码器）。
+
+- **单文件网页（`d9f12b3`）。** 存 MHT 之前 Word 先在注册表里找 `CLSID_IMimePropertySchema`，找不到就提示去装 Outlook Express 或 Windows Mail——
+  这个消息框 `DisplayAlerts` 挡不住，文件没存，自动化的保存一直等着。Windows 给 inetcomm.dll 注册了 31 个类；其中 Wine 实现了对象却既没注册
+  也没有类工厂的四个（属性模式、国际化、属性集即正文、消息树）现在都有了。类工厂造的国际化对象是新的一个，不是 `MimeOleGetInternat` 给的那个，
+  和 Windows 一样。
+- **图表（外层 `87b2ff0`）。** Word 插图表时要 Excel 的图表数据宿主，两个类在 Excel 的 App-V 注册表里只有 AppID（本地服务器是 EXCEL.EXE 的那个类的
+  AppID）。Windows 上由 App-V 的 COM 集成为它们启动 Excel；普通 COM 找不到服务器，`AddChart2` 失败（0x1066）。导出注册表时现在按 AppID 给这类
+  类补上本地服务器，Excel 以 `-Embedding` 启动后注册两个类对象，图表插入成功。
+- **XML 文档（`ef0a28b`）。** 存成 Word XML 文档（`wdFormatFlatXML`）时，Word 用 SAX 读取器逐个解析包里的部件，内容处理器是 `MXXMLWriter`。写出器的
+  `putDocumentLocator` 返回 `E_NOTIMPL`，读取器按致命错误处理，第一个部件就停了，Word 说文件写不了。现在返回 `S_OK`（它的 `IVBSAXContentHandler` 本来如此）。
+
+**AI 组件的线程池与纤程存储（`aaa4324`、`7d3052f`）。** Office 的 AI 组件（`Office16\AI` 下的 `aitrx.dll`、`ai.dll`）从 kernel32 导入
+`SetThreadpoolTimerEx`，又在 kernelbase 里查 `FlsGetValue2`，两个 Wine 都没有。Ex 版的定时器与等待照原版设置对象，返回设置前它是否还在等：
+一次性定时器触发后是 FALSE，周期定时器是 TRUE，等到了对象的等待是 FALSE；`TlsGetValue2`、`FlsGetValue2`（Windows 11 24H2）取值同原版但不动
+最后错误。新测试在 Windows 与 Wine 上都通过，Word 的日志里这两处缺失不再出现，三个应用的回归照常通过。
+
+同一份日志里还有几处导入 Wine 没有、这几轮都没被调用到的函数（调用会以“unimplemented function”终止，日志里没有）：App-V 子系统
+（`AppVIsvSubsystems64.dll`）要 `RtlIsNameInExpression` 与 AVL 通用表的枚举、判空；WinAppSDK 的 `CoreMessagingXP.dll`（Word 启动时经 React Native
+宿主激活 `Microsoft.UI.Dispatching.DispatcherQueue` 时加载）要 ALPC、等待完成包（`NtCreateWaitCompletionPacket` 一族）与 shcore 的功能用量记录；
+`mso30win32client.dll` 要 msvcp140 里宽字符的 `moneypunct` 与 `money_put` 的 `id`（Wine 的 msvcp 没有货币类 facet）。
