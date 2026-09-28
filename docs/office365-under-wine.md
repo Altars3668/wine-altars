@@ -10442,3 +10442,26 @@ Windows 上通过，旧代码失败 40 处。还不同的是黑框：Windows 贴
 顺带确认的两件：`office-paste.vbs` 里 `PasteSpecial` 作为对象不给位置时，Word 把工作表粘成浮动的 Shape（类型 7），给 `wdInLine` 时是
 InlineShape（类型 1），都是 `Excel.Sheet.12`——此前以为粘不上，是只数了 InlineShapes；`word-type.vbs` 用会话内 SendInput 键入中文，
 Word 正确收下，9 月初记录的“键入中文就崩溃”不再出现（经 XIM 的组字路径未测）。
+
+## 中文输入法：经 XIM 的组字、候选窗与输入上下文（wine-src `149ce1d`、`b7bd4c8`，以及 `a4c1a79`、`dcf9a14`）
+
+此前只用 `SendInput` 验证过 Word 收中文，那不经过 X 的输入法。`tools/imetest` 在一个 X 显示上单独起 fcitx5 或 ibus（独立的 D-Bus 与配置，
+不碰桌面上的输入法），用 XTEST 发真实按键，再读回文档：两种输入法都能正确上屏，Word 用 `ImmGetCompositionString` 取结果。fcitx5 的 XIM 只有
+over-the-spot，预编辑与候选都由它画在 `XNSpotLocation` 处；ibus 有 on-the-spot（预编辑回调），这是 Wine 请求的样式。
+
+发现并修好的三处：
+
+- **候选窗的位置（`149ce1d`）。** 插入符位置只在 over-the-spot 时、并且只在输入上下文已经存在时才告诉输入法，而上下文要等窗口第一次
+  获得焦点或按键才建，那时 Word 早已放好插入符：ibus 的候选面板停在屏幕左上角，fcitx 在插入符第一次移动前也画在左上角。现在驱动记住
+  窗口最后的插入符矩形，建上下文时给出、获焦时再设一次（ibus 只转发已获焦上下文的位置，fcitx 只认 set 而不认 create 时给的），回调样式
+  也设；位置取插入符底部（XIM 规定 spot 在基线上），候选窗出现在插入行下方而不是盖住它。原生 Xlib 客户端 `ximtest` 证明 ibus 在回调样式下
+  也按 spot 放面板。
+- **子窗口的输入上下文（`149ce1d`）。** `NotifyIMEStatus` 拿焦点窗口（Word 文档是没有 X 窗口的子窗口）去取输入上下文，结果建了一个客户窗口
+  为 0 的上下文：预编辑状态和关闭时的重置都落在它上面，键盘代码还会把它当顶层窗口的上下文去查字符。现在用顶层窗口的，没有 X 窗口的
+  窗口不再有自己的上下文。
+- **组字窗口（`b7bd4c8`）。** Word 把组字窗口留给 IME 放（`CFS_DEFAULT`），自己不画组字串；内置 IME 原来把它放在窗口左下角之下，ibus 打的
+  组字出现在状态栏下面。线程有插入符时，现在放在插入符处，大小正好容下字符串。
+
+同一轮普查（三个应用各存一次文件，FIXME 与 ERR 按消息归并）另修了 `GetLongPathNameW` 对 `\\?\C:\…` 原样返回的问题（`a4c1a79`，C2R 服务
+每次启动问五个这样的目录；原来 1024 字符的栈缓冲在长路径下还会越界），并确认 ClickToRun 目录里的 `msoxmlmf.dll` 在 winref 上同样不存在。
+OfficePLUS（中国版的模板与美化加载项）是 VSTO 加载项，服务也是 .NET 程序，需要 .NET Framework 4.x 与 VSTO 运行时，前缀里都没有，尚未处理。
