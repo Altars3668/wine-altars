@@ -10552,3 +10552,13 @@ WIC 解码器报的是 MF 错误码，背后也是这个扩展包（`tools/mftwe
 一样，而 `FullSeriesCollection` 两边都给出 1 个系列——这是 Excel 本身的行为，普查已改为对新式图表只问系列数。
 
 顺带看到的差异：同一个 445 错误，Wine 的 vbscript 中文文本是“对象不支持此动作”，Windows 是“对象不支持此操作”。
+
+**同一读取器的相邻缺口（wine-src `7525a31`）。** 读取器接受声明处理器、DTD 处理器却从不调用它们，也不认识 DTD 声明的任何实体：
+第一处对内部实体或参数实体的引用就是致命错误（“Entity 'i' not defined”“PEReference: %pe; not found”）。现在用解析器自己的一个文档存
+libxml2 的实体，并按 Windows 实测报告：`elementDecl` 的内容模型取声明原文去掉空白（libxml2 的树分不出 `(a)*` 与 `(a*)`、`(a,(b,c))`
+与 `(a,b,c)`）；`attributeDecl`、`internal/externalEntityDecl`（替换文本里字符引用已换、实体引用保留，参数实体名带 `%`）、
+`notationDecl`、`unparsedEntityDecl`；内容里内部实体的替换前后报 `startEntity`/`endEntity`（嵌套照嵌套），DTD 里参数实体包住它带来的
+声明；属性值里的实体直接替换、不报边界；不读的外部子集报 `skippedEntity("[dtd]")`，外部实体与“外部子集本可能声明”的未声明实体也
+报 `skippedEntity` 而不是出错。msxml3 把缺省的公共/系统标识报成 NULL，msxml6 报空串，并把系统标识按基准 URL（或当前目录）解析成绝对
+URL；`getBaseURL`/`getSecureBaseURL` 与对应的 put 原来都是桩。两份新测试（msxml3、msxml6）在 Windows 与 Wine 上都通过；Office
+的包里没有 DTD，改后两个普查与回归照常通过。
