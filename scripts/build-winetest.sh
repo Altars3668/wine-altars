@@ -32,6 +32,13 @@ for idl in $(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o 
     fi
 done
 FLAGS="$FLAGS -I$O"
+# the tests' resources (user32's menus and dialogs, for one), compiled as makedep has wrc compile them
+res=
+for rc in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.rc\b'); do
+    tools/wrc/wrc -u -o $O/${rc%.rc}.res --nostdinc -I$O -Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include \
+        -I../include/msvcrt -D_MSVCR_VER=0 -D__WINESRC__ ../dlls/$dll/tests/$rc
+    res="$res $O/${rc%.rc}.res"
+done
 imports=$(grep '^IMPORTS' ../dlls/$dll/tests/Makefile.in | cut -d= -f2)
 objs=
 for f in $srcs; do
@@ -46,6 +53,6 @@ x86_64-w64-mingw32-gcc -c -o $O/testlist.o dlls/$dll/tests/testlist.c $FLAGS
 libs=
 for d in $imports; do f=dlls/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=libs/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | head -1); [ -n "$f" ] || f=$(ls dlls/*/x86_64-windows/lib$d.a 2>/dev/null | head -1); [ -n "$f" ] && libs="$libs $f"; done
 tools/winegcc/winegcc -o $O/${dll}_test.exe --wine-objdir . -b x86_64-w64-mingw32 -mconsole \
-    $objs $O/testlist.o $libs dlls/winecrt0/x86_64-windows/libwinecrt0.a dlls/ucrtbase/x86_64-windows/libucrtbase.a \
+    $objs $O/testlist.o $res $libs dlls/winecrt0/x86_64-windows/libwinecrt0.a dlls/ucrtbase/x86_64-windows/libucrtbase.a \
     dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a
 echo built $O/${dll}_test.exe
