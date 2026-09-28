@@ -9850,3 +9850,47 @@ D2D/合成渲染，**不能**仅给 `CreateEffectFactoryWithProperties` 返回�
 - 图片的模糊艺术效果看不出来，原因未查（可能是所用枚举值不是模糊，也可能 Office 在 CPU 端处理）。
 - d2d1 全量在 GL、Vulkan 下各 **18749 项/0 失败**；wintypes 1725 项/0 失败；三应用保存探针通过。
 - GL 下 d2d1 全量偶尔仍会以退出码 5 提前结束（这次 5 次中 1 次，无汇总行），与以前记录的现象相同，原因未明。
+
+## d2d1 的几何算法：组合、轮廓、测长、加宽与回放，照 Windows 实测实现（wine-src `41c007d`）
+
+Excel 图表探针暴露出 `d2d_rectangle_geometry_CombineWithGeometry ... combine_mode 0x3 ... stub!`。查下去，d2d1 的几何算法几乎全是桩：
+各类几何的 `CombineWithGeometry`、`Outline`、`CompareWithGeometry`、`ComputeLength`、`ComputePointAtLength`、`Widen`、`GetWidenedBounds`，
+路径的 `Stream`，group 的 `Simplify`/`Tessellate`/`ComputeArea`/包含测试，椭圆与圆角矩形的 `GetBounds` 和包含测试。
+
+**先测原生。** `tools/d2dgeomprobe/d2dgeom.c`、`d2dstroke.c` 在 winref（build 29671）上跑，输出留存为 `*.win.txt`；
+七位有效数字的数据再用 Python 模型拟合，规则都逐位复现后才写进 Wine：
+
+- **展平**：每段三次 Bézier 递归二分，直到两个控制点与弦上 1/3、2/3 处的点在 L∞ 下都小于容差。
+  用它复现了 `ComputeArea`（圆 309.3903/314.12088、椭圆 156.9767）与 `ComputeLength`（62.5969、50.53018）；
+  上游两条 `ComputeArea` 的 `todo_wine` 因此通过（面积改在 double 下按填充区域求）。
+- **组合/轮廓输出**：先 `SetFillMode(ALTERNATE)`；图形从最上再最左的顶点开始，按起点 (y, x) 降序；
+  每点一次 `AddLines(1)`、显式回到起点、`EndFigure(CLOSED)`；外正内反；**曲线保留为 Bézier**。
+- **比较**：相同为 IS_CONTAINED，边或角接触即为 OVERLAP。
+- **测长的切线**：该段两端曲线导数的加权插值，权重是到达该端点那一段的参数长度，曲线自身端点为 1/18。
+  六种段长与不同段长相接的数据验证到 1e-7。
+- **加宽**：MITER 超上限在“上限 × 半线宽”处截平（上限按 ≥1），MITER_OR_BEVEL 才退斜角，折返时斜接向前伸出；
+  椭圆、圆角矩形的 `Simplify` 在开图前设 `FORCE_ROUND_LINE_JOIN`，所以加宽处处圆角。
+- **圆弧**二分到每段 ≤90°（270° 是 4 段）；**Stream** 按段原样回放（直线、三次曲线合并，二次曲线、弧逐个）。
+
+**实现**：新文件 `dlls/d2d1/polygon.c`。两个展平后的几何叠放：边在相交、端点落在边上、共线重叠处切开，
+相距几个 float ulp 的端点并为一个顶点，每段记住两侧各被哪个几何填充；组合就是留下结果只在一侧的段并沿边界走成图形，
+同一曲线上的段按参数拼回子曲线。加宽把笔画摊成凸块（段矩形、连接楔、线帽，圆的用曲线画再展平）再求并。
+
+**顺带修的缺陷**：圆角矩形 `Simplify` 的四角上下颠倒；圆弧分段与 Windows 不同；路径包围盒用二次近似代替三次曲线；
+路径 `FillContainsPoint` 把曲线当成端点连线、且不计容差；不带样式的描边命中测试不含连接；恰在图形末端结束的虚线用了虚线帽；
+容差为 0 时展平无限递归。还有一个自己引入又修掉的：`qsort` 比较函数用静态全局指针取键值，d2d1 测试多线程并发时偶发给出错误图形。
+
+**结果**：
+
+- d2d1 全量在 Wine GL、Vulkan 下 **20711 项/0 失败**；同一测试 PE 在 winref 桌面会话 20770 项，
+  只有上游原有的顶点缓冲测试 2 项失败（`Map` 已映射缓冲区返回不同指针，与本次无关）。
+- 两个探针与 Windows 输出除末位 float 差异外一致，剩余差异见 `tools/d2dgeomprobe/README.md`。
+- 部署后三应用保存回归通过；Excel 图表探针全部步骤通过，截图中带阴影柱形图、折线图、三维饼图、数据条、色阶、图标集、迷你图正确；
+  `+d2d` 下 Excel 调用了 5 次矩形的 `CombineWithGeometry`（EXCLUDE，其中 4 次容差为 5），不再是桩。
+
+**与 Windows 的已知差异**：`Widen` 的图形结构不同（Windows 是 WINDING、open、自重叠，这里是闭合不重叠，填充相同）；
+加宽曲线时用的是展平后的曲线，面积略有出入（椭圆 533.3 对 531.2）；hollow 图形不透传进组合结果。
+
+**仍未查明**：d2d1 全量偶尔以退出码 5 中途结束、无汇总行（GL、Vulkan 都见过，约四五次一次）。
+5 是 `0xC0000005 & 0xFF`，但同一前缀里人为的页错误会打印 “wine: Unhandled page fault”，这里什么都没有；
+加 `+seh` 跑 4 次、在 strace 下跑 20 次都没复现。本次改动之前就已出现，原因待查。
