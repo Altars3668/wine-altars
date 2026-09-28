@@ -10397,3 +10397,33 @@ name 的“最长容器”几条规则。
 - `MergeFontPackage` 只会原样复制完整的包；SUBSET1（字形号压紧并加 `dttf` 表）、DELTA 与合并没有实现（`fontsubprobe.win.txt` 里有 Windows
   的结果）。Office 目前只用 SUBSET。
 - 其余表的物理顺序与 name 的三处例外。
+
+## 公式、用户活动与稀疏包：Word 与 Excel 启动和编辑时的三处（wine-src `a84f7a5`、`06d5d17`、`4b20d5a`）
+
+**公式是空的（`a84f7a5`）。** `tools/officeautomationprobe/word-math.vbs` 在文档里构建两个公式，Word 数得到、`BuildUp` 也成功，但屏幕上和
+导出的 PDF 里一个字形都没有。Word 的默认公式字体是 Cambria Math，只有带 OpenType MATH 表的字体它才排公式；Windows 总有这个字体，
+Office 不自带，Wine 也没有。Word 用 GDI 按名字建字体，Wine 给了 Liberation Sans，没有 MATH 表，于是公式全空。把文档的公式字体
+换成带 MATH 表的自由字体就出现了。现在没有 Cambria Math 时，已装的第一个自由数学字体顶替这个名字（和注册表
+`HKCU\Software\Wine\Fonts\Replacements` 里写的替换同一机制，注册表里写的优先）：DejaVu Math TeX Gyre、STIX Two Math、Latin Modern Math、
+TeX Gyre 各款等，TrueType 轮廓的在前。默认设置下公式在屏幕与 PDF 上都正确；gdi32 的 font 测试开关替换时失败项相同。
+
+选 CFF 轮廓的数学字体（Latin Modern Math，或 Wine 在同名的 .ttf/.otf 中挑了 .otf 的 STIX Two Math）时，Word 导出 PDF 不嵌入它，而是
+把每个字形画成与行高等高的一位蒙版图，画面上出现贯穿的竖线。`tools/glyphrasterprobe` 对比了 GDI：字形位图两边基本一致，竖线不是
+从 GDI 的位图来的，原因未查清。它另外量到两处与 Windows 不同：`GGO_BEZIER` 对 CFF 字体，Windows 给原来的三次曲线（每条记录 3 点），
+Wine 把三次控制点当二次处理后再转回三次（每条记录 6 点）；`GGO_METRICS` 的返回值 Windows 是正的大小，Wine 是 1。
+
+**每个窗口的用户活动请求管理器（`06d5d17`）。** Word 打开文档时向 `UserActivityRequestManager` 的工厂要
+`IUserActivityRequestManagerInterop`，用 `GetForWindow` 取文档窗口的管理器，注册一个请求处理器。`tools/useractivityprobe` 在 Windows 上量到：
+本进程的窗口（子窗口也算）得到管理器，同一窗口持有期间是同一个，另一窗口是另一个；没有窗口或已销毁给
+`ERROR_INVALID_WINDOW_HANDLE`，别的进程的窗口（包括桌面）给 `E_ACCESSDENIED`；管理器不是 agile 的；处理器的令牌就是它的地址；
+桌面程序调 `GetForCurrentView` 得 `ERROR_NOT_FOUND`（Wine 原来会造一个）。现在逐项相同，新测试在 Wine 与 Windows 上都通过。
+
+**Office 的 AI 稀疏包（`4b20d5a`）。** Excel 每次启动先找包家族 `aimgr_8wekyb3d8bbwe`，找不到就用 `IPackageManager9::AddPackageByUriAsync`
+注册安装目录里的 `root\Integration\Addons\aimgr.msix`，外部位置是 `Office16\AI`——给 Office 的 AI 组件包身份的稀疏包。Wine 原来没有
+`IPackageManager9`，Excel 拿到 `E_NOINTERFACE` 后抛 C++/WinRT 异常。现在接口在，部署照这个客户端的其他部署一样以 `ERROR_NOT_SUPPORTED`
+的操作结束（Wine 没有包仓库），跟踪里写出包和外部位置。`AddPackageAsync` 按 Windows 拒绝开发模式；application model 测试原来没跟上
+“包查询回空列表”的实现，一并改好。
+
+顺带确认的两件：`office-paste.vbs` 里 `PasteSpecial` 作为对象不给位置时，Word 把工作表粘成浮动的 Shape（类型 7），给 `wdInLine` 时是
+InlineShape（类型 1），都是 `Excel.Sheet.12`——此前以为粘不上，是只数了 InlineShapes；`word-type.vbs` 用会话内 SendInput 键入中文，
+Word 正确收下，9 月初记录的“键入中文就崩溃”不再出现（经 XIM 的组字路径未测）。
