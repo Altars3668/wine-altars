@@ -10398,7 +10398,7 @@ name 的“最长容器”几条规则。
   的结果）。Office 目前只用 SUBSET。
 - 其余表的物理顺序与 name 的三处例外。
 
-## 公式、用户活动与稀疏包：Word 与 Excel 启动和编辑时的三处（wine-src `a84f7a5`、`06d5d17`、`4b20d5a`）
+## 公式、用户活动与稀疏包：Word 与 Excel 启动和编辑时的三处（wine-src `a84f7a5`、`5a8ec28`、`06d5d17`、`4b20d5a`）
 
 **公式是空的（`a84f7a5`）。** `tools/officeautomationprobe/word-math.vbs` 在文档里构建两个公式，Word 数得到、`BuildUp` 也成功，但屏幕上和
 导出的 PDF 里一个字形都没有。Word 的默认公式字体是 Cambria Math，只有带 OpenType MATH 表的字体它才排公式；Windows 总有这个字体，
@@ -10406,6 +10406,12 @@ Office 不自带，Wine 也没有。Word 用 GDI 按名字建字体，Wine 给�
 换成带 MATH 表的自由字体就出现了。现在没有 Cambria Math 时，已装的第一个自由数学字体顶替这个名字（和注册表
 `HKCU\Software\Wine\Fonts\Replacements` 里写的替换同一机制，注册表里写的优先）：DejaVu Math TeX Gyre、STIX Two Math、Latin Modern Math、
 TeX Gyre 各款等，TrueType 轮廓的在前。默认设置下公式在屏幕与 PDF 上都正确；gdi32 的 font 测试开关替换时失败项相同。
+
+DirectWrite 原来只读注册表里的替换，认不得 win32u 内置的这一条（`5a8ec28` 补上，注册表里没有 Replacements 键时也生效）。Word 界面
+经 DirectWrite 查的族名里只有 Cambria Math 查不到（“Microsoft YaHei UI”“DengXian”在前缀的 `C:\windows\Fonts` 里，都找得到）；导出 PDF 时
+Word 向 DirectWrite 要这个字体的 PostScript 名，找不到就拿族名“Cambria Math”去命名嵌入的 DejaVu Math 子集，现在 PDF 里的名字是真实的
+“DejaVuMathTeXGyre-Regular”，画面逐像素相同。gdi32 与 dwrite 各加了测试：有 Cambria Math 时它必须带 MATH 表，在 Wine 上装了任一自由数学字体
+就必须有 Cambria Math；Windows 上都通过，关掉替换（`CX_TURN_OFF_FONT_REPLACEMENTS`）时 Wine 上各失败 9 次。
 
 选 CFF 轮廓的数学字体（Latin Modern Math，或 Wine 在同名的 .ttf/.otf 中挑了 .otf 的 STIX Two Math）时，Word 导出 PDF 不嵌入它，而是
 把每个字形画成与行高等高的一位蒙版图，画面上出现贯穿的竖线。`tools/glyphrasterprobe` 对比了 GDI：字形位图两边基本一致，竖线不是
