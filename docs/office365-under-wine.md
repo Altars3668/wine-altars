@@ -10057,3 +10057,29 @@ LINEAR 的位图画刷当不透明度画刷去填目标矩形——正是 `FillG
 
 **仍有的差异**：Windows 画曲线（ALIASED 与抗锯齿都是）先折线化，Wine 用精确曲线，边缘差一个像素上下；ALIASED 模式下半透明描边
 在连接处与线段重叠的地方会混合两次（抗锯齿模式用覆盖遮罩取并集，没有这个问题）。
+
+## 按 Office 实际撞到的桩排序：COM 远端 QI 与加载失败的返回值（wine-src `b8692b5`、`048eaaf`）
+
+图形这边补完 `FillOpacityMask`、`FillMesh` 和连接之后，用 `excel-charts.vbs`、`powerpoint-effects.vbs` 两个自动化探针在
+`WINEDEBUG=fixme+d2d,fixme+dwrite,fixme+dcomp,fixme+d3d11,fixme+dxgi` 下各跑一遍：每一步都成功，d2d 只剩“选项被忽略”一类无害的
+fixme，没有撞到任何绘制桩。改用全通道 `err+all,fixme+all` 看 PowerPoint 一次会话，排在前面的是：
+
+- `err:ole:marshal_object Failed to create an IRpcStubBuffer ... {a6ef9860-...}`（IDispatchEx）**216 次**。脚本引擎对 PowerPoint 的远端对象
+  探测 IDispatchEx，`IRemUnknown::RemQueryInterface` 对每个接口都调 `marshal_object`，而它先加载该接口的代理/存根工厂、建存根，
+  直到存根连接或登记 ifstub 时才 QI 对象、失败、打 ERR。“对象不支持”本是这次远端 QI 的正确答案。`b8692b5` 改成先 QI，
+  不支持就直接返回它的 HRESULT：结果不变，216 条 ERR 与相应的工厂加载、存根构造都没了；ole32 marshal/compobj、combase roapi 测试前后一致。
+- `err:ole:apartment_add_dll couldn't load in-process dll "...\ClickToRun\msoxmlmf.dll"`。这条摘要里一直挂着的“路径问题”查清了：
+  OfficeClickToRun.exe 的内嵌清单故意把 InfoPath 的 XML MIME 过滤器声明在自己目录里一个不存在的 `msoxmlmf.dll` 上，
+  注释写明“只从我们的文件夹加载”——Windows 上同样加载失败。不是 Wine 的错。
+- 顺带量出 `tools/comprobe/missingdll.c`：服务器加载不了时 Windows 返回加载器的错误（0x8007007e / 0x800700c1），Wine 一律
+  `E_ACCESSDENIED`。`048eaaf` 改为 `HRESULT_FROM_WIN32(GetLastError())`，加了 `test_missing_server`；ole32 测试里原本就有
+  `broken(hr == HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND))` 的注记，与此一致。同一探针还发现 **HKCU\Software\Classes 下注册的类
+  Wine 的 COM 看不见**（HKCR 没有合并视图），见 `tools/comprobe/README.md`；Office 的类全在 HKLM，眼下不受影响。
+- 其余：`taskschd` 读任务 XML 的大量 “unhandled element”（C2R 注册的计划任务）、urlmon `ProcessUrlAction`、
+  `Windows.Security.EnterpriseData.ProtectionPolicyManager` 与 `Windows.UI.Composition.Interactions.*` 的激活失败、
+  `wevtutil im` 桩；另有 2 次 `RemRelease failed`/`get_stub_manager_from_ipid not found`，改动前后次数相同。
+  `{e19c7100-9709-4db7-9373-e7b518b47086}` 的 QI 失败（MSXML、netprofm、WMI 各种对象都被问到）不在任何 Windows/Wine 头文件里，
+  像是 Office 内部“是不是自家对象”的探测，E_NOINTERFACE 正是应有的回答。
+
+两次改动部署后三应用保存回归都通过。顺手修了 `scripts/build-winetest.sh`：测试目录里带同名 `.spec` 的源文件（ole32 的 `testlib.c`、
+combase 的 `wine.combase.test.c`）是测试加载的辅助模块，不再编进测试程序；源文件名按整词匹配（原先会从 `wine.combase.test.spec` 里截出 `wine.c`）。
