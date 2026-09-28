@@ -10525,3 +10525,30 @@ WIC 解码器报的是 MF 错误码，背后也是这个扩展包（`tools/mftwe
 结果：Word 普查 43 项全部通过，WebP（有损、带透明、动画）都插得进去，文档里存成 PNG，与 libwebp 的解码逐像素相同（带透明的差 ≤2，
 是 Word 自己的预乘舍入）。三个应用的回归照常通过。还缺的 WIC 组件：CUR、DNG、HEIF、Raw、JPEG XL 解码器与 HEIF、JPEG XL 编码器，
 以及大量像素格式、转换器和元数据处理器（Windows 89/5/45/43，Wine 30/1/16/7）。
+
+## Excel 功能普查：动态数组让工作簿“损坏”——msxml 的属性按名查找（wine-src `2dbd95f`）
+
+`tools/officeautomationprobe/excel-sweep.vbs` 仿照 Word 的普查逐项跑 Excel：新旧公式（动态数组、XLOOKUP、LET、LAMBDA、具名 LAMBDA）、
+数字格式、条件格式、经典与新式图表、迷你图、表、数据透视表、排序筛选、数据验证、批注、超链接、目录里每种格式的图片、形状与 SmartArt、
+查找替换、分列、单变量求解、Excel 能写的每种格式（xlsx、xlsm、xlsb、xls、csv、txt、xml、ods、htm、mht、xltx）、加密保存后用密码打开
+（错误密码被拒）、再打开存下的工作簿、保护。第一次跑时，凡是存过的工作簿都打不开（1004），加密的那份也一样。
+
+- **根因。** 最小复现是一个 `=SEQUENCE(3)` 的工作簿：存下再开，Excel 报“发现……中的部分内容有问题”，修复记录是 `/xl/metadata.xml`
+  部分的元数据。Excel 用 msxml6 的 SAX 读取器读包里的部件；读 `<ext uri="{bdbb8cdc-…}">` 时调 `getValueFromName(NULL, 0, L"uri", 3)`
+  取无命名空间的属性。Windows 的 msxml6 把“没给命名空间、长度 0”当作无命名空间，找得到；Wine 返回 `E_POINTER`，Excel 跳过了动态数组
+  的扩展，把整个部件当坏的。
+- **Windows 的行为（Windows 11 build 29671，msxml3 与 msxml6 分别量）。** msxml3 对缺命名空间或本地名一律 `E_INVALIDARG`，只有缺
+  index 才 `E_POINTER`；msxml6 接受 `(NULL, 0)`。msxml6 在检查任何东西之前先把输出清零（index 为 0，字符串 NULL、长度 0），失败也一样；
+  msxml3 不动。无命名空间的属性报空串而不是 NULL。`getType*` 报 CDATA 或 DTD 声明的类型（关键字；枚举为 `(a|b)`，记法为
+  `NOTATION (a|b)`；同一属性以第一次声明为准）——Wine 原来这三个函数都是 `E_NOTIMPL` 桩。msxml3 把命名空间声明按开始标签里的位置
+  夹在其他属性之间，msxml6 放在最后；两者都把 DTD 补上的默认属性排在指定的属性之后。取值、取类型的查找先查输出指针。
+- **实现。** 读取器接上 libxml2 的 `attributeDecl` 回调记下声明的类型；libxml2 把命名空间声明与属性分开交给回调，msxml3 的次序从刚解析
+  过的开始标签原文里读回（属性值里不会有 `<`，开始标签就从解析位置往前最近的 `<` 起）。`xml:` 前缀属性的命名空间原来每个属性分配一次、
+  从不释放，现在每次解析只分配一次。新测试（msxml3 与 msxml6 各一份）在 Windows 与 Wine 上都通过；原来因次序不同而标 todo 的两处
+  msxml3 属性序列测试现在直接通过。
+
+修好后普查 80 项全部通过，加密保存再打开、错误密码被拒、重新打开存下的工作簿都正常。原先仅剩的“失败”是瀑布图、树状图、旭日图、直方图、
+箱形图、漏斗图这类新式图表的 `SetSourceData` 报 445（“对象不支持此操作”）：在 winref 上用原生 Excel（build 20522）跑同样的步骤，结果完全
+一样，而 `FullSeriesCollection` 两边都给出 1 个系列——这是 Excel 本身的行为，普查已改为对新式图表只问系列数。
+
+顺带看到的差异：同一个 445 错误，Wine 的 vbscript 中文文本是“对象不支持此动作”，Windows 是“对象不支持此操作”。
