@@ -9995,5 +9995,33 @@ UAV 暂时整个清除，并加了测试。
 **结果：**
 
 - 探针在 GL、Vulkan 下四种情形都与 Windows 逐值相同。
-- d3d11 全量：GL 失败项不变（17）；**Vulkan 从 303 项失败降到 16 项**——大量测试在循环里反复创建、释放像素着色器，
-  之前都撞上了过期管线；`ps_ibfe` 的 4 个边界用例因此不再需要 `todo`。新增 `test_sample_interpolation`（着色器由 Windows 的编译器编译）。
+- d3d11 全量：**Vulkan 从 303 项失败降到 12 项**——大量测试在循环里反复创建、释放像素着色器，之前都撞上了过期管线；
+  `ps_ibfe` 的 4 个边界用例在两个后端都已通过，去掉 `todo` 后 GL 从 17 项降到 13 项。新增 `test_sample_interpolation`
+  （着色器由 Windows 的编译器编译）。
+- 同一测试 PE 在 winref 桌面会话：5562179 项、180 项失败（上一次 179 项，多出的一项在 `test_unbind_shader_resource_view`，
+  Windows 上与本次改动无关）；新的 `test_clear_view`、`test_sample_interpolation` 与去掉 `todo` 的 4 个 `ps_ibfe` 用例都通过。
+- d2d1 全量两个后端仍 0 失败；部署后三应用保存回归通过（48 秒）。
+
+## d2d1 的 FillOpacityMask，与 DrawBitmap 的倒置源矩形（wine-src `8755ae5`）
+
+`FillOpacityMask` 的两个入口（1.0 带 content 参数的与 1.1 的）一直是桩：只校验参数、只往命令列表里录，画到位图目标上什么也不出。
+它是“一张 alpha 位图当遮罩，画刷透过它上色”，灰度文字位图、图标蒙版常这样画，命令列表回放时也经由它。
+
+**先测原生。** `tools/d2daaprobe/d2dmask.c` 在 winref 上把 4×4 的 A8 遮罩放大、缩小、截取后逐行打印 alpha：
+遮罩按双线性采样、在遮罩自己的边上夹取（取中间 2×2 时边上照样混入源矩形外的纹素）；源矩形先规范化再与遮罩求交，完全在外时整块取角落纹素，
+零宽时什么都不画；没有目标矩形时按源矩形的 DIP 尺寸放在原点（192 DPI 的遮罩是双线性缩小）；只用 alpha；content 只校验，非法值
+`E_INVALIDARG`；非 ALIASED 目标上两个入口都是 `D2DERR_WRONG_STATE`。
+
+**实现。** 把 `DrawBitmap` 的放置计算抽成 `d2d_bitmap_get_placement`（规范化、求交、映射到目标矩形或原点），用遮罩建一个 CLAMP、
+LINEAR 的位图画刷当不透明度画刷去填目标矩形——正是 `FillGeometry` 的不透明度画刷通路，颜色画刷可以是任何类型。两个入口也补上了
+不在 `BeginDraw` 内时的 `D2DERR_WRONG_STATE`。
+
+**顺带修的相邻缺口。** 同一探针显示 Windows 的 `DrawBitmap` 也把倒置的源矩形规范化，而 Wine 遇到倒置的源矩形就整个忽略、改画整张位图。
+现有测试只倒置过覆盖整张位图的源矩形，那时两种做法结果相同，所以一直没暴露。
+
+**结果：**
+
+- 探针在 GL、Vulkan 下与 Windows 逐行相同，只差恰好落在半数上的双线性值的舍入（±1）。
+- 新增 `test_fill_opacity_mask`（含命令列表录制后回放、倒置源矩形的 `DrawBitmap`）；d2d1 全量在 GL、Vulkan 下各 **21945 项/0 失败**；
+  同一测试 PE 在 winref 桌面会话 22004 项，只有原有的 2 项失败（顶点缓冲那两项）。
+- 部署后三应用保存回归通过。

@@ -20,3 +20,25 @@
 每个抗锯齿图元先在它的设备空间包围盒内画一张 8 倍多重采样的 R8 覆盖遮罩：三角形的边由多重采样给出覆盖，曲线、描边曲线和圆角连接在像素着色器里按有符号距离给出盒式滤波的覆盖，MAX 混合取并集；再用一个覆盖包围盒的四边形把画刷乘遮罩（各样本的平均）画到目标上。像素对齐的矩形跳过遮罩。裁剪的抗锯齿边在像素着色器里按重叠面积精确计算。
 
 矩形与裁剪与 Windows 逐值相同；直边是 8 级采样的量化值（如三角形边 32 对 48），曲线边缘差十几级以内。
+
+# FillOpacityMask 原生对照
+
+`d2dmask.c` 把一张 4×4 的 A8 遮罩经白色画刷画到透明黑底的 32×32 WIC 位图上（ALIASED），逐行打印 alpha：整张放大 4 倍、取中间 2×2 放大 8 倍、不给目标矩形、只给源矩形、源矩形越出遮罩或完全在遮罩外、零宽的源矩形、倒置的目标或源矩形、另外两种 content 与一个非法值、1.1 的 `ID2D1DeviceContext::FillOpacityMask`、BGRA 与 192 DPI 的遮罩、非 ALIASED 的目标；最后看 `DrawBitmap` 怎样对待倒置的源矩形。
+
+    scripts/build-probe.sh tools/d2daaprobe/d2dmask.c tools/d2daaprobe/d2dmask.exe d2d1 ole32 uuid
+    WIN_HOST=… WIN_USER=… WIN_PORT=… scripts/winrun.sh tools/d2daaprobe/d2dmask.exe > tools/d2daaprobe/d2dmask.win.txt
+
+`d2dmask.win.txt` 是 winref（build 29671）上的输出。
+
+## 测出的契约
+
+- 遮罩按双线性采样，在遮罩自己的边上夹取，而不是在源矩形的边上：取中间 2×2 时，边上的像素照样混入源矩形外的纹素（第一个像素 80，正是行 0/1、列 0/1 的双线性）。
+- 源矩形先规范化（左右或上下颠倒都一样），再与遮罩求交；完全在遮罩外时整块取最近的角落纹素（128）；零宽的源矩形什么都不画。
+- 没有目标矩形时，源矩形（没有就是整张遮罩）按自身的 DIP 尺寸放在原点；倒置的目标矩形与正的相同。
+- 192 DPI 的 4×4 遮罩只有 2×2 DIP，缩小也是双线性（64、160），不是盒式平均。
+- content 只做校验：GRAPHICS、TEXT_NATURAL、TEXT_GDI_COMPATIBLE 画出相同的值，值 3 在 `EndDraw` 返回 `E_INVALIDARG`。
+- 只用遮罩的 alpha：BGRA 遮罩与 A8 的结果相同。
+- 两个入口在非 ALIASED 的目标上都记 `D2DERR_WRONG_STATE`，什么也不画（同一次绘制里之前的 `Clear` 照常生效）。
+- `DrawBitmap` 同样把倒置的源矩形规范化。
+
+Wine（wine-src 的 `FillOpacityMask` 实现之后）在 GL、Vulkan 下的输出与此逐行相同，只差恰好落在半数上的双线性值的舍入（141.5 → 141 对 142，159.5 → 159 对 160）。
