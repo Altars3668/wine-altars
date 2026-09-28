@@ -9903,3 +9903,38 @@ dwrite 工厂缓存系统与 EUDC 字体集合却不持有引用，集合在最�
 再对赢家的多放一次，引用比持有者少一个。d2d1 测试的多个线程同时从一个工厂创建文本格式，正好撞上。
 现在在工厂锁下查看缓存，引用计数非零时才加引用交出，集合摘下自己也在同一把锁下；同时新建的一个让位给已缓存且仍被持有的那个。
 修后 24 次（GL、Vulkan 各 12 次）全部完整结束；dwrite 自身测试的失败项前后相同。提交 `918d65f`；部署到 /opt 后三应用保存回归通过。
+
+## d2d1 的渐变：扩展模式、gamma、颜色空间与预乘，照 Windows 实测实现（wine-src `cabc95c`）
+
+d2d1 的渐变 stop 集合只存了 stop：所有渐变都按 CLAMP、在 sRGB 里插值，`GetColorInterpolationGamma`/`GetExtendMode` 是桩，
+1.1 的 `ID2D1DeviceContext::CreateGradientStopCollection` 返回 `E_NOTIMPL`，对象也不是 `ID2D1GradientStopCollection1`。
+更要紧的是渐变颜色从不预乘：渐变到透明色时，透明端照样按不透明的颜色叠上去。
+
+**先测原生。** `tools/d2dgradprobe/d2dgrad.c`、`d2dgrad2.c`、`d2dgrad3.c` 在 winref（build 29671）上画进 WIC 位图，输出留存为 `*.win.txt`。
+测出的规则（细节见该目录 README）：
+
+- 位置先按扩展模式归入 [0,1]（截断、取小数、周期 2 的三角波），再在按位置稳定排序的 stop 间插值；落在 [0,1] 外的 stop 只通过它们在区间内造成的颜色起作用。
+- 直通模式插值未预乘的颜色与 alpha，从插值空间换到输出空间，再预乘；预乘模式换空间时先去预乘。
+  1.0 的集合等于 pre=sRGB（gamma 2.2）或 pre=scRGB（gamma 1.0）、post=sRGB、8 位、直通；gamma 1.0 时 stop 先按 sRGB 曲线换成线性，
+  `GetGradientStops1` 交回换算后的值。UNORM 精度把 stop 截到 [0,1]，浮点精度保留超界值。
+- 零长度、零半径、每像素重复一次以上的渐变显示两端各半或周期平均色；焦点在椭圆外时取射线与椭圆较远的交点，看不到的区域画末端颜色。
+- 非法参数：0 个 stop、CUSTOM 空间、越界的 gamma/扩展/插值模式为 `E_INVALIDARG`，精度 UNKNOWN 为 `D2DERR_INVALID_CALL`。
+
+**实现。** 集合对象实现 `ID2D1GradientStopCollection1`，记下 pre/post 空间、精度、扩展与插值模式；着色器缓冲区里放排好序、换到插值空间（按精度截断、按模式预乘）的 stop，末尾放整个周期的平均色。
+像素着色器按上述规则处理扩展模式、空间转换与预乘；位置的屏幕导数表明一像素跨过半个周期以上时向平均色过渡。
+另修两处：`isinf` 在所带 vkd3d 的 SM4 后端尚未实现（`E5017`），改以 $2^{24}$ 为界；1.1 创建函数的精度检查按实测返回 `D2DERR_INVALID_CALL`。
+
+**PowerPoint 怎么用。** 新探针 `tools/officeautomationprobe/powerpoint-gradients.vbs` 在 `trace+d2d` 下显示：
+PowerPoint 全用 1.0 的 `CreateGradientStopCollection`，形状渐变多是自己预算的 200～256 个 stop、gamma 1.0，另有 3、7 个 stop 的 gamma 2.2，
+**扩展模式全是 MIRROR**，画刷全是线性渐变——“从中心”的矩形路径渐变由四块镜像的线性渐变拼成。以前 Wine 一律按 CLAMP 画。
+
+**结果：**
+
+- 三个探针与 Windows 逐列对照，除下面的差异外在 1 级以内。
+- d2d1 全量在 Wine GL、Vulkan 下各 **21437 项/0 失败**；同一测试 PE 在 winref 桌面会话（GPU）上 21496 项，只有原有的顶点缓冲测试 2 项失败，新加的渐变测试全部通过。
+- 部署后三应用保存回归通过；渐变探针的截图中线性、从中心、从角部、彩虹、渐隐到透明（下面的深色条逐渐透出）、半透明中间 stop、渐变文字都正确。
+
+**与 Windows 的已知差异**：Windows 用由 stop 生成的纹理采样渐变，WRAP 接缝半个纹素内混入另一端颜色，压进一两个像素的 CLAMP 渐变被滤波平均，
+Wine 逐像素精确求值，这些像素差 2～5 级；gamma 1.0 下接近 0 的线性值，Windows 的 CLAMP 结果比精确 sRGB 曲线低 2 级，原因未明。
+
+**截图另见**：形状与渐变文字的边缘有锯齿——Wine 的 d2d1 没有实现逐图元抗锯齿，`SetAntialiasMode` 只记下模式。
