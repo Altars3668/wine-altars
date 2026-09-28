@@ -10125,3 +10125,21 @@ Windows 的规则由各 setter 抬高、由声明的版本约束读取；注册�
 标准框架（含标题栏）缩可见矩形、让窗口管理器装饰”处理，结果 GNOME 标题栏盖住了 Office 自己的标题栏。`1af6bd6` 让客户区伸到标题栏
 位置的窗口保持整窗可见、不加装饰；user32 `win` 测试的失败与改动前相同（均为该显示上的输入/焦点环境项），三应用回归通过。那几像素的
 非客户区现在由 Wine 按经典样式画成细边框；Windows 11 上它们是隐形的，之后可以再细化。
+
+## COM 激活过滤器照 Windows 实现，以及 OLE 从数据建对象看不见嵌入对象（wine-src `5510cc7`）
+
+Word 启动时调用 `CoRegisterActivationFilter` 注册自己的过滤器；Wine 原先接下就不再理会，等于任何激活都不经 Office 过问。
+`tools/comprobe/actfilter.c` 在 winref 上把 COM 激活对象的每条途径走了一遍（契约见 `tools/comprobe/README.md`）：每次激活都先问过滤器、
+再找类（没注册的类也先问）；替换参数进来总是 GUID_NULL，顶替的类用同一类型再问一次；类型按途径区分——直接创建与 `OleCreate` 为 0，
+类 moniker 与 `OleLoadFromStream` 为 FROM_MONIKER，`OleLoad` 为 FROM_STORAGE，`OleCreateFromData` 为 FROM_DATA，
+`CoGetInstanceFromFile` 为 FROM_FILE，文件 moniker 为两者之和；代理/存根工厂只在首次载入时问，combase 自带的标准代理不问；
+只有一个过滤器，另注册一个是 `CO_E_NOT_SUPPORTED`，COM 不引用它。`5510cc7` 照此实现（类型经线程局部状态从 ole32 告诉 combase），
+新测试 `ole32:activation` 在 winref 与 Wine 上都 134 项 0 失败，其余 ole32/combase 测试的失败与改动前相同，三应用保存回归通过。
+
+顺带修了同一路径上的缺口：OLE 的剪贴板格式只在第一次用剪贴板时注册，此前 `OleQueryCreateFromData` 回答 S_FALSE、
+`OleCreateFromData` 找不到任何嵌入对象；现在按需注册，并按 Windows 的次序先问 `Embedded Object`、再取 `Embed Source`。
+
+Office 里：普通会话中过滤器被问几十次，全是类型 0、全部放行。ActiveX 控件在激活之前就被 Microsoft 365 的策略拒绝
+（“由于您的策略设置，无法插入此对象。”）。`tools/officeautomationprobe/word-embed.vbs` 在 Word 里嵌入 Excel 工作表时，过滤器放行了
+`Excel.Sheet.12`，Excel 以 `-Embedding` 启动并注册了类对象，随后 Word 对 Excel 的一次跨进程调用返回 0x800703e6，Word 报 Excel
+“尚未安装或无响应”——换回改动前的 combase/ole32 结果相同，是下一个要查的既有缺陷。

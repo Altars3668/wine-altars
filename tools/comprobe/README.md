@@ -44,3 +44,30 @@ Office 运行时 `err:ole:apartment_add_dll couldn't load in-process dll "...\Co
 - `Suggest("helo")` 给出有序候选（hello、halo、helot…），对拼对的词也给近似词，对无意义的串给空列表；`Ignore` 之后同一检查器不再报该词。
 
 Wine 若要实现，宿主机有 `libhunspell-1.7.so.0` 与 en_US/en_GB 词典，可以 dlopen 其 C API；建议的顺序与措辞以此为准，候选词本身因词典不同不必逐字相同。
+
+# COM 激活过滤器的原生对照
+
+`actfilter.c` 用 `CoRegisterActivationFilter`（Windows 8 起）注册一个记录每次调用的 `IActivationFilter`，再按 COM 提供的每条途径激活对象：`CoCreateInstance`/`CoGetClassObject` 普通进程内类、COM 自己的全局接口表、`CoRegisterClassObject` 注册的类、根本没注册的类；从存储、流、文件、类 moniker、文件 moniker、`clsid:` 显示名、`OleCreate`、`OleCreateFromFile`、`OleCreateFromData`（数据对象打印被问到的每一步）；自定义 OBJREF 指名的解组器；标准列集为 combase、oleaut32、actxprxy 各自代理的接口建的存根与（另一线程上的）代理；另一线程上的激活。然后让过滤器拒绝一个类、用另一个类顶替、顶替后再拒绝顶替者、回答 S_FALSE，最后注册第二个过滤器、`OleUninitialize` 后重新初始化。
+
+    scripts/build-probe.sh tools/comprobe/actfilter.c tools/comprobe/actfilter.exe ole32 uuid shell32 user32
+
+`actfilter.win.txt` 是 winref（build 29671）上的输出。Wine 实现后同一探针只剩下面“内部类”与 `OleCreateFromFile` 两处差异；`dlls/ole32/tests/activation.c` 把这些契约写成了一致性测试，Windows 与 Wine 上都 0 失败。
+
+## 测出的契约
+
+- **每次激活都先问过滤器一次，再去找类**：`CoCreateInstance(Ex)`、`CoGetClassObject`、COM 自己的 GIT、`CoRegisterClassObject` 注册的类都问；没注册的类也先问一次，然后才 `REGDB_E_CLASSNOTREG`；另一线程（MTA）上的激活同样问。
+- `pReplacementClsId` 进来时**总是 GUID_NULL**。过滤器返回失败，激活就以该 HRESULT 失败（E_ACCESSDENIED 原样返回）；S_FALSE 等成功码视为放行。过滤器写入另一个类时，COM 用同一类型再问一次这个替换类（入参仍是 GUID_NULL），放行后激活的是替换类；替换类被拒则整个激活以其 HRESULT 失败。写回类自身或 GUID_NULL 就是不替换。
+- **类型**（`ACTIVATIONTYPE`，按位）：直接的 `CoCreateInstance`/`CoGetClassObject`、`OleCreate`、自定义 OBJREF 的解组器都是 0；类 moniker 绑定、**`OleLoadFromStream`** 是 FROM_MONIKER（1）；`OleLoad` 是 FROM_STORAGE（4）；`OleCreateFromData` 是 FROM_DATA（2）；`CoGetInstanceFromFile` 是 FROM_FILE（0x10）；文件 moniker 绑定是 FROM_MONIKER|FROM_FILE（0x11）；`OleCreateFromFile` 里从存储载入是 0x10。替换类被问时类型与原来相同（经类 moniker 顶替时两次都是 1）。FROM_STREAM（8）在这些途径里都没出现。
+- **代理/存根工厂**：combase 自带的标准代理（IPersist、IClassFactory 等，`{00000320}`）不问；其他工厂（oleaut32 的 PSDispatch `{00020420}`，IServiceProvider 的）只在进程第一次载入时问一次，类型 0，之后同一工厂建存根、在另一线程上建代理都不再问。
+- **注册**：NULL 是 E_INVALIDARG；同一个过滤器再注册 S_OK；另一个过滤器是 `CO_E_NOT_SUPPORTED`（0x80004021），原来的照旧；COM 不 AddRef 过滤器，也从不 QueryInterface 它；`OleUninitialize` 之后再初始化，过滤器仍在。
+- Windows 还会问两个内部类，Wine 不产生这些对象，不仿：`{00000346-0000-0000-C000-000000000046}`（注册表里没有；出现在 `OleLoad`、`OleCreate`、`OleCreateFromData`、`CoGetInstanceFromFile`、文件 moniker 这些涉及存储的途径里，类型与随后那次相同），以及解析 `clsid:` 显示名时的类 moniker 类 `{0000031A}`（类型 1）。
+- `OleCreateFromFile` 对不是 OLE 服务器的文件，Windows 建的是打包对象（Packager `{F20DA720-C02F-11CE-927B-0800095AE340}` 及几个外壳类），成功；Wine 的 `OleCreateFromFile` 直接绑定文件 moniker，这里 E_NOINTERFACE。缺的是打包器这条路，与过滤器无关。
+- `OleCreateFromData` 在 Windows 上先 `EnumFormatEtc`，再 `QueryGetData("Embedded Object", TYMED_ISTORAGE)`，没有就直接 `GetDataHere("Embed Source", TYMED_ISTORAGE)`；`OleQueryCreateFromData` 只 `EnumFormatEtc`。Wine 原先在进程从没用过 OLE 剪贴板时，这两处拿到的格式号都是 0（格式只在建剪贴板对象时才注册），`OleQueryCreateFromData` 因此回答 S_FALSE、`OleCreateFromData` 根本找不到嵌入对象。
+
+## 探针自身的一个坑
+
+最初的 `name()` 返回同一个静态缓冲区，而一条 `printf` 里调用了它两次：参数从右往左求值，后一次把前一次覆盖，于是凡是以 GUID 字符串打印的类都显得“替换参数预置为类自身”，与以名字打印的类（GUID_NULL）矛盾。换成两个轮流使用的缓冲区后，Windows 上 45 次调用的入参全是 GUID_NULL。量出与直觉不符的结果时，先查探针自己的格式化。
+
+## Office 用它做什么
+
+Word 启动时就调用 `CoRegisterActivationFilter`（过滤器是堆上的对象）。普通会话里它被问几十次，全是类型 0，全部放行。插入 ActiveX 控件（`Forms.CommandButton.1`）根本走不到激活：Microsoft 365 先按策略拒绝，提示“由于您的策略设置，无法插入此对象。”（2025 年起默认禁用 ActiveX）。用 `tools/officeautomationprobe/word-embed.vbs` 嵌入 Excel 工作表时，过滤器被问到 `Excel.Sheet.12`（`{00020830}`）两次（先进程内、后本地服务器），类型 0，都放行；随后 Word 调 Excel 的一次跨进程调用返回 0x800703e6，Word 报“用于创建此对象的程序是 Excel。您的计算机尚未安装此程序或此程序无响应。”——换回没有过滤器的 combase/ole32 结果相同，是另一个既有缺陷。
