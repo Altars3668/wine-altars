@@ -30,3 +30,9 @@
 2026-09-28 在 winref 上三次都没能得到原生的就地激活：Excel 以嵌入方式启动、加载完第三方加载项后，Word 的激活仍以 0x17B5（“……请确保 Excel 中的任何对话框都已关闭”）失败，Excel 从未建 EXCEL9 窗口；当时会话锁屏。另见 `docs/office365-under-wine.md` 的就地激活一节。
 
 `word-spell.vbs <进度日志>` 看 Word 的校对能不能用：美式英语用的是哪个拼写词典，一句美式英语里拼错的三个词 Word 标出哪些，给 `mispeled` 的建议，以及 `CheckSpelling` 对拼对、拼错的词各答什么（布尔值以 `CInt` 写出，-1 为真，与界面语言无关）。只退出自己启动的 Word，不保存文档。2026-09-28 在 Wine 下：词典是 Office 自带的 `PROOF\MSSP7EN.LEX`，三个错词都标出，建议为 `misspelled`、`misplead`——Word 的拼写检查不依赖 Windows 的拼写检查 API（`ISpellCheckerFactory`）。
+
+`word-pdf.vbs <输出.pdf> <进度日志>` 在新文档里写标题、一行英文、一行中文、一张 2×2 的表和一个形状，记下 Word 报告的页数，用 `ExportAsFixedFormat`（`wdExportFormatPDF` = 17）导出 PDF，不保存文档；只退出自己启动的 Word。导出时 Word 对每个用到的字体调 `fontsub.dll` 的 `CreateFontPackage`（字形列表、平台 3、编码 0xFFFF）。2026-09-28：原先 fontsub 把整个字体原样返回，这一页 PDF 嵌入了两份完整的等线，19.3 MB；fontsub 照 Windows 取子集后是 39 KB，`pdftoppm` 渲染与嵌入完整字体时逐像素相同（`tools/fontsubprobe`）。
+
+`word-embedfonts.vbs <输出.docx> <进度日志>` 在新文档（缺省字体，外加一行中文）上打开 `EmbedTrueTypeFonts` 与 `SaveSubsetFonts`，存为 DOCX，关闭再打开，记下嵌入设置和正文开头。Word 保存时以字符列表调 `CreateFontPackage`，嵌入的 `word/fonts/font1.odttf` 是混淆过的子集：原先是 16 MB 的完整等线，现在未压缩 780 KB（字形号保持不变，所以度量表仍按原字形数），重新打开正常。
+
+`office-paste.vbs <进度日志>` 经剪贴板在 Excel 与 Word 之间复制：Excel 复制 A1:B2，在 Word 里 `Selection.Paste`（成为表格），再 `PasteSpecial` 为 OLE 对象；Word 复制文字后 `Worksheet.Paste` 到 Excel 的 D1。它会占用剪贴板，只在没有人用的显示上跑（开发用的无头 `:2`），不要在有人使用的桌面上跑。2026-09-28 在 Wine 下：表格粘贴与 Word→Excel 粘贴成功，`PasteSpecial` 作为对象后 `InlineShapes.Count` 为 0，待查。

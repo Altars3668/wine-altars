@@ -10351,3 +10351,49 @@ button、static、edit、listview、tooltips，usp10 与 riched20 `txtsrv` 与�
 - GetCharacterPlacement 的 lpDx 仍取 GetCharWidth32；Windows 对字体里没有的字符给 0，并按簇分配。
 - Windows 对字体里没有的字符用字体链接（SystemLink）的字体量宽度，与 Wine 的缺省字形宽度不同（探针里 U+115F、U+17B4 等）。
 - 上面说的 GGO_METRICS 与单色位图前进宽度不一致本身：Wine 的 GetTextExtentPoint 与实际画出的宽度在这种字号上不相等。
+
+## 嵌入字体的子集：fontsub 照 Windows 实测实现（wine-src `1bf949b`）
+
+Word 导出一页文字的 PDF 写出了 19.3 MB，存为“嵌入字体”的 DOCX 带着 16 MB 的字体。Office 嵌入字体时调 `fontsub.dll` 的
+`CreateFontPackage` 取子集（导出 PDF 用字形列表、平台 3、编码 0xFFFF；嵌入字体用字符列表），Wine 的实现把整个字体原样返回。
+
+测量分两步。`tools/fontsubprobe/fontsubprobe` 在 Windows 上把各种调用方式都试一遍（`fontsubprobe.win.txt`）；然后 `compare.cmd` 在同一台
+Windows 上把同一批输入交给系统的 fontsub 和 Wine 的 fontsub（Wine 的 PE 版只导入 kernel32、ntdll、ucrtbase，改名为 `wfontsub.dll`
+直接加载），逐表比较（`compare.win.txt`），48 组，包括宋体（含点阵）、MS Gothic、Arial、Times、等线、微软雅黑、SimSun-ExtB、Segoe UI、
+Segoe UI Emoji、Tahoma、Cambria、Verdana、Consolas、Calibri、Georgia 与十几种自由字体。微软字体的子集只在那台机器上比较。
+
+Windows 的做法：
+
+- **保留字形号**：没保留的字形只是没有轮廓与字符，其余表照旧引用字形号。除了要求的字形或字符，还保留字形 0–2、JSTF 扩展字形、给了列表时
+  '"'、'M'、'd'、'r' 的字形、组合字形的部件、GSUB 能替换出的所有字形、COLR 的图层。
+- **glyf/loca**：每个字形补齐到 2 字节，能放下就用短 loca。**hmtx/vmtx**：长度量数取 min(原数, 最后一个保留字形 + 2)，丢弃的字形度量为 0；
+  若长度量数不变，整表原样不动（所以保留了高编号汉字时 hmtx 不变小）。**LTSH、hdmx**：丢弃字形的项为 0，hdmx 每个字号的最大宽度按保留字形重算。
+- **cmap**：按记录顺序逐子表重建，共用的子表仍共用，子表起点补齐到 2 字节；format 0/4/6/12/13 只留映射到保留字形的字符（映射到字形 0
+  的不算），空的 format 4 留一个 [0,0] 段、空的 format 12 留一个 {0,0,0} 组；format 14 原样照抄；重建后比原表大的保留原表。
+- **OS/2 的首末字符**：只有当某个平台 3 的子表**自己**被重建（不是与前面平台 0 的记录共用）时才更新，取各重建子表（format 4/6/12/13，
+  Mac 子表要在第一个 Unicode 子表之后才算）的最小、最大字符。FontForge 出的字体 (0,3) 与 (3,1) 共用一个子表，所以 Liberation、
+  DejaVu 等的范围保持原值——这是用互换表的字体在 Windows 上二分出来的，之前以为与 LTSH/hdmx 有关是错的。
+- **EBLC/EBDT**：每个字号按原次序保留含保留字形的索引子表，范围缩到保留字形；format 1/3 都写成 format 3（2 字节偏移），format 2（等宽
+  区间）在保留字形连续时仍为 2、否则改为 format 5 列表，4/5 只留保留的项；多个字号共用的点阵仍共用；字号的起止字形取原范围内首末保留字形；
+  没有子表的字号去掉；某个 format 3/4 子表的点阵超过 64 KB 时整个字号去掉，但已写进 EBDT 的点阵留着（宋体保留 2000 个汉字时 ppem 16/17
+  就是这样）；一个字号都不剩时两表都去掉。原先 Wine 遇到 format 2/5 就整段保留：MS Gothic、uming 的子集几乎带着全部点阵。
+- **其他**：maxp 的各最大值按保留字形与 fpgm/prep 重算；kern 只留两边都保留的字形对，没有就去掉；post 变 3.0；name 的每个字符串放进
+  **所有记录中最长的**包含它的字符串里（没放过就先放那个），否则找已放过的相同字符串，否则追加；没有 maxp 的字体报 ERR_NO_GLYPHS
+  （1009），缺 loca 报 1035；不带 `TTFCFP_FLAGS_SUBSET` 时返回 0、什么也不写；COMPRESS 标志被忽略。
+- **表的物理顺序**：Windows 自己安排的表（head hhea maxp OS/2 hmtx LTSH VDMX hdmx cmap fpgm prep cvt glyf loca kern name post gasp PCLT
+  vhea vmtx EBLC EBDT）按这个顺序；其余表的顺序看不出规律（Windows 的 fontsub 导入了 msvcrt 的 qsort/bsearch，但按“并列元素交给
+  qsort”模拟也对不上），Wine 按原目录顺序、目录以上述表结尾时把第一张挪到最后，这在 48 组里对上 13 组。
+
+结果：48 组中 44 组所有表都与 Windows 相同，其中 12 组逐字节相同，其余只是物理顺序不同。剩下 4 组：name 里有三个字符串 Windows 没放进
+现成的容器（DejaVu、Gentium、Segoe UI Emoji 各一处，对齐、距离、长度都排除了，原因未明）；Gentium 的 Mac format 6 子表 Windows 把字符 c
+的字形写在下标 c − 2 × firstCode 处（firstCode 为 32 时 32–63 的字符全丢、其余错位），这是 Windows 的缺陷，Wine 不照做。
+
+Word 导出那一页 PDF：19.3 MB → 39 KB，`pdftoppm` 渲染与嵌入完整字体时逐像素相同；嵌入字体的 DOCX：字体 16 MB → 未压缩 780 KB，重新打开
+正常。fontsub 的一致性测试 82 项在 Wine 与 Windows 上都通过，其中新测试用构造的 cmap/name 表固定了 OS/2 范围、format 14、长度量数不变与
+name 的“最长容器”几条规则。
+
+还没做的：
+
+- `MergeFontPackage` 只会原样复制完整的包；SUBSET1（字形号压紧并加 `dttf` 表）、DELTA 与合并没有实现（`fontsubprobe.win.txt` 里有 Windows
+  的结果）。Office 目前只用 SUBSET。
+- 其余表的物理顺序与 name 的三处例外。
