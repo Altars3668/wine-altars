@@ -42,3 +42,5 @@
     sendkeys -w OpusApp -d 200 "text:hello 中文输入测试，你好。" enter "text:第二行 ABC"
 
 2026-09-28 在 Wine 下（`:2`）：正文为“Hello 中文输入测试，你好。”“第二行 ABC”两段（Word 把 hello 自动改成首字母大写），没有崩溃；9 月 4 日记录的“键入中文时 Word 以 0xe0000002 崩溃”不再出现。这只验证了 Unicode 字符输入，经 X 输入法（XIM）的组字路径没有测。
+
+`word-math.vbs <输出.pdf> <进度日志> [公式字体或 ""] [显示秒数]` 在新文档里用线性格式写两个公式（a^2+b^2=c^2 与求根公式），`OMaths.Add` 后 `BuildUp` 成专业格式，记下 Word 数到的公式数、各自的函数数与文字，导出 PDF；给了字体就把文档的公式字体设成它，给了秒数就让 Word 可见地停留这么久以便截图。只退出自己启动的 Word，不保存。2026-09-28：Wine 下没有 Cambria Math，GDI 给了 Liberation Sans，公式在屏幕和 PDF 上都是空的；换成带 MATH 表的自由字体后出现。wine-src `a84f7a5` 让已装的自由数学字体（DejaVu Math TeX Gyre 等，TrueType 轮廓的优先）在没有 Cambria Math 时顶替它，默认公式字体下屏幕与 PDF 都正常。选 CFF 轮廓的数学字体（Latin Modern Math、系统同名的 STIX Two Math .otf）时，Word 导出 PDF 会把字形画成图像，画面上出现贯穿的竖线，原因未查清（`tools/glyphrasterprobe`）。
