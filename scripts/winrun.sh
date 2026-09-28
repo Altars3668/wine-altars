@@ -29,7 +29,10 @@ scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$exe" "$USERNAME@$HOST:
 
 if [ "$desktop" = 0 ]; then
     "${SSH[@]}" "cd /d %TEMP% && $name $*" 2>&1 | tr -d '\r'
-    exit "${PIPESTATUS[0]}"
+    status=${PIPESTATUS[0]}
+    # the program goes again, as the desktop task's files do
+    "${SSH[@]}" "del /q %TEMP%\\$name" >/dev/null 2>&1 || echo "cleanup of $name failed" >&2
+    exit "$status"
 fi
 
 tag="WineAltarsProbe_$(date +%s)_$RANDOM"
@@ -53,6 +56,6 @@ output_status=${PIPESTATUS[0]}
 result=$("${SSH[@]}" "type %TEMP%\\$tag.exit" 2>/dev/null | tr -d '\r\n') || { echo "desktop task exit status unavailable" >&2; exit 2; }
 [ "$output_status" = 0 ] || { echo "desktop task output unavailable" >&2; exit 2; }
 case "$result" in ''|*[!0-9]*) echo "invalid desktop task exit status" >&2; exit 2 ;; esac
-"${SSH[@]}" "schtasks /delete /tn $tag /f >nul 2>&1 & del /q %TEMP%\\$tag.out %TEMP%\\$tag.exit %TEMP%\\$tag.ps1 2>nul" >/dev/null 2>&1 || echo "desktop task cleanup failed" >&2
+"${SSH[@]}" "schtasks /delete /tn $tag /f >nul 2>&1 & del /q %TEMP%\\$tag.out %TEMP%\\$tag.exit %TEMP%\\$tag.ps1 %TEMP%\\$name 2>nul" >/dev/null 2>&1 || echo "desktop task cleanup failed" >&2
 printf 'remote_exit_code=%s\n' "$result" >&2
 [ "$result" = 0 ]
