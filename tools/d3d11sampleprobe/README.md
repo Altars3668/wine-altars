@@ -16,10 +16,16 @@
 
 即：逐样本执行本身不改变插值位置，只有 `sample` 修饰才在样本处插值；`SV_Position` 始终是像素中心。
 
-## Wine（未修）
+## Wine
 
-- GL（wined3d GLSL）：读 `SV_SampleIndex` 时普通属性在样本处插值（84/85），应为 64。
+修之前：
+
+- GL（wined3d GLSL）：读 `SV_SampleIndex` 时普通属性在样本处插值（84/85），应为 64；centroid、sample 插值只打 FIXME。
 - Vulkan（vkd3d-shader SPIR-V）：`SV_Position` 给的是样本位置（84/85），应为 64。
 - vkd3d 的 HLSL 编译器不认 `sample` 修饰（`E5030: Unknown modifier "sample"`）；上游 master 也没有。
+- 另外 Vulkan 下结果随着色器的创建顺序变化，一旦保留所有着色器就恢复一致：wined3d 的图形管线缓存以 `VkShaderModule`
+  句柄为键，着色器销毁后句柄被复用，新着色器命中了旧管线。探针因此在最前、最后各画一次逐像素着色器。
 
-d2d1 的抗锯齿因此不依赖逐样本着色，改在像素着色器里算解析覆盖率。
+wine-src `0eea94d`、`7a3e3e6`、`b6df687`、`fc2489e` 之后，GL 与 Vulkan 的输出都与 Windows 逐值相同。
+
+`dxbcdump.c` 在 Windows 上用系统的编译器编出 d3d11 测试 `test_sample_interpolation` 所用着色器的字节码。

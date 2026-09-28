@@ -9964,8 +9964,8 @@ UAV 暂时整个清除，并加了测试。
 **走过的弯路：逐样本着色。** 最初想让遮罩这一遍逐样本着色，让曲线的 `clip()` 在每个样本处求值。结果 GL 下曲线正确而 Vulkan 下退化，
 补偿后又反过来。`tools/d3d11sampleprobe` 在 Windows 上测清了 D3D 的语义：读 `SV_SampleIndex` 的着色器，普通属性仍在像素中心插值，
 只有 `sample` 修饰才在样本处，`SV_Position` 始终是像素中心。Wine 两个后端各偏一边——GL 把普通属性放到样本处，Vulkan 的
-`SV_Position` 给样本位置——而 vkd3d 的 HLSL 编译器根本不认 `sample` 修饰（上游 master 也没有）。这三处是独立的 D3D 缺陷，**尚未修**；
-d2d1 改用上面的解析覆盖率，不依赖逐样本着色。
+`SV_Position` 给样本位置——而 vkd3d 的 HLSL 编译器根本不认 `sample` 修饰（上游 master 也没有）。d2d1 改用上面的解析覆盖率，
+不依赖逐样本着色；这三处 D3D 缺陷随后单独修了，见下一节。
 
 **结果：**
 
@@ -9975,3 +9975,25 @@ d2d1 改用上面的解析覆盖率，不依赖逐样本着色。
 - 部署后三应用保存回归通过（61 秒）；PowerPoint 渐变探针截图中椭圆外缘、渐变文字边缘平滑，四块镜像渐变拼成的“从中心”椭圆没有接缝。
 
 **仍有的差异**：直边是 8 级量化而非精确面积；`Clear` 在抗锯齿裁剪内仍按像素中心；原样画出不受上限约束的 MITER 连接会被遮罩包围盒截掉（Windows 在上限处截平）。
+
+## D3D 的逐样本插值语义，与 Vulkan 后端复用过期管线（wine-src `0eea94d`、`7a3e3e6`、`b6df687`、`fc2489e`）
+
+上一节的探针 `tools/d3d11sampleprobe` 把 D3D11 的语义量清之后，逐项修 Wine：
+
+- **vkd3d HLSL：`sample` 插值修饰。** 词法上用尾随上下文，只有后面跟着空白和标识符时 `sample` 才是关键字，
+  把 `sample` 当变量名的着色器不受影响；代码生成映射到 `LINEAR_SAMPLE`/`LINEAR_NOPERSPECTIVE_SAMPLE`。
+- **vkd3d SPIR-V：`SV_Position` 回到像素中心。** 未加 `sample` 修饰的 `SV_Position` 一律取 `floor(FragCoord.xy) + 0.5`：
+  逐像素时 FragCoord 本就在 n+0.5，结果不变；逐样本时从样本位置回到像素中心。
+- **wined3d GLSL：centroid 与 sample 插值。** 以前两者都只打 FIXME（Office 运行时见过的 “interpolation mode 0x3” 即 centroid）。
+  GLSL 4.40 起插值限定符可以只写在片段着色器，但接口块成员上的 centroid/sample 两端必须一致，而顶点着色器变体在 4.40+ 并不按
+  片段着色器的插值模式区分——所以两端都不声明，片段着色器把输入拷进 `ps_in[]` 时分别用 `interpolateAtCentroid`、
+  `interpolateAtSample(…, gl_SampleID)` 取值；逐样本着色器里的普通输入用 `interpolateAtOffset(…, vec2(0.0))` 取像素中心。
+- **wined3d Vulkan：着色器销毁后复用过期管线。** 修 Vulkan 时探针的结果随着色器创建顺序变化，一旦保留所有着色器就恢复一致。
+  根因：图形管线缓存以 `VkShaderModule` 句柄为键，着色器变体销毁时只清掉上下文的当前引用，缓存里用该模块建的管线留着；
+  驱动复用句柄后，新着色器命中旧管线，执行的是已销毁的着色器。现在销毁变体时把引用该模块的管线从缓存摘下并延迟销毁。
+
+**结果：**
+
+- 探针在 GL、Vulkan 下四种情形都与 Windows 逐值相同。
+- d3d11 全量：GL 失败项不变（17）；**Vulkan 从 303 项失败降到 16 项**——大量测试在循环里反复创建、释放像素着色器，
+  之前都撞上了过期管线；`ps_ibfe` 的 4 个边界用例因此不再需要 `todo`。新增 `test_sample_interpolation`（着色器由 Windows 的编译器编译）。

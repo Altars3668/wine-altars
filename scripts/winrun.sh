@@ -8,6 +8,9 @@
 #
 #   WIN_HOST=host WIN_USER=user WIN_PORT=22 scripts/winrun.sh probe.exe
 #
+# A desktop task is waited for about six minutes; WIN_WAIT sets the number of seconds for a longer
+# one, such as a whole conformance test.
+#
 # Check that the port answers before anything else, and never retry a failed login: the host
 # bans addresses that keep trying.
 set -uo pipefail
@@ -38,7 +41,8 @@ scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$ps1" "$USERNAME@$HOST:
 rm -f "$ps1"
 "${SSH[@]}" "schtasks /create /tn $tag /tr \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\$USERNAME\\AppData\\Local\\Temp\\$tag.ps1\" /sc once /st 23:59 /it >nul && schtasks /run /tn $tag >nul" >/dev/null 2>&1 || { echo "desktop task start failed" >&2; exit 2; }
 completed=0
-for i in $(seq 1 180); do
+polls=$(( ${WIN_WAIT:-360} / 2 ))
+for i in $(seq 1 "$polls"); do
     result=$("${SSH[@]}" "if exist %TEMP%\\$tag.exit (echo done) else (echo waiting)" 2>/dev/null | tr -d '\r') || { echo "desktop task polling failed" >&2; exit 2; }
     if [ "$result" = done ]; then completed=1; break; fi
     sleep 2

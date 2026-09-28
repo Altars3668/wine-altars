@@ -2,7 +2,8 @@
  * Where Direct3D 11 interpolates a pixel shader's inputs when the shader runs once a sample: a shader that reads
  * SV_SampleIndex writes the square of an attribute's fraction to a multisampled target, which is resolved and read.
  * At the pixel's centre that is 0.25 in every sample; at the samples, their mean.  Also with the attribute marked
- * "sample", "centroid", and with neither and no SV_SampleIndex, and what SV_Position holds in each case.
+ * "sample", and with neither and no SV_SampleIndex -- that one first and last, as a renderer may carry
+ * over drawing per sample -- and what SV_Position holds in each case.
  */
 #define COBJMACROS
 #include <windows.h>
@@ -21,6 +22,12 @@ static const char vs_code[] =
 
 static const char *ps_codes[] =
 {
+    /* per pixel, first */
+    "float4 main(float2 v : TEXCOORD, float4 position : SV_Position) : SV_Target\n"
+    "{\n"
+    "    float f = frac(v.x), g = frac(position.x);\n"
+    "    return float4(f * f, g * g, 0.0f, 1.0f);\n"
+    "}\n",
     /* per sample, plain attribute */
     "float4 main(float2 v : TEXCOORD, float4 position : SV_Position, uint s : SV_SampleIndex) : SV_Target\n"
     "{\n"
@@ -46,7 +53,8 @@ static const char *ps_codes[] =
     "    return float4(f * f, g * g, 0.0f, 1.0f);\n"
     "}\n",
 };
-static const char *ps_names[] = {"sample index", "sample attribute and index", "sample attribute", "per pixel"};
+static const char *ps_names[] = {"per pixel first", "sample index", "sample attribute and index", "sample attribute",
+        "per pixel"};
 
 int main(void)
 {
