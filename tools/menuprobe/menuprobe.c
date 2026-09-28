@@ -3,8 +3,9 @@
  * do with the shared menu: read it (IsMenu, GetMenuInfo, GetMenuItemCount, GetMenuItemInfo with its text,
  * GetMenuString, GetMenuState, GetMenuItemID, GetSubMenu), change it (SetMenuInfo, InsertMenu, InsertMenuItem with a
  * popup of its own, ModifyMenu, CheckMenuItem, EnableMenuItem, SetMenuDefaultItem, AppendMenu to a popup of it,
- * DeleteMenu, RemoveMenu), put one on a window of its own and destroy that window, and destroy one; and what the
- * process that made the menus sees of all that, while the other process runs and after it has exited.
+ * DeleteMenu, RemoveMenu), put one on a window of its own as its menu bar -- which the window makes room for and
+ * lays out -- and destroy that window, track a popup of it with keys posted beforehand, and destroy one; and what
+ * the process that made the menus sees of all that, while the other process runs and after it has exited.
  *
  * Both wait as threads with windows do, taking the messages sent to them meanwhile.
  *
@@ -100,8 +101,16 @@ static DWORD wait_pumping(HANDLE handle, DWORD timeout)
 #define report(what, expr) do { DWORD_PTR r_; SetLastError(0xdeadbeef); r_ = (DWORD_PTR)(expr); \
     printf("  %s: %#Ix, error %lu\n", what, r_, r_ ? 0 : GetLastError()); } while (0)
 
+static HMENU initmenupopup, menuselect;
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
+    switch (msg)
+    {
+    case WM_INITMENUPOPUP: initmenupopup = (HMENU)wparam; break;
+    case WM_MENUSELECT: if (lparam) menuselect = (HMENU)lparam; break;
+    case WM_TIMER: EndMenu(); break;
+    }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
@@ -177,9 +186,43 @@ static int child(char **argv)
     }
     hwnd = CreateWindowW(L"menuprobe", L"menuprobe", WS_OVERLAPPEDWINDOW, 0, 0, 200, 200, NULL, NULL,
                          GetModuleHandleW(NULL), NULL);
-    report("SetMenu(its window, B)", SetMenu(hwnd, bar));
-    printf("  GetMenu(its window): %s\n", name(GetMenu(hwnd)));
-    report("DrawMenuBar", DrawMenuBar(hwnd));
+    {
+        RECT before, after, item_rect;
+        MENUBARINFO mbi;
+
+        GetClientRect(hwnd, &before);
+        report("SetMenu(its window, B)", SetMenu(hwnd, bar));
+        GetClientRect(hwnd, &after);
+        printf("  GetMenu(its window): %s\n", name(GetMenu(hwnd)));
+        printf("  the client area made room for a menu bar: %d\n", after.bottom < before.bottom);
+        report("DrawMenuBar", DrawMenuBar(hwnd));
+        memset(&mbi, 0, sizeof(mbi));
+        mbi.cbSize = sizeof(mbi);
+        SetLastError(0xdeadbeef);
+        if (GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi))
+            printf("  GetMenuBarInfo: menu %s, bar %s, room made less the bar's height: %ld\n", name(mbi.hMenu),
+                   mbi.rcBar.bottom > mbi.rcBar.top ? "laid out" : "empty",
+                   (before.bottom - after.bottom) - (mbi.rcBar.bottom - mbi.rcBar.top));
+        else printf("  GetMenuBarInfo failed, error %lu\n", GetLastError());
+        SetLastError(0xdeadbeef);
+        if (GetMenuItemRect(hwnd, bar, 0, &item_rect))
+            printf("  GetMenuItemRect(B, 0): %s\n", item_rect.right > item_rect.left ? "laid out" : "empty");
+        else printf("  GetMenuItemRect(B, 0) failed, error %lu\n", GetLastError());
+    }
+
+    printf("the other process tracks P with keys posted beforehand:\n");
+    {
+        int id;
+
+        PostMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
+        PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+        SetTimer(hwnd, 1, 3000, NULL);
+        SetLastError(0xdeadbeef);
+        id = TrackPopupMenuEx(popup, TPM_RETURNCMD, 10, 10, hwnd, NULL);
+        KillTimer(hwnd, 1);
+        printf("  TrackPopupMenuEx: %d, error %lu\n", id, id ? 0 : GetLastError());
+        printf("  WM_INITMENUPOPUP named %s, WM_MENUSELECT named %s\n", name(initmenupopup), name(menuselect));
+    }
     report("DestroyWindow(its window)", DestroyWindow(hwnd));
     printf("  IsMenu(B): %d\n", IsMenu(bar));
 

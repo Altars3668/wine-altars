@@ -10216,7 +10216,7 @@ Office 里：普通会话中过滤器被问几十次，全是类型 0、全部�
    （dce.c 里本就注明“跨进程失效尚未支持”）。现在父窗口在别的进程时，向它投递 `WM_WINE_INVALIDATEDCE`，由它的线程把该窗口及其后代的 DC
    标脏。之后在 X 上截屏，就地工作表完整画在文档里，没有残影。
 
-还没解决的：Excel 的功能区显示在 Word 的功能区**下面**而不是取代它。Excel 建了共享菜单后调 Word 的 `IOleInPlaceFrame::InsertMenus`，
+当时还没解决的（后文“Word 就地激活时换上 Excel 的功能区”一节解决了它）：Excel 的功能区显示在 Word 的功能区**下面**而不是取代它。Excel 建了共享菜单后调 Word 的 `IOleInPlaceFrame::InsertMenus`，
 Word 的实现（`SDOF::InsertMenus`，转给 Office 命令栏对象的虚方法 +0x1d0）第一步就对这个菜单调 `GetMenuInfo`，Wine 的菜单只在创建它的进程里
 可用（`grab_menu_ptr: other process menu`），于是 E_INVALIDARG；Excel 随即销毁共享菜单、以空菜单调 `SetMenu`（Word 答 E_FAIL），Word 保留
 自己的功能区。Windows 的 HMENU 跨进程可用；要在 Wine 里做到，得把菜单操作转给创建菜单的线程（句柄表记着它）代办，或把菜单放进共享内存，
@@ -10272,3 +10272,82 @@ LockFile 传本地状态块。
 - 测试里 `ov.Internal` 是 ULONG_PTR，要先转成 NTSTATUS 再和负的状态常量比，否则 64 位上符号扩展后永远不等，Windows 上也一样。
 - 前缀里被杀掉的 Word 留下的文档，下次以桌面方式启动 Word 时会全部作为恢复文档打开（标题“最后由用户保存”），
   `office-debug.sh close` 只关得掉一个窗口。
+
+## Word 就地激活时换上 Excel 的功能区：跨进程的菜单与菜单栏，以及跨进程呈现的偏移（wine-src `4239112`、`7886337`、`8fd4a53`、`d4b9f9a`）
+
+上一节剩下的问题出在菜单：Excel 建好共享菜单后请 Word 的 `IOleInPlaceFrame::InsertMenus` 放进容器的菜单组，Word 先对它调
+`GetMenuInfo`，而 Wine 的菜单只活在建它的进程里。`tools/menuprobe` 在 Windows 上量出（`menuprobe.win.txt`）：另一个进程对菜单
+的读、改、插入自己的弹出菜单、删除、销毁全都可以；它可以把别人的菜单设成自己窗口的菜单栏，窗口为它让出位置、排好版，销毁窗口
+时连菜单一起销毁；可以跟踪别人的弹出菜单，通知里说的是那个菜单本身；建菜单的进程退出时，别人插进来的弹出菜单随之消失。
+
+1. **对另一个进程的菜单的调用**（`4239112`）：连同要设的或要读的文本打包，作为内部消息 `WM_WINE_MENU_CALL` 发给拥有菜单的线程，
+   由它执行并送回结果与错误码；拥有者线程要像处理别的线程对它窗口的调用那样收发消息。之后 Word 用 Excel 的功能区换下了自己的。
+2. **把别人的菜单显示成自己的菜单栏、跟踪别人的弹出菜单**（`7886337`）：排版、绘制和跟踪都要菜单项在本进程。现在本进程显示
+   另一个进程的菜单时经一份本地副本：菜单项照那边的样子，子菜单句柄照原样，所以应用收到的 WM_INITMENU、WM_INITMENUPOPUP、
+   WM_MENUSELECT、WM_MENUCOMMAND、WM_MENUCHAR、GetMenuBarInfo 与 MN_GETHMENU 仍是它认识的菜单。菜单成为窗口菜单或第一次显示时
+   建副本，菜单栏排版、DrawMenuBar、以及已通知应用菜单即将显示之后刷新，菜单销毁时丢弃。
+   这一步决定了 Excel 的工具栏放在哪里。Word 就地激活的顺序是 GetBorder → SetBorderSpace → SetActiveObject → InsertMenus → SetMenu；
+   `SDOF::GetBorder` 给的是框架客户区减去 MWD 记着的四边留白（+0x154～+0x160），Word 只在 `AppWndProc` 处理 WM_SIZE 时调 Excel 的
+   `IOleInPlaceActiveObject::ResizeBorder`。`SDOF::SetMenu` 里 `TBS::UIActivate` 经 `TBS::FUpdate` → `OTBSU::HrSetBorderSpace` 更新
+   留白，再由 `TBS::SetMenu` 调 `SetMenu(框架, 共享菜单)`：菜单栏出现、框架客户区变矮、WM_SIZE、`ResizeBorder`（顶边为 0），
+   Excel 才按新边框重排。菜单栏排不出来时没有这次 WM_SIZE，Excel 按旧边框摆放。
+3. **跨进程呈现的偏移**（`8fd4a53`）：菜单栏出现后，工作表只剩最上面约 20 像素。Excel 用 D3D/DirectComposition 画的子窗口内容
+   呈现到顶层 X 窗口时，要加上顶层客户区在 X 窗口里的偏移，而这个偏移只存在拥有顶层的进程（Word）的驱动数据里；Excel 进程里
+   没有它，内容被放高了一个菜单栏。`get_window_rectangles` 现在也回可见矩形（即 X 窗口的矩形），另一个进程的顶层由此得到偏移，
+   `NtUserGetWindowRects` 把任一窗口的三个矩形交给驱动。
+4. **菜单栏矩形**（`d4b9f9a`）：窗口为菜单栏让出的位置在菜单项上方有 1 像素的边；Windows 的 GetMenuBarInfo 给的矩形与菜单项等高，
+   比让出的位置少 1 像素，Wine 原来整整多算了这一像素（menu 测试里原有的 todo）。
+
+`tools/officeautomationprobe/word-embed.vbs` 就地激活后，Word 的菜单栏是“文件(F) 窗口(W)”，下面是 Excel 的快速访问工具栏、功能区
+与编辑栏，文档里的工作表有列标、行号和选中的 A1。user32 `menu` 测试新增子进程把父进程菜单设成菜单栏的用例（Windows 上同样通过），
+`msg`、`win` 失败数与基线相同；`menuprobe` 在 Wine 下与 Windows 逐行一致。
+
+还没做的：
+
+- 菜单的排版只存在显示它的进程：第三个进程对这个窗口调 GetMenuBarInfo 拿不到矩形（Windows 由 win32k 统一排版）。
+- 拥有菜单的线程必须收发消息，否则对它菜单的调用要等到超时。
+
+## 格式与控制字符不占宽度也不画，DrawText 照 Windows 断行（wine-src `9b5bdea`、`b0d674a`）
+
+就地激活后 Word 的菜单栏显示成“文件□□(F) 窗口□□(W)”：Office 合并菜单组时给菜单名加了零宽空格（U+200B），Wine 按字体的缺省字形
+量和画。`tools/textprobe/zwspprobe` 在 Windows 上测了菜单字体（微软雅黑 UI）、Tahoma、Courier New、Wingdings 与 Marlett
+（`zwspprobe.win.txt`）：
+
+- 这些字符不管字体有没有字形、字形多宽，文本宽度都不算它们、也不画：C0 里只有 TAB、LF、CR 与 U+001C～U+001F（U+0000、U+0001、
+  U+001B、VT、FF 不在内），C1 全部，U+034F，U+061C，U+200B～U+200F，U+2029，U+202A～U+202E，U+2061～U+2064，U+206A～U+206F，
+  U+FE00～U+FE0F，U+FEFF。U+2028、U+2060、U+2066～U+2069、U+00AD、U+180E、U+FFF9～U+FFFB 等不在内。GetCharWidth32 不受影响。
+- 符号字体（Wingdings）只剩 C0 那几个、U+200B～U+200D、变体选择符与 U+FEFF；Marlett 连 C0 也不算（原因未明，Wine 自带的 Marlett
+  只用来画界面符号，没有照做）。
+- 设了字符间距（SetTextCharacterExtra）时全部不做，宽度退回每个字符的 GetCharWidth32 加间距；ExtTextOut 带 ETO_IGNORELANGUAGE
+  时也不做，照字形画。说明这是 gdi32 的语言处理（LPK，经 Uniscribe）做的，不是 win32k。
+- 调用方给 lpDx 时，这些字符的宽度保留（位置空着），唯独 U+200B～U+200D、U+FEFF 和 U+061C 的宽度被丢掉。
+- GetTextExtentExPoint 算能放下几个字符时，这些字符只有结束在上限**之前**才算放得下（恰好在上限处不算），U+200B～U+200D、U+FEFF 与
+  组合用的 U+034F、变体选择符跟随前一个字符；开头的零宽字符同样按“之前”算，开头的变体选择符跟随后一个字符。
+
+实现分两层，与 Windows 一致：gdi32 做了语言处理（没有 ETO_IGNORELANGUAGE、不是字形索引）时，ExtTextOutW 不再给 win32u 加
+ETO_IGNORELANGUAGE，GetTextExtentExPointW 传 `NTGDI_GETTEXTEXTENT_LANGUAGE`；win32u 在没有字符间距时去掉这些字符的前进宽度，
+绘制时把它们从串里拿掉、一次交给驱动（给了 delta 的并到前一个字符上）。不用“按宽度逐个定位”的办法，是因为 Wine 里同一字体的
+GGO_METRICS 前进宽度和单色位图的前进宽度可以不同（Wine 的 Tahoma 11 像素时 'a' 是 7 与 6），按宽度定位的串会和不含这些字符的
+同一串画得不一样。双向文本走 Uniscribe 的路径：Uniscribe 标为零宽的字形同样拿掉、宽度扣掉；符号字体不做双向处理（Windows 上
+Wingdings 里的方向控制符照样画出来）；这条路径的 GetTextExtentExPoint 顺带改成不问能放几个时照样填满各字符的范围，簇的宽度按
+字符累计分摊。
+
+DrawText 因此暴露了断行的差别：user32 `text` 测试里 “Hello &World!\tThis…” 原来只因制表符有缺省字形那么宽才通过，制表符不占宽度后
+断在了 “Hello ” 之后。`tools/textprobe/linebreakprobe` 在 Windows 上测到（`linebreakprobe.win.txt`）：DrawText 在空格、制表符与全角
+空格后断行，断处的这些空白被吃掉；不在不间断空格、VT、en space、零宽空格处断，也不在连字符后断；东亚全角字符与相邻字符之间可以断，
+但不让“不可行首”的标点开头（它退回前一个字符之前），开括号可以留在行尾，长音符“ー”与小假名可以开头，单书名号 ‹ › 不能结尾。
+“不可行首”表按中文（简体）Windows 实测，写在 `dlls/user32/text.c`。Wine 原来用 Unicode 断行算法的空白与软断点，两处都与此不符。
+
+两个探针在 Wine 下与 Windows 逐行一致（Marlett 那一行除外）；gdi32 `font` 与 user32 `text` 新增的测试在 Windows 上通过，gdi32
+`font`、`metafile`、`path`、`dib`、`mapping`、`dc`，user32 `text`、`menu`、`edit`、`static`、`listbox`、`combo`，comctl32 的
+button、static、edit、listview、tooltips，usp10 与 riched20 `txtsrv` 与基线相同；riched20 `editor` 只多出与桌面共用剪贴板的
+粘贴失败，多跑几次时新旧版本互有多少。Office 回归通过。
+
+还没做的：
+
+- 双向文本里调用方给的 lpDx 被整个丢掉（原来就如此），所以方向标记“保留宽度”在这条路径上不成立（测试里的 todo）。
+- 非双向路径没有簇：Windows 把组合字符与前一个字符的宽度在两者间分摊（GetTextExtentExPoint 的逐字范围），组合用的浊点
+  U+3099/U+309A 在 DrawText 里跟随前一个字符。
+- GetCharacterPlacement 的 lpDx 仍取 GetCharWidth32；Windows 对字体里没有的字符给 0，并按簇分配。
+- Windows 对字体里没有的字符用字体链接（SystemLink）的字体量宽度，与 Wine 的缺省字形宽度不同（探针里 U+115F、U+17B4 等）。
+- 上面说的 GGO_METRICS 与单色位图前进宽度不一致本身：Wine 的 GetTextExtentPoint 与实际画出的宽度在这种字号上不相等。
