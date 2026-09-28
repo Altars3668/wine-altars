@@ -10562,3 +10562,36 @@ libxml2 的实体，并按 Windows 实测报告：`elementDecl` 的内容模型�
 报 `skippedEntity` 而不是出错。msxml3 把缺省的公共/系统标识报成 NULL，msxml6 报空串，并把系统标识按基准 URL（或当前目录）解析成绝对
 URL；`getBaseURL`/`getSecureBaseURL` 与对应的 put 原来都是桩。两份新测试（msxml3、msxml6）在 Windows 与 Wine 上都通过；Office
 的包里没有 DTD，改后两个普查与回归照常通过。
+
+## VBScript：移植上游、补齐错误表与译文，以及对象参数、Null 与流名（wine-src `33bb4986`…`ffa8703d`）
+
+起因是 Excel 普查里同一个 445 错误，Wine 的中文描述是“对象不支持此动作”，Windows 是“对象不支持此操作”。顺着查下去，Wine 的 vbscript
+缺的远不止译文：字符串表 35 条（Windows 130 条），`Eval/Execute/ExecuteGlobal/GetRef`、`DateDiff/DatePart/DateValue/TimeValue`、`Filter`、
+`Escape/Unescape`、`Get/SetLocale`、`LenB` 一族、`InputBox`、`LoadPicture` 全是 E_NOTIMPL 桩。`tools/vbscriptprobe` 的五个脚本在 Windows 与
+Wine 上逐项对照。
+
+- **移植上游。** 上游 Wine 自 11.0 起有 180 个 vbscript 提交（绝大多数是 Francis De Brabandere 的），补上了上面多数函数、编译错误号与大量
+  解析细节。CrossOver 没改过 vbscript，除一个全局的版本资源提交外 179 个都干净地套上，结果与上游 master 逐文件相同（只差版本资源）。
+  其中 And/Imp 与 Null 的测试依赖同期的 oleaut32 修正，于是把上游 oleaut32 自 11.0 起的 25 个提交一并移植（VarAnd/VarImp 的 Null、
+  VarDecRound、VariantTimeToSystemTime 的毫秒溢出、格式化函数的几处越界等），oleaut32 与 vbscript 的全部测试通过。之前本地实现的 ChrW/AscW
+  与一版错误号修正先撤回，由上游版本取代。
+- **错误表与译文（`33bb4986`）。** 在上游 88 条之外补齐到 Windows 的 130 条（只缺 30000，其中文是“ZH”，英文原文无从核实）。中文取自
+  Windows 自己的 vbscript.dll 与 jscript.dll 字符串表（`tools/stringtableprobe`；两者共享的条目用词一致），59 条已有译文改成 Windows 的说法，
+  新增 79 条；vbscript 的 “File not found”（Windows 是“文件未找到”）与 comdlg32 的（“找不到文件”）用 msgctxt 分开。
+- **行为（`62b2634e`）。** 内建函数拿到对象参数时先取其默认属性值、取不到即报那个错（Dictionary → 450，RegExp → 438），只有
+  `IsObject/IsArray/IsDate/IsEmpty/IsNull/IsNumeric/TypeName/VarType/Array` 按对象本身接收，`VarType` 返回默认值的类型（取不到才是 9）；
+  `TypeName` 先问 `IProvideClassInfo`（Dictionary 是 “Dictionary” 而不是 “IDictionary”）；Chr/Sqr/String/StrReverse/Round/Rnd 对 Null 报 94，
+  Trim 系列返回 Null；Exp 溢出报 6；`CreateObject("")`/`GetObject("")` 报 5；Split 计数 0 得空数组；非 Option Explicit 下调用未声明的名字报 13；
+  `LoadPicture` 实现为 Picture 对象（找不到 432、路径不存在或空名 76、非图片 481）；引擎版本报 10.8.16384、文件版本 10.0.29671.1000，与这版
+  Windows 相同。
+- **oleaut32（`fcc0548e`、`3622d349`）。** 中文（简、繁）的 `VARIANT_LOCALBOOL` 布尔串在 Windows 上仍是 True/False、俄语 True 是 Истина
+  （`tools/boolstrprobe`），Wine 原来是“真/假”——VBScript 的 `CStr(True)`、字符串拼接都受影响。`OleLoadPicture` 对非图片数据报
+  `CTL_E_INVALIDPICTURE`（无 placeable 头的元文件仍是 E_FAIL），`OleLoadPictureFile("")` 得空图片、目录不存在报 `CTL_E_PATHNOTFOUND`。
+- **scrrun（`9beb1290`）。** `GetFile` 对目录不存在或指向文件夹一律“文件未找到”，`GetFile/GetFolder("")` 是无效参数，`DeleteFolder` 不存在的
+  文件夹是“路径未找到”。
+- **ntdll 的流名（`ffa8703d`）。** 冒号只在路径最后一段表示流：中间一段带冒号（`C:\Windows:x\y`、`file:C:\x`、`win.ini:bad\name`）在 Windows
+  上是 `ERROR_INVALID_NAME`，Wine 原来当成目录名去找、报“路径未找到”；`文件::$DATA` 是文件自己的数据流，Windows 能打开，Wine 原来找不到。
+  unix 命名空间里的名字不受影响；kernel32 里原本标 todo 的 `CreateFileA("c:c:\\windows")` 现在直接通过。
+
+对照结果：`expressions.vbs`、`runtime.vbs`、`objects.vbs`、`files.vbs` 与 Windows 逐行相同，`errors.vbs` 只差 30000。新测试在 Windows 与 Wine 上
+都通过（vbscript 的 run 测试在中文 Windows 上另有 26 处失败，全是上游用例拿英文描述比较），三个应用的回归与 Word、Excel 普查照常通过。

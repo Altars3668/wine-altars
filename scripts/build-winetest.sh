@@ -23,6 +23,7 @@ for spec in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.spec\b'); do
     srcs=$(echo "$srcs" | grep -vxF "${spec%.spec}.c")
 done
 stubs=
+idlres=
 for idl in $(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o '[a-z0-9_.]*\.idl'); do
     tools/widl/widl -o $O/${idl%.idl}.h -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
     # an RPC interface the tests call needs its client stubs, as makedep would generate them
@@ -30,10 +31,19 @@ for idl in $(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o 
         tools/widl/widl -c -o $O/${idl%.idl}_c.c -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
         stubs="$stubs ${idl%.idl}_c.c"
     fi
+    # the GUIDs it defines, and the type library it describes as a resource (makedep's ident and typelib)
+    if grep -q '^#pragma makedep.*\bident\b' ../dlls/$dll/tests/$idl; then
+        tools/widl/widl -o $O/${idl%.idl}_i.c -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
+        stubs="$stubs ${idl%.idl}_i.c"
+    fi
+    if grep -q '^#pragma makedep.*\btypelib\b' ../dlls/$dll/tests/$idl; then
+        tools/widl/widl -o $O/${idl%.idl}_l.res -m64 --nostdinc -Ldlls/\* -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
+        idlres="$idlres $O/${idl%.idl}_l.res"
+    fi
 done
 FLAGS="$FLAGS -I$O"
 # the tests' resources (user32's menus and dialogs, for one), compiled as makedep has wrc compile them
-res=
+res=$idlres
 for rc in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.rc\b'); do
     tools/wrc/wrc -u -o $O/${rc%.rc}.res --nostdinc -I$O -Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include \
         -I../include/msvcrt -D_MSVCR_VER=0 -D__WINESRC__ ../dlls/$dll/tests/$rc
