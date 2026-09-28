@@ -10492,3 +10492,36 @@ odt、dotx、xml）、导出 PDF 与 XPS、加密保存后再用密码打开（�
 （`AppVIsvSubsystems64.dll`）要 `RtlIsNameInExpression` 与 AVL 通用表的枚举、判空；WinAppSDK 的 `CoreMessagingXP.dll`（Word 启动时经 React Native
 宿主激活 `Microsoft.UI.Dispatching.DispatcherQueue` 时加载）要 ALPC、等待完成包（`NtCreateWaitCompletionPacket` 一族）与 shcore 的功能用量记录；
 `mso30win32client.dll` 要 msvcp140 里宽字符的 `moneypunct` 与 `money_put` 的 `id`（Wine 的 msvcp 没有货币类 facet）。
+
+## App-V 子系统的 AVL 表与名字匹配（wine-src `c92e5b9`）
+
+Word 等应用都加载 Office 自带的 `AppvIsvSubsystems64.dll`（C2R 的进程内虚拟化层，经 `Office16` 里的重解析点指向 ClickToRun 目录的那份），
+它的表是 ntdll 的 AVL 通用表，名字用 `RtlIsNameInExpression` 匹配。Wine 的 AVL 函数全是空操作——初始化不初始化，插入不分配也不返回，
+查找永远为空——枚举、删除与 `RtlIsNameInExpression` 或缺或一调就异常。`tools/avlprobe` 在 Windows 上量了树形与平衡因子（BalancedRoot 的
+Balance 是再平衡的哨兵）、删除时谁来顶替、游标与 RestartKey 在插入删除后的去向、`LikeADirectory` 的规则，以及 2160 组通配符匹配（含 DOS 的
+`<`、`>`、`"` 与 NT 算法的怪癖），实现后探针输出与 Windows 逐行相同，ntoskrnl 原来永远返回 FALSE 的 `FsRtlIsNameInExpression` 也用它。
+
+App-V 子系统启动时仍抛两次（都被接住）`windows_exception_impl<0>`：它唯一的抛出点是注册表类 `reg_key`，打不开的是
+`HKLM\SOFTWARE\Microsoft\AppV\Subsystem\ComExclusions` 和 `HKLM\SOFTWARE\WOW6432Node\Microsoft\AppV`——Windows 自带的 App-V 客户端
+（`Enabled=0`）的配置，前缀里没有；它们只是 COM 与对象名的排除表，未补。
+
+## WebP 图片：Office 先找 WebP 图像扩展的 MF 变换，再用 WIC 解码（wine-src `c6061ac`、`2330bd8`、`3adedf3`）
+
+Word 普查里最后一项失败是插入 WebP：`AddPicture` 不报错，但文档里什么也没有，取形状属性得 E_FAIL。Windows 11 build 29671 的 WIC 自带
+“Microsoft Webp Decoder”（还有 HEIF、Raw、JPEG XL 解码器），Wine 没有；可补上解码器后 Word 仍然什么都不插，而且根本没加载 windowscodecs。
+跟踪到 Word 先调 `MFTEnumEx(视频解码器, 输入 Video/{7693e886-…})`——子类型就是 WIC WebP 解码器的 CLSID——没有结果就放弃。Windows 上的
+结果是 Store 的 WebP 图像扩展包登记的 “WebpImageExtension”：可以激活，除 `GetAttributes` 外每个方法都返回 `E_NOTIMPL`，只是个标记；
+WIC 解码器报的是 MF 错误码，背后也是这个扩展包（`tools/mftwebpprobe`）。
+
+- `libs/webp` 捆绑 libwebp 1.6.0 的解码部分。Windows 的解码结果与 libwebp 逐字节相同：静态图是 `WebPDecodeRGBA`，动画帧是
+  `WebPAnimDecoder` 合成的整幅画布，一律非预乘 32bppRGBA、72 DPI（`tools/wicwebpprobe`，7 个样本逐项吻合）。
+- 解码器照 Windows 的怪癖：静态图只要头能读出尺寸就创建成功，解码时才报 `MF_E_INVALID_FILE_FORMAT`；动画须完整，否则创建时 `E_UNEXPECTED`；
+  `GetFrame` 越界也成功，取像素得 `MF_E_INVALIDINDEX`。动画的循环次数与每帧时长是元数据，由 ANIM、ANMF 两个读取器给出（有组件信息、
+  不能 COM 创建，与 Windows 一样）。
+- windowscodecs 登记同样的标记变换；mfplat 的 `MFTEnumEx` 原来不给注册表里的变换名字、只给过滤那一侧的类型，照 Windows 补全。
+- 顺带补齐 WIC 组件信息：各编解码器的四个 `DoesSupport*`、元数据处理器的 `DoesRequireFixedSize`、签名状态（一律 Signed）、SpecVersion
+  原来是桩或缺失；DDS 编码器登记进编码器列表；几个元数据读取器/写入器的名字与标志改成 Windows 的。
+
+结果：Word 普查 43 项全部通过，WebP（有损、带透明、动画）都插得进去，文档里存成 PNG，与 libwebp 的解码逐像素相同（带透明的差 ≤2，
+是 Word 自己的预乘舍入）。三个应用的回归照常通过。还缺的 WIC 组件：CUR、DNG、HEIF、Raw、JPEG XL 解码器与 HEIF、JPEG XL 编码器，
+以及大量像素格式、转换器和元数据处理器（Windows 89/5/45/43，Wine 30/1/16/7）。
