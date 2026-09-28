@@ -110,3 +110,18 @@ Word 启动时就调用 `CoRegisterActivationFilter`（过滤器是堆上的对�
 - **IRemUnknown 的调用（RemQueryInterface、RemRelease）不交给过滤器**，只有应用自己的调用才交。Wine 原先都交，还把 COM 内部的 RemUnknown 对象当作 `pUnk` 递给应用——Word 的过滤器每次都去 QI 它要 Word 自己的接口 `{000209FA-…}`，于是 Office 日志里满是 `RemUnknown_QueryInterface No interface`。
 - 调用类型：线程在 `CoWaitForMultipleHandles` 里等（包括等自己发出的调用）时到来的调用是 `CALLTYPE_TOPLEVEL_CALLPENDING`（4）；只在普通消息循环里时是 `CALLTYPE_TOPLEVEL`（1）。Wine 原先按“正在服务的调用数”判断。
 - 另：Office 在很多对象上 QI 的 `{E19C7100-9709-4DB7-9373-E7B518B47086}`，Windows 上 NetworkListManager、WbemLocator、MXXMLWriter60、SAXXMLReader60 同样答 E_NOINTERFACE（临时探针实测），Wine 那些 FIXME/ERR 只是日志。
+
+# 被拒绝与“稍后再试”的调用：retrylater 的原生对照
+
+`retrylater.c`：主线程（单线程套间）注册一个按给定次序回答 `HandleInComingCall` 的消息过滤器（`SERVERCALL_RETRYLATER`、`SERVERCALL_REJECTED`，用完后 `SERVERCALL_ISHANDLED`），做一个只有 IPersist 的对象；另一个线程作为单线程套间、注册自己的过滤器（其 `RetryRejectedCall` 也按给定次序回答：0 立即重试、150 等 150 毫秒、-1 放弃），调 `IPersist::GetClassID`，打印结果、两边过滤器被调到的参数和大致耗时。再从没有过滤器的单线程套间、从多线程套间各做一遍；最后把对象放进本探针另起的一个进程里，跨进程再做其中几种。
+
+    scripts/build-probe.sh tools/comprobe/retrylater.c tools/comprobe/retrylater.exe ole32 user32
+
+`retrylater.win.txt` 是 winref（build 29671）上的输出；wine-src `728920b` 之后 Wine 与之逐行一致（进程内与跨进程都是）。
+
+- 被调方回答 `SERVERCALL_RETRYLATER` 或 `SERVERCALL_REJECTED` 时，**调用不执行、原样退回调用方**。Wine 原先对“稍后再试”照样执行（FIXME），对拒绝返回 `RPC_E_CALL_REJECTED` 但从不问调用方。
+- 调用方是**有过滤器的单线程套间**：调它的 `RetryRejectedCall(被调线程的 ID, 从调用开始的毫秒数, 被调方的回答)`；返回 -1 则调用以 `RPC_E_CALL_REJECTED` 失败；0–99 立即重发（99 也是立即）；≥100 等那么多毫秒再重发，等待期间不调 `MessagePending`（没有消息到来时）。重发后被调方的过滤器再被问一次。两种回答都这样处理，只是 `dwRejectType` 不同。
+- **没有过滤器的单线程套间**：两种回答都是 `RPC_E_CALL_REJECTED`，不重试。**多线程套间**：“稍后再试”是 `RPC_E_SERVERCALL_RETRYLATER`（0x8001010A），拒绝是 `RPC_E_CALL_REJECTED`。
+- `HandleInComingCall` 的 `htaskCaller` 是**调用方线程的 ID**（调用方是多线程套间时为 0），跨进程时也是；Wine 原先给的是被调进程自己的 PID。Wine 在本地调用的 ORPCTHIS 的 `reserved1` 里捎带调用方的单线程套间线程（Windows 另有自己的本地 ORPCTHIS 结构），被调线程则取自对方套间的 OXID。
+
+Office 为什么需要：Excel 在 Word 里就地激活时调 `IOleInPlaceFrame::SetBorderSpace`，Word 正在排版，它的过滤器回答“稍后再试”；Wine 原先当场执行，在 Word 不愿意的时刻重入了它的代码。

@@ -13,6 +13,16 @@
  *
  * If the module is not loaded yet, it arms when the module loads: the name is
  * read from the export directory of each image the debug events report.
+ *
+ * BPTRACE_ARG7=<hex> reports (and counts) only the hits whose seventh argument,
+ * at [rsp+0x38] on entry, is that value -- SetWindowPos's flags, say; and
+ * BPTRACE_R9=<module>+<hex> only those whose fourth argument, in r9, is that
+ * address -- SetTimer's timer procedure; BPTRACE_RDX=<hex> only those whose
+ * second, in rdx, is that value -- a timer's id.  Each hit carries the tick
+ * count it happened at.
+ * BPTRACE_STACK=<n> also prints, of the first n qwords of the stack, those that
+ * point into a loaded module: a heuristic call chain, return addresses and some
+ * stale values among them, which a PDB turns into function names.
  * Everything is restored before detaching at max_hits; killing it while armed
  * leaves int3s behind in the target, which then dies on the next hit.
  *
@@ -86,6 +96,11 @@ int main(int argc, char **argv)
     DWORD pid; const char *mod; char *list, *tok; int maxhits, hits = 0;
     DWORD64 base = 0; DEBUG_EVENT ev; SIZE_T n; BYTE cc = 0xcc;
     DWORD stepping_tid = 0; int stepping_bp = -1; BOOL first = TRUE;
+    const char *arg7_env = getenv("BPTRACE_ARG7"), *stack_env = getenv("BPTRACE_STACK");
+    const char *r9_env = getenv("BPTRACE_R9"), *rdx_env = getenv("BPTRACE_RDX");
+    DWORD64 arg7_want = arg7_env ? strtoull(arg7_env, NULL, 16) : 0, r9_want = 0;
+    DWORD64 rdx_want = rdx_env ? strtoull(rdx_env, NULL, 16) : 0;
+    int stack_qwords = stack_env ? atoi(stack_env) : 0;
 
     if (argc < 5) { printf("usage: bptrace pid module rvas maxhits [offs]\n"); return 2; }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -97,6 +112,14 @@ int main(int argc, char **argv)
         load_modules(pid);
         for (int i = 0; i < nmods; i++) if (!_stricmp(mods[i].name, mod)) base = mods[i].base;
         if (!base) Sleep(250);
+    }
+    if (r9_env)
+    {
+        char r9_mod[64]; const char *plus = strchr(r9_env, '+');
+        lstrcpynA(r9_mod, r9_env, plus ? min(64, plus - r9_env + 1) : 64);
+        for (int i = 0; i < nmods; i++) if (!_stricmp(mods[i].name, r9_mod)) r9_want = mods[i].base;
+        if (!r9_want) { printf("%s is not loaded\n", r9_mod); return 1; }
+        r9_want += plus ? strtoull(plus + 1, NULL, 16) : 0;
     }
     list = _strdup(argv[3]);
     for (tok = strtok(list, ","); tok && nbp < MAXBP; tok = strtok(NULL, ",")) bps[nbp++] = strtoull(tok, NULL, 16);
@@ -117,16 +140,28 @@ int main(int argc, char **argv)
             {
                 HANDLE th = OpenThread(THREAD_ALL_ACCESS, FALSE, ev.dwThreadId);
                 CONTEXT ctx; ctx.ContextFlags = CONTEXT_FULL; GetThreadContext(th, &ctx);
-                DWORD64 ret = 0, off; ReadProcessMemory(proc, (void *)ctx.Rsp, &ret, 8, &n);
-                const char *rm = modname(ret, &off);
-                printf("hit %d rva %llx tid %lx rcx %llx rdx %llx r8 %llx ret %s+%llx", ++hits, bps[which] - base,
-                       ev.dwThreadId, ctx.Rcx, ctx.Rdx, ctx.R8, rm, off);
-                for (int k = 0; k < noff; k++)
+                DWORD64 ret = 0, off, arg7 = 0; ReadProcessMemory(proc, (void *)ctx.Rsp, &ret, 8, &n);
+                ReadProcessMemory(proc, (void *)(ctx.Rsp + 0x38), &arg7, 8, &n);
+                if ((!arg7_env || (DWORD)arg7 == arg7_want) && (!r9_env || ctx.R9 == r9_want) &&
+                    (!rdx_env || ctx.Rdx == rdx_want))
                 {
-                    DWORD64 q = 0; ReadProcessMemory(proc, (void *)(ctx.Rcx + offs[k]), &q, 8, &n);
-                    printf(" [rcx+%llx]=%llx", offs[k], q);
+                    const char *rm = modname(ret, &off);
+                    printf("hit %d tick %lu rva %llx tid %lx rcx %llx rdx %llx r8 %llx r9 %llx arg7 %llx ret %s+%llx",
+                           ++hits, GetTickCount(), bps[which] - base, ev.dwThreadId, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9,
+                           arg7 & 0xffffffff, rm, off);
+                    for (int k = 0; k < noff; k++)
+                    {
+                        DWORD64 q = 0; ReadProcessMemory(proc, (void *)(ctx.Rcx + offs[k]), &q, 8, &n);
+                        printf(" [rcx+%llx]=%llx", offs[k], q);
+                    }
+                    printf("\n");
+                    for (int k = 1; k < stack_qwords; k++)
+                    {
+                        DWORD64 q = 0; const char *qm;
+                        if (!ReadProcessMemory(proc, (void *)(ctx.Rsp + 8 * k), &q, 8, &n)) break;
+                        if ((qm = modname(q, &off))[0] != '?') printf("    [rsp+%x] %s+%llx\n", 8 * k, qm, off);
+                    }
                 }
-                printf("\n");
                 WriteProcessMemory(proc, (void *)bps[which], &orig[which], 1, &n); FlushInstructionCache(proc, (void *)bps[which], 1);
                 ctx.Rip = bps[which]; ctx.EFlags |= 0x100; stepping_tid = ev.dwThreadId; stepping_bp = which;
                 SetThreadContext(th, &ctx); CloseHandle(th);

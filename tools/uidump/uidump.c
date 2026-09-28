@@ -7,9 +7,11 @@
  * way round, asking the application for the text, so it works whether or not a
  * single pixel reached the screen.
  *
- *   uidump [class-substring]
+ *   uidump [class-substring] [pid]
  *
- * With no argument every top-level window is dumped.
+ * With no argument every top-level window is dumped; with a process id, only
+ * that process's.  Text beyond ASCII is written as \uXXXX, so that it survives
+ * an output captured as ASCII, as a remote run's is.
  *
  * Copyright 2026 AltarsCN.  LGPL 2.1 or later, as Wine.
  */
@@ -18,26 +20,35 @@
 #include <initguid.h>
 #include <oleacc.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *want;
+static DWORD want_pid;
+
+static void put_text(const WCHAR *s)
+{
+    for (; *s; s++)
+        if (*s >= 0x20 && *s < 0x7f) putchar(*s);
+        else printf("\\u%04x", *s);
+}
 
 static void put(const char *label, BSTR s)
 {
-    char a[1024];
     if (!s) return;
-    WideCharToMultiByte(CP_UTF8, 0, s, -1, a, sizeof(a), NULL, NULL);
-    if (a[0]) printf("%s=\"%s\" ", label, a);
+    if (s[0])
+    {
+        printf("%s=\"", label);
+        put_text(s);
+        printf("\" ");
+    }
     SysFreeString(s);
 }
 
 static const char *role_name(LONG role)
 {
     static char buf[64];
-    WCHAR w[64];
-    UINT n = GetRoleTextW(role, w, ARRAYSIZE(w));
-    if (!n) { sprintf(buf, "role%ld", role); return buf; }
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, sizeof(buf), NULL, NULL);
+    sprintf(buf, "role%ld", role);
     return buf;
 }
 
@@ -110,19 +121,29 @@ static BOOL CALLBACK enum_top(HWND hwnd, LPARAM param);
 
 static BOOL CALLBACK enum_top(HWND hwnd, LPARAM param)
 {
-    char cls[128], text[512];
+    WCHAR text[512];
+    char cls[128];
     IAccessible *acc = NULL;
     VARIANT self;
     RECT r;
 
     GetClassNameA(hwnd, cls, sizeof(cls));
-    if (want && !strstr(cls, want) && GetParent(hwnd) == NULL) return TRUE;
+    /* the filters choose top-level windows; a chosen one's children all go */
+    if (!param && want && !strstr(cls, want)) return TRUE;
+    if (!param && want_pid)
+    {
+        DWORD pid;
+
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != want_pid) return TRUE;
+    }
     if (!IsWindowVisible(hwnd)) return TRUE;
 
-    GetWindowTextA(hwnd, text, sizeof(text));
+    GetWindowTextW(hwnd, text, ARRAYSIZE(text));
     GetWindowRect(hwnd, &r);
-    printf("== hwnd %p class %s title \"%s\" %ldx%ld\n", hwnd, cls, text,
-           r.right - r.left, r.bottom - r.top);
+    printf("== hwnd %p class %s title \"", hwnd, cls);
+    put_text(text);
+    printf("\" %ldx%ld\n", r.right - r.left, r.bottom - r.top);
 
     /* Office answers WM_GETOBJECT on OBJID_CLIENT for the content and on
      * OBJID_WINDOW only for the frame, so ask for both rather than guess. */
@@ -145,13 +166,14 @@ static BOOL CALLBACK enum_top(HWND hwnd, LPARAM param)
 
     /* and walk the child HWNDs, because the content of a NUIDialog lives in a
      * NetUIHWND that EnumWindows never visits */
-    EnumChildWindows(hwnd, enum_top, 0);
+    EnumChildWindows(hwnd, enum_top, 1);
     return TRUE;
 }
 
 int main(int argc, char **argv)
 {
-    if (argc > 1) want = argv[1];
+    if (argc > 1 && argv[1][0]) want = argv[1];
+    if (argc > 2) want_pid = strtoul(argv[2], NULL, 0);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     EnumWindows(enum_top, 0);
     CoUninitialize();

@@ -19,4 +19,12 @@
 
 `powerpoint-gradients.vbs <输出.pptx> <进度日志> [秒数]` 在一张空白幻灯片上放各种渐变填充：30° 的线性渐变、从中心、从角部、多 stop 的彩虹预设、渐隐到透明（压在一条深色条上，看透明部分是否透出）、中间 stop 半透明的三色渐变，以及渐变填充的文字；保存后保持显示若干秒供截图，再退出。每一步单独容错并记录结果。
 
-`word-embed.vbs <输出.docx> <进度日志> [要打包嵌入的文件]` 在新文档里用 `InlineShapes.AddOLEObject("Excel.Sheet.12")` 嵌入一张 Excel 工作表（给了文件时再嵌入它的包），保存、关闭、重新打开，读嵌入对象的类，然后像双击那样 `OLEFormat.Activate` 就地激活，取 `OLEFormat.Object` 读 `Worksheets(1).Name`，关闭并退出。每一步单独容错并记录结果。ActiveX 控件不试：Microsoft 365 在激活之前就按策略拒绝（“由于您的策略设置，无法插入此对象。”）。它会以 `-Embedding` 启动 Excel；Word 的激活过滤器、跨进程的就地激活与 OLE 默认处理器都走一遍（见 `tools/comprobe/README.md`、`tools/subclassprobe/README.md`）。2026-09-28 起整个脚本在 Wine 下走完；有一次 Word 在最后 `Quit` 时崩溃（wwlib 内空指针，未能复现），另有一次 Word 退出后 Excel 过了几秒才退出。
+`word-embed.vbs <输出.docx> <进度日志> [要打包嵌入的文件] [显示秒数] [选项]` 在新文档里用 `InlineShapes.AddOLEObject("Excel.Sheet.12")` 嵌入一张 Excel 工作表（给了文件时再嵌入它的包），保存、关闭、重新打开，读嵌入对象的类，然后像双击那样 `OLEFormat.Activate` 就地激活，取 `OLEFormat.Object` 读 `Worksheets(1).Name`，关闭并退出。每一步单独容错并记录结果；激活失败时隔十秒再试，共三次。给了显示秒数时 Word 可见，工作表保持就地激活这么久再继续。选项用逗号分隔：`open` 改用 `DoVerb(OLEIVERB_OPEN)` 在 Excel 自己的窗口里打开；`new` 不附着已在运行的 Word、只启动并退出自己的实例（在别人的 Windows 机器上必须用它）；`existing` 不新建文档、直接打开已有的输出文档（某账户第一次新建文档时 Word 会弹“自动保存新文件？”并一直等人回答）；`wait` 在激活前写下 `waiting`，等到“进度日志名 + .go”这个文件出现才继续，好先挂上调试器。ActiveX 控件不试：Microsoft 365 在激活之前就按策略拒绝（“由于您的策略设置，无法插入此对象。”）。它会以 `-Embedding` 启动 Excel；Word 的激活过滤器、跨进程的就地激活与 OLE 默认处理器都走一遍（见 `tools/comprobe/README.md`、`tools/subclassprobe/README.md`）。2026-09-28 起整个脚本在 Wine 下走完；有一次 Word 在最后 `Quit` 时崩溃（wwlib 内空指针，未能复现），另有一次 Word 退出后 Excel 过了几秒才退出。
+
+`embedevents.exe <word-embed.vbs> <输出.docx> <进度日志> <显示秒数> [选项] [窗口.bmp]` 运行 `word-embed.vbs`（选项缺省为 `new`），用进程外的 WinEvent 钩子记录期间新出现的 Word 与 Excel 进程的每个窗口的创建、显示、隐藏、移动（只记 EXCEL* 与 `_WwG`）、换父窗口与销毁，注明事件来自哪个进程的线程，与脚本进度交错打印；显示期将尽时列出两者的窗口树，给了文件时用 `PrintWindow` 存下 Word 窗口画的内容（屏幕上别的东西不会进去）。启动前已在运行的 Office 进程只计数、不碰。
+
+    scripts/build-probe.sh tools/officeautomationprobe/embedevents.c tools/officeautomationprobe/embedevents.exe user32 gdi32
+
+在 Wine 下“由哪个线程引起”会显示为窗口所属的线程：跨线程的 `SetWindowPos` 在 Wine 里由窗口所属线程执行；要知道调用者，用 `+win` 看 `NtUserSetWindowPos` 所在的线程，或在调用者进程里对 `win32u.dll` 的 `NtUserSetWindowPos` 下断点（`tools/bptrace`，`BPTRACE_ARG7=8f` 只报隐藏）。
+
+2026-09-28 在 winref 上三次都没能得到原生的就地激活：Excel 以嵌入方式启动、加载完第三方加载项后，Word 的激活仍以 0x17B5（“……请确保 Excel 中的任何对话框都已关闭”）失败，Excel 从未建 EXCEL9 窗口；当时会话锁屏。另见 `docs/office365-under-wine.md` 的就地激活一节。

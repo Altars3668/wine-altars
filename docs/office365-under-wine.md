@@ -10172,3 +10172,57 @@ Office 里：普通会话中过滤器被问几十次，全是类型 0、全部�
 与预览 EMF）、重开、就地激活、经 `OLEFormat.Object` 读到 `Sheet1`、关闭、退出；三应用保存回归通过，ole32/combase/comctl32 测试的失败数与
 改动前相同（其中两个既有失败被修好），新测试在 winref 与 Wine 上都 0 失败。仍未解决：一次 Word 在 `Quit` 时于 wwlib 内空指针崩溃（未能复现）；
 偶尔 Word 退出后 Excel 过几秒才退出；默认处理器的聚合身份；只有 IUnknown 的本地服务器对象 Windows 也能 `OleRun`（ole_server 测试的 todo_wine）。
+
+## 就地激活之后看得见工作表：Excel 主窗口、消息过滤器与 Word 的滚动动画（wine-src `e7f8f28`、`c28e1b3`、`728920b`、`6d87101`）
+
+上一节之后脚本走得完，但激活的工作表看不见：Word 窗口里多了 Excel 的功能区和编辑栏，文档里却只有嵌入对象的预览图，以及几块带阴影边框的
+残影。一层层查下来：
+
+1. **Excel 的主窗口盖在 Word 上**（`e7f8f28`）。就地激活时 Excel 先显示自己的主窗口、随即隐藏；在窗口管理器还没映射它时隐藏，winex11 在映射
+   完成后按“期望状态”撤回——但下一次不带 SWP_HIDEWINDOW 的位置变化把“正在映射”当成窗口仍要显示，重新设了可见样式，把撤回换成了映射，
+   一个空白窗口留在 Word 上面。现在按期望状态判断。
+2. **消息过滤器**（`c28e1b3`、`728920b`）。IRemUnknown 的调用不该交给应用的过滤器（Word 的过滤器每次都去 QI COM 的内部对象）；调用类型按线程
+   是否在 COM 里等待区分（`tools/comprobe/msgfilter.c`）。之后看到 Word 的过滤器对 Excel 的 `IOleInPlaceFrame::SetBorderSpace` 答
+   `SERVERCALL_RETRYLATER`——Wine 照样执行了。`tools/comprobe/retrylater.c` 量出 Windows 的全套语义（退回调用方、由调用方过滤器的
+   `RetryRejectedCall` 决定放弃或何时重发，没有过滤器的单线程套间一律 `RPC_E_CALL_REJECTED`，多线程套间区分两种回答，`htaskCaller`
+   是调用方线程），进程内与跨进程都与 Wine 逐行一致。这一层单独修好不改变画面，但它是 Word 与 Excel 之间确实会走到的路径。
+3. **Word 自己把 Excel 的就地窗口藏起来了**（`6d87101`）。`tools/officeautomationprobe/embedevents.c` 记录窗口事件：EXCEL9（Excel 的就地窗口，
+   是 Word 文档窗格 `_WwG` 的跨进程子窗口）显示、隐藏、移动、再显示，约 100 毫秒后又被隐藏，此后再没显示。`+win` 显示最后那次
+   `SetWindowPos(…, SWP_HIDEWINDOW|SWP_NOREDRAW…)` 来自 Word 的主线程。在 Word 里对 `win32u!NtUserSetWindowPos` 下断点（`tools/bptrace`，
+   `BPTRACE_ARG7=8f` 只报这种隐藏，`BPTRACE_STACK` 扫栈），用 wwlib 的公开符号解析（见下）得到：
+   `CRootLayer::SetScrollArea → ScrollTo → BeginScrollZoomAnimation → ALayer::HideHwnds → CHwndLayer::HideHwnds`。即 Word 的 AirSpace 渲染层
+   开始一次滚动/缩放动画时，先藏起它承载的子窗口；动画结束（`CRootLayer::HandleViewportMove → EndScrollZoomAnimation → ShowHwnds`）再显示——
+   隐藏不足 250 毫秒就用 `MsoSetTimer`（→ `SetCoalescableTimer`，id 0x119）250 毫秒后由 `ShowHwndTimerProc` 再试。
+   对这些函数同时下断点（它们很少被调用，不改变时序）看到：第一次动画结束了；第二次 `BeginScrollZoomAnimation` 来自一次**目标与当前相同**的
+   `ScrollTo(-116, -325)`，之后“视口移动”通知再也没来。`ScrollTo` 只和自己记下的“上次位置”（`CRootLayer`+0x148/+0x14c）比较，而这个位置被
+   动画期间的通知改写为 -326——**差 1 像素**。
+   通知的来源是 WinComp（Windows.UI.Composition）后端的 InteractionTracker：Word 用 `TryUpdatePosition(-325, ClampingOption.Disabled)` 滚动，
+   同时 Content 视觉的 Size 用 267 毫秒的缓动动画变化，跟踪器的 MinPosition/MaxPosition 是引用 Content.Size 的表达式动画，经
+   `IsPositionRoundingSuggested ? Round(Floor/Ceil(…))` 取整，上下界始终相差 1。Wine 的空闲跟踪器每帧把**上一帧已钳过的位置**再钳进新边界，
+   于是位置先被钳到 -445，再被上升的下界一路推到 -326 停住（下界最终是 -326、上界 -325）。现在以不钳位方式请求的位置被保留：边界钳住的是
+   显示的位置，边界容得下时就回到请求的位置；新请求、Adjust、离开空闲状态都结束这种保留。之后 EXCEL9 在激活期间一直显示，工作表的
+   列标、行号、选中的 A1、滚动条与阴影边框都画在文档里。
+
+   **这一步未经 Windows 实测**：winref 当时锁屏，锁屏会话不产生合成帧——`tools/trackerprobe/clamp.c`（复刻上面的情形：不钳位地请求一个边界随后才
+   到达的位置）在 Windows 上一个回调都收不到、位置始终为 0，接了窗口目标也一样。依据只有文档的一句“Idle 与 CustomAnimation 状态下
+   Position 总在 MinPosition 与 MaxPosition 之间”，以及 Word 在 Windows 上不可能这样一直藏着就地窗口。会话解锁后应先跑 `clamp.exe`
+   （`scripts/winrun.sh --desktop`）对照，再决定保留还是修正这种语义。
+
+还没解决的：Excel 的功能区显示在 Word 的功能区**下面**而不是取代它——Excel 调 `IOleInPlaceFrame::InsertMenus` 得 E_INVALIDARG、`SetMenu`
+得 E_FAIL，Wine 的菜单句柄只在本进程有效，Windows 的 HMENU 跨进程可用；以及 EXCEL9 移动前的位置留着一块阴影边框的残影（隐藏与移动都带
+SWP_NOREDRAW，旧区域没有重画）。
+
+### Office 的 PDB 要经 OMAP 才能对上地址
+
+wwlib、mso 等 Office DLL 链接后经过重排（BBT），公开 PDB 里的符号仍是链接器给的地址：PDB 另存链接时的节表和一张 OMAP 表。不经换算，
+每个地址都对到毫不相干的函数上（wwlib 自己导出的 `FMain` 被解析成一个 JSON 序列化函数），PDB 的 GUID 却与 DLL 完全匹配。
+`scripts/pdb-addr2sym.py` 现在先按 DBI 可选调试头里的 OMAP_TO_SRC 把映像 RVA 换回源地址，再按原始节表找最近的公开符号；导出函数
+都对到自身 +0x0。`--lookup 名字片段` 反过来经 OMAP_FROM_SRC 给出函数在映像里的 RVA，用来反汇编与下断点。
+
+### winref 上做 Office 自动化的限制（2026-09-28）
+
+- 以 `new` 选项只启动自己的 Word：机器上一直开着用户的 WINWORD（`/restore` 启动，没有标题）。
+- 新建文档会等“云创建引导 / 自动保存新文件？”对话框（它显示账户名与邮箱，读到的内容不保留），回答它会改用户设置，所以改用 `existing`
+  打开事先做好的文档。
+- 嵌入的 Excel 三次都没能就地激活（0x17B5），Excel 从未建 EXCEL9；Excel 带 .NET/WebView2 与 Acrobat 的加载项，会话锁屏。
+- 自动化启动的 WINWORD 退出后常剩一个线程卡在内核里，`taskkill /F` 回答没有该实例，进程却一直列着。
