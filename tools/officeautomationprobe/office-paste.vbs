@@ -58,7 +58,18 @@ Else
     word.Selection.TypeParagraph
     word.Selection.PasteSpecial , , , , 0
     check "PasteSpecial as an object"
-    mark "pasted as an object: inline shapes " & document.InlineShapes.Count
+    mark "pasted as an object: inline shapes " & document.InlineShapes.Count & ", shapes " & document.Shapes.Count & _
+        ", fields " & document.Fields.Count & ", characters " & document.Characters.Count
+    For Each shape In document.Shapes
+        mark "  shape type " & shape.Type & ", class " & shape.OLEFormat.ProgID
+    Next
+    check "reading the floating object"
+    ' and once more in line with the text (wdInLine)
+    word.Selection.EndKey 6
+    word.Selection.TypeParagraph
+    word.Selection.PasteSpecial , , 0, , 0
+    check "PasteSpecial as an object in line"
+    mark "pasted in line: inline shapes " & document.InlineShapes.Count & ", shapes " & document.Shapes.Count
     For Each shape In document.InlineShapes
         mark "  inline shape type " & shape.Type & ", class " & shape.OLEFormat.ProgID
     Next
