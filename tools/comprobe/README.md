@@ -98,3 +98,15 @@ Word 启动时就调用 `CoRegisterActivationFilter`（过滤器是堆上的对�
 - 处理器自己有的（IOleObject、IDataObject、IPersistStorage、IRunnableObject、IViewObject2、IOleCache2）任何时候都给。
 - 别的接口：**从未运行过**时答 E_NOINTERFACE；**运行中**转给对象（IOleWindow、IOleInPlaceObject、IDispatch、IPersistFile 都拿得到），且拿到的指针 QI(IUnknown) 得到的是处理器本身——Windows 把代理管理器聚合在处理器里；**运行过又关闭**后答 CO_E_OBJNOTCONNECTED（CrossOver 注释里说的“原生返回 CO_E_OBJNOTCONNECTED”只对这种状态成立）；IOleLink 任何时候都是 E_NOINTERFACE。
 - wine-src `c3cde46` 按此实现了这三种状态的返回值；运行中返回的是对象代理本身，身份没有聚合进处理器——Wine 的 `CoGetStdMarshalEx` 还是桩、代理管理器不支持聚合，这一点仍与 Windows 不同。
+
+# 消息过滤器被交到哪些调用：msgfilter 的原生对照
+
+`msgfilter.c`：主线程（单线程套间）注册一个记录 `HandleInComingCall` 的消息过滤器、做一个只有 IPersist 的对象；另一个线程解组代理，向代理要一个对象没有的接口和 IUnknown（COM 经 IRemUnknown 去问对象的套间），调 `IPersist::GetClassID`，释放代理（IRemUnknown 的 RemRelease）——此时主线程在 `CoWaitForMultipleHandles` 里等；然后再解组一个代理、调一次 `GetClassID`，这时主线程只用 `GetMessage` 泵消息。
+
+    scripts/build-probe.sh tools/comprobe/msgfilter.c tools/comprobe/msgfilter.exe ole32 user32 uuid
+
+`msgfilter.win.txt` 是 winref 上的输出（开头一长串是 Windows 的 COM 在列集时对对象的 QI，与本题无关）。wine-src `c28e1b3` 之后，除这些 QI 外 Wine 与之一致。
+
+- **IRemUnknown 的调用（RemQueryInterface、RemRelease）不交给过滤器**，只有应用自己的调用才交。Wine 原先都交，还把 COM 内部的 RemUnknown 对象当作 `pUnk` 递给应用——Word 的过滤器每次都去 QI 它要 Word 自己的接口 `{000209FA-…}`，于是 Office 日志里满是 `RemUnknown_QueryInterface No interface`。
+- 调用类型：线程在 `CoWaitForMultipleHandles` 里等（包括等自己发出的调用）时到来的调用是 `CALLTYPE_TOPLEVEL_CALLPENDING`（4）；只在普通消息循环里时是 `CALLTYPE_TOPLEVEL`（1）。Wine 原先按“正在服务的调用数”判断。
+- 另：Office 在很多对象上 QI 的 `{E19C7100-9709-4DB7-9373-E7B518B47086}`，Windows 上 NetworkListManager、WbemLocator、MXXMLWriter60、SAXXMLReader60 同样答 E_NOINTERFACE（临时探针实测），Wine 那些 FIXME/ERR 只是日志。
