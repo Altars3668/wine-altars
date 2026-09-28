@@ -36,3 +36,9 @@
 `word-embedfonts.vbs <输出.docx> <进度日志>` 在新文档（缺省字体，外加一行中文）上打开 `EmbedTrueTypeFonts` 与 `SaveSubsetFonts`，存为 DOCX，关闭再打开，记下嵌入设置和正文开头。Word 保存时以字符列表调 `CreateFontPackage`，嵌入的 `word/fonts/font1.odttf` 是混淆过的子集：原先是 16 MB 的完整等线，现在未压缩 780 KB（字形号保持不变，所以度量表仍按原字形数），重新打开正常。
 
 `office-paste.vbs <进度日志>` 经剪贴板在 Excel 与 Word 之间复制：Excel 复制 A1:B2，在 Word 里 `Selection.Paste`（成为表格），再两次 `PasteSpecial` 为 OLE 对象（`wdPasteOLEObject`），一次不给位置、一次给 `wdInLine`；Word 复制文字后 `Worksheet.Paste` 到 Excel 的 D1。它会占用剪贴板，只在没有人用的显示上跑（开发用的无头 `:2`），不要在有人使用的桌面上跑。2026-09-28 在 Wine 下全部成功：不给位置时对象是浮动的 Shape（类型 7，`Excel.Sheet.12`），给 `wdInLine` 时是 InlineShape（类型 1，`Excel.Sheet.12`）；路径是 `OleCreateFromDataEx` 从 Excel 的剪贴板数据取 Embed Source，经默认处理器以 `-Embedding` 启动 Excel。早先只数 InlineShapes，误以为没有粘上。
+
+`word-type.vbs <进度日志> <go 文件>` 让 Word 可见地新建一个文档并等待，另一个程序往里键入、go 文件出现后，把文档正文和其中每个非可打印 ASCII 字符的码点写进进度日志，然后不保存退出。配合 `tools/sendkeys`（会话内 SendInput，`KEYEVENTF_UNICODE`）使用：
+
+    sendkeys -w OpusApp -d 200 "text:hello 中文输入测试，你好。" enter "text:第二行 ABC"
+
+2026-09-28 在 Wine 下（`:2`）：正文为“Hello 中文输入测试，你好。”“第二行 ABC”两段（Word 把 hello 自动改成首字母大写），没有崩溃；9 月 4 日记录的“键入中文时 Word 以 0xe0000002 崩溃”不再出现。这只验证了 Unicode 字符输入，经 X 输入法（XIM）的组字路径没有测。

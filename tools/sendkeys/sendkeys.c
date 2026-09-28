@@ -25,6 +25,7 @@
  * Copyright 2026 AltarsCN.  LGPL 2.1 or later, as Wine.
  */
 #include <windows.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,16 +120,16 @@ static void press_key(const char *name, BOOL up)
     SendInput(1, &in, sizeof(in));
 }
 
-static void type_text(const char *text)
+/* the text comes from the wide command line: argv is in the ANSI code page, which has no room for most of it */
+static void type_text(const WCHAR *text)
 {
-    WCHAR buf[512];
-    int len = MultiByteToWideChar(CP_UTF8, 0, text, -1, buf, ARRAYSIZE(buf)) - 1, i;
+    int len = lstrlenW(text), i;
 
     for (i = 0; i < len; i++)
     {
         INPUT in[2] = {0};
         in[0].type = in[1].type = INPUT_KEYBOARD;
-        in[0].ki.wScan = in[1].ki.wScan = buf[i];
+        in[0].ki.wScan = in[1].ki.wScan = text[i];
         in[0].ki.dwFlags = KEYEVENTF_UNICODE;
         in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         SendInput(2, in, sizeof(in[0]));
@@ -137,7 +138,8 @@ static void type_text(const char *text)
 
 int main(int argc, char **argv)
 {
-    int i, delay = 150;
+    int i, delay = 150, wargc;
+    WCHAR **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     BOOL close = FALSE;
 
     for (i = 1; i < argc && argv[i][0] == '-' && argv[i][1]; i++)
@@ -168,7 +170,7 @@ int main(int argc, char **argv)
         char chord[64];
 
         lstrcpynA(chord, argv[i], sizeof(chord));
-        if (!strncmp(argv[i], "text:", 5)) type_text(argv[i] + 5);
+        if (!strncmp(argv[i], "text:", 5)) type_text(wargv && i < wargc ? wargv[i] + 5 : L"");
         else if (!strncmp(argv[i], "move:", 5)) move_pointer(argv[i] + 5);
         else if (!strcmp(argv[i], "click"))
         {
