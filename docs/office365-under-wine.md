@@ -10083,3 +10083,28 @@ fixme，没有撞到任何绘制桩。改用全通道 `err+all,fixme+all` 看 Po
 
 两次改动部署后三应用保存回归都通过。顺手修了 `scripts/build-winetest.sh`：测试目录里带同名 `.spec` 的源文件（ole32 的 `testlib.c`、
 combase 的 `wine.combase.test.c`）是测试加载的辅助模块，不再编进测试程序；源文件名按整词匹配（原先会从 `wine.combase.test.spec` 里截出 `wine.c`）。
+
+## 计划任务的定义对象与 XML 往返，以及 xmllite 在分块与文档结束处（wine-src `56fadec`、`edba3c9`、`8b58e3c`）
+
+上一节 fixme 排序里 `taskschd` 的大量 “unhandled element” 背后是实在的缺口：C2R 用 `RegisterTask(xml)` 注册的任务在 Wine 里被解析成
+一个几乎空的定义，再按 Wine 自己的格式写出去，存下来的是 `<Triggers/>`、空的 `<Principal>`、没有命令的 `<Exec/>`。
+`tools/taskschdprobe/taskdump.c` 把 winref 上导出的 10 个 Office 任务逐个 `put_XmlText`，打印对象模型看到的一切和 `get_XmlText` 写回的
+XML，再用对象模型造一个 11 种触发器俱全的任务并读回；Wine 与 Windows 相差 1719 行。
+
+`56fadec` 按实测补全了定义对象：各类触发器及其重复模式与日程、可按序号或 id 删除的触发器集合、空闲/网络设置、失败重启、
+`ITaskSettings2`、以 SID 保存并按名字返回账户的主体（含隐含的登录类型）、带 id 与 Context 的动作集合；XML 按 Windows 的格式写
+（UTF-16 声明、CRLF、元素次序、哪些只在设置过才写），读时按 Windows 校验取值并返回同样的 `SCHED_E_*`。`scheduler.c` 加了逐字比对
+XML 并读回的 `test_XmlText`，原来两处 `todo_wine` 通过；winref 与 Wine 上都通过（winref 另有一处与本改动无关的上游域名假设失败）。
+
+往返时撞到 xmllite 两处真问题，各自量过 Windows 后修掉：
+
+- `edba3c9`：UTF-16 文档每读一块都把原始缓冲里已拷过的数据再拷一遍，大文档的元素重复、乱序或丢失（taskdump 的“读回”一项就停在这里）。
+- `8b58e3c`：元素未闭合时文档末尾会无限重复最后一个节点（元素每次深一层）——Windows 是 `MX_E_INPUTEND` 并粘住；注释、CDATA、
+  处理指令的结束符跨在两次读入的块之间时整个看不见；只有声明的 UTF-8 文档触发断言，UTF-16 的把开头读两遍。按
+  `tools/xmlliteprobe/xmleof.c` 的实测一并对齐了缺根元素、多根元素、非开头的 `<?xml`、名字处截断等返回值，`reader.c` 加了
+  `test_document_end`、`test_markup_end_chunk_boundary`、`test_utf16_chunks`，winref 与 Wine 都通过，旧代码在跨块测试上死循环。
+
+之后 taskdump 与 Windows 逐行一致；三应用保存回归通过；Office 重新注册的 5 个任务存下来有全部触发器、Users 组主体、命令与参数。
+还没对齐的：`tools/taskschdprobe/regtasks.c` 显示 Windows 的 `IRegisteredTask::get_Xml` 是服务端自己的规范化序列化（另一种元素次序、
+省略默认值、规范化时长、补 `<URI>`），任务文件是 UTF-16LE；Wine 返回定义的 `get_XmlText`，文件是 UTF-8 加一行注释。另有
+`RegistrationInfo.SecurityDescriptor`、各部分自己的 `XmlText`、`_NewEnum`、ComHandler 等其他动作类型、各对象的 IDispatch 仍是桩。
