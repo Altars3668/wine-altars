@@ -10114,3 +10114,14 @@ DISPID 与参数，并加上 Windows 10 的 IExecAction2、IPrincipal2、ITaskSe
 IDispatch 经类型库实现（最派生接口），集合有了枚举器，`Schedule.Service` 的 VBScript 在 Wine 与 Windows 上输出逐字一致。兼容级别按
 Windows 的规则由各 setter 抬高、由声明的版本约束读取；注册信息的 SecurityDescriptor 也保存了。探针见 `tools/taskschdprobe/README.md`。
 顺手让 `scripts/build-winetest.sh` 给测试目录里标了 `makedep client` 的 IDL 生成客户端桩（schedsvc 的 rpcapi/atsvcapi 由此可编）。
+
+## DWM 窗口属性照 Windows 11 实现，以及自绘标题栏的窗口不再被窗口管理器装饰（wine-src `1af6bd6`、`5d52423`）
+
+三应用在 `err+all,fixme+all` 下的普查里，WinRT 类已全部能激活；剩下有实质的是 `DwmGetWindowAttribute(33)`（Windows 11 的圆角偏好）
+返回 `E_NOTIMPL`、`DwmSetWindowAttribute` 是完全的桩。`tools/dwmprobe/dwmattr.c` 在 winref 的桌面会话里测了 0–40 号属性的读写、尺寸与
+窗口种类规则，`5d52423` 照此按属性表实现（值存为窗口属性，跨进程可见），dwmapi 测试加了 `test_window_attributes`，winref 与 Wine 都通过。
+
+答对之后 Office 改走 Windows 11 的框架：标题栏画进客户区，只留左右下 4 像素与顶部 1 像素的非客户区。win32u 按“有非客户区就按样式的
+标准框架（含标题栏）缩可见矩形、让窗口管理器装饰”处理，结果 GNOME 标题栏盖住了 Office 自己的标题栏。`1af6bd6` 让客户区伸到标题栏
+位置的窗口保持整窗可见、不加装饰；user32 `win` 测试的失败与改动前相同（均为该显示上的输入/焦点环境项），三应用回归通过。那几像素的
+非客户区现在由 Wine 按经典样式画成细边框；Windows 11 上它们是隐形的，之后可以再细化。
