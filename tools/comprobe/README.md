@@ -20,3 +20,27 @@ Office 运行时 `err:ole:apartment_add_dll couldn't load in-process dll "...\Co
     <file name="msoxmlmf.dll"><comClass clsid="{807583E5-...}" .../></file>
 
 而它自己的目录里没有这个文件——微软用免注册 COM 故意让服务加载不到这个过滤器（`grooveex.dll` 等同理）。Windows 上同样加载失败，只是不打日志。
+
+# ProcessUrlAction 的原生对照
+
+`urlaction.c` 用 `CoInternetCreateSecurityManager` 得到的安全管理器，对 Internet 区域里策略为允许、询问、拒绝的几个动作各问一次 `ProcessUrlAction`，都带 `PUAF_NOUI`；再按 Click-to-Run 服务的问法问 file URL 的 `URLACTION_SHELL_FILE_DOWNLOAD`，以及带 `PUAF_ISFILE` 的普通路径和空 URL。
+
+    scripts/build-probe.sh tools/comprobe/urlaction.c tools/comprobe/urlaction.exe urlmon ole32 uuid
+
+- 策略为询问（QUERY）时，带 `PUAF_NOUI` 返回 **S_FALSE**（不能问就是不允许），策略值照常写回；Wine 原先返回 E_FAIL。
+- 允许的返回 S_OK，拒绝的 S_FALSE；file URL 与带 `PUAF_ISFILE` 的路径都是本机区域 0；空 URL 是 E_INVALIDARG。这些 Wine 本来就对。
+- **`PUAF_WARN_IF_DENIED` 遇到拒绝时，即使同时给了 `PUAF_NOUI`，Windows 也要弹“被拒绝”的警告**：在 ssh 的服务会话里这次调用永远不返回（探针里因此不再问这一项）。
+- Office 一次会话里的 45 条 `SecManagerImpl_ProcessUrlAction Unsupported arguments` 全是 Click-to-Run 服务对 `C2RManifest.*.xml` 的 file URL 问 `URLACTION_SHELL_FILE_DOWNLOAD`（0x1803）、带 `PUAF_NOUI`，策略允许，结果本来就对。
+
+# Windows 拼写检查 API 的原生对照
+
+`spellcheck.c` 量 `MsSpellCheckingFacility.dll` 的 `SpellCheckerFactory`（`{7AB36653-1796-484B-BDFA-E74F1DB7C1DC}`，Windows 8 起）。Office（PowerPoint 一次会话 4 次）会去创建它；Wine 没有这个 DLL，`CoCreateInstance` 失败后 Office 回退到自带的校对工具。接口按 SDK 在探针里声明，每个都按 IID 做了 QI，所以 IID 也一并核对过了。
+
+    scripts/build-probe.sh tools/comprobe/spellcheck.c tools/comprobe/spellcheck.exe ole32 uuid
+
+- winref 上支持的语言：en-CA、en-LR、en-PH、en-US、zh-Latn-CN-x-ext；`IsSupported` 不分大小写，"en"、"en-GB"、"zh-CN" 都不支持，空串 E_INVALIDARG，不支持的语言 `CreateSpellChecker` 也是 E_INVALIDARG。
+- 检查器的 Id 是 `MsSpell`，没有选项（`OptionIds` 为空，`GetOptionValue` E_INVALIDARG），支持 `ISpellChecker2` 与 `IUserDictionariesRegistrar`。
+- `Check` 按出现顺序给错误：拼错的词是 `CORRECTIVE_ACTION_GET_SUGGESTIONS`，重复的词（“the the”的第二个）是 `DELETE`，替换串是空串而不是 NULL；空文本 E_INVALIDARG。`ComprehensiveCheck` 在这些例子上结果相同。
+- `Suggest("helo")` 给出有序候选（hello、halo、helot…），对拼对的词也给近似词，对无意义的串给空列表；`Ignore` 之后同一检查器不再报该词。
+
+Wine 若要实现，宿主机有 `libhunspell-1.7.so.0` 与 en_US/en_GB 词典，可以 dlopen 其 C API；建议的顺序与措辞以此为准，候选词本身因词典不同不必逐字相同。
