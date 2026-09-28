@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 B="${WINE_BUILD:-$ROOT/wine-src/build-wow64}"
 dll=$1; O=$(realpath -m "$2"); mkdir -p "$O"
 cd $B
-FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2"
+FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D_CRT_NON_CONFORMING_WCSTOK -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2"
 srcs=$(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o '[a-z0-9_.]*\.c')
 for idl in $(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o '[a-z0-9_.]*\.idl'); do
     tools/widl/widl -o $O/${idl%.idl}.h -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl

@@ -9886,11 +9886,20 @@ Excel 图表探针暴露出 `d2d_rectangle_geometry_CombineWithGeometry ... comb
   只有上游原有的顶点缓冲测试 2 项失败（`Map` 已映射缓冲区返回不同指针，与本次无关）。
 - 两个探针与 Windows 输出除末位 float 差异外一致，剩余差异见 `tools/d2dgeomprobe/README.md`。
 - 部署后三应用保存回归通过；Excel 图表探针全部步骤通过，截图中带阴影柱形图、折线图、三维饼图、数据条、色阶、图标集、迷你图正确；
-  `+d2d` 下 Excel 调用了 5 次矩形的 `CombineWithGeometry`（EXCLUDE，其中 4 次容差为 5），不再是桩。
+  `+d2d` 下 Excel 调用了 5 次矩形的 `CombineWithGeometry`（EXCLUDE，其中 4 次容差为 0.5），不再是桩。
 
 **与 Windows 的已知差异**：`Widen` 的图形结构不同（Windows 是 WINDING、open、自重叠，这里是闭合不重叠，填充相同）；
 加宽曲线时用的是展平后的曲线，面积略有出入（椭圆 533.3 对 531.2）；hollow 图形不透传进组合结果。
 
-**仍未查明**：d2d1 全量偶尔以退出码 5 中途结束、无汇总行（GL、Vulkan 都见过，约四五次一次）。
-5 是 `0xC0000005 & 0xFF`，但同一前缀里人为的页错误会打印 “wine: Unhandled page fault”，这里什么都没有；
-加 `+seh` 跑 4 次、在 strace 下跑 20 次都没复现。本次改动之前就已出现，原因待查。
+**退出码 5 的根因（已修，在 dwrite）**：d2d1 全量偶尔以退出码 5 中途结束、无汇总行（GL、Vulkan 都见过，约四五次一次），
+是 dwrite 的竞争。非交互的 winetest 调用 `SetErrorMode(SEM_NOGPFAULTERRORBOX)`，崩溃时既不启动调试器也不打印
+“wine: Unhandled page fault”，进程直接以异常码的低字节退出（0xC0000005 → 5），所以 `+seh` 4 次、strace 20 次都一无所获
+（它们还改变了时序）。只加 `WINETEST_INTERACTIVE=1`，前缀里设 `HKCU\Software\Wine\WineDbg\ShowCrashDialog=0`，
+第 1 轮就拿到 winedbg 回溯：`dwritefactory_CreateTextFormat` → `factory_get_system_collection` →
+`IDWriteFontCollection_QueryInterface` 读地址 0。
+
+dwrite 工厂缓存系统与 EUDC 字体集合却不持有引用，集合在最后一个引用释放时自己从工厂摘下。旧代码先检查指针、再读一次去 QI，
+中间没有锁：另一线程恰好放掉最后一个引用，就读到 NULL 或已释放的内存；两个线程同时创建时，输的一方先放掉自己的，
+再对赢家的多放一次，引用比持有者少一个。d2d1 测试的多个线程同时从一个工厂创建文本格式，正好撞上。
+现在在工厂锁下查看缓存，引用计数非零时才加引用交出，集合摘下自己也在同一把锁下；同时新建的一个让位给已缓存且仍被持有的那个。
+修后 24 次（GL、Vulkan 各 12 次）全部完整结束；dwrite 自身测试的失败项前后相同。提交 `918d65f`；部署到 /opt 后三应用保存回归通过。
