@@ -9068,7 +9068,8 @@ Wine 原来发 WM_PRINT。现在的做法：给被打印的窗口加一个窗口
 - Effect/Backdrop 画刷和 ShapeVisual。
 - DirectComposition 设备（`DCompositionCreateDevice*`）。
 - PrintWindow 拷不到交换链里的内容（PW_RENDERFULLCONTENT），以及 WS_EX_NOREDIRECTIONBITMAP。
-- Windows 拼写检查 API（ISpellCheckerFactory），Word 会尝试创建它。
+- Windows 拼写检查 API（ISpellCheckerFactory），Word 会尝试创建它；Word 自己的拼写检查不靠它，用 Office 的
+  `PROOF\MSSP7EN.LEX`，在 Wine 下可用（`tools/officeautomationprobe/word-spell.vbs`，2026-09-28）。
 - 手动提交模式下，动画帧画的是当前的树，不是上次提交的那一版。
 
 ## Word 启动时的系统调用：电源通知、周期计数、DPI 托管与挂起的 I/O

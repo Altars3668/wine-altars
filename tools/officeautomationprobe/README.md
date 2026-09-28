@@ -28,3 +28,5 @@
 在 Wine 下“由哪个线程引起”会显示为窗口所属的线程：跨线程的 `SetWindowPos` 在 Wine 里由窗口所属线程执行；要知道调用者，用 `+win` 看 `NtUserSetWindowPos` 所在的线程，或在调用者进程里对 `win32u.dll` 的 `NtUserSetWindowPos` 下断点（`tools/bptrace`，`BPTRACE_ARG7=8f` 只报隐藏）。
 
 2026-09-28 在 winref 上三次都没能得到原生的就地激活：Excel 以嵌入方式启动、加载完第三方加载项后，Word 的激活仍以 0x17B5（“……请确保 Excel 中的任何对话框都已关闭”）失败，Excel 从未建 EXCEL9 窗口；当时会话锁屏。另见 `docs/office365-under-wine.md` 的就地激活一节。
+
+`word-spell.vbs <进度日志>` 看 Word 的校对能不能用：美式英语用的是哪个拼写词典，一句美式英语里拼错的三个词 Word 标出哪些，给 `mispeled` 的建议，以及 `CheckSpelling` 对拼对、拼错的词各答什么（布尔值以 `CInt` 写出，-1 为真，与界面语言无关）。只退出自己启动的 Word，不保存文档。2026-09-28 在 Wine 下：词典是 Office 自带的 `PROOF\MSSP7EN.LEX`，三个错词都标出，建议为 `misspelled`、`misplead`——Word 的拼写检查不依赖 Windows 的拼写检查 API（`ISpellCheckerFactory`）。
