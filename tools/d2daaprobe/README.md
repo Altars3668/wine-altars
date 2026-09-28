@@ -42,3 +42,31 @@
 - `DrawBitmap` 同样把倒置的源矩形规范化。
 
 Wine（wine-src 的 `FillOpacityMask` 实现之后）在 GL、Vulkan 下的输出与此逐行相同，只差恰好落在半数上的双线性值的舍入（141.5 → 141 对 142，159.5 → 159 对 160）。
+
+# FillMesh 原生对照
+
+`d2dmesh.c` 用半透明（alpha 0.5）白色画刷把网格画到透明黑底的 64×64 WIC 位图上（ALIASED），这样被画两次的像素是 192 而不是 128：沿对角线分开的正方形、两个交叠的三角形、边穿过像素中心的三角形、两种绕向、退化三角形、世界变换下的三角形；再把一个圆的 `Tessellate` 结果用 `FillMesh` 画，与 `FillGeometry` 画同一个圆比较；最后是非 ALIASED 目标、从未 Close 的网格和空网格。
+
+    scripts/build-probe.sh tools/d2daaprobe/d2dmesh.c tools/d2daaprobe/d2dmesh.exe d2d1 ole32 uuid
+
+## 测出的契约
+
+- 网格就是依次画出的三角形列表：交叠处画刷混合两次（192），共享的边只画一次（D3D 的左上规则：像素中心落在上边、左边上算，落在下边、右边上不算），两种绕向都画，退化三角形不画，世界变换照常生效。
+- 非 ALIASED 目标、从未 Close 的网格都在 `EndDraw` 返回 `D2DERR_WRONG_STATE`、什么也不画；空网格 `S_OK`。
+- 半径 10.3 的圆：`Tessellate`（容差 0.25）给出 22 个三角形，填出 324 个像素；ALIASED 的 `FillGeometry` 填出 326 个——Windows 画曲线也先折线化，比精确的圆（Wine 的 332 个）少。
+
+Wine（wine-src `ee62e28`）在 GL、Vulkan 下只差交叠处的混合舍入（191 对 192），tessellation 填出的像素数与 Windows 相同。
+
+# 描边连接原生对照
+
+`d2djoin.c` 用 4 像素宽的白色描边（ALIASED）画尖端朝右、尖在 (40, 20.5) 的 V 形，打印沿角平分线那一行画到哪个像素：30° 与 8° 的 V 在 MITER（上限 2、10）、MITER_OR_BEVEL（上限 2）、ROUND、BEVEL 与不给样式时；再画一条走到 (40, 20.5) 又原路折返的线。
+
+    scripts/build-probe.sh tools/d2daaprobe/d2djoin.c tools/d2daaprobe/d2djoin.exe d2d1 ole32 uuid
+
+## 测出的契约
+
+- MITER 的斜接超过上限时在 `上限 × 半宽` 处垂直于角平分线截平（上限 2 的 30° V 到 43；不给样式时是上限 10 的 MITER，8° V 到 59），不是画满，也不是斜切；MITER_OR_BEVEL 超限时斜切（到 40）；ROUND 到圆（41）。
+- 原路折返时，MITER 向前画一个长为 `上限 × 半宽` 的矩形（上限 10 到 59，上限 2 到 43），ROUND 画半圆（41），BEVEL 与 MITER_OR_BEVEL 不向前延伸（39）。
+- 与 `Widen` 的实测一致（`d2d_stroke_pieces_join`）。
+
+Wine 原先 MITER 超限时画满（30° 到 47，8° 到 68），折返时不论连接都向前画 25 个单位（到 64）；wine-src `bbce22a` 之后与此逐行相同，只有两处贴边 0.04 像素的像素因 Windows 光栅化的顶点定点化而不同。
