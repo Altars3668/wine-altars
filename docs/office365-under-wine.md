@@ -10235,3 +10235,39 @@ wwlib、mso 等 Office DLL 链接后经过重排（BBT），公开 PDB 里的符
   打开事先做好的文档。
 - 嵌入的 Excel 三次都没能就地激活（0x17B5），Excel 从未建 EXCEL9；Excel 带 .NET/WebView2 与 Acrobat 的加载项，会话锁屏。
 - 自动化启动的 WINWORD 退出后常剩一个线程卡在内核里，`taskkill /F` 回答没有该实例，进程却一直列着。
+
+## 文件字节范围锁照 Windows 完成：重叠加锁、完成端口与等待中的锁（wine-src `6057e5f`）
+
+原来 NtLockFile 拒收状态块、APC 和完成端口，只在成功时置事件；重叠句柄上需要等待的锁返回 STATUS_PENDING 之后就没人管，
+既不授予也不完成。LockFileEx 不传状态块，OVERLAPPED 从来不写。每个 Office 进程启动时打印一次的
+“I/O completion on lock not implemented yet”并不说明调用者绑了完成端口：hEvent 低位为 0 时 kernelbase 总把 OVERLAPPED
+当完成上下文传下去，任何一次 LockFileEx 都会打出它。Word 运行时实际持有的锁（`/proc/locks` 里属于 wineserver 的条目按
+inode 对到文件）是 ole32 复合文档在 `~WRF{…}.tmp`、`STO*.tmp` 上 0x7FFFFF93 一带的范围锁，和 OfficeClickToRun 遥测
+SQLite 库的锁，都在同步句柄上立即授予。
+
+`tools/fileinfoprobe/lockiocp` 在 Windows 上测到的（`lockiocp.win.txt`）：
+
+- 立即授予、立即拒绝（LOCKFILE_FAIL_IMMEDIATELY）都像普通 I/O 一样完成：写状态块（拒绝为 STATUS_LOCK_NOT_GRANTED，
+  Information 0），置事件，投递完成包，拒绝也投递；hEvent 低位置 1 时不投递。句柄设了
+  FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 时，没挂起的一律不投递，**拒绝也不投递**，比文档字面的“立即成功”更宽。
+- 需要等待的返回 ERROR_IO_PENDING，Internal 为 STATUS_PENDING，InternalHigh 不动，事件不置。挡路的锁被解开或其句柄
+  关闭时授予（STATUS_SUCCESS）；CancelIoEx 取消为 STATUS_CANCELLED（完成包错误 995）；自己文件对象的最后一个句柄关闭时
+  为 STATUS_RANGE_NOT_LOCKED（错误 158）。每种都置事件并投递完成包，不受 SKIP 标志影响。
+- 同步句柄上等待的锁阻塞到授予；立即拒绝同样写状态块、置事件。
+- NtLockFile 不给状态块时，在加锁之前就返回 STATUS_ACCESS_VIOLATION。
+
+实现：lock_file 请求带上 async 参数；固定部分放下 async 与偏移后只剩空隙放标志，count 进可变数据。服务端把重叠句柄上
+需要等待的锁作为请求 async 挂到 inode 的等待队列；inode 上任何锁移除（解锁、句柄关闭、进程退出）时按先后授予不再冲突的，
+文件对象最后一个句柄关闭时以 STATUS_RANGE_NOT_LOCKED 完成它的等待锁，取消走通用的 async 取消；被 Wine 之外的 Unix 锁
+挡住时每 100 ms 再看一次，与同步句柄客户端的轮询一致。客户端对立即结果用 `file_complete_async`（状态块、事件、APC 或
+完成包，SKIP 标志由服务端的 add_fd_completion 过滤）。LockFileEx 把 OVERLAPPED 当状态块并先写 STATUS_PENDING，
+LockFile 传本地状态块。
+
+64 位与 32 位（wow64，用 i686 mingw 直接编探针）在 Wine 下的输出都与 Windows 逐行一致；kernel32 `file` 测试新增
+`test_LockFile_overlapped` 与无状态块用例，Wine 0 失败，Windows 上只有与锁无关的 3 个既有失败；ntdll `file`、`pipe`
+0 失败；Office 回归通过。
+
+- 协议版本变为 1814：部署时先停前缀的 wineserver，wineserver 与 ntdll.so 一起换。
+- 测试里 `ov.Internal` 是 ULONG_PTR，要先转成 NTSTATUS 再和负的状态常量比，否则 64 位上符号扩展后永远不等，Windows 上也一样。
+- 前缀里被杀掉的 Word 留下的文档，下次以桌面方式启动 Word 时会全部作为恢复文档打开（标题“最后由用户保存”），
+  `office-debug.sh close` 只关得掉一个窗口。
