@@ -1,8 +1,9 @@
 Option Explicit
 ' word-embed.vbs <output.docx> <progress log> [file to embed]
 ' Embeds objects Word activates through COM in a new document -- an Excel worksheet, and a package of a file
-' when one is given -- saves it, opens it again and loads the worksheet, so what the activation filter Office
-' registers is asked about, and what it answers, shows in a trace.  Each step records its result on its own.
+' when one is given -- saves it, opens it again, activates the worksheet in place and reads its object model, so
+' what the activation filter Office registers is asked about, and what it answers, shows in a trace.  Each step
+' records its result on its own.
 ' ActiveX controls are not tried: Microsoft 365 refuses to insert them by policy ("because of your policy
 ' settings"), before anything is activated.
 Dim fso, progress, destination, embedded, word, document, started, shape
@@ -62,8 +63,13 @@ For Each shape In document.InlineShapes
 Next
 If document.InlineShapes.Count > 0 Then
     Dim loaded
+    ' the object is activated first, as double-clicking it would, and then gives its object model
+    document.InlineShapes(1).OLEFormat.Activate
+    result "worksheet activated"
     Set loaded = document.InlineShapes(1).OLEFormat.Object
     result "worksheet loaded"
+    mark "sheet " & loaded.Worksheets(1).Name
+    result "sheet named"
     Set loaded = Nothing
 End If
 document.Close False

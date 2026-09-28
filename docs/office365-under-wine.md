@@ -10143,3 +10143,32 @@ Office 里：普通会话中过滤器被问几十次，全是类型 0、全部�
 （“由于您的策略设置，无法插入此对象。”）。`tools/officeautomationprobe/word-embed.vbs` 在 Word 里嵌入 Excel 工作表时，过滤器放行了
 `Excel.Sheet.12`，Excel 以 `-Embedding` 启动并注册了类对象，随后 Word 对 Excel 的一次跨进程调用返回 0x800703e6，Word 报 Excel
 “尚未安装或无响应”——换回改动前的 combase/ole32 结果相同，是下一个要查的既有缺陷。
+
+## Word 里嵌入并就地编辑 Excel 工作表：四层依次挡住的缺口（wine-src `8741ba9`、`548ca9b`、`c3cde46`、`ab9bb8e`）
+
+上一节的 0x800703e6 是 Excel 在服务 `IOleObject::DoVerb` 时访问违例（服务端桩把异常变成 ERROR_NOACCESS 回给 Word）。修一层露出下一层，
+四层各自量过 Windows：
+
+1. **comctl32 跨进程读子类栈**（`8741ba9`）。故障地址在 comctl32 v6 的 `GetWindowSubclass`：Excel 对 **Word 的窗口**调它，`GetPropW` 取回的是 Word
+   进程里的指针（窗口属性跨进程可见），解引用即崩。`tools/subclassprobe/subclass.c` 测得 Windows：别的进程的窗口三个辅助函数都返回 FALSE、
+   不动任何东西；同进程别的线程能 Get、能 Remove、不能 Set；`DefSubclassProc` 在子类过程之外返回 0；v6 的属性名是 `UxSubclassInfo`。
+2. **从发送来的消息里向外调用**（`548ca9b`）。随后 Word 在 `document.Close` 里卡死：Word 主线程停在 `NtUserDestroyWindow`（向 Excel 的跨进程子窗口
+   发 WM_DESTROY 并等待），Excel 在 WM_DESTROY 里调 `IOleInPlaceSite::DiscardUndoState` 并等 Word。`tools/comprobe/inputsync.c` 测得 Windows 的规则：
+   处理别的线程发来、仍在等回复的消息时，只有 `[input_sync]` 方法能调出去（以发送消息投递，等待中的调用方照样处理），其余立即
+   `RPC_E_CANTCALLOUT_ININPUTSYNCCALL`——Wine 原先只在已有未完成调用时才拒绝。并逐个方法量出 Windows 11 上哪些是 input_sync（11 个），widl 把
+   `RPCFLG_INPUT_SYNCHRONOUS` 写进过程标志，通道经 ORPCTHIS 带到对端，服务端对 STA 改用 SendMessage；`TranslateAccelerator` 的代理照 Windows
+   本地回 S_FALSE。COM 自己用 SendMessage 让主套间建对象（DM_HOSTOBJECT）不受此限。
+3. **默认处理器的 QI**（`c3cde46`）。CrossOver 把处理器对自身未实现接口的 QI 一律改成 CO_E_OBJNOTCONNECTED，且只对进程内服务器转发，
+   运行中的本地服务器对象（Excel）的 IOleInPlaceObject、IDispatch 都拿不到。`tools/comprobe/handlerqi.c` 在 winref 桌面会话里用真的 Excel 测得：
+   从未运行 E_NOINTERFACE，运行中转给对象，运行过再关闭才是 CO_E_OBJNOTCONNECTED，IOleLink 始终 E_NOINTERFACE。这也修好了 ole32 `marshal`、
+   `ole2` 两个一直失败的测试。运行中返回指针的身份仍不是处理器（Windows 聚合了代理管理器，Wine 的 `CoGetStdMarshalEx` 还是桩）。
+4. **CrossOver 的 shm surface 在持 USER 锁时跨进程发送**（`ab9bb8e`）。`OLEFormat.Activate` 时 Excel 整个卡死：插桩（线程退出各步、USER 锁的
+   持有者与获取时的回溯、持锁代码的检查点）一路追到——父窗口在别的进程的子窗口用 CX HACK 23950 的共享内存 surface，其 flush 向父窗口
+   进程发 `WM_WINE_FLUSHSHMSURFACE`；设窗口位置时 `apply_window_pos` 持着 USER 锁调 `update_surface_region`→设形状→flush，发送前的
+   `user_check_not_lock` 断言失败，线程带着 USER 锁停住；下一个退出的线程在 user32 的 THREAD_DETACH 里持着加载器锁等 USER 锁，其余线程
+   等加载器锁，winedbg 附加也因要建线程而卡住。现在持锁时 shm flush 只保留脏区，锁释放后的下一次 flush 再发。
+
+之后 `tools/officeautomationprobe/word-embed.vbs` 在 Wine 下完整走完：嵌入工作表、保存（docx 里有 `word/embeddings/Microsoft_Excel_Worksheet.xlsx`
+与预览 EMF）、重开、就地激活、经 `OLEFormat.Object` 读到 `Sheet1`、关闭、退出；三应用保存回归通过，ole32/combase/comctl32 测试的失败数与
+改动前相同（其中两个既有失败被修好），新测试在 winref 与 Wine 上都 0 失败。仍未解决：一次 Word 在 `Quit` 时于 wwlib 内空指针崩溃（未能复现）；
+偶尔 Word 退出后 Excel 过几秒才退出；默认处理器的聚合身份；只有 IUnknown 的本地服务器对象 Windows 也能 `OleRun`（ole_server 测试的 todo_wine）。

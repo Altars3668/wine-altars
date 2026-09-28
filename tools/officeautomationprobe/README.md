@@ -18,3 +18,5 @@
 `excel-charts.vbs <输出.xlsx> <进度日志> [秒数]` 填一小张表，再加上 Excel 经 Direct2D/DirectWrite 绘制的内容：带阴影的簇状柱形图、折线图、三维饼图、数据条、三色色阶、图标集、两种迷你图，保存后保持显示若干秒供截图，再退出。每一步单独容错并记录结果。探针只调 COM 接口，不读用户文件。要看 Excel 的 d2d 日志，先 `wineserver -k`，再以带 `WINEDEBUG` 的 `cscript` 作为会话首个进程启动它：COM 激活出的 Excel 继承会话首个进程的环境，也把输出写到它的 stderr；截图要带 `:2` 的 `XAUTHORITY`，按标题“… - Excel”找窗口。
 
 `powerpoint-gradients.vbs <输出.pptx> <进度日志> [秒数]` 在一张空白幻灯片上放各种渐变填充：30° 的线性渐变、从中心、从角部、多 stop 的彩虹预设、渐隐到透明（压在一条深色条上，看透明部分是否透出）、中间 stop 半透明的三色渐变，以及渐变填充的文字；保存后保持显示若干秒供截图，再退出。每一步单独容错并记录结果。
+
+`word-embed.vbs <输出.docx> <进度日志> [要打包嵌入的文件]` 在新文档里用 `InlineShapes.AddOLEObject("Excel.Sheet.12")` 嵌入一张 Excel 工作表（给了文件时再嵌入它的包），保存、关闭、重新打开，读嵌入对象的类，然后像双击那样 `OLEFormat.Activate` 就地激活，取 `OLEFormat.Object` 读 `Worksheets(1).Name`，关闭并退出。每一步单独容错并记录结果。ActiveX 控件不试：Microsoft 365 在激活之前就按策略拒绝（“由于您的策略设置，无法插入此对象。”）。它会以 `-Embedding` 启动 Excel；Word 的激活过滤器、跨进程的就地激活与 OLE 默认处理器都走一遍（见 `tools/comprobe/README.md`、`tools/subclassprobe/README.md`）。2026-09-28 起整个脚本在 Wine 下走完；有一次 Word 在最后 `Quit` 时崩溃（wwlib 内空指针，未能复现），另有一次 Word 退出后 Excel 过了几秒才退出。

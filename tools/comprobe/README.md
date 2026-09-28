@@ -68,6 +68,33 @@ Wine 若要实现，宿主机有 `libhunspell-1.7.so.0` 与 en_US/en_GB 词典�
 
 最初的 `name()` 返回同一个静态缓冲区，而一条 `printf` 里调用了它两次：参数从右往左求值，后一次把前一次覆盖，于是凡是以 GUID 字符串打印的类都显得“替换参数预置为类自身”，与以名字打印的类（GUID_NULL）矛盾。换成两个轮流使用的缓冲区后，Windows 上 45 次调用的入参全是 GUID_NULL。量出与直觉不符的结果时，先查探针自己的格式化。
 
-## Office 用它做什么
+## Office 用它做什么（续见下两节）
 
 Word 启动时就调用 `CoRegisterActivationFilter`（过滤器是堆上的对象）。普通会话里它被问几十次，全是类型 0，全部放行。插入 ActiveX 控件（`Forms.CommandButton.1`）根本走不到激活：Microsoft 365 先按策略拒绝，提示“由于您的策略设置，无法插入此对象。”（2025 年起默认禁用 ActiveX）。用 `tools/officeautomationprobe/word-embed.vbs` 嵌入 Excel 工作表时，过滤器被问到 `Excel.Sheet.12`（`{00020830}`）两次（先进程内、后本地服务器），类型 0，都放行；随后 Word 调 Excel 的一次跨进程调用返回 0x800703e6，Word 报“用于创建此对象的程序是 Excel。您的计算机尚未安装此程序或此程序无响应。”——换回没有过滤器的 combase/ole32 结果相同，是另一个既有缺陷。
+这个“既有缺陷”后来查清并修掉了，见下两节与 `tools/subclassprobe/README.md`：Excel 崩溃在 comctl32 跨进程读子类栈，之后的卡死依次是跨线程发送消息时的向外调用、默认处理器的 QI、以及 CrossOver 的 shm surface 在持 USER 锁时跨进程发送。现在 `word-embed.vbs` 能嵌入工作表、保存、重开、就地激活并读到 `Worksheets(1).Name`。
+
+# 处理别的线程发来的消息时向外调用：input_sync 的原生对照
+
+`inputsync.c`：主线程（单线程套间）做一个对象，带就地激活用到的全部接口——`IOleInPlaceFrame`（含 `IOleWindow`、`IOleInPlaceUIWindow`）、`IOleInPlaceSite`、`IOleInPlaceActiveObject`、`IOleInPlaceObject`、`IOleClientSite`、`IOleCommandTarget`——把代理交给第二个单线程套间，后者有一个窗口。主线程向这个窗口**发送**消息，第二个线程在处理它时逐个调用每个代理的每个方法；对象记录自己是否真被调到。另外在处理投递的消息、在已 `ReplyMessage` 的发送消息里、在线程发给自己的消息里各调一次 `GetWindow` 与 `ContextSensitiveHelp`。发送方五秒后放弃，调用若在等发送方就会显示为“等到发送方放弃才送达”。
+
+    scripts/build-probe.sh tools/comprobe/inputsync.c tools/comprobe/inputsync.exe ole32 oleaut32 user32 uuid
+
+`inputsync.win.txt` 是 winref 上的输出；wine-src `548ca9b` 之后 Wine 与之逐行一致。
+
+- 线程在处理**别的线程发送、且还在等回复**的消息时（`InSendMessageEx` 为 `ISMEX_SEND`），只有 IDL 标了 `[input_sync]` 的方法能调出去——Windows 用发送消息投递它们，正在 `SendMessage` 里等待的调用方线程照样处理；其余方法立即失败 `RPC_E_CANTCALLOUT_ININPUTSYNCCALL`（0x8001010D），对象不会被调到。**不论这个线程自己有没有未完成的调用**（Wine 原先只在有未完成调用时才拒绝，于是 Word 销毁承载 Excel 的窗口、等 Excel 处理 WM_DESTROY 时，Excel 在 WM_DESTROY 里调 `IOleInPlaceSite::DiscardUndoState` 并等 Word——双方永远等下去）。
+- 投递的消息、`ReplyMessage` 之后（`ISMEX_SEND|ISMEX_REPLIED`）、线程发给自己的消息（`InSendMessageEx` 为 0）里，任何调用都照常。
+- Windows 11 上 input_sync 的方法恰好是：`IOleWindow::GetWindow`；`IOleInPlaceUIWindow::GetBorder/RequestBorderSpace/SetBorderSpace`；`IOleInPlaceFrame::SetMenu/SetStatusText`；`IOleInPlaceActiveObject::OnFrameWindowActivate/OnDocWindowActivate/ResizeBorder`；`IOleInPlaceObject::SetObjectRects`；`IOleCommandTarget::QueryStatus`。`IOleInPlaceSite` 除继承的 `GetWindow` 外一个都不是，`IOleClientSite` 与 `IOleCommandTarget::Exec` 也不是。
+- `IOleInPlaceActiveObject::TranslateAccelerator` 的代理在任何情况下都直接回 S_FALSE，不调对象（另一套间的对象在自己的消息循环里处理加速键）。
+
+# OLE 默认处理器的 QueryInterface：handlerqi 的原生对照
+
+`handlerqi.c` 用 `OleCreateDefaultHandler` 为 ProgID 的类（默认 `Excel.Sheet.12`，本地服务器）建默认处理器，对一组接口 QI：未运行时、`InitNew` 后 `OleRun` 运行中、`IOleObject::Close` 之后各一次，并检查拿到的指针 QI(IUnknown) 是不是处理器本身。要能启动本地服务器，须在桌面会话里跑：
+
+    scripts/build-probe.sh tools/comprobe/handlerqi.c tools/comprobe/handlerqi.exe ole32 uuid
+    WIN_HOST=… WIN_USER=… WIN_PORT=… WIN_WAIT=240 scripts/winrun.sh --desktop tools/comprobe/handlerqi.exe
+
+`handlerqi.win.txt` 是 winref 上的输出（会以嵌入方式短暂启动 Excel 再关闭）。
+
+- 处理器自己有的（IOleObject、IDataObject、IPersistStorage、IRunnableObject、IViewObject2、IOleCache2）任何时候都给。
+- 别的接口：**从未运行过**时答 E_NOINTERFACE；**运行中**转给对象（IOleWindow、IOleInPlaceObject、IDispatch、IPersistFile 都拿得到），且拿到的指针 QI(IUnknown) 得到的是处理器本身——Windows 把代理管理器聚合在处理器里；**运行过又关闭**后答 CO_E_OBJNOTCONNECTED（CrossOver 注释里说的“原生返回 CO_E_OBJNOTCONNECTED”只对这种状态成立）；IOleLink 任何时候都是 E_NOINTERFACE。
+- wine-src `c3cde46` 按此实现了这三种状态的返回值；运行中返回的是对象代理本身，身份没有聚合进处理器——Wine 的 `CoGetStdMarshalEx` 还是桩、代理管理器不支持聚合，这一点仍与 Windows 不同。
