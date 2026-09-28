@@ -22,14 +22,24 @@ srcs=$(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.c\b')
 for spec in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.spec\b'); do
     srcs=$(echo "$srcs" | grep -vxF "${spec%.spec}.c")
 done
+stubs=
 for idl in $(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o '[a-z0-9_.]*\.idl'); do
     tools/widl/widl -o $O/${idl%.idl}.h -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
+    # an RPC interface the tests call needs its client stubs, as makedep would generate them
+    if grep -q '^#pragma makedep.*\bclient\b' ../dlls/$dll/tests/$idl; then
+        tools/widl/widl -c -o $O/${idl%.idl}_c.c -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
+        stubs="$stubs ${idl%.idl}_c.c"
+    fi
 done
 FLAGS="$FLAGS -I$O"
 imports=$(grep '^IMPORTS' ../dlls/$dll/tests/Makefile.in | cut -d= -f2)
 objs=
 for f in $srcs; do
     x86_64-w64-mingw32-gcc -c -o $O/${f%.c}.o ../dlls/$dll/tests/$f $FLAGS
+    objs="$objs $O/${f%.c}.o"
+done
+for f in $stubs; do
+    x86_64-w64-mingw32-gcc -c -o $O/${f%.c}.o $O/$f $FLAGS
     objs="$objs $O/${f%.c}.o"
 done
 x86_64-w64-mingw32-gcc -c -o $O/testlist.o dlls/$dll/tests/testlist.c $FLAGS

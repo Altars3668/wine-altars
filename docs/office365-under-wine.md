@@ -10108,3 +10108,9 @@ XML 并读回的 `test_XmlText`，原来两处 `todo_wine` 通过；winref 与 W
 还没对齐的：`tools/taskschdprobe/regtasks.c` 显示 Windows 的 `IRegisteredTask::get_Xml` 是服务端自己的规范化序列化（另一种元素次序、
 省略默认值、规范化时长、补 `<URI>`），任务文件是 UTF-16LE；Wine 返回定义的 `get_XmlText`，文件是 UTF-8 加一行注释。另有
 `RegistrationInfo.SecurityDescriptor`、各部分自己的 `XmlText`、`_NewEnum`、ComHandler 等其他动作类型、各对象的 IDispatch 仍是桩。
+
+后续（wine-src `13a0fba`、`c8d033d`、`ff3d5e4`）：把 taskschd 余下的桩按 winref 实测补完。IDL 按 Windows 的类型库改成双接口、带 SDK 的
+DISPID 与参数，并加上 Windows 10 的 IExecAction2、IPrincipal2、ITaskSettings3、IMaintenanceSettings 与三种非 Exec 动作；每个对象的
+IDispatch 经类型库实现（最派生接口），集合有了枚举器，`Schedule.Service` 的 VBScript 在 Wine 与 Windows 上输出逐字一致。兼容级别按
+Windows 的规则由各 setter 抬高、由声明的版本约束读取；注册信息的 SecurityDescriptor 也保存了。探针见 `tools/taskschdprobe/README.md`。
+顺手让 `scripts/build-winetest.sh` 给测试目录里标了 `makedep client` 的 IDL 生成客户端桩（schedsvc 的 rpcapi/atsvcapi 由此可编）。
