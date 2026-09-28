@@ -7,6 +7,4 @@
 `glyphrasterprobe-92.win.txt`、`glyphrasterprobe-220.win.txt` 是 Windows 上 Latin Modern Math（CFF 轮廓）在 -92 与 -220 的结果。与 Wine 对比（2026-09-28）：
 
 - 位图（`GGO_BITMAP`、`ExtTextOut`）两边基本一致，盒子差 1～2 像素，没有多出的整列像素——Word 导出 PDF 时 CFF 数学字体的竖线不是 GDI 的字形位图带来的。
-- `GGO_BEZIER`：Windows 给出字体原来的三次曲线，每段一条 `TT_PRIM_CSPLINE` 记录、3 个点；Wine 把 FreeType 轮廓里的三次控制点（`FT_CURVE_TAG_CUBIC`）当成二次控制点，先近似成二次再转回三次，每条记录 6 个点。
-- `GGO_NATIVE`：两边都把三次曲线近似成二次，但近似方法不同（Windows 多为每段 1 个二次、记录 2 个点）。
-- `GGO_METRICS` 的返回值：Windows 返回一个与字形大小有关的正数，Wine 返回 1。
+- `GGO_BEZIER`、`GGO_NATIVE` 与 `GGO_METRICS` 的返回值：Wine 原来把 FreeType 轮廓里的三次控制点（`FT_CURVE_TAG_CUBIC`）当成二次控制点，`GGO_METRICS` 返回 1；`tools/outlineprobe` 量出了 Windows 的规则，wine-src `dcf9a14` 已照此实现。

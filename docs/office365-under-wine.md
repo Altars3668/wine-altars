@@ -10398,7 +10398,7 @@ name 的“最长容器”几条规则。
   的结果）。Office 目前只用 SUBSET。
 - 其余表的物理顺序与 name 的三处例外。
 
-## 公式、用户活动与稀疏包：Word 与 Excel 启动和编辑时的三处（wine-src `a84f7a5`、`5a8ec28`、`06d5d17`、`4b20d5a`）
+## 公式、用户活动与稀疏包：Word 与 Excel 启动和编辑时的三处（wine-src `a84f7a5`、`5a8ec28`、`dcf9a14`、`06d5d17`、`4b20d5a`）
 
 **公式是空的（`a84f7a5`）。** `tools/officeautomationprobe/word-math.vbs` 在文档里构建两个公式，Word 数得到、`BuildUp` 也成功，但屏幕上和
 导出的 PDF 里一个字形都没有。Word 的默认公式字体是 Cambria Math，只有带 OpenType MATH 表的字体它才排公式；Windows 总有这个字体，
@@ -10417,6 +10417,15 @@ Word 向 DirectWrite 要这个字体的 PostScript 名，找不到就拿族名�
 把每个字形画成与行高等高的一位蒙版图，画面上出现贯穿的竖线。`tools/glyphrasterprobe` 对比了 GDI：字形位图两边基本一致，竖线不是
 从 GDI 的位图来的，原因未查清。它另外量到两处与 Windows 不同：`GGO_BEZIER` 对 CFF 字体，Windows 给原来的三次曲线（每条记录 3 点），
 Wine 把三次控制点当二次处理后再转回三次（每条记录 6 点）；`GGO_METRICS` 的返回值 Windows 是正的大小，Wine 是 1。
+
+**CFF 轮廓与 GetGlyphOutline（`dcf9a14`）。** `tools/outlineprobe` 在 Windows 上把两款 CFF 字体从 16 到 4000 像素逐点量了一遍：`GGO_BEZIER`
+把每段三次曲线原样给成一条 3 点记录；`GGO_NATIVE` 把它给成一条 $n$ 段的二次样条记录，三阶差分 $d=p_3-3p_2+3p_1-p_0$ 两个方向都不超过
+1 像素时 $n=1$，否则取满足 $\max(|d_x|,|d_y|)\le 10n^3$ 的最小 $n\ge2$，按参数等分，每段控制点是 $\frac{3(a_1+a_2)-a_0-a_3}{4}$——1240 段曲线全部吻合。
+Wine 原来把三次控制点当二次控制点，两种格式的形状都不对（GDI 路径里的文字也走 `GGO_NATIVE`），现在照这条规则给；段数取决于设备上的大小，
+所以求所需大小时也先做变换。`GGO_METRICS` 返回字形 GLYPHBITS 的大小 $\mathrm{align}_4(16+\lceil w/8\rceil h)$（252 个实测值全部吻合）。
+顺带查出：`FIXED` 转 `FT_Fixed` 经过 `unsigned int`，64 位的 unix 侧零扩展，传给 `GetGlyphOutline` 的矩阵里任何负元素都变成约 65536——
+转半圈时字形黑框宽 52428000 像素；原有测试只查 16 位的 `gmCellIncY`，按 65536 取模恰好蒙对。gdi32 新测试带一个自制的小 CFF 字体，
+Windows 上通过，旧代码失败 40 处。还不同的是黑框：Windows 贴着曲线（或黑像素），Wine 用含控制点的控制框，旋转后差得更多。
 
 **每个窗口的用户活动请求管理器（`06d5d17`）。** Word 打开文档时向 `UserActivityRequestManager` 的工厂要
 `IUserActivityRequestManagerInterop`，用 `GetForWindow` 取文档窗口的管理器，注册一个请求处理器。`tools/useractivityprobe` 在 Windows 上量到：
