@@ -10173,7 +10173,7 @@ Office 里：普通会话中过滤器被问几十次，全是类型 0、全部�
 改动前相同（其中两个既有失败被修好），新测试在 winref 与 Wine 上都 0 失败。仍未解决：一次 Word 在 `Quit` 时于 wwlib 内空指针崩溃（未能复现）；
 偶尔 Word 退出后 Excel 过几秒才退出；默认处理器的聚合身份；只有 IUnknown 的本地服务器对象 Windows 也能 `OleRun`（ole_server 测试的 todo_wine）。
 
-## 就地激活之后看得见工作表：Excel 主窗口、消息过滤器与 Word 的滚动动画（wine-src `e7f8f28`、`c28e1b3`、`728920b`、`6d87101`）
+## 就地激活之后看得见工作表：Excel 主窗口、消息过滤器、Word 的滚动动画与跨进程的 DC（wine-src `e7f8f28`、`c28e1b3`、`728920b`、`6d87101`、`4dee4a1`）
 
 上一节之后脚本走得完，但激活的工作表看不见：Word 窗口里多了 Excel 的功能区和编辑栏，文档里却只有嵌入对象的预览图，以及几块带阴影边框的
 残影。一层层查下来：
@@ -10208,9 +10208,18 @@ Office 里：普通会话中过滤器被问几十次，全是类型 0、全部�
    Position 总在 MinPosition 与 MaxPosition 之间”，以及 Word 在 Windows 上不可能这样一直藏着就地窗口。会话解锁后应先跑 `clamp.exe`
    （`scripts/winrun.sh --desktop`）对照，再决定保留还是修正这种语义。
 
-还没解决的：Excel 的功能区显示在 Word 的功能区**下面**而不是取代它——Excel 调 `IOleInPlaceFrame::InsertMenus` 得 E_INVALIDARG、`SetMenu`
-得 E_FAIL，Wine 的菜单句柄只在本进程有效，Windows 的 HMENU 跨进程可用；以及 EXCEL9 移动前的位置留着一块阴影边框的残影（隐藏与移动都带
-SWP_NOREDRAW，旧区域没有重画）。
+4. **文档盖住了工作表的上半部分，工作表旧位置留着残影**（`4dee4a1`）。在 X 上直接截屏（Wine 的 `PrintWindow` 只拷窗口表面，与屏幕不符）
+   看到：合成层画的文档（嵌入对象的预览图）盖住了 EXCEL9 的上半部分，旧位置下方露出 EXCEL9 的旧像素。`+win,+x11drv` 显示 Word 的合成
+   线程每帧经 `_WwG` 的缓存 DC 取 `WS_CLIPCHILDREN` 的系统区域、把离屏内容 StretchBlt 到顶层 X 窗口；这个裁剪里挖掉的洞正是 EXCEL9 的
+   **旧位置**（下移 122 像素）。EXCEL9 在 Excel 进程里移动，`invalidate_dce` 只把 Excel 进程的 DC 标脏，Word 进程的缓存 DC 一直用旧的可见区
+   （dce.c 里本就注明“跨进程失效尚未支持”）。现在父窗口在别的进程时，向它投递 `WM_WINE_INVALIDATEDCE`，由它的线程把该窗口及其后代的 DC
+   标脏。之后在 X 上截屏，就地工作表完整画在文档里，没有残影。
+
+还没解决的：Excel 的功能区显示在 Word 的功能区**下面**而不是取代它。Excel 建了共享菜单后调 Word 的 `IOleInPlaceFrame::InsertMenus`，
+Word 的实现（`SDOF::InsertMenus`，转给 Office 命令栏对象的虚方法 +0x1d0）第一步就对这个菜单调 `GetMenuInfo`，Wine 的菜单只在创建它的进程里
+可用（`grab_menu_ptr: other process menu`），于是 E_INVALIDARG；Excel 随即销毁共享菜单、以空菜单调 `SetMenu`（Word 答 E_FAIL），Word 保留
+自己的功能区。Windows 的 HMENU 跨进程可用；要在 Wine 里做到，得把菜单操作转给创建菜单的线程（句柄表记着它）代办，或把菜单放进共享内存，
+连同菜单项里的子菜单与位图句柄。winref 上拿不到原生的就地激活，无法对照 Word 换功能区的具体做法。
 
 ### Office 的 PDB 要经 OMAP 才能对上地址
 
