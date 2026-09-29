@@ -39,6 +39,8 @@
 
 `office-paste.vbs <进度日志>` 经剪贴板在 Excel 与 Word 之间复制：Excel 复制 A1:B2，在 Word 里 `Selection.Paste`（成为表格），再两次 `PasteSpecial` 为 OLE 对象（`wdPasteOLEObject`），一次不给位置、一次给 `wdInLine`；Word 复制文字后 `Worksheet.Paste` 到 Excel 的 D1。它会占用剪贴板，只在没有人用的显示上跑（开发用的无头 `:2`），不要在有人使用的桌面上跑。2026-09-28 在 Wine 下全部成功：不给位置时对象是浮动的 Shape（类型 7，`Excel.Sheet.12`），给 `wdInLine` 时是 InlineShape（类型 1，`Excel.Sheet.12`）；路径是 `OleCreateFromDataEx` 从 Excel 的剪贴板数据取 Embed Source，经默认处理器以 `-Embedding` 启动 Excel。早先只数 InlineShapes，误以为没有粘上。
 
+`word-cjkfonts.vbs <输出.pdf> <进度日志>` 每段用一种中文字体写同一句中文——Windows 自带而 Office 不带的宋体、新宋体、黑体、楷体、仿宋（中文名，外加 SimSun、SimHei 英文名），和 Office 自己装的微软雅黑、等线、华文宋体——导出 PDF；`pdffonts` 看实际嵌入了哪些字体，`pdftoppm` 渲染看有没有豆腐块。2026-09-29 在 Wine 下：宋体/SimSun 用的是 Microsoft 365 **云字体**下载到 `AppData\Local\Microsoft\FontCache\4\CloudFonts\SimSun` 的真宋体，新宋体、黑体、楷体、仿宋、SimHei 这次回退到微软雅黑，全部字形正常。所以 CrossOver 在 GDI 里“缺宋体就换成主机中文字体”的 HACK（bugs 13095/13610）对 Office 用不着。
+
 `word-type.vbs <进度日志> <go 文件>` 让 Word 可见地新建一个文档并等待，另一个程序往里键入、go 文件出现后，把文档正文和其中每个非可打印 ASCII 字符的码点写进进度日志，然后不保存退出。配合 `tools/sendkeys`（会话内 SendInput，`KEYEVENTF_UNICODE`）使用：
 
     sendkeys -w OpusApp -d 200 "text:hello 中文输入测试，你好。" enter "text:第二行 ABC"
