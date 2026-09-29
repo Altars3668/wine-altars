@@ -10740,8 +10740,16 @@ Office 附带装的 OfficePLUS 服务（.NET 程序）因此起不来；`riched2
 临时打开 Click-to-Run 的详细日志（`HKLM\SOFTWARE\Microsoft\ClickToRun\OverRide` 的 `LogLevel`=3，看完即删）可见：
 Excel 启动后问服务 `DetermineIsRepairRequiredEx`，每次都得到 True，服务于是 `TaskIntegrateRepair::DoRepairForApp
 {'AppID':'Excel'}`：重新集成虚拟注册表（带 `{@@}AppVCreatedKey` 所有权标记重写文件关联与 COM 注册）、删建 5 个计划任务、
-导入 ETW 清单、跑 msiexec 注册 MSI 存根，前后约 20 秒 CPU。计划任务在 Wine 下持久化正常（只有这 5 个被重写），判断依据
-日志没有写；Windows 上是否同样每次修复，在 winref 上用这些文件与计划任务的修改时间对比服务启动时间来看。
+导入 ETW 清单、跑 msiexec 注册 MSI 存根，前后约 20 秒 CPU。PowerPoint 也一样，Word 不触发。计划任务在 Wine 下持久化
+正常（只有这 5 个被重写），判断依据日志没有写；Windows 上是否同样每次修复，在 winref 上用这些文件与计划任务的修改时间对比
+服务启动时间来看。
+
+排查中看到 Excel 启动时约 113 次按原生路径 `\Registry\User\<sid>_Classes\...` 查用户的类（App-V 层合并 Office 虚拟
+注册表时两侧都查），全部失败：Windows 上用户的类是单独的 hive `HKEY_USERS\<sid>_Classes`，`HKCU\Software\Classes`
+是指向它的链接，Wine 没有这个名字。wineserver 现在在载入 user.reg 后把它建成指向 `Software\Classes` 的易失链接
+（altars-up `a3345e01f89`，advapi32 测试 `test_user_classes_hive`；方向与 Windows 相反，所以 `HKCU\Software\Classes`
+的内核名仍是 `...\<sid>\Software\Classes`，Windows 上是 `...\<sid>_Classes`）。临时补上这个名字后 C2R 仍判定需要
+修复，所以它不是触发原因。
 
 ### PowerPoint 导出动画 GIF 之后不再响应
 
