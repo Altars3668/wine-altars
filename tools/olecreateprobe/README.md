@@ -13,8 +13,10 @@ LocalServer32 指向不存在的程序。
 - InprocHandler32=ole32.dll 时 OLERENDER_NONE 成功、对象未运行，`Run` 返回 REGDB_E_CLASSNOTREG；OLERENDER_DRAW
   需要运行服务器，`OleCreate` 失败。
 
-Wine（`results/olecreateprobe.wine-hklm.txt`，注册在 HKLM）与 Windows 逐行相同。注册在 HKCU 时 Wine 全部失败：
-Wine 的 HKEY_CLASSES_ROOT 不合并 `HKCU\Software\Classes`（Windows 会），这是另一处缺口。
+Wine（`results/olecreateprobe.wine-hklm.txt`，注册在 HKLM）与 Windows 逐行相同。注册在 HKCU 时 Wine 原先全部失败：
+Wine 的 HKEY_CLASSES_ROOT 不合并 `HKCU\Software\Classes`（Windows 会）。altars-up 的 kernelbase 合并视图与
+combase/ole32 先查用户的类（`7d0dd7e27c7`、`691f1d81c14`）之后，注册在 HKCU 的结果（`results/olecreateprobe.wine.txt`）
+与 Windows 逐行相同。
 
 构建：`x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror olecreateprobe.c -o olecreateprobe.exe -lole32
 -loleaut32 -luuid -ladvapi32`。
