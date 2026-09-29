@@ -51,9 +51,15 @@ display=${OFFICE_DEBUG_DISPLAY:-0}
 xauth=$(xauth_for "$display")
 [ -n "$xauth" ] || die "no Xwayland for :$display"
 
+# On a test display Wine must not fall back to Wayland: with WAYLAND_DISPLAY unset libwayland
+# connects to wayland-0, the signed-in desktop, so an application whose X display failed would
+# open there.  A socket that does not exist makes that fallback fail instead.
+nowayland=()
+[ "$display" = 0 ] || nowayland=(WAYLAND_DISPLAY=wine-altars-no-wayland)
+
 helper_env=(DISPLAY=":$display" XAUTHORITY="$xauth" WINEPREFIX="$prefix" WINEDEBUG=-all
             LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 HOME="$HOME" USER="$USER" PATH="$PATH"
-            XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
+            XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" "${nowayland[@]}")
 
 tool() {
     local name=$1
@@ -78,7 +84,7 @@ start)
     debug=${1:-}
     log=${2:-/tmp/office-debug-word.log}
     mapfile -t envv < <(session_env)
-    env -i "${envv[@]}" DISPLAY=":$display" XAUTHORITY="$xauth" WINEPREFIX="$prefix" \
+    env -i "${envv[@]}" DISPLAY=":$display" XAUTHORITY="$xauth" WINEPREFIX="$prefix" "${nowayland[@]}" \
         ${debug:+WINEDEBUG="$debug"} "$wine" "$word_exe" > "$log" 2>&1 &
     echo "started Word, output in $log"
     ;;
