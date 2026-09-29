@@ -11,13 +11,14 @@
  *   warn:msxml:doparse Namespace prefix appv is not defined
  *
  * AppXManifest.xml does declare xmlns:appv on its root, so whatever is being
- * parsed is a fragment that carries no declaration.  MSXML is not
- * namespace-strict: it keeps "appv:Foo" as the node's name and reports the
- * prefix.  libxml2 raises the undefined-prefix error and recovers, and what it
- * recovers to is the question this answers -- because if the recovered tree is
- * shaped differently, a node the caller holds is no longer a child of the
- * parent it means to remove it from, which is exactly the E_INVALIDARG that
- * dlls/msxml3/node.c returns.
+ * parsed is a fragment that carries no declaration.  Measured on Windows 11
+ * (results/xmlprobe.win.txt): MSXML is namespace-strict here, and loadXML()
+ * of such a fragment fails with 0xc00ce01d, "reference to undeclared namespace
+ * prefix", whether the prefix is on an element or only on an attribute.  So on
+ * Windows the fragment Click-to-Run parses must carry its declaration, and a
+ * fragment without one points at whatever produced it under Wine, not at the
+ * parser.  (The libxml2-based msxml3 recovered from the error instead, and the
+ * old tree once made it keep such prefixes; Windows does not.)
  *
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -municode \
  *       -o xmlprobe.exe xmlprobe.c -lole32 -loleaut32 -luuid
