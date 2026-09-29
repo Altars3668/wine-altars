@@ -64,3 +64,13 @@ ppsx、严格 OOXML、odp、xml、pdf、xps、PNG 目录）、加密保存后用
 2026-09-29 在 altars-up 上：WIC 的 GIF 元数据写入链补齐后（wine-src-up `01c911684cf`），`SaveCopyAs` 2 秒写出两帧循环
 GIF，之后 Close、Quit 照常，48 项通过；视频在 SinkWriter 的编码与收尾补上后（`67c84e5b7dc` 等）4 秒生成 174 KB，
 只剩 SVG 导出（与原生相同）。
+
+`office-vba.vbs <进度日志>` 查 VBA 宏能不能跑：在 Word、Excel、PowerPoint 里各新建文档，经 VBA 工程对象模型加一个模块，
+用 `Application.Run` 运行其中的函数（算术、`Format`、`CreateObject("Scripting.Dictionary")`、`On Error` 接住除零、
+`Declare PtrSafe` 调 kernel32 的 `GetCurrentProcessId`），Word 里再跑一个改写正文的宏，Excel 里在单元格用自定义函数。
+Office 运行宏前让 AMSI 扫描代码，所以它也验证了扫描器（clamd）可达。“信任对 VBA 工程对象模型的访问”（各应用
+`Security\AccessVBOM`）只在运行期间打开，**等应用进程真正退出后**再按原状恢复并回读核对：应用退出时会把内存里的
+信任中心设置写回注册表，`Quit` 返回时恢复会被它覆盖；而且 Excel、PowerPoint 要等脚本放掉全部引用才会退出。
+写模块时 `Declare` 必须放在声明区、所有过程之前，否则 VBA 报编译错误并弹出模态对话框（自动化会一直等它）；
+PowerPoint 的 `Run` 要带模块名，模块名随界面语言（中文是“模块1”）。2026-09-29 三个应用 33 项全部通过；此前 Excel
+读过 `VBProject` 后 `Quit` 不退出，是 combase 在调用结束后才从分派线程释放存根（altars-up `53a55969585`）。
