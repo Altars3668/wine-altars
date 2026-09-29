@@ -42,7 +42,12 @@ printf '%s\r\n' "\$exe = Join-Path \$env:TEMP \"$name\"" \
     "Set-Content -Encoding ascii -Path (Join-Path \$env:TEMP \"$tag.exit\") -Value \$LASTEXITCODE" > "$ps1"
 scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$ps1" "$USERNAME@$HOST:$TEMP/$tag.ps1" || { rm -f "$ps1"; echo "desktop task upload failed" >&2; exit 2; }
 rm -f "$ps1"
-"${SSH[@]}" "schtasks /create /tn $tag /tr \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\$USERNAME\\AppData\\Local\\Temp\\$tag.ps1\" /sc once /st 23:59 /it >nul && schtasks /run /tn $tag >nul" >/dev/null 2>&1 || { echo "desktop task start failed" >&2; exit 2; }
+# schtasks gives a task no start on battery power, and the laptop often runs on its battery: such a
+# task only sits queued until the wait runs out.  PowerShell takes the settings off it before it runs.
+settings=$(printf '%s' "\$ProgressPreference = 'SilentlyContinue'; \$t = Get-ScheduledTask -TaskName $tag;" \
+    " \$t.Settings.DisallowStartIfOnBatteries = \$false; \$t.Settings.StopIfGoingOnBatteries = \$false;" \
+    " Set-ScheduledTask -InputObject \$t | Out-Null" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+"${SSH[@]}" "schtasks /create /tn $tag /tr \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\$USERNAME\\AppData\\Local\\Temp\\$tag.ps1\" /sc once /st 23:59 /it >nul && powershell -NoProfile -EncodedCommand $settings >nul 2>&1 && schtasks /run /tn $tag >nul" >/dev/null 2>&1 || { echo "desktop task start failed" >&2; exit 2; }
 completed=0
 polls=$(( ${WIN_WAIT:-360} / 2 ))
 for i in $(seq 1 "$polls"); do
