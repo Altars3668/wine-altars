@@ -10769,3 +10769,10 @@ altars-up `01c911684cf` 补上了这条链：编码器与每一帧各有一张�
 普查的下一项随之暴露：`CreateVideo` 2 秒后以状态 4（失败）结束、0 字节（原生 5 秒生成）。跟踪止于
 `sink_writer_Finalize` 的 FIXME：mfreadwrite 的 SinkWriter 把未编码的样本直接交给接收器（编码一步是 FIXME），
 `Finalize` 未实现，上游与 CrossOver 都缺；上游测试 `test_sink_writer_sample_process` 已有 Windows 上测过的规格。
+
+altars-up `37fb1028bf0`、`1763983021d`、`67c84e5b7dc` 补上：SinkWriter 让每个样本依次经过转换器与编码器、把输出按接收器的
+请求交付，`Finalize` 排空变换、交付余下样本、经 IMFFinalizableMediaSink 收尾并关闭接收器（同步返回，或按
+MF_SINK_WRITER_ASYNC_CALLBACK 回调 OnFinalize）；winegstreamer 的 MP4 接收器实现了 PlaceMarker 并在开始与处理后请求
+样本；mfplat 文件字节流的 `Close` 原是 E_NOTIMPL，文件要到最后一次释放才关，`Finalize` 之后不能独占打开（Windows 上可以）。
+mfreadwrite 测试去掉 6 个 todo_wine、0 失败。PowerPoint `CreateVideo` 4 秒写出幻灯片的 H.264 视频（gst-discoverer：
+640×360、15 fps，逐帧内容正确），普查 48 项里只剩 SVG 导出，与原生相同。

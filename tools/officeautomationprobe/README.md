@@ -62,4 +62,5 @@ ppsx、严格 OOXML、odp、xml、pdf、xps、PNG 目录）、加密保存后用
 `SaveCopyAs` 动画 GIF 同样不出文件但之后照常响应，视频 5 秒生成。
 
 2026-09-29 在 altars-up 上：WIC 的 GIF 元数据写入链补齐后（wine-src-up `01c911684cf`），`SaveCopyAs` 2 秒写出两帧循环
-GIF，之后 Close、Quit 照常，48 项通过；剩下 SVG 导出（与原生相同）和视频（mfreadwrite 的 SinkWriter 不编码、不收尾）。
+GIF，之后 Close、Quit 照常，48 项通过；视频在 SinkWriter 的编码与收尾补上后（`67c84e5b7dc` 等）4 秒生成 174 KB，
+只剩 SVG 导出（与原生相同）。
