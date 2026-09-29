@@ -10735,21 +10735,44 @@ engine”），Office 的 `UserInfo` 用户名与缩写也还是 crossover。按
 PowerPoint 的个人模板位置、自定义词典）仍指向旧目录，属于应用状态，暂不动。另外前缀的 DllOverrides 里 `mscoree` 被禁用，
 Office 附带装的 OfficePLUS 服务（.NET 程序）因此起不来；`riched20`、`msvcp100/120`、`concrt140` 设为 native，也是瓶子带来的。
 
-### Excel 每次启动都让 Click-to-Run“修复”集成
+### Excel 每次启动都让 Click-to-Run“修复”集成（已解决：旧 msxml3 写坏的 App-V 合并清单）
 
 临时打开 Click-to-Run 的详细日志（`HKLM\SOFTWARE\Microsoft\ClickToRun\OverRide` 的 `LogLevel`=3，看完即删）可见：
 Excel 启动后问服务 `DetermineIsRepairRequiredEx`，每次都得到 True，服务于是 `TaskIntegrateRepair::DoRepairForApp
-{'AppID':'Excel'}`：重新集成虚拟注册表（带 `{@@}AppVCreatedKey` 所有权标记重写文件关联与 COM 注册）、删建 5 个计划任务、
-导入 ETW 清单、跑 msiexec 注册 MSI 存根，前后约 20 秒 CPU。PowerPoint 也一样，Word 不触发。计划任务在 Wine 下持久化
-正常（只有这 5 个被重写），判断依据日志没有写；Windows 上是否同样每次修复，在 winref 上用这些文件与计划任务的修改时间对比
-服务启动时间来看。
+{'AppID':'Excel'}`：重新集成虚拟注册表、删建 5 个计划任务、导入 ETW 清单、跑 msiexec 注册 MSI 存根，前后约 20 秒 CPU，
+Excel 自动化探针要 20–27 秒。PowerPoint 也一样，Word 不触发。
+
+- **谁在问。** excel.pdb 公开：调用者是 EXCEL.EXE 的 `CheckForC2RRepair()`，过三道前置判断（`Mso20Win32Client!#16665(6)`、
+  Excel 内部一个函数、`Mso30Win32Client!#46109()`）后用 `GetProcAddress` 取 C2R64 的 `IsRepairRequiredEx`，以
+  `(L"Excel", &result, 0x10)` 询问服务；结果非 0 才修复。Word 的前置判断不通过，从不询问。
+- **服务凭什么答 True。** 服务没有公开符号。只给服务进程开注册表跟踪（`WINEDEBUG=-all,officeclicktorun.exe:+reg,...`）：
+  决策线程在回答之前唯一的判据是打开 `HKLM\Software\Classes\Excel.Sheet.12\shell\open\command`，不存在即答 True。
+  这个键应当由 App-V 集成 Excel 的文件关联时写入，而修复之后它仍不存在。
+- **为什么集成不出来。** App-V 用的合并清单 `Microsoft Office\AppXManifest.xml`（以及它在
+  `ProgramData\Microsoft\ClickToRun\MachineData\Catalog\Packages\{9AC08E99-…}\{…}` 的副本 `Manifest.xml` 与 App-V 派生的
+  `UserManifest.xml`）里，从 `PackageManifests\AppXManifest.90160000-0016-…xml`（Excel）等产品清单合并进来的 2342 个扩展点
+  全部写成了没有前缀的 `<Extension>`，落在文档默认的 appx 命名空间；只有 common 清单的 631 个保留 `appv:`。App-V 只认
+  appv 命名空间的扩展点，于是 Excel、Word、PowerPoint、Outlook 的文件关联与 COM 类从来没有集成，而修复用的是同一份清单，
+  永远修不好。
+- **为什么写坏。** Click-to-Run 用 MSXML 把产品清单的扩展点克隆进 common 清单。这个前缀是 9 月 20 日安装时写的，当时
+  Wine 的 msxml3 在 `cloneNode` 时丢掉节点前缀（altars-up `e7313aa729c` 已修）。现在的 msxml3 用 DOM 移动或克隆重做同样的
+  合并，前缀正确（`tools/manifestmergeprobe`）。Click-to-Run 只在安装、更新、刷新语言时重建合并清单，快速修复与每个应用的
+  修复都不重建；`scenario=CULTUREREFRESH` 在 Wine 下停在 `TaskGetUserCulture`（“Unable to get user-preferred UI
+  culture”，按用户界面语言与已装文化比对后失败，本意是装语言包，可能触发下载），没有走下去。
+- **修复前缀。** `scripts/fix-c2r-merged-manifest.py`：对每个错位的扩展点，按忽略命名空间的结构签名（源里的
+  `!(loc.…)` 占位符匹配合并时本地化出的文本）在产品清单里找到它的来源，把它与后代的命名空间还原成来源的（App-V 的
+  UserManifest 统一用其 Extensions 的 appv 2014 命名空间）；全部匹配才写，原文件先复制到指定的备份目录，根元素的全部
+  命名空间声明保留（`IgnorableNamespaces` 按前缀引用 appv1.1/appv1.2）。修后 Excel 冷启动修复一次即写出
+  `Excel.Sheet.12\shell\open\command`，再冷启动服务答 False、不再修复，Excel 探针 27 秒降到 11 秒；再跑一次快速修复
+  （`OfficeClickToRun.exe scenario=Repair platform=x64 culture=zh-cn RepairType=QuickRepair DisplayLevel=False`）把 Word、
+  PowerPoint 的关联也集成（`.docx` → `Word.Document.12`，`WINWORD.EXE /n "%1" /o "%u"`）。用旧 Wine 装的前缀都要跑一次：
+  Wine 修好之后，它当年写坏的持久数据不会自愈。
 
 排查中看到 Excel 启动时约 113 次按原生路径 `\Registry\User\<sid>_Classes\...` 查用户的类（App-V 层合并 Office 虚拟
 注册表时两侧都查），全部失败：Windows 上用户的类是单独的 hive `HKEY_USERS\<sid>_Classes`，`HKCU\Software\Classes`
 是指向它的链接，Wine 没有这个名字。wineserver 现在在载入 user.reg 后把它建成指向 `Software\Classes` 的易失链接
 （altars-up `a3345e01f89`，advapi32 测试 `test_user_classes_hive`；方向与 Windows 相反，所以 `HKCU\Software\Classes`
-的内核名仍是 `...\<sid>\Software\Classes`，Windows 上是 `...\<sid>_Classes`）。临时补上这个名字后 C2R 仍判定需要
-修复，所以它不是触发原因。
+的内核名仍是 `...\<sid>\Software\Classes`，Windows 上是 `...\<sid>_Classes`）。它与修复循环无关。
 
 ### PowerPoint 导出动画 GIF 之后不再响应
 
