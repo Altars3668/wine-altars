@@ -10815,6 +10815,21 @@ libwayland 连 `wayland-0`——用户真实的 GNOME 会话。:2（无头 mutte
 `scripts/office-debug.sh` 会设，直接运行时要自己设 `XAUTHORITY`，并设 `WAYLAND_DISPLAY=wayland-1` 兜底。在 Wayland 驱动下
 Excel 启动后死锁（一个线程持加载器锁空转），X11 下正常，待查。
 
+### VBA 宏，以及读过 VBProject 的 Excel 不退出（altars-up `53a55969585`）
+
+`tools/officeautomationprobe/office-vba.vbs` 在 Word、Excel、PowerPoint 里经 VBA 工程对象模型加模块并用
+`Application.Run` 运行：函数、`Format`、`CreateObject`、`On Error`、`Declare PtrSafe` 调 kernel32、改写正文的宏、
+Excel 单元格里的自定义函数。三个应用 33 项全部通过（AMSI 经 clamd 扫描，宏照常运行）。
+
+同时发现：自动化启动的 Excel 只要读过一次 `book.VBProject`，`Quit` 并放掉全部引用之后就永远不退出。二分到最小
+触发之后开 `+ole`：cscript 的 `RemRelease` 都发了，Excel 存根的外部引用也归零了，主线程空闲在消息循环里；默认的 err
+通道里每次都有 `stub_manager_delete Got page fault when releasing stub!`，发生在 RPC 线程上。原因：跨进程调用 STA
+对象时，`dispatch_rpc` 持有存根管理器与存根缓冲区，等 STA 线程执行完调用、发出信号之后才在 RPC 线程上释放；Excel 读
+`VBProject` 时恰好紧接着对 VBA 工程的一个对象 `CoLockObjectExternal` 解锁并 `CoDisconnectObject`，COM 最后的几次
+`Release` 于是晚到、而且跑在对象套间之外，碰上已不存在的对象。现在由 STA 线程在调用执行完、通知 RPC 线程之前自己
+释放。ole32 新测试 `test_disconnect_after_call` 用一个子进程里的 STA 服务器（对象在方法里断开自己）记录每次 `Release`
+所在的线程：旧代码稳定地有 3 次在别的线程上，修后为 0。修后 Excel 在 `Quit` 后 3 秒退出。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
