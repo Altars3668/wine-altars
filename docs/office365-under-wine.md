@@ -10700,7 +10700,54 @@ Office 在新配置文件 `~/.wine-c2r-up` 里重新激活；旧树的 606 个�
 报 0xc00ce01d（`tools/xmlprobe`），新树不移植；CrossOver 在 `OleCreate` 失败后改用默认处理器——Windows 同样返回
 REGDB_E_CLASSNOTREG（`tools/olecreateprobe`），不做。
 
-**仍然不同、已记下的。** HKEY_CLASSES_ROOT 不合并用户的类（按用户注册的 COM 加载项因此找不到，正在做）；MSXML 的
-`parseError` 没有行列与原因文本；MSXML 3 默认的 DTD 校验（validateOnParse）新解析器没有；MSXML 对象不提供类信息
+**仍然不同、已记下的。** MSXML 3 默认的 DTD 校验（validateOnParse）新解析器没有；MSXML 对象不提供类信息
 （`TypeName` 给接口名）；d3d9 在空客户区上比 Windows 宽松；UniversalApiContract 报 10（winref 为 20），只在相应 API
-实现后再提高。
+实现后再提高。（MSXML 的 `parseError` 行列与原因文本已在 `837741d585d` 补上。）
+
+### HKEY_CLASSES_ROOT 合并用户的类，以及它的代价（`7d0dd7e27c7`、`691f1d81c14`）
+
+- **做了什么。** Windows 的 HKCR 是 `HKCU\Software\Classes` 叠在 `HKLM\Software\Classes` 之上的合并视图，每次调用重新
+  判断用哪一侧；经 HKCR 打开的句柄带标记（`(h & 3) == 2`），值与子键先找用户侧，两边都没有的键建在 HKLM，删除先删用户的，
+  枚举先列用户的、再列只有机器有的。规格是 advapi32 自带、在 Windows 上测过的 `test_classesroot*`，原先停在第一个
+  todo_wine 上，现在全部通过。COM 自己用私有句柄查 HKLM 的类（不受 `RegOverridePredefKey` 影响），所以 combase/ole32
+  另外先查用户的类；`tools/olecreateprobe` 注册在 HKCU 的类因此与 Windows 逐行一致（原先全部 REGDB_E_CLASSNOTREG）。
+- **第一版的代价。** 每次操作都 `NtQueryKey` 取键名、再按路径把用户侧和机器侧各开一遍，`RegQueryInfoKey` 把机器侧每个子键
+  拿到用户侧查一遍：读一个值从 15 µs 到 73 µs，数 CLSID 的子键从 30 µs 到 14.6 ms（`tools/regbench`，本机一次 wineserver
+  往返约 15 µs）。Office 回归冷启动三轮成对比较慢了 17～29 秒，分应用计时后落在 Excel 上：它启动时 Click-to-Run 服务会
+  跑一遍 `integrator.exe`，后者经 HKCR 带 `KEY_WOW64_32KEY` 打开约两万个键。64 位进程要 32 位视图时，重定向只能在
+  kernelbase 做（ntdll 测试表明 Windows 内核对 64 位调用者的 32KEY 也不重定向，wineserver 只替 WoW64 进程做），
+  kernelbase 逐级打开并检查每层 `Wow6432Node`，合并前就要 51 万次 `NtOpenKeyEx`、约 18 秒；第一版在用户侧再完整走一遍，
+  变成 101 万次、28 秒。
+- **现在。** 每个标记句柄的路径与所在侧只查一次、保存到 `RegCloseKey`；机器侧直接用句柄本身；只有“用户侧有没有”每次
+  重查（多一次服务器调用）；用户侧的 Wow6432Node 遍历先看路径第一段在不在用户的 Classes 或其 Wow6432Node 下；计数只
+  遍历两侧中较小的一侧。回归耗时与合并前一致（旧 75/74/69 秒，新 74/77/75 秒），功能普查 Word 34、Excel 72 项照旧全过。
+  HKCR 被 `RegOverridePredefKey` 覆盖时当作普通键（与合并前相同；Windows 上的行为在 `tools/hkcrprobe` 里待测）。
+- **测量中的坑。** 用 `cp -al` 做的对比安装在主安装之后按换 inode 方式更新过的 DLL 上会停留在旧版：一次对比里 wined3d
+  还是早上的旧版，PowerPoint 在 wined3d 的命令流线程崩溃，看上去像注册表改动引起的。对比前重建硬链接副本、只换要测的
+  DLL，并用 `cmp` 列出差异文件核对。
+
+### Office 前缀里 CrossOver 留下的状态（2026-09-29 清理）
+
+`~/.wine-c2r-up` 是从 CrossOver 瓶子迁来的：`HKCU\Environment` 的 TEMP/TMP、`Shell Folders` 里 7 个文件夹缓存、
+HKLM 的 `Common Favorites` 仍指向 `C:\users\crossover`，还有 CrossOver 专有的 `Uninstall\CXHTML`（“CrossOver HTML
+engine”），Office 的 `UserInfo` 用户名与缩写也还是 crossover。按纯 Wine master 新建前缀的值改回 `C:\users\user`，
+删去 CXHTML 与 UserInfo 的两个值（Office 下次启动时自己重建）。剩下 Office 自己的缓存路径（模板与 DTS 图片缓存、
+PowerPoint 的个人模板位置、自定义词典）仍指向旧目录，属于应用状态，暂不动。另外前缀的 DllOverrides 里 `mscoree` 被禁用，
+Office 附带装的 OfficePLUS 服务（.NET 程序）因此起不来；`riched20`、`msvcp100/120`、`concrt140` 设为 native，也是瓶子带来的。
+
+### Excel 每次启动都让 Click-to-Run“修复”集成
+
+临时打开 Click-to-Run 的详细日志（`HKLM\SOFTWARE\Microsoft\ClickToRun\OverRide` 的 `LogLevel`=3，看完即删）可见：
+Excel 启动后问服务 `DetermineIsRepairRequiredEx`，每次都得到 True，服务于是 `TaskIntegrateRepair::DoRepairForApp
+{'AppID':'Excel'}`：重新集成虚拟注册表（带 `{@@}AppVCreatedKey` 所有权标记重写文件关联与 COM 注册）、删建 5 个计划任务、
+导入 ETW 清单、跑 msiexec 注册 MSI 存根，前后约 20 秒 CPU。计划任务在 Wine 下持久化正常（只有这 5 个被重写），判断依据
+日志没有写；Windows 上是否同样每次修复，在 winref 上用这些文件与计划任务的修改时间对比服务启动时间来看。
+
+### PowerPoint 导出动画 GIF 之后不再响应
+
+功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
+`Close`、`Quit` 全被拒（RPC_E_CALL_REJECTED），而原生 PowerPoint 之后照常响应、5 秒生成视频。`+wincodecs` 跟踪：
+PowerPoint 建 GIF 编码器、`Initialize`，随即 `GetMetadataQueryWriter`，得到 E_NOTIMPL 就放弃，一帧都不建，后台导出从此
+不结束。上游的元数据写入链是空的：所有编码器（GIF 与 PNG/JPEG/TIFF 的公共实现）的帧块写入器都是 E_NOTIMPL，
+`SetMetadataByName` 对所有格式返回 S_OK 却什么也不写，GIF 的 LSD/IMD/GCE/APE/注释只有读取器，编码器提交时不写任何扩展。
+Windows 的规格用 `tools/gifencprobe` 实测。
