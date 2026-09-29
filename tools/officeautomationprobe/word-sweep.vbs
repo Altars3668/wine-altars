@@ -1,7 +1,7 @@
 ' A sweep over Word features that lean on Windows components: styles and a table of contents, footnotes, comments,
 ' tracked changes, table styles, pictures in each format found in a directory, a chart, SmartArt, WordArt, a text box,
-' a hyperlink, a page number field, a wildcard search, saving in each format Word writes, a password-encrypted save that
-' is opened again, comparing two documents and restricting editing.  Each step is logged with its result or its error,
+' a hyperlink, a page number field, a wildcard search, saving in each format Word writes, the exported PDF opened
+' again, a password-encrypted save that is opened again, comparing two documents and restricting editing.  Each step is logged with its result or its error,
 ' and one failing does not stop the others.  Nothing is printed, mailed or sent to a cloud service.
 ' Usage: cscript word-sweep.vbs <output directory> <progress log> [picture directory]
 Option Explicit
@@ -174,6 +174,26 @@ document.ExportAsFixedFormat outdir & "\sweep.pdf", 17
 result "export sweep.pdf", size_of(outdir & "\sweep.pdf") & " bytes"
 document.ExportAsFixedFormat outdir & "\sweep.xps", 18
 result "export sweep.xps", size_of(outdir & "\sweep.xps") & " bytes"
+
+' the PDF opened again: Word converts it with PDFREFLOW.EXE, after a notice DisplayAlerts does not hold back, so the
+' notice is switched off for this step and the setting put back as it was
+Dim shell, pdf_warning, had_warning
+Set shell = CreateObject("WScript.Shell")
+pdf_warning = "HKCU\Software\Microsoft\Office\" & word.Version & "\Word\Options\DisableConvertPdfWarning"
+had_warning = shell.RegRead(pdf_warning)
+If Err.Number <> 0 Then had_warning = Empty : Err.Clear
+shell.RegWrite pdf_warning, 1, "REG_DWORD"
+Set doc2 = word.Documents.Open(outdir & "\sweep.pdf", False, True, False)
+If Err.Number <> 0 Then
+    result "open sweep.pdf", ""
+Else
+    found = ""
+    found = doc2.Paragraphs.Count & " paragraphs, " & doc2.InlineShapes.Count + doc2.Shapes.Count & " shapes"
+    result "open sweep.pdf", found
+    doc2.Close False
+End If
+If IsEmpty(had_warning) Then shell.RegDelete pdf_warning Else shell.RegWrite pdf_warning, had_warning, "REG_DWORD"
+Err.Clear
 
 ' encrypted with a password, then opened with it
 document.SaveAs2 outdir & "\sweep-password.docx", 16, , "Sweep-2026"
