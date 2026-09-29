@@ -6944,16 +6944,16 @@ err:ole:marshal_object Failed to create an IRpcStubBuffer ...
 决定性的一步是去看 **Office 请求的 URL**。WebView2 的 `History` 里存着它：
 
 ```
-login.microsoftonline.com/...?...login_hint=user%40example.com
-login.live.com/...?...login_hint=user%40example.com
+login.microsoftonline.com/...?...login_hint=<旧账户>%40outlook.com
+login.live.com/...?...login_hint=<旧账户>%40outlook.com
 ```
 
 **是 Office 自己把这个地址当 `login_hint` 传出去的**——所以它一定存在本地。但全 prefix
 搜明文只命中 WebView2 的 History 和 Favicons，都是导航留下的痕迹。
 
 漏掉的是**注册表里的二进制值**：`user.reg` 把 REG_BINARY 写成十六进制字节，搜
-`account` 自然搜不到，要搜 `61,00,63,00,63,00,6f,00,75,00,6e,00,74,00`（UTF-16LE 的
-十六进制形式）。一搜就中：
+账户名的明文自然搜不到，要搜它 UTF-16LE 的十六进制形式（每个字符两个字节，如 `x` 是
+`78,00`）。一搜就中：
 
 ```
 HKCU\Software\Microsoft\Office\16.0\Outlook\Profiles\Outlook\caa1c55647359940981dcf71a08288f2
@@ -6966,7 +6966,7 @@ HKCU\Software\Microsoft\Office\16.0\Outlook\Profiles\Outlook\caa1c55647359940981
 
 ```
 登录/对话框窗口: 0 个
-(display name) (user@example.com) 已登录
+<显示名> (<当前账户>) 已登录
 ```
 
 教训有两条，都值得记：
