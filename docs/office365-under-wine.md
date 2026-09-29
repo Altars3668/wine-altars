@@ -10774,6 +10774,47 @@ Excel 自动化探针要 20–27 秒。PowerPoint 也一样，Word 不触发。
 （altars-up `a3345e01f89`，advapi32 测试 `test_user_classes_hive`；方向与 Windows 相反，所以 `HKCU\Software\Classes`
 的内核名仍是 `...\<sid>\Software\Classes`，Windows 上是 `...\<sid>_Classes`）。它与修复循环无关。
 
+### Word 打开 PDF：PDFREFLOW 的两处缺口（altars-up `6fbec143386`、`83989262b3a`）
+
+Word 打开 PDF 时由 `PDFREFLOW.EXE`（本地 COM 服务器，Word 先后启动两次）把 PDF 转成一个 docx 包交回 Word。
+普查里导出的 `sweep.pdf`（有图片、图表、SmartArt、超链接、脚注）打开失败，Word 只说 1401“在试图打开文件时遇到错误”。
+
+- **失败链从 Word 自己的遥测里读。** `%LOCALAPPDATA%\Temp\Diagnostics\WINWORD\Primary*.log` 每行一个事件；
+  `Office.Word.FileOpen.UserInitiatedOpen` 的 `Activity.Result.Code/Tag` 与 `Data.IntermediateResults`（按时间的
+  `{Code, Type, Tag}` 数组）给出整条链。Tag 是 WWLIB.DLL 里紧跟失败调用的立即数，搜 `.text` 得 RVA，用 wwlib 的公开 PDB
+  （OMAP，`scripts/pdb-addr2sym.py`）命名：`HrReadMetroFromPistm`（读 OOXML 包）返回 0x80CB9101；这个码只由 Mso30 的
+  OPC 加载器（`CContentTypesLoader`、`CRelationshipsLoader` 等的 `startElement`）产生，即包结构不合法。
+- **第一处：WIC 的 8bpp Alpha。** PDFREFLOW 要 `GUID_WICPixelFormat8bppAlpha` 的组件信息（Direct2D 的纯 alpha 位图、
+  PDF 软蒙版），Wine 没注册，`CreateComponentInfo` 失败后它抛 `CException`。按 Windows 的数据注册（8 位、1 通道、
+  掩码 0xff、无符号整数、支持透明；测试 `test_pixelformat_info_8bppAlpha`，待 winref 实测）。
+- **第二处：opcservices 丢了 TargetMode。** PDFREFLOW 用系统的 OPC API（`IOpcFactory`、
+  `IOpcRelationshipSet::CreateRelationship(..., OPC_URI_TARGET_MODE_EXTERNAL)`）生成 docx。Wine 的
+  `opc_relationship_create` 从不保存目标模式（`GetTargetMode` 永远是内部），写关系部件时也从不写 `TargetMode`，
+  超链接 `https://example.com/` 因而成了非法的内部部件名。对照：只差 `TargetMode="External"` 的两个手工 docx，
+  Word 只拒前者（“文件可能已经损坏”）。修后这份 PDF 8 秒打开（24 段、9 个形状，图片、超链接、脚注尾注、文本框都在），
+  `word-sweep.vbs` 加上“重新打开导出的 PDF”一步后 Word 普查全部通过。
+- **opcservices 补齐（`e417eb13825`、`a4ada818b49`）。** 写包时“不压缩”的部件原来先过 deflate 0 级再标成 stored，条目比
+  部件长 5 字节、任何读取方都当损坏（PDFREFLOW 写图片正用这一档），ZIP64 的几处记录也写错了；现在照 ZIP 规范写。
+  `ReadPackageFromStream` 原是桩，现在读 ZIP32/ZIP64、stored 与 deflate（校验长度和 CRC）、内容类型（Override 先于
+  Default，不分大小写）、各部件的压缩档位和全部关系（含 TargetMode）；删部件与关系、按类型枚举、关系部件内容流、
+  流的其余方法、部件 URI 的比较、相对化与规范化也都补上，原有测试的 todo_wine 全部通过（871 项 0 失败）。
+  这部分由 Claudex 按任务卡施工，审查后改了三处（同一部件的相对引用应为空，它给出 `../`；文件流 `Stat` 的
+  `grfMode` 不凭空定为只读；恢复一处注释）。非法包的错误码、LockRegion、CopyTo 到尾、内容流的 grfMode 等未经
+  Windows 实测，`tools/opcprobe` 与新测试都在 winref 批次里。
+- **排查中的弯路。** Mso30 自己也含 “TargetMode”，先怀疑是它的写入器；opcservices 的调试通道叫 `msopc`，
+  用 `+opcservices` 什么也看不到。
+
+**用遥测找隐藏故障。** 同样的日志按“事件名 + 结果码 + 标签”汇总所有 `Activity.Success=false` 的事件（只取这些字段，
+日志里有账户相关内容，不外传），能一次列出三个应用里所有悄悄失败的活动。今天这样找到了 Excel 每次启动约 34 次的
+`Office.AirSpace.Backend.CompositionErrorActivity`（0x88980801，DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED）：AirSpace
+的渲染线程对一个表面 BeginDraw、SuspendDraw、再对同一表面 BeginDraw，UI 线程稍后才 EndDraw；Wine 拒绝挂起之后的
+BeginDraw，与 DirectComposition 文档一致，Windows 为何不报错待 `tools/drawsurfprobe` 在 winref 上实测。
+
+**测试显示的教训。** 本机已没有 X 显示 :78；winex11 连不上时 explorer 改选 winewayland，而 `WAYLAND_DISPLAY` 未设时
+libwayland 连 `wayland-0`——用户真实的 GNOME 会话。:2（无头 mutter 的 Xwayland）也要它自己 `-auth` 文件里的 cookie，
+`scripts/office-debug.sh` 会设，直接运行时要自己设 `XAUTHORITY`，并设 `WAYLAND_DISPLAY=wayland-1` 兜底。在 Wayland 驱动下
+Excel 启动后死锁（一个线程持加载器锁空转），X11 下正常，待查。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
