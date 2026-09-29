@@ -60,3 +60,6 @@ ppsx、严格 OOXML、odp、xml、pdf、xps、PNG 目录）、加密保存后用
 另存为 PNG 失败（DXGI 表面渲染目标各用各的 D2D 设备，wine-src `32ea29df`）；导出 WMF 曾不出文件（`GdipEmfToWmfBits` 是桩，wine-src
 `94ff49cf`）。winref 上的原生 PowerPoint（build 20522）对同一演示文稿：SVG 导出同样报“转换器未安装”，WMF 13 MB，XPS 299 KB，
 `SaveCopyAs` 动画 GIF 同样不出文件但之后照常响应，视频 5 秒生成。
+
+2026-09-29 在 altars-up 上：WIC 的 GIF 元数据写入链补齐后（wine-src-up `01c911684cf`），`SaveCopyAs` 2 秒写出两帧循环
+GIF，之后 Close、Quit 照常，48 项通过；剩下 SVG 导出（与原生相同）和视频（mfreadwrite 的 SinkWriter 不编码、不收尾）。

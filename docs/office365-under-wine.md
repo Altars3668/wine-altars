@@ -10758,4 +10758,14 @@ Excel 启动后问服务 `DetermineIsRepairRequiredEx`，每次都得到 True，
 PowerPoint 建 GIF 编码器、`Initialize`，随即 `GetMetadataQueryWriter`，得到 E_NOTIMPL 就放弃，一帧都不建，后台导出从此
 不结束。上游的元数据写入链是空的：所有编码器（GIF 与 PNG/JPEG/TIFF 的公共实现）的帧块写入器都是 E_NOTIMPL，
 `SetMetadataByName` 对所有格式返回 S_OK 却什么也不写，GIF 的 LSD/IMD/GCE/APE/注释只有读取器，编码器提交时不写任何扩展。
-Windows 的规格用 `tools/gifencprobe` 实测。
+
+altars-up `01c911684cf` 补上了这条链：编码器与每一帧各有一张元数据写入器列表（IWICMetadataBlockWriter），编码器的
+查询写入器建在它上面；`SetMetadataByName` 在已有的写入器上设值，路径上的块不存在时按其格式建写入器挂到父级；五种 GIF
+块都有写入器；提交时写出设置过的描述符字段、全局颜色表之后的应用扩展与注释、每帧图像之前的图形控制扩展。PowerPoint 2 秒
+写出两帧、无限循环、带每页延时的 GIF，之后照常响应，普查从 45 项升到 48 项。winref 连不上，空块列表、没设 /grctlext
+时不写 GCE、几种错误码、`/appext/Data` 末尾零字节的处理暂未实测（`tools/gifencprobe` 待跑）。注意：PNG/JPEG/TIFF 的帧块
+写入器仍是桩，过去它们的 `SetMetadataByName` 假装成功，现在如实返回错误；普查里 PNG、JPG 导出不受影响。
+
+普查的下一项随之暴露：`CreateVideo` 2 秒后以状态 4（失败）结束、0 字节（原生 5 秒生成）。跟踪止于
+`sink_writer_Finalize` 的 FIXME：mfreadwrite 的 SinkWriter 把未编码的样本直接交给接收器（编码一步是 FIXME），
+`Finalize` 未实现，上游与 CrossOver 都缺；上游测试 `test_sink_writer_sample_process` 已有 Windows 上测过的规格。
