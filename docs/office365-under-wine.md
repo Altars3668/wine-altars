@@ -10595,3 +10595,35 @@ Wine 上逐项对照。
 
 对照结果：`expressions.vbs`、`runtime.vbs`、`objects.vbs`、`files.vbs` 与 Windows 逐行相同，`errors.vbs` 只差 30000。新测试在 Windows 与 Wine 上
 都通过（vbscript 的 run 测试在中文 Windows 上另有 26 处失败，全是上游用例拿英文描述比较），三个应用的回归与 Word、Excel 普查照常通过。
+
+## msxml3：上游写出器的修复，SAX 读取器的属性与两个上限，以及 libxml2 自己的限制（wine-src `afad9ace`…`010cc274`）
+
+动手前先查上游：自 wine-11.0 起上游 msxml3 有 232 个提交，Nikolay Sivov 把 SAX 解析器、DOM 与 XPath 都改成了不依赖 libxml2 的自有实现
+（`bd3176206a`、`21735ee834`、`c23cbae37a`，到 9 月还在修崩溃），XSLT 仍走 libxslt。这与这里基于 libxml2 的十几个本地提交（ProhibitDTD、
+MaxElementDepth、文档流、属性查找、DTD 报告……）改的是同一批函数；整体换过去要把这些 Windows 实测语义在新解析器上重做一遍，而对 Office
+没有直接收益，风险却不小。所以暂不整体移植，只取与解析器无关、能独立套上的部分：
+
+- **写出器（MXXMLWriter）。** 上游 7 个提交：`putDocumentLocator` 返回 S_OK（与本地 `ef0a28b` 同一修正，改用上游写法）、换行统一写成
+  CRLF、属性值里的换行 4.0 起写成 `&#xA;`、CDATA 里的换行也规范化、开了缩进时第一个元素前不加换行、`endElement` 不缩进（会改变文本内容）。
+  上游的相应测试依赖一批测试文件重构，改写成本地测试文件的写法并入；4.0 写属性值换行的期望单列（上游把 4.0 的行挪到了 msxml4 测试里）。
+- **读取器与 DOM 的旧解析器提交。** VB 接口的 `startElement/endElement` 不再收到 NULL 的 uri，`createNode` 接受类型名，设置处理器的 trace，
+  以及 SAX 错误消息表 `msxml.mc`（查消息改为先查本模块）。上游的 VB 内容处理器测试与本地一个测试同名，本地那个改名。
+
+**读取器的属性（`3d006c71`）。** 上游测试里 VB 接口取处理器属性的类型是 todo；顺着看，读取器的 `getProperty` 除两个处理器与 `xmldecl-version`
+之外全是 `E_NOTIMPL`，`max-xml-size`、`max-element-depth` 设非零值也是 `E_NOTIMPL`。`tools/saxpropprobe` 在 winref 上量了 3.0 与 6.0 的全部
+属性（见其 README）：处理器经 VB 接口是 `VT_DISPATCH`；XML 声明三项 6.0 保留上一个文档的、3.0 永远 NULL；各属性的默认值与 3.0/6.0 的
+差别；不认识的名字是 `E_INVALIDARG`。两个上限照实测实现：大小以 KB 计，流按字节、字符串 6.0 按字节而 3.0 按字符；超限时 3.0 先开始文档
+再以 `E_ABORT`（消息“System error: MaxXMLSize.”）停在 1:1，6.0 不开始文档、以 0xc00cee91 停在 1:0；嵌套超限停在那个开始标签、不报它的
+`startElement`，3.0 的位置在名字开头、6.0 在名字之后，错误是 `E_ABORT` 或 0xc00cee92。消息加进 `msxml.mc`（6.0 的英文原文取自微软文档的
+max-xml-size 示例）。新测试（msxml3 测 3.0、msxml6 测 6.0）在 Windows 与 Wine 上都通过。
+
+**libxml2 自己的限制（`010cc274`）。** 量上限时发现 libxml2 另有两道限制：元素嵌套到 256 层就报错，文本节点超过一千万字符就截断——而且截断后
+文档照常“加载成功”。DOM 只在 MaxElementDepth 大于 256 时才放开（`XML_PARSE_HUGE`），于是 DOMDocument60（默认 256）载入 11 MB 文本只剩
+9,999,997 个字符，Windows 上完整；SAX 读取器从不放开，3.0 在 257 层就停，而 MSXML 3 默认允许 5000 层。现在两处都始终放开，只由 MSXML 自己的
+属性限制；libxml2 的实体膨胀保护与这个选项无关，仍然有效。两处都有新测试，在 Windows 上通过；去掉修正时 SAX 的 300 层用例失败。
+
+顺带量了 Office 对 MSXML 对象反复 QueryInterface 的两个未公开接口（`{e19c7100-9709-4db7-9373-e7b518b47086}` 一次普查八百多次、
+`{c970c32d-9ffd-45e5-bf20-c3cbaab26222}`）：原生 MSXML 也不实现，Wine 日志里的对应 ERR/FIXME 只是噪声。仍然不同的是解析错误的错误码——
+libxml2 报的错一律是 `E_FAIL`，Windows 各有代码（如文档不完整时 3.0 是 0xc00ce553、6.0 是 0xc00cee01）；消息语言则随系统界面。
+
+部署后三个应用的回归、Word 普查（42 项，含经 SAX 读取器与写出器写扁平 XML）与 Excel 普查（80 项，含动态数组工作簿的往返）全部通过。
