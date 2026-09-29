@@ -46,3 +46,15 @@
 2026-09-28 在 Wine 下（`:2`）：正文为“Hello 中文输入测试，你好。”“第二行 ABC”两段（Word 把 hello 自动改成首字母大写），没有崩溃；9 月 4 日记录的“键入中文时 Word 以 0xe0000002 崩溃”不再出现。这只验证了 Unicode 字符输入，经 X 输入法（XIM）的组字路径没有测。
 
 `word-math.vbs <输出.pdf> <进度日志> [公式字体或 ""] [显示秒数]` 在新文档里用线性格式写两个公式（a^2+b^2=c^2 与求根公式），`OMaths.Add` 后 `BuildUp` 成专业格式，记下 Word 数到的公式数、各自的函数数与文字，导出 PDF；给了字体就把文档的公式字体设成它，给了秒数就让 Word 可见地停留这么久以便截图。只退出自己启动的 Word，不保存。2026-09-28：Wine 下没有 Cambria Math，GDI 给了 Liberation Sans，公式在屏幕和 PDF 上都是空的；换成带 MATH 表的自由字体后出现。wine-src `a84f7a5` 让已装的自由数学字体（DejaVu Math TeX Gyre 等，TrueType 轮廓的优先）在没有 Cambria Math 时顶替它，默认公式字体下屏幕与 PDF 都正常。选 CFF 轮廓的数学字体（Latin Modern Math、系统同名的 STIX Two Math .otf）时，Word 导出 PDF 会把字形画成图像，画面上出现贯穿的竖线，原因未查清（`tools/glyphrasterprobe`）。
+
+`powerpoint-sweep.vbs <输出目录> <进度日志> [图片目录]` 逐项跑依赖 Windows 组件的 PowerPoint 功能：各种版式的幻灯片与中英文文字、带样式的表格、
+图表、SmartArt、艺术字、带渐变/阴影/发光/柔化边缘/映像/棱台的形状、图片目录里每种格式的图片、脚本自己写的 SVG 与 3D 模型（OBJ）、超链接、
+备注、批注、切换（含平滑切换）、动画、节、查找替换、把幻灯片导出为 PNG/JPG/SVG/EMF、PowerPoint 能写的每种格式（pptx、ppt、pptm、potx、
+ppsx、严格 OOXML、odp、xml、pdf、xps、PNG 目录）、加密保存后用密码打开（错误密码被拒）、重新打开存下的文件、标记为最终版本（先存盘，
+否则会弹出“另存为”）、放映并翻页再退出，最后是动画 GIF 与视频（两者在后台生成）。每项记下结果或错误，一项失败不影响后面的；不打印、不
+发邮件、不碰云服务，输出只写进给定目录。PowerPoint 是单实例：在别人的 Windows 机器上跑之前先确认它没在运行。
+
+2026-09-28 在 Wine 下的进展：插入 3D 模型曾使 PowerPoint 崩溃（桌面没有 DACL，wine-src `bfd4e06c`）；带映像与棱台的形状曾使导出图片与
+另存为 PNG 失败（DXGI 表面渲染目标各用各的 D2D 设备，wine-src `32ea29df`）；导出 WMF 曾不出文件（`GdipEmfToWmfBits` 是桩，wine-src
+`94ff49cf`）。winref 上的原生 PowerPoint（build 20522）对同一演示文稿：SVG 导出同样报“转换器未安装”，WMF 13 MB，XPS 299 KB，
+`SaveCopyAs` 动画 GIF 同样不出文件但之后照常响应，视频 5 秒生成。

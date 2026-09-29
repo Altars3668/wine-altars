@@ -10627,3 +10627,29 @@ max-xml-size 示例）。新测试（msxml3 测 3.0、msxml6 测 6.0）在 Windo
 libxml2 报的错一律是 `E_FAIL`，Windows 各有代码（如文档不完整时 3.0 是 0xc00ce553、6.0 是 0xc00cee01）；消息语言则随系统界面。
 
 部署后三个应用的回归、Word 普查（42 项，含经 SAX 读取器与写出器写扁平 XML）与 Excel 普查（80 项，含动态数组工作簿的往返）全部通过。
+
+## PowerPoint 功能普查：3D 模型、带特效形状的导出与 WMF（wine-src `91a75d97`…`94ff49cf`）
+
+`tools/officeautomationprobe/powerpoint-sweep.vbs` 仿照 Word、Excel 的普查逐项跑 PowerPoint（见其 README）。第一次跑到“插入 3D 模型”
+PowerPoint 就崩溃了，之后各步都是 462。
+
+- **3D 模型：桌面没有 DACL（`bfd4e06c`，另移植上游 `253b2d25e1`）。** 崩溃点是 ntdll 的 `RtlQueryInformationAcl` 读空指针。临时在它和
+  `GetAclInformation` 里记下返回地址，爬到 mso.dll：Office 为 3D 导入器建 Chromium 式的沙箱（受限令牌、作业对象、改默认 DACL、设完整性
+  级别、模拟），代理用 `GetSecurityInfo(桌面, SE_KERNEL_OBJECT, DACL)` 取线程桌面的 DACL 以加入沙箱令牌的 SID，拿到后不查 NULL 就交给
+  `GetAclInformation`。wineserver 建窗口站和桌面时不带安全描述符，DACL“不存在”。`tools/desktopsdprobe` 在 winref 的服务会话与交互会话里
+  量了原生的描述符：新建桌面得到窗口站里带 OBJECT_INHERIT 的 ACE（去掉继承标志、通用权限映射为桌面权限），后建的窗口站复制调用进程所在
+  窗口站的 DACL，WinSta0 给登录 SID、受限代码、SYSTEM 全部权限，给 Administrators 与两个应用包 SID 较少权限，各一条给自己、一条留给桌面
+  继承。服务端照此给出默认描述符，user32 的 `Get/SetUserObjectSecurity` 取上游实现。上游只在客户端传入描述符时才有，NULL 时仍然没有。
+- **带映像与棱台的形状导出失败：D2D 设备不共享（`32ea29df`）。** 导出 PNG/JPG、另存为 PNG 报“储存此文件时发生错误”，单项排查定位到同一
+  形状同时有映像和棱台。oart.dll 抛 `Art::CommandListNotImplementedException`，d2d 日志是“Pixel shader … was never loaded”：Office 在某个
+  DXGI 表面渲染目标的设备上另建上下文、创建效果与输入，再画进之后新建的表面渲染目标。d2d1 测试在 Windows 上量得：同一工厂在同一 DXGI
+  设备上的表面渲染目标共用一个设备（与 `CreateDevice` 得到的都不同），全部释放后才换新；跨设备画效果是 `D2DERR_WRONG_RESOURCE_DOMAIN`。
+  Wine 每个渲染目标新建一个设备；现在工厂按 DXGI 设备弱引用地共享。导出图里棱台与映像都画出来了。
+- **WMF 导出：`GdipEmfToWmfBits`（`94ff49cf`，此前先移植了上游 gdiplus 自 11.0 起的 57 个提交）。** PowerPoint 以
+  `GdipEmfToWmfBits(emf, 0, NULL, MM_ANISOTROPIC, 0)` 取大小，桩返回的状态码 6 被当成 6 字节。`tools/emftowmfprobe` 量得原生结果就是
+  `GetWinMetaFileBits` 的 GDI 记录，按标志去掉嵌入的 EMF、加可放置头；照此实现后纯 GDI 元文件的输出与 Windows 逐项一致。但 Wine 下导出的
+  WMF 只有 130 字节（Windows 13 MB）：Wine 的 GDI+ 录制双格式元文件时只写 EMF+ 记录，不写 GDI 回退记录，PowerPoint 导出的 EMF 里 99 条
+  全是 EMF+——不认 EMF+ 的程序看到的是空白。这一处尚未实现。
+
+普查其余各项（表格、图表、SmartArt、艺术字、各种特效、WebP 与 SVG 图片、超链接、备注、批注、平滑切换、动画、节、查找替换、各种格式保存、
+密码、重新打开）都通过；SVG 导出在原生 PowerPoint 上同样不支持。三项改动之后 Word（42 项）、Excel（80 项）普查与回归照常通过。
