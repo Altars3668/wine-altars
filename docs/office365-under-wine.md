@@ -10671,3 +10671,36 @@ PowerPoint 就崩溃了，之后各步都是 462。
   GIF，但之后照常响应。
 - **暂未移植。** msado15（48 个提交）、jscript（23 个）、oledb32（3 个）本地与 CrossOver 都没改过，按路径套上后测试不过（msado15 的测试
   需要上游新增的 `msdshape.h`，jscript 两组、oledb32 的类型转换各有失败），需要连同依赖一起移植，已撤回。
+
+## 迁到上游 master 之后：新树 altars-up 的状态（2026-09-29）
+
+新树 `wine-src-up`（分支 `altars-up`）以纯 Wine master `6880117619a` 为底，不带 CrossOver 的改动（含用户名 hack），
+Office 在新配置文件 `~/.wine-c2r-up` 里重新激活；旧树的 606 个提交逐一核对后按上游现状取舍，此后的修复都按 winref
+（Windows 11 build 29671）实测来做。CrossOver 26.3 的差异审计见 `docs/crossover-delta-audit.md`。
+
+**现状。** `scripts/office-regress.sh` 的 Word、Excel、PowerPoint 保存回归，与 `word-embed.vbs`（Word 里就地激活 Excel）
+都通过；功能普查 Word 34 项、Excel 72 项全部通过，PowerPoint 45 项通过，余下的 SVG 导出在原生 PowerPoint 上同样
+“转换器未安装”，动画 GIF 之后的视频一项因 PowerPoint 仍在后台忙于 GIF 而被拒（旧树已查明：WIC 的元数据写入链是桩，
+上游至今只补了帧级查询写入器，`SetMetadataByName` 与 GIF 各块的写入器仍缺）。
+
+**今天的修复（altars-up）。**
+- Office 启动卡死：Mesa 共享上下文的竞态（`patches/mesa` 补丁待定是否提交上游），本地以 `88ea33779d2` 关掉 Mesa 的
+  线程化上下文规避；dcomp 先建默认设备再锁（`7bd9beccfdd`）。
+- dxgi：客户区缺一维时按 8 像素、flip 模型最小化照常呈现（`a32fc1b75c9`，`tools/dxgizeroprobe`）。
+- ole32/combase/rpcrt4：LockServer 与 ResizeBorder 的代理存根、代理 QI 返回调用本身的错误、RPC 服务线程句柄竞态
+  （`dbbc1723168`、`6b563643516`、`fe9092ea2ef`）。
+- vbscript：宿主不是服务提供者时照样给对象站点，Wine 的 cscript 里终于能建 MSXML 6 文档（`9cc85e31966`，
+  `tools/scriptsiteprobe`）。
+- mlang 的 RFC 1766 表（`d0e66a45375`）；msxml3 的扩展函数、SAX 读取器、解析设置、属性查询、命名空间管理器、
+  克隆保留前缀、脚本文本、XSLT 两个开关、MXXMLWriter 写入文档（`4435c78926a`…`a37e3bfb752`，探针 `msxslfuncprobe`、
+  `msxmlpropprobe`、`xsltsecprobe`、`xmlprobe`）。其中 domdoc、saxreader 的新测试在 Windows 上 0 失败。
+- 旧树诊断代码（`altars-` 追踪、写 /tmp 的纹理转储、热路径上的 getenv）清掉（`eaea18eb825`）。
+
+**实测推翻的旧结论。** 旧树曾让 DOM 保留未声明的命名空间前缀并在插入时绑定——Windows 的 MSXML 3 与 6 对这种片段一律
+报 0xc00ce01d（`tools/xmlprobe`），新树不移植；CrossOver 在 `OleCreate` 失败后改用默认处理器——Windows 同样返回
+REGDB_E_CLASSNOTREG（`tools/olecreateprobe`），不做。
+
+**仍然不同、已记下的。** HKEY_CLASSES_ROOT 不合并用户的类（按用户注册的 COM 加载项因此找不到，正在做）；MSXML 的
+`parseError` 没有行列与原因文本；MSXML 3 默认的 DTD 校验（validateOnParse）新解析器没有；MSXML 对象不提供类信息
+（`TypeName` 给接口名）；d3d9 在空客户区上比 Windows 宽松；UniversalApiContract 报 10（winref 为 20），只在相应 API
+实现后再提高。
