@@ -124,6 +124,29 @@ static void probe(const char *name, REFCLSID clsid)
     IXMLDOMDocument2_getProperty(doc, prop, &v);
     printf("  now vt %d value %ld\n", V_VT(&v), V_VT(&v) == VT_I4 ? V_I4(&v) : -1);
     SysFreeString(prop);
+
+    for (i = 2; i < ARRAYSIZE(props) - 1; i++)
+    {
+        prop = SysAllocString(props[i]);
+        V_VT(&v) = VT_BOOL; V_BOOL(&v) = VARIANT_TRUE;
+        hr = IXMLDOMDocument2_setProperty(doc, prop, v);
+        VariantInit(&v);
+        printf("  set %ls true %#lx, then get %#lx", props[i], hr, IXMLDOMDocument2_getProperty(doc, prop, &v));
+        printf(" vt %d value %d\n", V_VT(&v), V_VT(&v) == VT_BOOL ? V_BOOL(&v) : -1);
+        VariantClear(&v);
+        SysFreeString(prop);
+    }
+
+    prop = SysAllocString(L"MaxXMLSize");
+    V_VT(&v) = VT_I4; V_I4(&v) = 5;
+    hr = IXMLDOMDocument2_setProperty(doc, prop, v);
+    VariantInit(&v);
+    printf("  set MaxXMLSize 5 %#lx, then get %#lx", hr, IXMLDOMDocument2_getProperty(doc, prop, &v));
+    printf(" vt %d value %ld\n", V_VT(&v), V_VT(&v) == VT_I4 ? V_I4(&v) : -1);
+    V_VT(&v) = VT_I4; V_I4(&v) = -1;
+    hr = IXMLDOMDocument2_setProperty(doc, prop, v);
+    printf("  set MaxXMLSize -1 %#lx\n", hr);
+    SysFreeString(prop);
     IXMLDOMDocument2_Release(doc);
 }
 
