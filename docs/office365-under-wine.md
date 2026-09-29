@@ -10653,3 +10653,21 @@ PowerPoint 就崩溃了，之后各步都是 462。
 
 普查其余各项（表格、图表、SmartArt、艺术字、各种特效、WebP 与 SVG 图片、超链接、备注、批注、平滑切换、动画、节、查找替换、各种格式保存、
 密码、重新打开）都通过；SVG 导出在原生 PowerPoint 上同样不支持。三项改动之后 Word（42 项）、Excel（80 项）普查与回归照常通过。
+
+### 双格式元文件的 GDI 记录、windowscodecs 移植与动画 GIF（wine-src `2718e9e6`、`de4daa4b`…`fbdf7e82`）
+
+- **双格式元文件（`2718e9e6`）。** 以 `EmfTypeEmfPlusDual` 录制的元文件按规范要有两套完整记录：认 EMF+ 的程序读 EMF+，不认的（GDI 本身、
+  `GetWinMetaFileBits`）读 GDI 记录。Windows 为每次调用写矢量 GDI 记录；这里在录制结束时用 gdiplus 自己的 EMF+ 回放把整张图画进位图，
+  以两条 StretchDIBits 追加在最后（先 SRCAND 掩码、后 SRCPAINT 颜色，未画到处保持透明）。EMF+ 读者按规范忽略没有 GetDC 引导的 GDI
+  记录，Wine 的回放也是。纯 GDI 回放一个双格式矩形的测试在 Windows（矢量）与 Wine（栅格）下都通过；PowerPoint 导出的 WMF 从 130 字节
+  变为 2.9 MB，用 libwmf 独立渲染，SmartArt、艺术字与带特效的形状都在。与 Windows 的差别是回退为栅格、边缘可差一像素。
+- **windowscodecs。** 上游自 11.0 起的 21 个提交（像素格式转换补全、GIF 按需解码与 LZW 表满的修正、BMP/DDS 溢出检查等），外加 BMP
+  解码器要用的 `include/intsafe.h`（上游 `cc68bd9087`）。上游同期把各模块的 `WIN32_NO_STATUS` 去掉的全局头文件改动（`9e03f3324c`）
+  没有移植，windowscodecs 里对应的删除也就不取。新增的像素格式转换器要重新注册 windowscodecs（`regsvr32 windowscodecs.dll`）才能找到。
+- **动画 GIF 仍不可用。** 导出时后台失败，PowerPoint 弹出“储存此文件时发生错误”，自动化此后一直被拒（RPC_E_CALL_REJECTED）。原因
+  不在媒体基础：`GifEncoder_GetMetadataQueryWriter` 是桩，而再往下，查询写入器的 `SetMetadataByName` 对所有格式都是返回 S_OK 的桩，GIF
+  各块（GCE、APE、注释）只有读取器，编码器提交时不写任何扩展——上游 master 同样如此。只接上编码器的查询写入器会让 PowerPoint“成功”
+  写出一个没有帧延时与循环的 GIF，属于假成功，所以留待把整条元数据写入链实现之后。原生 PowerPoint 经自动化 `SaveCopyAs` 同样没有写出
+  GIF，但之后照常响应。
+- **暂未移植。** msado15（48 个提交）、jscript（23 个）、oledb32（3 个）本地与 CrossOver 都没改过，按路径套上后测试不过（msado15 的测试
+  需要上游新增的 `msdshape.h`，jscript 两组、oledb32 的类型转换各有失败），需要连同依赖一起移植，已撤回。
