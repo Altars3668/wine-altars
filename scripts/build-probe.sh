@@ -9,6 +9,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 B="${WINE_BUILD:-$ROOT/wine-src/build-wow64}"
 src=$(realpath "$1"); out=$(realpath -m "$2"); shift 2
 cd "$B"
+# upstream moved winecrt0 from dlls/ to libs/, and links PE modules with the bundled compiler-rt;
+# take whichever this tree has
+crt0=libs/winecrt0/x86_64-windows/libwinecrt0.a; [ -f $crt0 ] || crt0=dlls/winecrt0/x86_64-windows/libwinecrt0.a
+rtlib=libs/compiler-rt/x86_64-windows/libcompiler-rt.a; [ -f $rtlib ] || rtlib=
 FLAGS="-Iinclude -I../include -I../include/msvcrt -I$(dirname "$src") -D_UCRT -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -mcx16 -g -O1"
 x86_64-w64-mingw32-gcc -c -o "$out.o" "$src" $FLAGS
 libs=
@@ -20,7 +24,7 @@ for d in "$@"; do
     [ -n "$f" ] && libs="$libs $f"
 done
 tools/winegcc/winegcc -o "$out" --wine-objdir . -b x86_64-w64-mingw32 -mconsole "$out.o" $libs \
-    dlls/winecrt0/x86_64-windows/libwinecrt0.a dlls/ucrtbase/x86_64-windows/libucrtbase.a \
+    $crt0 $rtlib dlls/ucrtbase/x86_64-windows/libucrtbase.a \
     dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a
 rm -f "$out.o"
 echo "built $out"

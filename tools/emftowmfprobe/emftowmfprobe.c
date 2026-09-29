@@ -191,6 +191,51 @@ int main(void)
             DeleteEnhMetaFile(emf);
         }
     }
+    {
+        /* what a buffer smaller than the result gets */
+        static const RECT frame = { 0, 0, 2000, 2000 };
+        static const INT flags[] = { 0, 1, 2 };
+        UINT size, full, got, i, j;
+        BYTE *data;
+
+        mfdc = CreateEnhMetaFileW(hdc, NULL, &frame, NULL);
+        Rectangle(mfdc, 10, 10, 60, 50);
+        emf = CloseEnhMetaFile(mfdc);
+        full = GetWinMetaFileBits(emf, 0, NULL, MM_ANISOTROPIC, hdc);
+        for (i = 0; i < ARRAY_SIZE(flags); i++)
+        {
+            size = GdipEmfToWmfBits(emf, 0, NULL, MM_ANISOTROPIC, flags[i]);
+            printf("flags %#x: %u bytes (GetWinMetaFileBits %u)\n", flags[i], size, full);
+            {
+                const UINT sizes[] = { size + 1, size, size - 1, size - 2, size / 2, 40, 22, 18, 17, 1 };
+                for (j = 0; j < ARRAY_SIZE(sizes); j++)
+                {
+                    data = malloc(size + 64);
+                    memset(data, 0xcc, size + 64);
+                    SetLastError(0xdeadbeef);
+                    got = GdipEmfToWmfBits(emf, sizes[j], data, MM_ANISOTROPIC, flags[i]);
+                    {
+                        UINT written = size + 64, off = flags[i] & 2 ? 22 : 0, pos, last = 0;
+                        while (written && data[written - 1] == 0xcc) written--;
+                        printf("  into %u: %u, error %lu, %u bytes written", sizes[j], got, GetLastError(), written);
+                        if (written >= off + 18 && *(WORD *)(data + off) == 1)
+                        {
+                            printf(", mtSize %lu words, mtMaxRecord %lu", *(DWORD *)(data + off + 6),
+                                   *(DWORD *)(data + off + 12));
+                            for (pos = off + 18; pos + 6 <= written && *(DWORD *)(data + pos) >= 3
+                                 && pos + *(DWORD *)(data + pos) * 2 <= written; pos += *(DWORD *)(data + pos) * 2)
+                                last = *(WORD *)(data + pos + 4);
+                            printf(", records end at %u, last function %#x", pos, last);
+                        }
+                        if (off && written >= 22) printf(", placeable key %#lx", *(DWORD *)data);
+                        printf("\n");
+                    }
+                    free(data);
+                }
+            }
+        }
+        DeleteEnhMetaFile(emf);
+    }
     ReleaseDC(NULL, hdc);
     printf("done\n");
     return 0;

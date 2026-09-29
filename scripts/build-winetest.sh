@@ -14,6 +14,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 B="${WINE_BUILD:-$ROOT/wine-src/build-wow64}"
 dll=$1; O=$(realpath -m "$2"); mkdir -p "$O"
 cd $B
+# upstream moved winecrt0 from dlls/ to libs/, and links PE modules with the bundled compiler-rt;
+# take whichever this tree has
+crt0=libs/winecrt0/x86_64-windows/libwinecrt0.a; [ -f $crt0 ] || crt0=dlls/winecrt0/x86_64-windows/libwinecrt0.a
+rtlib=libs/compiler-rt/x86_64-windows/libcompiler-rt.a; [ -f $rtlib ] || rtlib=
 FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D_CRT_NON_CONFORMING_WCSTOK -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2"
 list=$(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in)
 srcs=$(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.c\b')
@@ -60,9 +64,11 @@ for f in $stubs; do
     objs="$objs $O/${f%.c}.o"
 done
 x86_64-w64-mingw32-gcc -c -o $O/testlist.o dlls/$dll/tests/testlist.c $FLAGS
+# never a delay-import library (libX.delay.a): a module the tests import that way is not loaded until its
+# first call, and GetModuleHandle() on it at the start of a test answers NULL
 libs=
-for d in $imports; do f=dlls/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=libs/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | head -1); [ -n "$f" ] || f=$(ls dlls/*/x86_64-windows/lib$d.a 2>/dev/null | head -1); [ -n "$f" ] && libs="$libs $f"; done
+for d in $imports; do f=dlls/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=libs/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | /usr/bin/grep -v '\.delay\.a$' | head -1); [ -n "$f" ] || f=$(ls dlls/*/x86_64-windows/lib$d.a 2>/dev/null | head -1); [ -n "$f" ] && libs="$libs $f"; done
 tools/winegcc/winegcc -o $O/${dll}_test.exe --wine-objdir . -b x86_64-w64-mingw32 -mconsole \
-    $objs $O/testlist.o $res $libs dlls/winecrt0/x86_64-windows/libwinecrt0.a dlls/ucrtbase/x86_64-windows/libucrtbase.a \
+    $objs $O/testlist.o $res $libs $crt0 $rtlib dlls/ucrtbase/x86_64-windows/libucrtbase.a \
     dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a
 echo built $O/${dll}_test.exe
