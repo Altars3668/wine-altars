@@ -429,6 +429,125 @@ static void run_selection_language(void)
     }
 }
 
+static IXMLDOMDocument *load_doc(const WCHAR *xml)
+{
+    IXMLDOMDocument *doc = new_doc();
+    VARIANT_BOOL ok = VARIANT_FALSE;
+    BSTR src;
+
+    if (!doc) return NULL;
+    src = SysAllocString(xml);
+    IXMLDOMDocument_loadXML(doc, src, &ok);
+    SysFreeString(src);
+    if (ok != VARIANT_TRUE)
+    {
+        outf(L"  loadXML 失败: %ls\n", xml);
+        IXMLDOMDocument_Release(doc);
+        return NULL;
+    }
+    return doc;
+}
+
+static void say_xml(const WCHAR *label, void *unknown)
+{
+    IXMLDOMNode *node;
+    BSTR xml = NULL;
+
+    if (!unknown || FAILED(IUnknown_QueryInterface((IUnknown *)unknown, &IID_IXMLDOMNode, (void **)&node)))
+    {
+        outf(L"  %ls: <无>\n", label);
+        return;
+    }
+    IXMLDOMNode_get_xml(node, &xml);
+    outf(L"  %ls: %ls\n", label, xml ? xml : L"<null>");
+    SysFreeString(xml);
+    IXMLDOMNode_Release(node);
+}
+
+/* What the xml property says for a node whose namespaces are declared on an ancestor -- the
+ * text a caller carries from one document into another and parses again. */
+static void run_serialization(void)
+{
+    IXMLDOMNode *node = NULL, *child = NULL, *plain = NULL, *clone = NULL, *removed = NULL, *moved = NULL;
+    IXMLDOMNode *created = NULL, *added = NULL, *element = NULL;
+    IXMLDOMElement *root_a = NULL, *root_b = NULL, *root_c = NULL;
+    IXMLDOMDocument *a, *b, *c;
+    VARIANT type;
+    BSTR name, uri;
+
+    outf(L"== 序列化：命名空间声明在祖先上\n");
+    if (!(a = load_doc(L"<Package xmlns:appv=\"urn:appv\" xmlns=\"urn:default\">"
+                       L"<appv:Extensions><appv:Extension Id=\"x\"/><Plain/></appv:Extensions></Package>")))
+        return;
+    IXMLDOMDocument_get_documentElement(a, &root_a);
+    IXMLDOMElement_get_firstChild(root_a, &node);
+    say_xml(L"appv:Extensions", node);
+    IXMLDOMNode_get_firstChild(node, &child);
+    say_xml(L"appv:Extension", child);
+    IXMLDOMNode_get_lastChild(node, &plain);
+    say_xml(L"Plain（默认命名空间）", plain);
+    IXMLDOMNode_cloneNode(node, VARIANT_TRUE, &clone);
+    say_xml(L"cloneNode(true)", clone);
+    IXMLDOMElement_removeChild(root_a, node, &removed);
+    say_xml(L"removeChild 之后", removed);
+
+    if ((b = load_doc(L"<Package/>")))
+    {
+        IXMLDOMDocument_get_documentElement(b, &root_b);
+        IXMLDOMElement_appendChild(root_b, removed, &moved);
+        say_xml(L"搬进无声明的文档后，该文档的根", root_b);
+
+        V_VT(&type) = VT_I4;
+        V_I4(&type) = NODE_ELEMENT;
+        name = SysAllocString(L"appv:Created");
+        uri = SysAllocString(L"urn:appv");
+        IXMLDOMDocument_createNode(b, type, name, uri, &created);
+        SysFreeString(name);
+        SysFreeString(uri);
+        say_xml(L"createNode(appv:Created, urn:appv)", created);
+        IXMLDOMElement_appendChild(root_b, created, &added);
+        say_xml(L"再加进根之后，该文档的根", root_b);
+    }
+
+    if ((c = load_doc(L"<r xmlns:p=\"urn:p\"><e p:a=\"1\"/><p:f p:a=\"2\"><p:g/></p:f></r>")))
+    {
+        IXMLDOMNode *f = NULL, *deep = NULL, *shallow = NULL;
+        BSTR qname = NULL;
+
+        IXMLDOMDocument_get_documentElement(c, &root_c);
+        IXMLDOMElement_get_firstChild(root_c, &element);
+        say_xml(L"只有属性带前缀的 e", element);
+        IXMLDOMElement_get_lastChild(root_c, &f);
+        IXMLDOMNode_cloneNode(f, VARIANT_TRUE, &deep);
+        say_xml(L"p:f 的 cloneNode(true)", deep);
+        if (deep && SUCCEEDED(IXMLDOMNode_get_nodeName(deep, &qname)))
+            outf(L"  它的 nodeName: %ls\n", qname);
+        SysFreeString(qname);
+        IXMLDOMNode_cloneNode(f, VARIANT_FALSE, &shallow);
+        say_xml(L"p:f 的 cloneNode(false)", shallow);
+        if (shallow) IXMLDOMNode_Release(shallow);
+        if (deep) IXMLDOMNode_Release(deep);
+        if (f) IXMLDOMNode_Release(f);
+    }
+
+    if (element) IXMLDOMNode_Release(element);
+    if (root_c) IXMLDOMElement_Release(root_c);
+    if (c) IXMLDOMDocument_Release(c);
+    if (added) IXMLDOMNode_Release(added);
+    if (created) IXMLDOMNode_Release(created);
+    if (moved) IXMLDOMNode_Release(moved);
+    if (root_b) IXMLDOMElement_Release(root_b);
+    if (b) IXMLDOMDocument_Release(b);
+    if (removed) IXMLDOMNode_Release(removed);
+    if (clone) IXMLDOMNode_Release(clone);
+    if (plain) IXMLDOMNode_Release(plain);
+    if (child) IXMLDOMNode_Release(child);
+    if (node) IXMLDOMNode_Release(node);
+    IXMLDOMElement_Release(root_a);
+    IXMLDOMDocument_Release(a);
+    outf(L"\n");
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -453,6 +572,7 @@ int wmain(int argc, WCHAR **argv)
 
     run_cross_document();
     run_selection_language();
+    run_serialization();
 
     if (argc > 1) { run_manifest(argv[1]); }
 
