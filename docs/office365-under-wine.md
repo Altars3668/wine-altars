@@ -11073,6 +11073,24 @@ PowerPoint 55 项）前后一致。查询失败时 Windows 是否也不写
 `Windows.UI.Composition` 一系的激活是已知的大缺口（见上文 AirSpace 一节），WIC 三次插值等 `tools/wicscalerprobe` 的数据。
 Office 保存回归照常。
 
+### kernel32 文件测试剩下的 todo（altars-up `0a72bf1e68c`…`614ab18456b`）
+
+逐个看 kernel32 文件测试里还标着 todo 的检查（都是 Windows 实测），凡是 Office 可能碰到的都补上：
+
+- **只改大小写的改名**（`0a72bf1e68c`）：“report.docx” 改成 “Report.docx” 原先什么也不做——大小写不敏感的查找找到的就是
+  文件本身，服务器见是同一文件直接返回成功。Windows 只在完全同名时才直接返回（[MS-FSA] 2.1.5.15.12）。现在目标就是被改名的
+  文件时按请求的大小写改名；目标是另一个文件且要求替换时，先替换，再把结果改成请求的大小写（否则替换后留下旧的大小写）。
+  经 8.3 短名匹配到的不算。文件与目录都适用（两处测试）。
+- 改名要求句柄有 DELETE 权限（`d1f912a450e`；建硬链接不要求）。
+- `FindFirstFile("不存在的目录\")` 得 `ERROR_PATH_NOT_FOUND`（`93e9121743b`；原先一律 `ERROR_FILE_NOT_FOUND`）。
+- `CreateFile(已有目录, CREATE_NEW)` 得 `ERROR_ACCESS_DENIED`（`07a232b3cc7`）：要的是文件，“是目录”先于“名字已存在”。
+- 以 `FILE_OPEN_IF` 加删除时关闭打开已有的只读文件得 `STATUS_CANNOT_DELETE`（`f8df7cf92a5`）；原先只对不创建的处置检查，
+  这种打开会在关闭时把只读文件删掉。
+- `OpenFile` 失败时不填 `cBytes`（`614ab18456b`）。
+
+余下的是原始卷读写（`\\.\C:`、卷 GUID 路径）、`SetFileValidData`、符号链接、`GetFileType` 对 section 句柄等，与 Office 无关，
+暂不处理。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
