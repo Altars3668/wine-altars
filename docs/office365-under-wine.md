@@ -11006,6 +11006,38 @@ kernel32 文件测试 57 万项 0 失败、todo 从 243 降到 218；ntdll 的 f
 系统文件而不带同样属性时 Windows 是否拒绝（文档这么写，Wine 的测试没覆盖）由 `tools/overwriteattrprobe` 量。
 设为 `FILE_ATTRIBUTE_NORMAL` 后 Windows 查询返回 0x80（Wine 返回 ARCHIVE）需要记录存档位，暂未做。
 
+### 设置文件信息：状态块、缓冲区检查、分配大小、改名（altars-up `de83556c28c`…`c4b07d0df2a`）
+
+依据是上游测试里 Windows 实测的 todo 和 [MS-FSA] 2.1.5.15（Windows 文件系统行为的公开规范，各信息类的检查顺序、返回码
+都写明了，附录 A 注明 NTFS 与 FAT 的差别）：
+
+- **失败的请求不写状态块。** `NtSetInformationFile` 以错误状态失败时调用方的 `IO_STATUS_BLOCK` 保持原样（测试检查
+  `io.Status` 仍是 0xdeadbeef，16 处 todo 转为通过）；wow64 转接自己判定的错误原先从一个没初始化的 64 位块拷回，32 位
+  调用方拿到的 Information 是个栈地址。`tools/setinfoprobe`（64、32 位两个版本）把同样的问题问到测试没覆盖的类。
+- **缓冲区过短是 `STATUS_INFO_LENGTH_MISMATCH`**（Wine 原为 `STATUS_INVALID_PARAMETER_3`；邮槽超时原先不查长度）。
+  改名的新名字长度为 0、奇数或超出缓冲区是 `STATUS_INVALID_PARAMETER`，链接的名字也要在缓冲区内——两者原先都会读过缓冲区
+  末尾；wow64 按 `FileName[len/2]` 分配 64 位缓冲区，奇数长度时拷贝多写一个字节。
+- **实现 `FileAllocationInformation`**（原先 `STATUS_NOT_IMPLEMENTED`，`SetFileInformationByHandle(FileAllocationInfo)` 是
+  `ERROR_CALL_NOT_IMPLEMENTED`）：按簇（Wine 报 4096）向上取整；大于文件长度用 `fallocate(FALLOC_FL_KEEP_SIZE)` 预留，
+  不动文件长度，文件系统不支持时只当提示；小于文件长度时截断到对齐后的值（NTFS 如此，FAT 截断到原值）。设分配大小和
+  文件长度都要 `FILE_WRITE_DATA`、对目录是 `STATUS_INVALID_PARAMETER`——服务器原先对设文件长度不查权限，只读句柄靠
+  `ftruncate` 失败才被拒，还报成 `STATUS_INVALID_HANDLE`。缩小已有预留（仍不低于文件长度）时 Windows 会收回到对齐值，
+  Wine 保留预留：Linux 上释放预留会改掉修改时间，而 Windows 只更新 ChangeTime。
+- `SetFileInformationByHandle` 对只能查询的类一律 `ERROR_INVALID_PARAMETER`（原先十一个类走 FIXME、`ERROR_CALL_NOT_IMPLEMENTED`，
+  另四个已是 `ERROR_INVALID_PARAMETER` 且有测试）。
+- **改名后同一文件的其他句柄跟着新名字。** Windows 上名字属于文件，另一句柄查 `FileNameInformation`、
+  `GetFinalPathNameByHandle` 得到新名字（两处测试）。服务器原先只改发起改名的 fd，其他 fd 仍记旧路径——它们关闭时的
+  删除（delete on close、POSIX 删除）也会去 unlink 旧路径，若其间有人在旧路径建了新文件，删掉的就是那个。现在按旧名字
+  打开的其他 fd 和挂在该名字上的待删除记录一并改到新名字；经另一个硬链接打开的保持原名。
+- **目录下有打开的文件时拒绝改名目录**（`STATUS_ACCESS_DENIED`，[MS-FSA] 2.1.4.2，任意深度；NTFS 还会先打断机会锁再
+  重试，Wine 没有机会锁）。服务器遍历所有打开的 fd 按路径前缀判断；设备哈希表的桶是用到才初始化的，遍历要跳过没初始化
+  的桶（第一次没跳，wineserver 在 `next == NULL` 上崩溃）。
+
+ntdll file/directory/pipe、kernel32 file/pipe 测试 0 失败（ntdll 文件测试 todo 71→60，kernel32 218→214），新加分配大小、
+只读句柄设长度、目录、改名名字长度的断言，随下一批在 Windows 上验证；Office 保存回归照常。查询失败时 Windows 是否也不写
+状态块、不能设置的类的确切返回码（Wine 现为 `STATUS_NOT_IMPLEMENTED`）、`FileCaseSensitiveInformation` 的设置、
+`FileModeInformation` 的设置（Wine 都未实现）等 `setinfoprobe` 在 winref 上的结果再定。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
