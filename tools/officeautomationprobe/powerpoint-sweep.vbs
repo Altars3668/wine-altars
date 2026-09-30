@@ -206,8 +206,12 @@ pres2.Close
 Err.Clear
 Set pres2 = Nothing
 Set pres2 = app.Presentations.Open(outdir & "\sweep-password.pptx::wrong::", True, False, False)
-If Err.Number <> 0 Then
+' E_FAIL is the refusal; 462 would be PowerPoint gone
+If Err.Number = &H80004005 Then
     mark "ok   open with a wrong password refused: " & Hex(Err.Number)
+    Err.Clear
+ElseIf Err.Number <> 0 Then
+    mark "FAIL open with a wrong password: " & Hex(Err.Number) & " " & Err.Description
     Err.Clear
 Else
     mark "FAIL open with a wrong password succeeded"

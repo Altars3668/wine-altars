@@ -205,8 +205,12 @@ found = doc2.Paragraphs.Count & " paragraphs, first " & Left(doc2.Paragraphs(1).
 result "open with the password", found
 doc2.Close False
 Set doc2 = word.Documents.Open(outdir & "\sweep-password.docx", False, True, False, "wrong")
-If Err.Number <> 0 Then
+' 5408 is the refusal; 462 would be Word gone
+If Err.Number = 5408 Then
     mark "ok   open with a wrong password refused: " & Hex(Err.Number)
+    Err.Clear
+ElseIf Err.Number <> 0 Then
+    mark "FAIL open with a wrong password: " & Hex(Err.Number) & " " & Err.Description
     Err.Clear
 Else
     mark "FAIL open with a wrong password succeeded"

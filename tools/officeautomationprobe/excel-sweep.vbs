@@ -265,8 +265,12 @@ If Not again Is Nothing Then again.Close False
 Err.Clear
 Set again = Nothing
 Set again = app.Workbooks.Open(outdir & "\sweep-password.xlsx", , True, , "wrong")
-If Err.Number <> 0 Then
+' 1004 is the refusal; 462 would be Excel gone
+If Err.Number = 1004 Then
     mark "ok   open with a wrong password refused: " & Hex(Err.Number)
+    Err.Clear
+ElseIf Err.Number <> 0 Then
+    mark "FAIL open with a wrong password: " & Hex(Err.Number) & " " & Err.Description
     Err.Clear
 Else
     mark "FAIL open with a wrong password succeeded"

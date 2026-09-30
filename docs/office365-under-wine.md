@@ -11116,3 +11116,40 @@ MF_SINK_WRITER_ASYNC_CALLBACK 回调 OnFinalize）；winegstreamer 的 MP4 接�
 样本；mfplat 文件字节流的 `Close` 原是 E_NOTIMPL，文件要到最后一次释放才关，`Finalize` 之后不能独占打开（Windows 上可以）。
 mfreadwrite 测试去掉 6 个 todo_wine、0 失败。PowerPoint `CreateVideo` 4 秒写出幻灯片的 H.264 视频（gst-discoverer：
 640×360、15 fps，逐帧内容正确），普查 48 项里只剩 SVG 导出，与原生相同。
+
+### 可警报等待先跑排队的用户 APC，以及被 APC 打断的同步 I/O（altars-up `4202b7f67c3`…`252c1da7ece`）
+
+kernel32 的 overlapped 测试（Windows 实测）：线程已有排队的用户 APC 时，对已触发的事件做可警报等待返回
+`WAIT_IO_COMPLETION`，事件保持触发。上游 wineserver 的 `check_wait` 先看对象、后看 APC，记作 todo。`97e8e89bd27`
+把 APC 的检查移到对象之前；ntsync 路径在进内核等待前先读线程的警报事件（本机没有 `/dev/ntsync`，未实测）。user32 的
+msg 测试另定：`MsgWaitForMultipleObjectsEx` 带 `MWMO_ALERTABLE`、已有消息在等时返回队列、APC 留在队列——Windows
+在等待之前先查队列（`b44ac8f23de`，目前只在可警报的 WaitAny 里这样做；有事件又有新消息、flags 为 0 时 Windows 返回哪一个，
+`tools/waitorderprobe` 待 winref 实测，若也返回队列，条件里的 `MWMO_ALERTABLE` 应去掉）。
+
+**坑：Wine 的 unix 侧内部等待一旦投递用户 APC，就让整个外层系统调用以 `STATUS_USER_APC` 返回**（APC 在返回用户态途中
+执行，调用者拿到的就是这个状态）。APC 优先之后，这种内部可警报等待更容易被打断，暴露出两处原本就与 Windows 不符的地方：
+
+- `NtCancelIoFile` 等取消完成时用了可警报等待，被取消请求自己的完成 APC 就在里面跑了，ntdll 的 pipe 测试要求它留到下一次
+  可警报等待（“IOAPC ran too early”）。改为不可警报（`801eaf498d4`）。
+- 以 `FILE_SYNCHRONOUS_IO_ALERT` 打开的文件上的同步请求（管道 listen/读写、套接字、串口）被 APC 打断时，Wine 返回
+  `STATUS_USER_APC` 而请求仍在后台挂着。Windows 的 I/O 管理器（IopSynchronousServiceTail）是：取消该请求、不可警报地
+  等它结束、返回它的最终状态，APC 在返回途中执行。`2148b25e194` 照此实现 `wait_async`；pipe 测试两处 todo（APC 打断同步
+  listen 应返回 `STATUS_CANCELLED`）去掉。
+- 与之配套的服务器规则：Windows 10/11 上，同步文件上先挂起后失败的请求也写 IOSB（ntoskrnl 测试里非 broken 的期望，
+  老 Windows 10 不写）；同步请求失败时不排完成 APC，只置事件（`4202b7f67c3`、`4a68c5b65b0`，ntoskrnl 测试四处 todo 去掉）。
+
+`CopyFile` 覆盖隐藏/系统文件按 Windows 规则失败之后（`97d0f78ea33`），wintrust 的 `CryptCATAdminAddCatalog` 第二次加同名
+编目就失败（编目文件被它自己设成系统文件），setupapi 的 `SetupDiInstallDevice` 接着对未赋值的 `filepart` 解引用而崩溃。
+编目先清属性再覆盖（`ad2d2455667`），INF 复制失败时安装设备如实失败（`252c1da7ece`）。顺带：`FileAllInformation` 的
+`AccessFlags` 照 [MS-FSA] 填本句柄的授予权限（`9bfbfe7830e`）。
+
+测试构建脚本 `scripts/build-winetest.sh` 现在也编 `#pragma makedep testdll` 的辅助模块并以 TESTDLL 资源嵌入（外层
+`7fabb32`）：ntoskrnl 的驱动测试能跑了（29192 项，只剩 driver.c 里一处与本机 24 核有关的亲和性掩码），user32 msg 测试
+因缺 helper 的那批失败也消失。验证：ntdll file/pipe/sync、kernel32 file/pipe/sync、ws2_32 sock/afd、ntoskrnl、user32 msg
+0 失败（msg 另有一处 :77 无窗口管理器导致的“todo 里通过”）；Office 回归三件通过；普查 Word 42、Excel 79、PowerPoint 55
+（唯一 FAIL 是与原生相同的 SVG 导出）；APC 顺序改动之前观察到的一次 Excel 普查中途崩溃，其后 10 遍 Word→Excel 与多遍全量
+普查均未再现。驱动测试要在 scratchpad 的干净前缀里跑：它装测试驱动、建设备实例，中途崩溃会在前缀里留下陈旧的驱动库条目，
+干扰下一次运行。
+
+普查脚本里“错误密码被拒”原先只看有无错误，应用崩溃（462）也记成通过；现在只接受各应用的拒绝码（Word 5408、Excel 1004、
+PowerPoint E_FAIL）。
