@@ -2,8 +2,10 @@
 # winbatch.sh <file>... -- <command>...
 #
 # Runs several probes or tests on the reference Windows machine in one connection: one upload of all
-# the files, then one session that runs every command in turn in their directory and then removes it,
-# the session sharing the upload's login (ControlMaster).
+# the files and of a batch file holding the commands, then one session that runs the batch file in their
+# directory and then removes it, the session sharing the upload's login (ControlMaster).  The commands
+# go through a file because cmd.exe refuses a command line over 8191 characters ("命令行太长"); in it a
+# "%" stands for itself, as it did on the command line.
 # Each command's output follows a line "===== <command>" and ends with "WINRUN-EXIT <code>".  It runs
 # in the ssh service session; programs that need the signed-in user's desktop go through
 # scripts/winrun.sh --desktop instead.
@@ -38,13 +40,33 @@ timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -o ControlMaste
 stage=$(mktemp -d)
 mkdir "$stage/$tag"
 cp -- "${files[@]}" "$stage/$tag/" || { rm -rf -- "${stage:?}"; exit 2; }
+# the batch file: each command after its "=====" line, then its exit code; the echo line has cmd's
+# special characters escaped outside quotes, both lines have "%" doubled
+python3 - "$stage/$tag/winbatch-run.cmd" "$@" <<'PY' || { rm -rf -- "${stage:?}"; exit 2; }
+import sys
+def literal(text):
+    return text.replace('%', '%%')
+def echoable(text):
+    out, quoted = [], False
+    for c in literal(text):
+        if c == '"':
+            quoted = not quoted
+        elif not quoted and c in '^&|<>()':
+            out.append('^')
+        out.append(c)
+    return ''.join(out)
+lines = ['@echo off', 'cd /d "%~dp0"']
+for command in sys.argv[2:]:
+    # "(call )" clears the error level, which cmd's own commands such as echo leave as it was
+    lines += ['echo ===== ' + echoable(command), '(call )', literal(command), 'echo WINRUN-EXIT %errorlevel%']
+with open(sys.argv[1], 'w', newline='') as f:
+    f.write('\r\n'.join(lines) + '\r\n')
+PY
 scp -q -r -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -P "$PORT" "$stage/$tag" "$USERNAME@$HOST:$TEMP/" ||
     { rm -rf -- "${stage:?}"; echo "scp failed" >&2; exit 2; }
 rm -rf -- "${stage:?}"
 
-line="cd /d %TEMP%\\$tag"
-for cmd in "$@"; do
-    line+=" & echo ===== $cmd & $cmd & call echo WINRUN-EXIT %^errorlevel%"
-done
-line+=" & cd /d %TEMP% & rmdir /s /q $tag"
+# afterwards also remove what an earlier run that stopped half-way left behind
+line="cd /d %TEMP%\\$tag & cmd /d /c winbatch-run.cmd & cd /d %TEMP% & rmdir /s /q $tag"
+line+=' & for /d %d in ("%TEMP%\WineAltarsBatch_*") do @rmdir /s /q "%d"'
 ssh -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -p "$PORT" "$USERNAME@$HOST" "$line" 2>&1 | tr -d '\r'
