@@ -11176,8 +11176,10 @@ Office 真实使用功能时撞到的桩，挑不必等 Windows 实测、影响�
 - `DrawSpriteBatch` 在位图目标上什么都不画（PowerPoint 25 次/普查）；现在逐个精灵经“精灵变换×当前变换”把源矩形画进目标矩形，
   颜色的 alpha 作不透明度（`8045a4c38c5`；非白色的着色与钳到源矩形尚未做）。
 
-仍在清单上、量大但属于大工程的：`CreateSwapChainForComposition`（DirectComposition，PowerPoint 一次普查六千多次，每次失败后
-回退）与 Windows.UI.Composition 系列。d2d1 测试里 2D 仿射变换效果第 2 组（4×4 图按 0.75×2.5 缩放）的覆盖轮廓对不上，
+`CreateSwapChainForComposition` 在这两次普查里各有四五千次，全在 PowerPoint：普查运行器用 `env -i` 清掉了 LANG，C 区域的字符集是
+ASCII，“另存为 PNG”建不了中文名的“幻灯片1.PNG”，PowerPoint 在失败的导出路径上反复尝试组合交换链；设了 LANG 时为 0 次。
+altars-up `5870f57b0a7` 让 C/POSIX 区域的 Unix 名按 UTF-8 处理（ASCII 是其子集，原来能用的不变），导出与这些调用一并恢复
+正常。组合交换链（dxgi 与合成器的 `CreateCompositionSurfaceForSwapChain` 仍是桩）因此不再是普查里的热点。d2d1 测试里 2D 仿射变换效果第 2 组（4×4 图按 0.75×2.5 缩放）的覆盖轮廓对不上，
 本次改动之前就是如此。
 
 另查明一个残留进程：PowerPoint 插入图表时以 `CREATE_SUSPENDED` 启动 `EXCEL.EXE /Automation -Embedding /K`，14 毫秒后就
