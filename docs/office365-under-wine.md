@@ -10674,7 +10674,7 @@ PowerPoint 就崩溃了，之后各步都是 462。
 
 ## 迁到上游 master 之后：新树 altars-up 的状态（2026-09-29）
 
-新树 `wine-src-up`（分支 `altars-up`）以纯 Wine master `6880117619a` 为底，不带 CrossOver 的改动（含用户名 hack），
+新树 `wine-src-up`（分支 `altars-up`）以纯 Wine master 为底（09-29 晚同步到 `abc6aebd55b`），不带 CrossOver 的改动（含用户名 hack），
 Office 在新配置文件 `~/.wine-c2r-up` 里重新激活；旧树的 606 个提交逐一核对后按上游现状取舍，此后的修复都按 winref
 （Windows 11 build 29671）实测来做。CrossOver 26.3 的差异审计见 `docs/crossover-delta-audit.md`。
 
@@ -10829,6 +10829,32 @@ Excel 单元格里的自定义函数。三个应用 33 项全部通过（AMSI �
 `Release` 于是晚到、而且跑在对象套间之外，碰上已不存在的对象。现在由 STA 线程在调用执行完、通知 RPC 线程之前自己
 释放。ole32 新测试 `test_disconnect_after_call` 用一个子进程里的 STA 服务器（对象在方法里断开自己）记录每次 `Release`
 所在的线程：旧代码稳定地有 3 次在别的线程上，修后为 0。修后 Excel 在 `Quit` 后 3 秒退出。
+
+### icu.dll：C++ 时区数据库与 Office 的 React Native 引擎（altars-up `6ef87791215`）
+
+新树 Word 启动时的 FIXME 普查里有 `__std_tzdb_get_current_zone returning Windows time zone name`。追下去：Office 自带的
+`msvcp140_atomic_wait.dll`（微软 STL 原版）、React Native 的 JS 引擎 `hermes.dll`、`react-native-win32.dll`、
+`WritingAssistant.exe`、WinAppSDK 的 `Microsoft.Windows.Search.dll` 都会从 system32 加载 `icu.dll`（Windows 10 起系统自带
+的 ICU），拿时区、日期与数字格式化（JS 的 `Intl`）；Outlook 的 `EMSMDB32.DLL` 还直接导入 `__std_tzdb_get_sys_info`。
+而 Wine 这边：
+
+- **构建里根本没有 `icu.dll`。** 上游已经带了用 ICU 源码编成 PE 的 `icu.dll`，但它（连同自带的 libc++、dmsynth、
+  fluidsynth）要 C++17 的 PE 交叉编译器；本机只装了 mingw 的 gcc、没有 g++（缺 `cc1plus`），configure 于是**静默**把
+  它们放进 `DISABLED_SUBDIRS`。不动系统的做法：`apt download g++-mingw-w64-{x86-64,i686}-win32`（与已装的
+  gcc-mingw-w64 同版本 13.2.0），`dpkg -x` 到 `~/.local/opt/mingw-w64-gxx-13-win32`，configure 时给
+  `x86_64_CXX="x86_64-w64-mingw32-gcc -B…/13-win32/"`、`i386_CXX=…`（C++17 检测体不引用标准头，Wine 编 C++ 用自带的
+  libc++ 8.0.1 头文件，所以只缺 cc1plus）。`scripts/build-wine.sh` 现在自己找这份编译器，找不到会提示。更干净的做法是
+  系统里装 `g++-mingw-w64`，之后普通的 configure 就会带上 C++。
+- **Wine 内置的 `msvcp140_atomic_wait` 给的是 Windows 时区名，`__std_tzdb_get_sys_info` 是桩。** Wine 的这些运行库没有
+  标 prefer-native，Office 自带的那份并不会被加载，所以内置版必须做对。现在它照 Windows 从 `icu.dll` 取：按序的 IANA
+  名与链接、ICU 数据版本、ICU 的默认时区，以及某时区某时刻的偏移、夏令时量、前后两次切换（一侧没有切换时为
+  ±DBL_MAX）与短名（转不成代码页时退成 `+HH`/`+HHMM`）；名字后那个字节选“只要偏移”或“偏移加范围”；闰秒读
+  `HKLM\SYSTEM\CurrentControlSet\Control\LeapSecondInformation`。没有 `icu.dll` 时名字照旧给 Windows 的，换算返回“缺库”
+  错误而不是让进程中止。
+
+验证：`tools/tzdbprobe` 在同一个 Wine 的 `icu.dll` 上，用 Wine 的实现与用 Office 自带的微软原版逐行相同（634 个时区、
+157 个链接、各时区的偏移、切换与短名、选项字节）；`msvcp140_atomic_wait` 测试 748 项 0 失败；装上 `icu.dll` 后 Word、
+Excel、PowerPoint 保存回归照常通过。Windows 上的对照（`tzdbprobe`、`msvcp140_atomic_wait` 测试）待 winref。
 
 ### PowerPoint 导出动画 GIF 之后不再响应
 
