@@ -11178,8 +11178,29 @@ Office 真实使用功能时撞到的桩，挑不必等 Windows 实测、影响�
 
 `CreateSwapChainForComposition` 每次普查四五千到六千多次，全来自 Excel（先前按进程号误认成 PowerPoint）：给普查每一步留下带
 时间戳的标记后看到，它们集中在表格、数据透视表、排序、筛选、数据验证、批注几步，一个线程两秒内调几千次——表格网格的动画
-每帧都试着建组合交换链，失败就回退。组合交换链（dxgi 与合成器的 `CreateCompositionSurfaceForSwapChain`）仍是桩，结果是
+每帧都试着建组合交换链，失败就回退。组合交换链（dxgi 与合成器的 `CreateCompositionSurfaceForSwapChain`）原是桩，结果是
 这些动画不显示、白耗一些 CPU；普查结果不受影响。
+
+现在两者都已实现（altars-up `5e5c6ad5e7a` dxgi、`67a3e1bb2b0` dcomp）。组合交换链是挂在隐藏窗口上的普通交换链，窗口由 dxgi
+自己的一个线程所有（哪个线程释放交换链都能销毁它）；Present 不去窗口，而是把整个缓冲（脏矩形已合成进去）复制进设备上的一张
+纹理，再调用登记过的回调。合成器的交换链表面在目标的 Direct2D 上下文里画这张纹理，设备不同就先经暂存纹理带过去（与绘制表面
+的瓦片共用这段代码）；与 Windows 一样不需要提交：每次 Present 只在合成器线程上排一次重画，按当前状态画各目标。顺带修了部分
+呈现的合成原先不拿 wined3d 锁（`fe57596d01b`），组合交换链的呈现在 Excel 的渲染线程上、合成器同时在用同一设备。
+
+实现时撞到的坑：创建一成功，AirSpace 马上调 `GetFrameStatistics`，桩回的 E_NOTIMPL 让它 fail-fast——Mso20win32client.dll
+RVA 0x415900 是带标签的崩溃函数（向地址 0 写 1，再 `int 0x29`），+seh 里是紧跟在那次 FIXME 之后、同一线程上的写 0 访问违例，
+Excel 在数据透视表一步崩掉，普查 37 ok/41 FAIL。组合交换链的 `GetFrameStatistics` 在首次 Present 前回
+`DXGI_ERROR_FRAME_STATISTICS_DISJOINT`、之后按 60 Hz 计数，只改这一处就回到 79 ok。原来“创建失败就回退”的路径反倒安全：
+新打通的路径上，后面每个桩都可能把回退变成崩溃。
+
+同一普查、同样调试通道的对照：改动前一轮 733 次创建桩，另有 1466 个另一类 C++ 异常与 745 次重抛；改动后组合交换链只建 24 次，
+那两类异常消失。`AirSpace::DeviceError`（Mso40UIwin32client.dll）改动前 777 个、58 串，改动后 648 个、46 串——这是另一个
+原有问题：每串之前 AirSpace 都在 D2D 命令列表上查询 `ID2D1Bitmap`（该失败的类型检查）并连调 `GetDeviceRemovedReason`，
+真正失败的调用还没找到。
+
+显示验证：`tools/compswapchainprobe` 在 200x200 窗口上用交换链表面画一个 100x100 精灵，Wine 下先后呈现红、绿、预乘的半透明红，
+都不提交，屏幕读到 0000ff、00ff00、000080，精灵外不变。创建时的描述校验、无窗口交换链上 GetDesc 的 OutputWindow、
+全屏切换、ResizeBuffers(0x0)、表面的运行时类名等细节是按文档与推断写的，待这个探针在 winref 实测后对齐。
 
 另：普查运行器若用 `env -i` 清掉 LANG，C 区域的字符集是 ASCII，PowerPoint“另存为 PNG”建不了中文名的“幻灯片1.PNG”而失败。
 altars-up `5870f57b0a7` 让 C/POSIX 区域的 Unix 名按 UTF-8 处理（ASCII 是其子集，原来能用的不变）。d2d1 测试里 2D 仿射变换效果第 2 组（4×4 图按 0.75×2.5 缩放）的覆盖轮廓对不上，
