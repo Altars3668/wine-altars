@@ -11267,6 +11267,12 @@ Start、读到空报告，放映照常进行。已有前缀要 `wineboot -u` 才
 截图里拖动中 859、抬起后 3410 个红色像素）。PowerPoint 自己画笔迹（读笔画的包），不调用 InkRenderer 的 Draw。
 Office 还在墨迹对象上查询两个 SDK 里没有的接口 {49e015bc-…}（ink）和 {4a145a90-…}（stroke），不支持也能工作。
 
+放映结束时“是否保留墨迹注释?”选“保留”，PowerPoint 要把笔画变成墨迹形状，先读每笔 X、Y 的包属性度量；这个方法原是桩，
+形状出不来（`73d3d0557ee`、`07bc82cd52c` 让笔画保存度量，StrokeBuilder 把 RTS 给的度量交给笔画）。现在幻灯片上有了
+“墨迹 1”（p14:contentPart，位置尺寸都在），但写出的 ppt/ink/ink1.xml 是空的 InkML：OART 读完点、描述、属性、逐包数据后
+新建一个 InkDisp，却没有往里放笔画，此前在原 ink 上查询 {49e015bc-…} 失败——它是否是 Windows inkobj 自己的私有接口，
+由 winref 上的 inkprobe（Windows 的 InkDisp/笔画/属性对这几个 IID 的回答）来定。
+
 仍未做：ISF 保存/载入、剪贴板、按矩形裁剪、压力改变笔宽、平板与光标对象、真正的笔和触摸输入；Word 的“绘图”选项卡在功能区
 模型里存在但被隐藏（`SM_TABLETPC`/`SM_DIGITIZER` 改成非 0 也不出现，开关另有所在）；AirSpace 的 InkDesktopHost/InkD2DRenderer
 也没有。各默认值、组合顺序、错误码等未实测的细节列在各提交说明里，`tools/inkprobe` 与 inkobj/rtscom 的测试在 winref 上跑后对齐。
