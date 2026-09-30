@@ -191,6 +191,14 @@ static void probe_objects(void)
     }
 }
 
+/* a probe that hangs would hold up every command after it in a batch */
+static DWORD WINAPI watchdog(void *arg)
+{
+    Sleep(60000);
+    printf("watchdog: still running after 60 s, exiting\n");
+    ExitProcess(1);
+}
+
 int main(void)
 {
     static const struct { const char *name; int index; } metrics[] =
@@ -202,6 +210,8 @@ int main(void)
     unsigned int i;
     HRESULT hr;
 
+    setvbuf(stdout, NULL, _IONBF, 0);
+    CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     printf("CoInitializeEx(STA) %#lx\n", hr);
     for (i = 0; i < ARRAYSIZE(classes); i++)

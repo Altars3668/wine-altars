@@ -131,6 +131,14 @@ static void print_contexts(IRealTimeStylus *rts)
     CoTaskMemFree(tcids);
 }
 
+/* a probe that hangs would hold up every command after it in a batch */
+static DWORD WINAPI watchdog(void *arg)
+{
+    Sleep(60000);
+    printf("watchdog: still running after 60 s, exiting\n");
+    ExitProcess(1);
+}
+
 int main(void)
 {
     IRealTimeStylus *rts, *rts2;
@@ -146,6 +154,8 @@ int main(void)
     HWND hwnd, hwnd2;
     HRESULT hr;
 
+    setvbuf(stdout, NULL, _IONBF, 0);
+    CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     hwnd = CreateWindowW(L"static", L"rtsprobe", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 300, 200, NULL, NULL, NULL, NULL);
     hwnd2 = CreateWindowW(L"static", L"rtsprobe 2", WS_OVERLAPPEDWINDOW, 100, 100, 300, 200, NULL, NULL, NULL, NULL);
