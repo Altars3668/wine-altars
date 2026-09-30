@@ -18,7 +18,9 @@ cd $B
 # take whichever this tree has
 crt0=libs/winecrt0/x86_64-windows/libwinecrt0.a; [ -f $crt0 ] || crt0=dlls/winecrt0/x86_64-windows/libwinecrt0.a
 rtlib=libs/compiler-rt/x86_64-windows/libcompiler-rt.a; [ -f $rtlib ] || rtlib=
-FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D_CRT_NON_CONFORMING_WCSTOK -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2"
+# a variable of the tests' Makefile.in
+makevar() { sed -n "s/^$1 *= *//p" ../dlls/$dll/tests/Makefile.in; }
+FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D_CRT_NON_CONFORMING_WCSTOK -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2 $(makevar EXTRADEFS)"
 list=$(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in)
 srcs=$(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.c\b')
 # A source marked "#pragma makedep testdll" is a helper module the tests load from a TESTDLL resource (ole32's
@@ -34,23 +36,35 @@ for spec in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.spec\b'); do
 done
 stubs=
 idlres=
+proxies=
+# each IDL file gives what its "#pragma makedep" lines ask for, widl choosing the output by its name as it does
+# for makedep, and with the Makefile.in's EXTRAIDLFLAGS and <name>_EXTRAIDLFLAGS (rpcrt4's server tests
+# prefix their stubs' names); the header always
 for idl in $(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in | grep -o '[a-z0-9_.]*\.idl'); do
-    tools/widl/widl -o $O/${idl%.idl}.h -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
-    # an RPC interface the tests call needs its client stubs, as makedep would generate them
-    if grep -q '^#pragma makedep.*\bclient\b' ../dlls/$dll/tests/$idl; then
-        tools/widl/widl -c -o $O/${idl%.idl}_c.c -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
-        stubs="$stubs ${idl%.idl}_c.c"
-    fi
-    # the GUIDs it defines, and the type library it describes as a resource (makedep's ident and typelib)
-    if grep -q '^#pragma makedep.*\bident\b' ../dlls/$dll/tests/$idl; then
-        tools/widl/widl -o $O/${idl%.idl}_i.c -m64 --nostdinc -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
-        stubs="$stubs ${idl%.idl}_i.c"
-    fi
-    if grep -q '^#pragma makedep.*\btypelib\b' ../dlls/$dll/tests/$idl; then
-        tools/widl/widl -o $O/${idl%.idl}_l.res -m64 --nostdinc -Ldlls/\* -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ ../dlls/$dll/tests/$idl
-        idlres="$idlres $O/${idl%.idl}_l.res"
+    base=${idl%.idl}
+    widl_idl() {
+        tools/widl/widl -m64 --nostdinc -Ldlls/\* -Iinclude -I../include -I../dlls/$dll/tests -D__WINESRC__ \
+            $(makevar EXTRAIDLFLAGS) $(makevar ${base}_EXTRAIDLFLAGS) "$@" ../dlls/$dll/tests/$idl
+    }
+    widl_idl -o $O/$base.h
+    pragmas=$(sed -n 's/^#pragma makedep //p' ../dlls/$dll/tests/$idl)
+    for output in client:_c.c server:_s.c proxy:_p.c ident:_i.c; do
+        echo " $pragmas " | tr '\n' ' ' | grep -qw "${output%%:*}" || continue
+        widl_idl -o $O/$base${output#*:}
+        stubs="$stubs $base${output#*:}"
+    done
+    echo " $pragmas " | tr '\n' ' ' | grep -qw proxy && proxies="$proxies $idl"
+    # the type library it describes, as a resource (makedep's typelib)
+    if echo " $pragmas " | tr '\n' ' ' | grep -qw typelib; then
+        widl_idl -o $O/${base}_l.res
+        idlres="$idlres $O/${base}_l.res"
     fi
 done
+# the proxies' list for the module, as makedep writes it
+if [ -n "$proxies" ]; then
+    tools/widl/widl --dlldata-only -o $O/dlldata.c $proxies
+    stubs="$stubs dlldata.c"
+fi
 FLAGS="$FLAGS -I$O"
 # the tests' resources (user32's menus and dialogs, for one), compiled as makedep has wrc compile them
 res=$idlres

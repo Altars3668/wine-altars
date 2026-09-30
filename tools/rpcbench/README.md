@@ -7,8 +7,9 @@ Windows 走 ALPC；Wine 的 ncalrpc 是命名管道，每次调用要经 wineser
 与 App-V 的请求一样大），打印每秒调用次数与每次微秒数，然后让服务端退出；`rpcbench both [次数] [字节] [impersonate]`
 自己起服务端子进程，带 `impersonate` 时服务端每次调用都模拟客户端再恢复（App-V 的服务端这样做）。
 
-`results/rpcbench.wine.txt`（altars-up，i7 笔记本）：每次 220 µs，模拟客户端 260 µs，4000 字节 218 µs——开销全在往返，
-不在数据量；一万次就是 2 秒多。Windows 上的数值（winref）作对照，优化 rpcrt4 的命名管道读写后用它量效果。
+`results/rpcbench.wine.txt`（altars-up，i7 笔记本）：开销全在往返，不在数据量。原先收一个包要读三次管道（先读 0 字节
+等数据，再读公共头，再读其余），每次调用 22 个 wineserver 请求、约 280 µs；wine 8caf6adef4e 起 rpcrt4 把整条消息
+一次读进缓冲区，降到 14 个请求、约 170 µs（同一棵树、同一前缀新旧交替测）。Windows 上的数值（winref）作对照。
 
 构建（stub 由 Wine 树里的 widl 生成，已一起提交）：
 `widl -m64 --prefix-server=s_ -h -H rpcbench.h -c -C rpcbench_c.c -s -S rpcbench_s.c rpcbench.idl`，
