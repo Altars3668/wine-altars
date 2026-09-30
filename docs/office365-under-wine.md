@@ -11053,6 +11053,26 @@ PowerPoint 55 项）前后一致。查询失败时 Windows 是否也不写
 状态块、不能设置的类的确切返回码（Wine 现为 `STATUS_NOT_IMPLEMENTED`）、`FileCaseSensitiveInformation` 的设置、
 `FileModeInformation` 的设置（Wine 都未实现）等 `setinfoprobe` 在 winref 上的结果再定。
 
+### Office 启动时撞到的几处 API（altars-up `304db160e6c`、`1b717d6b839`、`cf340eae246`）
+
+用默认调试通道起 Word、Excel、PowerPoint 各输入一次再关闭，统计它们实际撞到的 FIXME，挑出能凭测试或文档定下来的：
+
+- **propsys 转字符串**：Excel、PowerPoint 启动时调 `VariantToString`，Wine 只认 BSTR 和 I4。测试（Windows 实测）定下了其余
+  写法——布尔按数值（TRUE 为 "1"）、浮点照写、FILETIME 与 DATE 写作 `yyyy/mm/dd:hh:mm:ss.mmm`（DATE 只到秒）、向量元素间用
+  "; "、空 VARIANT 为空串——`PropVariantToStringAlloc` 与 `VariantToString` 改为共用一个逐值格式化。Office 实际传的是字节
+  SAFEARRAY，Windows 怎么写没有依据，仍返回 `E_NOTIMPL`，由 `tools/propvarstrprobe` 在 winref 上量。
+- **`GetFinalPathNameByHandle` 的规范化名字**：默认的 FILE_NAME_NORMALIZED 应给出磁盘上的大小写（打开 "test.dat"、磁盘上是
+  "Test.Dat" 时返回后者，两处测试），Wine 两种标志都给打开时的写法。`FileNormalizedNameInformation` 改为取服务器存的
+  realpath，最终路径的卷之后部分用它；FILE_NAME_OPENED 本来就对，去掉那条 FIXME。
+- **`CopyFileEx`/`CopyFile2` 的进度回调与取消**：原先一律忽略。测试给出取消的语义（`ERROR_REQUEST_ABORTED`、能删时删掉副本——
+  别的句柄不共享删除时副本留下，可见 Windows 先以 `GENERIC_WRITE|DELETE` 打开目标、冲突再退回），其余照文档：每块复制完
+  `CALLBACK_CHUNK_FINISHED`，`PROGRESS_STOP` 留下部分副本，`PROGRESS_QUIET` 不再回调，取消标志等同 `PROGRESS_CANCEL`，
+  `CopyFile2` 发流与块的消息。块大小、空文件是否也报一块等由 `tools/copyprogressprobe` 在 winref 上校准。
+
+其余多为无害的 FIXME（`LOAD_LIBRARY_REQUIRE_SIGNED_TARGET` 不验签、跳转列表桩、MSAA 读界面时的 `LresultFromObject` wParam）；
+`Windows.UI.Composition` 一系的激活是已知的大缺口（见上文 AirSpace 一节），WIC 三次插值等 `tools/wicscalerprobe` 的数据。
+Office 保存回归照常。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
