@@ -13,8 +13,10 @@
  *
  * A key is a chord such as ctrl+p, alt+f, shift+tab, esc, enter, f10, or
  * text:some words to type literally.  move:x,y puts the pointer at a screen
- * position, click presses the left mouse button there, and wheel:n turns
- * the wheel n notches (negative scrolls down), where the pointer is.
+ * position, click presses the left mouse button there, press and release
+ * hold it down and let it go (so that press move:... release drags), and
+ * wheel:n turns the wheel n notches (negative scrolls down), where the
+ * pointer is.
  * down:key and up:key press and let go of one key on
  * its own, so that down:ctrl wheel:1 up:ctrl zooms.  With -w, the first visible top-level
  * window whose class contains the substring is brought to the foreground
@@ -110,6 +112,15 @@ static BOOL click_pointer(void)
     return SendInput(2, in, sizeof(in[0])) == 2;
 }
 
+static BOOL hold_button(BOOL up)
+{
+    INPUT in = {0};
+
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = up ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_LEFTDOWN;
+    return SendInput(1, &in, sizeof(in)) == 1;
+}
+
 static void press_key(const char *name, BOOL up)
 {
     INPUT in = {0};
@@ -175,6 +186,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "click"))
         {
             if (!click_pointer()) { fprintf(stderr, "mouse click failed: %lu\n", GetLastError()); return 1; }
+        }
+        else if (!strcmp(argv[i], "press") || !strcmp(argv[i], "release"))
+        {
+            if (!hold_button(argv[i][0] == 'r')) { fprintf(stderr, "mouse %s failed: %lu\n", argv[i], GetLastError()); return 1; }
         }
         else if (!strncmp(argv[i], "wheel:", 6)) turn_wheel(atoi(argv[i] + 6));
         else if (!strncmp(argv[i], "down:", 5)) press_key(argv[i] + 5, FALSE);

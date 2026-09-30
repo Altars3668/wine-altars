@@ -11234,3 +11234,24 @@ altars-up `5870f57b0a7` 让 C/POSIX 区域的 Unix 名按 UTF-8 处理（ASCII �
 另起 `EXCEL.EXE /automation -Embedding`，它只注册 Excel.Application、没有客户，PowerPoint 退出后一直不走（主线程空闲在
 消息循环里）。Windows 上是否也会多起一个、多起的会不会自己退出，由 `tools/officeautomationprobe/powerpoint-chartexcel.vbs`
 在 winref 实测后再定修法。
+
+### PowerPoint 放映：切换、传感器监视器与墨迹
+
+放映切换是好的：先前以为“切换不播动画”，是测试选的 3844 其实是 `ppEffectAppear`（瞬间出现，本无动画；常量从 MSPPT.OLB
+的类型库读出）。换成 3849（平滑淡出）与 3863（涡流，3D 粒子）后，:77 上每 0.23 秒一张截图，13 张各不相同，从第一张逐帧
+过渡到第二张，画面正确。
+
+但放映中 PowerPoint 会崩：从 `mfsensorgroup.dll` 延迟加载 `MFCreateSensorActivityMonitor`（Office 里只有 PPCORE 用它，也
+只用这一个），Wine 没有这个 DLL，0xc06d007e 没人接，主线程未处理异常。这里是放映开始约二十秒、用过指针之后；崩溃栈里有
+PPCORE 的延迟导入槽 RVA 0x2210648。altars-up `b5ae900caa9` 新增 mfsensorgroup：监视器 Start 后在线程池上给一份报告，
+其中没有传感器（Wine 没有帧服务器，不知道哪个进程在用摄像头），Stop 后不再报告。PowerPoint 现在建监视器、在另一线程
+Start、读到空报告，放映照常进行。已有前缀要 `wineboot -u` 才有这个新 DLL 的占位文件（没有占位时加载器只在引导前缀时
+才去 Wine 目录找内置 DLL）。参数错误、越界与未知设备名的返回值、Start 后是否立即报告等由 `tools/sensoractivityprobe`
+在 winref 实测后对齐。
+
+墨迹是个大缺口：放映里 `View.PointerType = 2`（笔）之后用 SendInput 拖动，单击照样推进放映、不留笔迹，`View.DrawLine`
+画完也看不到；期间 `CoCreateInstance(CLSID_InkRenderer)` 未注册 11–15 次。Office 模块里引用了成套的 Tablet PC 墨迹对象：
+InkRenderer、InkDisp（Word 的 WWLIB 也有）、InkCollector、InkDrawingAttributes、InkTransform、InkRectangle、
+RealTimeStylus、InkRecognizers，AirSpace（Mso40UIwin32client）还用 Windows 10 的 InkDesktopHost 与 InkD2DRenderer；
+Wine 一个都没有。先查清 Office 画墨迹时实际走哪条路（Tablet PC 自动化对象还是 WinRT 的 InkPresenter/InkD2DRenderer），
+再决定补哪一套。
