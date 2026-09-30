@@ -11006,7 +11006,7 @@ kernel32 文件测试 57 万项 0 失败、todo 从 243 降到 218；ntdll 的 f
 系统文件而不带同样属性时 Windows 是否拒绝（文档这么写，Wine 的测试没覆盖）由 `tools/overwriteattrprobe` 量。
 设为 `FILE_ATTRIBUTE_NORMAL` 后 Windows 查询返回 0x80（Wine 返回 ARCHIVE）需要记录存档位，暂未做。
 
-### 设置文件信息：状态块、缓冲区检查、分配大小、改名（altars-up `de83556c28c`…`c4b07d0df2a`）
+### 设置文件信息：状态块、缓冲区检查、分配大小、改名、删除标记（altars-up `de83556c28c`…`7456896871e`）
 
 依据是上游测试里 Windows 实测的 todo 和 [MS-FSA] 2.1.5.15（Windows 文件系统行为的公开规范，各信息类的检查顺序、返回码
 都写明了，附录 A 注明 NTFS 与 FAT 的差别）：
@@ -11033,8 +11033,20 @@ kernel32 文件测试 57 万项 0 失败、todo 从 243 降到 218；ntdll 的 f
   重试，Wine 没有机会锁）。服务器遍历所有打开的 fd 按路径前缀判断；设备哈希表的桶是用到才初始化的，遍历要跳过没初始化
   的桶（第一次没跳，wineserver 在 `next == NULL` 上崩溃）。
 
-ntdll file/directory/pipe、kernel32 file/pipe 测试 0 失败（ntdll 文件测试 todo 71→60，kernel32 218→214），新加分配大小、
-只读句柄设长度、目录、改名名字长度的断言，随下一批在 Windows 上验证；Office 保存回归照常。查询失败时 Windows 是否也不写
+- **删除标记属于名字**（altars-up `43302900126`，[MS-FSA] 2.1.5.15.3 的 `Open.Link.IsDeleted`）：经一个句柄设删除，同名打开的
+  所有句柄都算标记删除；经另一个句柄取消，文件就保留——Wine 原先把标记放在各自的 fd 上，谁设的谁关闭时照删，别的句柄
+  取消不了（两组测试，文件最后应还在）。取消也会收回“删除时关闭”的句柄关闭后留下的待删除；“立即移除名字”（POSIX 语义）
+  仍只在设它的那个句柄关闭时发生（测试：另一个句柄先关，文件还在）。已标记删除的名字不能再打开（`STATUS_DELETE_PENDING`，
+  `CreateFile` 得 `ERROR_ACCESS_DENIED`）、不能改名或建链接。`FileStandardInformation.DeletePending` 在文件已无名字时（POSIX 删除
+  之后，`st_nlink == 0`）为真；只是标记了、名字还在的情形仍报假：每次查询都要问服务器，实测本地查询 2.6 µs、一次服务器往返
+  10.3 µs，`GetFileSizeEx` 等都走这个类，不值得。
+- 以挂载点句柄为根、空名、不带 `FILE_OPEN_REPARSE_POINT` 打开，Windows 返回 `STATUS_IO_REPARSE_DATA_INVALID`（`40a6b38ac6f`）；
+  Wine 原先打开了挂载点本身，测试接着把它标记删除——以前关闭后连挂载点目录都删掉了。
+- 命名管道的 `DeletePending` 按 NPFS 恒为 1（`7456896871e`）。
+
+ntdll file/directory/pipe、kernel32 file/pipe 测试 0 失败（ntdll 文件测试 todo 71→49、管道 35→25，kernel32 218→214），新加分配大小、
+只读句柄设长度、目录、改名名字长度的断言，随下一批在 Windows 上验证；Office 保存回归照常，三件套功能普查（Word 42、Excel 79、
+PowerPoint 55 项）前后一致。查询失败时 Windows 是否也不写
 状态块、不能设置的类的确切返回码（Wine 现为 `STATUS_NOT_IMPLEMENTED`）、`FileCaseSensitiveInformation` 的设置、
 `FileModeInformation` 的设置（Wine 都未实现）等 `setinfoprobe` 在 winref 上的结果再定。
 
