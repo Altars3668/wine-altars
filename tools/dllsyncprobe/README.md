@@ -21,7 +21,7 @@ Word、PowerPoint 等 16 个 Office 二进制链接了 AuxUlib（`aux_ulib.lib`�
 
 `results/dllsyncprobe.wine.txt`：Wine（kernelbase 补上函数之后）。改之前各状态都是 “no function”，
 AuxUlib 自己的检查与现在函数的回答逐项相同。另一处差异：Wine 退出时**不以 `DLL_PROCESS_DETACH` 调用 exe
-的 TLS 回调**——只有 “DllMain, process detach at exit” 一行（上游 2020 年给 exe 补了进程附加、线程附加与
+的 TLS 回调**——只有 DllMain 那一行（上游 2020 年给 exe 补了进程附加、线程附加与
 分离，唯独没有进程分离）；MSVC 的 `__dyn_tls_dtor` 靠这一次调用析构主线程的 `thread_local` 对象。
 Windows 的结果待测（winref），据此定退出时两者的先后（以及 TLS 回调收到的 `reserved`）再改 ntdll。
 

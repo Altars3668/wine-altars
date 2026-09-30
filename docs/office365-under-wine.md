@@ -10909,6 +10909,30 @@ ncalrpc 是经 wineserver 的命名管道，每次往返更贵，一万次大约
 
 ole2 测试 3007 项 0 失败，todo 从 32 降到 22；Office 保存回归照常通过。
 
+### 加载器锁与 CET：AuxUlib 的 `PrivIsDllSynchronizationHeld`，以及 exe 的 TLS 回调在退出时（altars-up `8907ce29605`、altars-up `7b2d832a374`）
+
+启动普查里 Word 找了 31 次、PowerPoint 13 次 kernelbase 没有的 `PrivIsDllSynchronizationHeld`。来源是 16 个 Office 二进制
+静态链接的 AuxUlib（`aux_ulib.lib`）；反汇编最小的 `SDXHelper.exe` 看出：它 `GetModuleHandleW(L"api-ms-win-core-libraryloader-l1-1-0.dll")`
+后按名查找，按 `BOOL (WINAPI *)(BOOL *held)` 调用；查不到就自己比较 `PEB->LoaderLock`（PEB+0x110）的 `OwningThread` 与当前
+线程号。补上的实现答的就是这个（`RtlIsCriticalSectionLockedByThread`），`tools/dllsyncprobe` 在 TLS 回调、DllMain、DLL 通知
+回调、主线程持锁与否、他线程等状态下逐项对照：与 AuxUlib 的后备检查完全一致，所以 Office 的行为不变，只是每次启动少了
+这些查找失败。kernel32 的 loader 测试加了主线程、嵌套持锁、他线程与 DllMain 里的检查；Windows 的回答（包括 Windows 8
+以后加载器的 LoadOwner 标志会不会让它在别的情形答“持有”）在第七批里测。
+
+同一个探针顺带看出一个真缺口：**Wine 在进程退出时不以 `DLL_PROCESS_DETACH` 调用 exe 自己的 TLS 回调。** 上游 2020 年给
+exe 补了进程附加、线程附加与分离时的调用（bug 48971），唯独没有进程分离；`LdrShutdownProcess` 只遍历 DLL 的初始化顺序表。
+MSVC 运行库的 `__dyn_tls_dtor` 靠这次调用在退出时析构主线程的 `thread_local` 对象，mingw 的 `__mingw_TLScallback` 同理。
+退出时 exe 的 TLS 回调与各 DLL 的 `DllMain` 谁先谁后、回调收到的 `reserved` 是什么，公开资料说不清，等 winref 的结果再改 ntdll。
+
+**CET。** GFX.DLL 与 MSO.DLL（后者挨着受保护视图 LPAC 沙箱的配置名）经 kernel32 查 `IsUserCetAvailableInEnvironment`。
+Wine 不维护影子栈，进程与飞地都如实答 FALSE（altars-up `7b2d832a374`）；非法环境值时 Windows 设不设最后错误，由 `tools/win10apiprobe` 测。
+
+**探针自己的一个坑。** `printf("...", f(), GetLastError())` 的实参求值顺序是未定义的，mingw GCC 在 x86-64 上**先读
+`GetLastError()` 和输出缓冲区的字段，再调用 `f`**：win10apiprobe 因此把 `GetProcessMitigationPolicy` 显示成“返回 1 却没写
+缓冲区”。用脚本扫了全部探针（按括号配对，跨行也算）：win10apiprobe 的 `InheritWindowMonitor` 六行、wsprobe 一行都有这个
+问题，都还没在 Windows 上跑过；uilangfilter 一行的已编译代码恰好先读了 TEB 的 `LastErrorValue`，它的 Windows 结果仍然有效。
+现在一律先把错误码存进变量再打印。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
