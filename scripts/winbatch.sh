@@ -16,7 +16,10 @@
 # addresses that keep trying, and a burst of short connections as well; that is why both steps go over
 # the one connection.  The host is a laptop that sleeps (modern standby): its TCP stack answers while
 # sshd does not, so the login waits WIN_WAKE_WAIT seconds (default 300) for the banner on that one
-# connection, and tools/keepawake keeps it awake while the commands run.
+# connection, and tools/keepawake keeps it awake while the commands run.  It can also fall asleep again
+# right after a login (2026-09-30: a second after it, before the upload started), so WIN_PRELUDE=<command>
+# runs one command at once after the login, before the upload, e.g. one that changes its power settings;
+# and the connection outlasts a nap of up to about 15 minutes, which is also about when TCP gives up.
 set -uo pipefail
 files=()
 while [ $# -gt 0 ] && [ "$1" != -- ]; do files+=("$1"); shift; done
@@ -33,7 +36,7 @@ tag="WineAltarsBatch_$(date +%s)_$RANDOM"
 timeout 5 bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null || { echo "$HOST:$PORT does not answer" >&2; exit 2; }
 # the upload and the session share one connection; the control socket wants a short path
 mux=$(mktemp -d)
-MUX=(-o ControlMaster=auto -o "ControlPath=$mux/%C" -o ControlPersist=60 -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
+MUX=(-o ControlMaster=auto -o "ControlPath=$mux/%C" -o ControlPersist=60 -o ServerAliveInterval=30 -o ServerAliveCountMax=30)
 trap 'ssh "${MUX[@]}" -p "$PORT" -O exit "$USERNAME@$HOST" >/dev/null 2>&1; rm -rf -- "${mux:?}"' EXIT
 # scp never opens a shared connection itself (it passes ControlMaster=no), so one is opened first.
 # ConnectTimeout does not cover the key exchange, which has been seen to stall for good: the login
@@ -42,6 +45,14 @@ trap 'ssh "${MUX[@]}" -p "$PORT" -O exit "$USERNAME@$HOST" >/dev/null 2>&1; rm -
 timeout $((WAKE + 60)) ssh -o BatchMode=yes -o ConnectTimeout="$WAKE" "${MUX[@]}" -o ControlMaster=yes \
         ${WIN_SSH_LOG:+-v -E "$WIN_SSH_LOG"} -p "$PORT" -fN "$USERNAME@$HOST" ||
     { echo "ssh login failed" >&2; exit 2; }
+# the steps after the login go over its connection only: once it is gone they would each log in anew,
+# so they stop instead
+alive() { ssh "${MUX[@]}" -p "$PORT" -O check "$USERNAME@$HOST" 2>/dev/null || { echo "connection lost" >&2; false; }; }
+if [ -n "${WIN_PRELUDE:-}" ]; then
+    echo "===== $WIN_PRELUDE"
+    ssh -o BatchMode=yes "${MUX[@]}" -p "$PORT" "$USERNAME@$HOST" "$WIN_PRELUDE" 2>&1 | tr -d '\r'
+    echo "WINRUN-EXIT ${PIPESTATUS[0]}"
+fi
 stage=$(mktemp -d)
 mkdir "$stage/$tag"
 cp -- "${files[@]}" "$KEEPAWAKE" "$stage/$tag/" || { rm -rf -- "${stage:?}"; exit 2; }
@@ -68,6 +79,7 @@ lines.append('taskkill /f /im keepawake.exe >nul 2>&1')
 with open(sys.argv[1], 'w', newline='') as f:
     f.write('\r\n'.join(lines) + '\r\n')
 PY
+alive || { rm -rf -- "${stage:?}"; exit 2; }
 scp -q -r -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -P "$PORT" "$stage/$tag" "$USERNAME@$HOST:$TEMP/" ||
     { rm -rf -- "${stage:?}"; echo "scp failed" >&2; exit 2; }
 rm -rf -- "${stage:?}"
@@ -75,4 +87,5 @@ rm -rf -- "${stage:?}"
 # afterwards also remove what an earlier run that stopped half-way left behind
 line="cd /d %TEMP%\\$tag & cmd /d /c winbatch-run.cmd & cd /d %TEMP% & rmdir /s /q $tag"
 line+=' & for /d %d in ("%TEMP%\WineAltarsBatch_*") do @rmdir /s /q "%d"'
+alive || exit 2
 ssh -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -p "$PORT" "$USERNAME@$HOST" "$line" 2>&1 | tr -d '\r'
