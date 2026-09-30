@@ -41,6 +41,79 @@ static void dump(const BYTE *data, unsigned int size, unsigned int max)
     if (size > max) printf("    ... (%u more)\n", size - max);
 }
 
+/* the blocks of a GIF: screen size, colour table, each extension with its label and data size, each image,
+ * and whether a comment extension holds the given ISF */
+static void describe_gif(const BYTE *data, LONG size, const BYTE *isf, LONG isf_size)
+{
+    LONG pos = 13, i;
+
+    if (size < 13 || memcmp(data, "GIF", 3))
+    {
+        printf("    not a GIF\n");
+        return;
+    }
+    printf("    %.6s screen %ux%u flags %#x background %u aspect %u\n", data, data[6] | data[7] << 8,
+           data[8] | data[9] << 8, data[10], data[11], data[12]);
+    if (data[10] & 0x80) pos += 3 << ((data[10] & 7) + 1);
+    while (pos < size)
+    {
+        BYTE type = data[pos++];
+        if (type == 0x3b)
+        {
+            printf("    trailer at %ld of %ld\n", pos - 1, size);
+            return;
+        }
+        if (type == 0x21 && pos < size)
+        {
+            BYTE label = data[pos++];
+            LONG total = 0, blocks = 0, start = pos;
+            BYTE *joined = malloc(size);
+            while (pos < size && data[pos])
+            {
+                memcpy(joined + total, data + pos + 1, data[pos]);
+                total += data[pos];
+                blocks++;
+                pos += data[pos] + 1;
+            }
+            pos++;
+            printf("    extension %#x at %ld: %ld bytes in %ld blocks", label, start - 2, total, blocks);
+            if (label == 0xf9 && total >= 4) printf(" (flags %#x delay %u transparent %u)", joined[0], joined[1] | joined[2] << 8, joined[3]);
+            if (label == 0xff && total >= 11) printf(" (\"%.11s\")", joined);
+            if (label == 0xfe && isf) printf(" (%s the ISF)", total == isf_size && !memcmp(joined, isf, total) ? "is" : "is not");
+            if (label == 0xfe || label == 0xff)
+            {
+                printf(" starts");
+                for (i = 0; i < total && i < 16; i++) printf(" %02x", joined[i]);
+            }
+            printf("\n");
+            free(joined);
+            continue;
+        }
+        if (type == 0x2c && pos + 9 <= size)
+        {
+            LONG start = pos - 1, total = 0;
+            BYTE flags = data[pos + 8];
+            printf("    image at %ld: %u,%u %ux%u flags %#x", start, data[pos] | data[pos + 1] << 8, data[pos + 2] | data[pos + 3] << 8,
+                   data[pos + 4] | data[pos + 5] << 8, data[pos + 6] | data[pos + 7] << 8, flags);
+            pos += 9;
+            if (flags & 0x80) pos += 3 << ((flags & 7) + 1);
+            printf(" lzw %u", pos < size ? data[pos] : 0);
+            pos++;
+            while (pos < size && data[pos])
+            {
+                total += data[pos];
+                pos += data[pos] + 1;
+            }
+            pos++;
+            printf(", %ld bytes of data\n", total);
+            continue;
+        }
+        printf("    unknown block %#x at %ld\n", type, pos - 1);
+        return;
+    }
+    printf("    no trailer\n");
+}
+
 static IInkDisp *create_ink(void)
 {
     IInkDisp *ink = NULL;
@@ -366,6 +439,8 @@ int main(void)
 {
     static const BYTE empty[] = {0, 0};
     static const BYTE version1[] = {1, 0};
+    BYTE *gif_isf[3] = {0};
+    LONG gif_isf_size[3] = {0};
     IInkDisp *ink, *loaded, *empty_ink;
     BYTE *bytes, *isf = NULL;
     LONG size, isf_size = 0;
@@ -395,13 +470,23 @@ int main(void)
     if (!(ink = build_ink())) return 0;
     printf("built ink:\n");
     describe_ink(ink);
+    for (mode = IPCM_Default; mode <= IPCM_NoCompression; mode++)
+    {
+        BYTE *plain;
+        LONG plain_size;
+        if (FAILED(save(ink, IPF_InkSerializedFormat, mode, &plain, &plain_size))) continue;
+        free(gif_isf[mode]);
+        gif_isf[mode] = plain;
+        gif_isf_size[mode] = plain_size;
+    }
     for (format = IPF_InkSerializedFormat; format <= IPF_Base64GIF; format++)
         for (mode = IPCM_Default; mode <= IPCM_NoCompression; mode++)
         {
             if (FAILED(save(ink, format, mode, &bytes, &size))) continue;
             if (format == IPF_InkSerializedFormat) dump(bytes, size, 4096);
             else if (format == IPF_Base64InkSerializedFormat) printf("    \"%.*s\"%s\n", (int)(size > 400 ? 400 : size), bytes, size > 400 ? "..." : "");
-            else dump(bytes, size, 16);
+            else if (format == IPF_GIF) describe_gif(bytes, size, gif_isf[mode], gif_isf_size[mode]);
+            else printf("    \"%.*s\"%s\n", (int)(size > 120 ? 120 : size), bytes, size > 120 ? "..." : "");
             if (format == IPF_InkSerializedFormat && mode == IPCM_Default)
             {
                 isf = bytes;
