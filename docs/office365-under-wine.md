@@ -10933,6 +10933,36 @@ Wine 不维护影子栈，进程与飞地都如实答 FALSE（altars-up `7b2d832
 问题，都还没在 Windows 上跑过；uilangfilter 一行的已编译代码恰好先读了 TEB 的 `LastErrorValue`，它的 Windows 结果仍然有效。
 现在一律先把错误码存进变量再打印。
 
+### 加载时没解析上的导入：msvcp 的货币 facet、WinAppSDK 要的等待完成包与功能分级（altars-up `3e9f06e9cfd`、`5f352215387`…`bedde6b091f`、`e3ebc193e0b`、`41ed67b1664`）
+
+`WINEDEBUG=warn+module` 除了按名查找失败，还会打印 **加载时就没解析上的导入**（`import_dll No implementation for …`，
+loader 把它们指向一个一调用就中止进程的桩）。Word 启动时有三组：
+
+- **`mso30win32client.dll` 从 msvcp140 导入 `moneypunct<wchar_t,false/true>::id` 与 `money_put<wchar_t>::id`**（`3e9f06e9cfd`）。
+  Wine 的 msvcp 从没实现货币类 facet，spec 里这 18 个数据导出一直注释着。MSVC 的 STL 头文件让客户程序把 facet 代码内联
+  进自己，只从库里取 `id`：缺了导出，`use_facet()` 会把桩地址上的代码字节当成 facet 编号，越界或写到只读页。补上
+  `money_get`/`money_put`/`moneypunct`（char、wchar_t、unsigned short 三种）的 `id`、`moneypunct::intl` 常量，以及同样缺着的
+  `time_get<unsigned short>::id`，msvcp60 到 msvcp140、msvcp120_app、msvcp_win 一起（`make_specfiles` 同步）。msvcp140 测试加了
+  导出存在、互不相同、`intl` 取值的检查。
+- **`WinAppSDK\CoreMessagingXP.dll` 从 ntdll 导入 `NtCreate/Associate/CancelWaitCompletionPacket`**：Windows 8 起的
+  “等待完成包”，目标对象一变为有信号就往完成端口投一个完成包，线程池和 WinUI 的消息调度用它。上游有 CodeWeavers 的草稿
+  MR 6911（为 React Native 做，2026-08 关闭未合并，CrossOver 26.3 也没有），连同 4 个共 872 行的 Windows 实测测试移植过来
+  （`5f352215387`…`d4275307fa0`）。MR 基于 2025 年 10 月的上游，此后 wineserver 的对象模型改成指定初始化的操作表、
+  `object_params` 与 `init` 钩子，另起一个提交改写（`bedde6b091f`：同步对象一律经 `get_obj_sync()` 取，没有 `signaled` 的
+  同步对象当作无信号，唤醒时用安全迭代器）；MR 没带生成文件，`make_requests`/`make_specfiles` 重新生成（`3df7d54402f`，
+  中间几个提交单独编不过）。ntdll 的 file 测试 3334 项 0 失败，其中等待完成包 284 项；om 测试 0 失败；Office 保存回归通过。
+  互斥体、键控事件、完成端口作为目标会被拒（`STATUS_INVALID_PARAMETER_3`，MR 的测试按 Windows 这样测），所以不会走到
+  互斥体回调里要等待线程的那条路。
+- **CoreMessagingXP 还导入 `NtAlpcQueryInformation` 和 shcore 的 `UnsubscribeFeatureStateChangeNotification`。** 前者补成与
+  上游其他 ALPC 桩一样返回 `STATUS_NOT_IMPLEMENTED` 的系统调用（`41ed67b1664`）。后者属于功能分级（feature staging）那组
+  函数，WIL 的功能开关全靠它们：shcore 原来的订阅是连输出句柄都不写的空桩，退订、`GetFeatureVariant`、`RecordFeatureError`
+  都没有（`e3ebc193e0b`）。Wine 里没有功能会改变状态，所以订阅只需交回一个之后能释放的句柄，回调永不触发。
+  `tools/featurestagingprobe` 量 Windows 的回答。
+
+同一次普查确认上一节补的 `PrivIsDllSynchronizationHeld` 已不再出现；还剩 `InheritWindowMonitor`、
+`isolatedwindowsenvironmentutils.dll`、`mscoree`（前缀禁用 .NET），以及 Office 自己组件之间的版本差（`c2r64.dll` 缺
+`SaveRecording` 等、`OutlookServicing.dll` 缺序号 89），后两类 Windows 上也一样。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
