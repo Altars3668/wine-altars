@@ -10888,6 +10888,27 @@ ncalrpc 是经 wineserver 的命名管道，每次往返更贵，一万次大约
 `tools/wininetexpprobe` 顺带看出另两处与 Windows 可能不同、待 winref 实测：`Expires: -1` 等无效日期（RFC 7234 要求当作
 已过期）落到默认的十分钟有效期上；普通请求从不读缓存，连 2038 年才过期的条目也再去服务器。
 
+### 按上游测试补 COM 与 OLE 嵌入：CurVer、EMF 呈现、嵌入对象的几处（altars-up `2198761ed5f`…`73b8a3cb0e7`）
+
+上游测试里的 `todo_wine` 是 Windows 上测过、Wine 还没做到的行为，不需要 winref 就能动手。挑与 Office 直接相关的：
+
+- **ProgID 的 `CurVer`**（`2198761ed5f`）：版本无关的 ProgID 常常自己没有 `CLSID`，只有 `CurVer` 指向当前版本；Windows 顺着
+  链找到有类的那一个，Wine 一律 `CO_E_CLASSSTRING`。Office 前缀里 331 个带 `CurVer` 的 ProgID 有 97 个只能这样解析，其中有
+  VBA 窗体按名字建的 MSCOMCTL 控件（`MSComctlLib.ListViewCtrl`、`ImageListCtrl`、`ProgCtrl`、`SbarCtrl`）。成环为
+  `REGDB_E_INVALIDVALUE`（`CLSIDFromProgID` 报 `CO_E_CLASSSTRING` 并清零），`CLSIDFromString` 对“已注册但解析不了”的
+  ProgID 不动输出。compobj 测试去掉 11 个 todo。
+- **数据缓存画 EMF**（`eb2f1404eb6`）：缓存加载得了增强图元文件呈现（OlePres 流里存的是 WMF，加载时转回 EMF），
+  `IViewObject::Draw` 却只会画图元文件图片和 DIB，未运行的嵌入对象（容器显示它最后的图）一片空白。
+- **`Freeze`/`Unfreeze`**（`b7d98406600`）：原是 `E_NOTIMPL`；冻结的方面在运行中对象数据变化时保持原样。
+- **嵌入辅助对象的引用泄漏**（`b904190ada5`）：进程内服务器对象没有 `IDataObject` 时不算运行，但处理器留着另两个
+  引用，销毁时只撤销“运行”，引用就漏了——嵌入的服务器因此可能退不出去。
+- **默认处理器的 `Update` 与 `GetUserType`**（`582bf139289`）：未运行时 `Update` 先运行对象（未注册类得
+  `REGDB_E_CLASSNOTREG`）；类未注册时（文档里嵌了本机没装的程序的对象）`GetUserType` 退到存储记下的类型名，再退到
+  “Unknown”。中文 Windows 上这个字符串是否翻译，第七批的 ole2 测试会告诉我们。
+- **无格式的 `GetData`**（`73b8a3cb0e7`）：视图缓存已填上某种格式后，再按“无格式”取数据答 `DV_E_CLIPFORMAT`。
+
+ole2 测试 3007 项 0 失败，todo 从 32 降到 22；Office 保存回归照常通过。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
