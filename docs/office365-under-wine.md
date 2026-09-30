@@ -11249,9 +11249,24 @@ Start、读到空报告，放映照常进行。已有前缀要 `wineboot -u` 才
 才去 Wine 目录找内置 DLL）。参数错误、越界与未知设备名的返回值、Start 后是否立即报告等由 `tools/sensoractivityprobe`
 在 winref 实测后对齐。
 
-墨迹是个大缺口：放映里 `View.PointerType = 2`（笔）之后用 SendInput 拖动，单击照样推进放映、不留笔迹，`View.DrawLine`
-画完也看不到；期间 `CoCreateInstance(CLSID_InkRenderer)` 未注册 11–15 次。Office 模块里引用了成套的 Tablet PC 墨迹对象：
-InkRenderer、InkDisp（Word 的 WWLIB 也有）、InkCollector、InkDrawingAttributes、InkTransform、InkRectangle、
-RealTimeStylus、InkRecognizers，AirSpace（Mso40UIwin32client）还用 Windows 10 的 InkDesktopHost 与 InkD2DRenderer；
-Wine 一个都没有。先查清 Office 画墨迹时实际走哪条路（Tablet PC 自动化对象还是 WinRT 的 InkPresenter/InkD2DRenderer），
-再决定补哪一套。
+墨迹：放映里 `View.PointerType = 2`（笔）之后用 SendInput 拖动，原来单击照样推进放映、不留笔迹，`View.DrawLine` 画完
+也看不到。一层层查下来（altars-up `05c47d34a0b`、`fe12ccdf2b4`、`dc20c7dbc59`）：
+
+1. PowerPoint 放映时先 `CoCreateInstance(CLSID_InkRenderer)`，失败就不再管墨迹；inkobj 原是空壳。现在实现了 InkDisp（笔画、
+   集合、命名集合、删除/提取/克隆/命中测试）、InkRenderer（对象变换→视图变换→按 DC 分辨率换像素，GDI+ 画、非 CopyPen 用
+   ROP2）、InkDrawingAttributes（文档默认值）、InkTransform、InkRectangle，带类型库供 IDispatch。只注册这五个类，
+   InkCollector 等未实现的保持未注册。顺带修了 msinkaut.idl：IInkRectangle 缺基类（虚表整体错位）、hDC/hWnd 应为
+   LONG_PTR、DISPID、`ID` 的名字；以及 widl 编这个类型库时在 STGMEDIUM 的空 union 分支上崩溃（`0bede15c74f`）。
+2. 设笔时 Office Art（OART.DLL）的墨迹工具建 RealTimeStylus、`AddStylusSyncPlugin`，再建 StrokeBuilder 作为异步插件；
+   rtscom 原是存根（全部 E_NOTIMPL），StrokeBuilder 也未注册，工具抛出、整个墨迹输入被丢弃（跟踪里 RTS 刚建好就释放）。
+   现在 RTS 用窗口线程上的鼠标钩子把按下/移动/抬起变成 StylusDown/Packets/StylusUp（HIMETRIC、相对客户区），同步插件就地
+   调用、异步插件经该线程队列；StrokeBuilder 既能直接建笔画，也作为插件把每次按下建成一笔（通过 inkobj 笔画的私有接口
+   `IWineInkStroke::AppendPackets` 边画边长）。
+
+现在拖动时红色笔迹实时出现、抬起后保留，单击不再推进放映，`DrawLine` 的线也画出来（`tools/officeautomationprobe/powerpoint-pen.vbs`，
+截图里拖动中 859、抬起后 3410 个红色像素）。PowerPoint 自己画笔迹（读笔画的包），不调用 InkRenderer 的 Draw。
+Office 还在墨迹对象上查询两个 SDK 里没有的接口 {49e015bc-…}（ink）和 {4a145a90-…}（stroke），不支持也能工作。
+
+仍未做：ISF 保存/载入、剪贴板、按矩形裁剪、压力改变笔宽、平板与光标对象、真正的笔和触摸输入；Word 的“绘图”选项卡在功能区
+模型里存在但被隐藏（`SM_TABLETPC`/`SM_DIGITIZER` 改成非 0 也不出现，开关另有所在）；AirSpace 的 InkDesktopHost/InkD2DRenderer
+也没有。各默认值、组合顺序、错误码等未实测的细节列在各提交说明里，`tools/inkprobe` 与 inkobj/rtscom 的测试在 winref 上跑后对齐。

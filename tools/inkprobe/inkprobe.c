@@ -27,6 +27,9 @@ static const struct { const char *name; const char *clsid; } classes[] =
     {"InkRecognizers", "{9FD4E808-F6E6-4E65-98D3-AA39054C1255}"},
     {"InkStrokes", "{48F491BC-240E-4860-B079-A1E94D3D2C86}"},
     {"RealTimeStylus", "{E26B366D-F998-43CE-836F-CB6D904432B0}"},
+    {"StrokeBuilder", "{E810CEE7-6E51-4CB0-AA3A-0B985B70DAF7}"},
+    {"DynamicRenderer", "{ECD32AEA-746F-4DCB-BF68-082757FAFF18}"},
+    {"GestureRecognizer", "{EA30C654-C62C-441F-AC00-95F9A196782C}"},
     {"InkDesktopHost", "{062584A6-F830-4BDC-A4D2-0A10AB062B1D}"},
     {"InkD2DRenderer", "{4044E60C-7B01-4671-A97C-04E0210A07A5}"},
 };
