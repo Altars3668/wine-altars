@@ -21,8 +21,14 @@ rtlib=libs/compiler-rt/x86_64-windows/libcompiler-rt.a; [ -f $rtlib ] || rtlib=
 FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D_CRT_NON_CONFORMING_WCSTOK -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2"
 list=$(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in)
 srcs=$(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.c\b')
-# A source with a .spec of the same name is a helper module the tests load (ole32's testlib.dll, combase's
-# wine.combase.test.dll), not part of the test executable; it is not built, and what needs it fails or skips.
+# A source marked "#pragma makedep testdll" is a helper module the tests load from a TESTDLL resource (ole32's
+# testlib.dll, ntoskrnl's drivers, user32's hook dll): it is linked on its own and embedded, as makedep does.
+testdlls=
+for f in $srcs; do
+    grep -q '^#pragma makedep .*testdll' ../dlls/$dll/tests/$f && testdlls="$testdlls ${f%.c}"
+done
+for t in $testdlls; do srcs=$(echo "$srcs" | grep -vxF "$t.c"); done
+# one with a .spec of the same name but no such mark is not built, and what needs it fails or skips
 for spec in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.spec\b'); do
     srcs=$(echo "$srcs" | grep -vxF "${spec%.spec}.c")
 done
@@ -54,6 +60,29 @@ for rc in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.rc\b'); do
     res="$res $O/${rc%.rc}.res"
 done
 imports=$(grep '^IMPORTS' ../dlls/$dll/tests/Makefile.in | cut -d= -f2)
+# never a delay-import library (libX.delay.a): a module the tests import that way is not loaded until its
+# first call, and GetModuleHandle() on it at the start of a test answers NULL
+import_libs() {
+    local d f
+    for d in "$@"; do f=dlls/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=libs/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | /usr/bin/grep -v '\.delay\.a$' | head -1); [ -n "$f" ] || f=$(ls dlls/*/x86_64-windows/lib$d.a 2>/dev/null | head -1); [ -n "$f" ] && echo $f; done
+}
+defaults="$crt0 $rtlib dlls/ucrtbase/x86_64-windows/libucrtbase.a dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a"
+for t in $testdlls; do
+    timports=$(sed -n "s/^${t}_IMPORTS *= *//p" ../dlls/$dll/tests/Makefile.in); [ -n "$timports" ] || timports=$imports
+    tflags=$(sed -n "s/^${t}_EXTRADLLFLAGS *= *//p" ../dlls/$dll/tests/Makefile.in)
+    ext=.dll; link=-shared; case " $tflags " in *" -mconsole "*) ext=.exe; link=;; esac
+    # a module without the default libraries has no C runtime of its own (a driver takes ntoskrnl's)
+    tdefaults=$defaults; tcflags=$FLAGS
+    case " $tflags " in *" -nodefaultlibs "*) tdefaults=$rtlib; tcflags=${FLAGS/-D_UCRT/-D_MSVCR_VER=0};; esac
+    x86_64-w64-mingw32-gcc -c -o $O/$t.o ../dlls/$dll/tests/$t.c $tcflags
+    spec=; [ -f ../dlls/$dll/tests/$t.spec ] && spec=../dlls/$dll/tests/$t.spec
+    fname=; case $t in *.*) fname=-Wb,-F,$t$ext;; esac
+    tools/winegcc/winegcc -o $O/$t$ext --wine-objdir . -b x86_64-w64-mingw32 $tflags $link $spec $fname $O/$t.o \
+        $(import_libs $timports) $tdefaults -s
+    # wrc opens the file by a relative name only
+    (cd $O && echo "$t$ext TESTDLL \"$t$ext\"" | "$B/tools/wrc/wrc" -u -o $t$ext.res)
+    res="$res $O/$t$ext.res"
+done
 objs=
 for f in $srcs; do
     x86_64-w64-mingw32-gcc -c -o $O/${f%.c}.o ../dlls/$dll/tests/$f $FLAGS
@@ -64,11 +93,6 @@ for f in $stubs; do
     objs="$objs $O/${f%.c}.o"
 done
 x86_64-w64-mingw32-gcc -c -o $O/testlist.o dlls/$dll/tests/testlist.c $FLAGS
-# never a delay-import library (libX.delay.a): a module the tests import that way is not loaded until its
-# first call, and GetModuleHandle() on it at the start of a test answers NULL
-libs=
-for d in $imports; do f=dlls/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=libs/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | /usr/bin/grep -v '\.delay\.a$' | head -1); [ -n "$f" ] || f=$(ls dlls/*/x86_64-windows/lib$d.a 2>/dev/null | head -1); [ -n "$f" ] && libs="$libs $f"; done
 tools/winegcc/winegcc -o $O/${dll}_test.exe --wine-objdir . -b x86_64-w64-mingw32 -mconsole \
-    $objs $O/testlist.o $res $libs $crt0 $rtlib dlls/ucrtbase/x86_64-windows/libucrtbase.a \
-    dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a
+    $objs $O/testlist.o $res $(import_libs $imports) $defaults
 echo built $O/${dll}_test.exe
