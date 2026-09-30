@@ -5,7 +5,8 @@
  * For each kind of existing file and each set of attributes asked for, this prints what CreateFile
  * (CREATE_ALWAYS, TRUNCATE_EXISTING) and NtCreateFile (FILE_OVERWRITE, FILE_OVERWRITE_IF,
  * FILE_SUPERSEDE) answer and the attributes the file has afterwards.  Files go in a new directory under
- * %TEMP%, removed at the end.
+ * %TEMP%, removed at the end.  It also asks what the profile functions, CopyFile and a replacing move do
+ * with a hidden, system or read-only file they write over.
  *
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror overwriteattrprobe.c -o overwriteattrprobe.exe -lntdll
  */
@@ -101,6 +102,51 @@ int main(void)
                 if (!status) CloseHandle(file);
             }
         }
+
+    /* what writes over files for the caller does with a hidden one: the profile functions (desktop.ini
+     * is hidden and system), CopyFile, and a replacing move */
+    {
+        static const DWORD dest[] = {FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                                     FILE_ATTRIBUTE_READONLY};
+        WCHAR ini[MAX_PATH], src[MAX_PATH], value[16];
+        DWORD attr, error, size;
+        HANDLE file;
+        BOOL ret;
+
+        swprintf(ini, MAX_PATH, L"%ls\\profile.ini", dir);
+        swprintf(src, MAX_PATH, L"%ls\\source.txt", dir);
+        for (e = 0; e < ARRAYSIZE(dest); e++)
+        {
+            SetFileAttributesW(ini, FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(ini);
+            WritePrivateProfileStringW(L"s", L"k", L"1", ini);
+            WritePrivateProfileStringW(NULL, NULL, NULL, ini);
+            SetFileAttributesW(ini, dest[e]);
+            SetLastError(0xdeadbeef);
+            ret = WritePrivateProfileStringW(L"s", L"k", L"2", ini);
+            error = GetLastError();
+            WritePrivateProfileStringW(NULL, NULL, NULL, ini);
+            attr = GetFileAttributesW(ini);
+            GetPrivateProfileStringW(L"s", L"k", L"", value, ARRAYSIZE(value), ini);
+            printf("WritePrivateProfileString existing %#06lx: %s %lu, now %#06lx, value %ls\n", dest[e],
+                   ret ? "ok" : "failed", ret ? 0 : error, attr & ~FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, value);
+
+            file = CreateFileW(src, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            WriteFile(file, "source", 6, &size, NULL);
+            CloseHandle(file);
+            make(dest[e]);
+            SetLastError(0xdeadbeef);
+            ret = CopyFileW(src, path, FALSE);
+            report("CopyFile", dest[e], 0, ret, GetLastError());
+            make(dest[e]);
+            SetLastError(0xdeadbeef);
+            ret = MoveFileExW(src, path, MOVEFILE_REPLACE_EXISTING);
+            report("MoveFileEx replace", dest[e], 0, ret, GetLastError());
+            DeleteFileW(src);
+        }
+        SetFileAttributesW(ini, FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(ini);
+    }
 
     SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
     DeleteFileW(path);

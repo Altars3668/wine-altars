@@ -11003,7 +11003,10 @@ rpcrt4 在绑定的 QOS 为 `RPC_C_IMP_LEVEL_DEFAULT` 时会请求匿名级（�
 
 kernel32 文件测试 57 万项 0 失败、todo 从 243 降到 218；ntdll 的 file/directory/info 测试 0 失败，另加了“只设时间不动属性”
 “无写属性权限被拒”“只读文件可写属性打开”三组断言（随第七批在 Windows 上验证）；Office 保存回归照常。覆盖一个隐藏或
-系统文件而不带同样属性时 Windows 是否拒绝（文档这么写，Wine 的测试没覆盖）由 `tools/overwriteattrprobe` 量。
+系统文件而不带同样属性时 Windows 拒绝——`CreateFile` 文档与 [MS-FSA] 2.1.5.1.2 都这么写，已照做（altars-up `97d0f78ea33`，
+只看文件存的属性，点文件不算；Office 保存回归与三件套普查照常）；Wine 自己的 profile 写入原先用 `CREATE_ALWAYS` 覆盖整个
+文件，会冲掉 desktop.ini 的隐藏、系统属性，现改为就地写再截断（`e40b7d311c0`）。`tools/overwriteattrprobe` 在 winref 上复核，
+并量 profile 写入、`CopyFile`、替换式移动遇到隐藏目标时 Windows 怎么做。
 设为 `FILE_ATTRIBUTE_NORMAL` 后 Windows 查询返回 0x80（Wine 返回 ARCHIVE）需要记录存档位，暂未做。
 
 ### 设置文件信息：状态块、缓冲区检查、分配大小、改名、删除标记（altars-up `de83556c28c`…`7456896871e`）

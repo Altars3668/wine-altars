@@ -233,6 +233,53 @@ int main(void)
     set("allocation, directory", handle, &value, sizeof(value), 19);
     CloseHandle(handle);
 
+    printf("-- access, mode and alignment, alone and in FileAllInformation\n");
+    {
+        static const struct { DWORD access, options; const char *name; } opens[] =
+        {
+            {GENERIC_READ, 0, "GENERIC_READ"},
+            {GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_SEQUENTIAL_ONLY,
+             "read/write, synchronous, sequential"},
+            {FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_SYNCHRONOUS_IO_ALERT | FILE_WRITE_THROUGH,
+             "read attributes, alertable, write through"},
+            {GENERIC_READ | SYNCHRONIZE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NO_INTERMEDIATE_BUFFERING,
+             "read, synchronous, no buffering"},
+        };
+        union { FILE_ALL_INFORMATION all; BYTE bytes[1024]; } all;
+        UNICODE_STRING nt_name;
+        OBJECT_ATTRIBUTES attr;
+        IO_STATUS_BLOCK io;
+        NTSTATUS status;
+        ULONG values[3];
+
+        RtlDosPathNameToNtPathName_U(path, &nt_name, NULL, NULL);
+        InitializeObjectAttributes(&attr, &nt_name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        for (i = 0; i < ARRAYSIZE(opens); i++)
+        {
+            status = NtOpenFile(&handle, opens[i].access, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                opens[i].options);
+            if (status)
+            {
+                printf("%s: open %#010lx\n", opens[i].name, (unsigned long)status);
+                continue;
+            }
+            memset(values, 0xcc, sizeof(values));
+            NtQueryInformationFile(handle, &io, &values[0], sizeof(ULONG), (FILE_INFORMATION_CLASS)8);   /* access */
+            NtQueryInformationFile(handle, &io, &values[1], sizeof(ULONG), (FILE_INFORMATION_CLASS)16);  /* mode */
+            status = NtQueryInformationFile(handle, &io, &values[2], sizeof(ULONG), (FILE_INFORMATION_CLASS)17);
+            printf("%s: access %#lx, mode %#lx, alignment %#lx (%#010lx)\n", opens[i].name, values[0], values[1],
+                   values[2], (unsigned long)status);
+            memset(&all, 0xcc, sizeof(all));
+            status = NtQueryInformationFile(handle, &io, &all, sizeof(all), (FILE_INFORMATION_CLASS)18);
+            printf("%s: all %#010lx: access %#lx, mode %#lx, alignment %#lx, delete pending %u, links %lu\n",
+                   opens[i].name, (unsigned long)status, all.all.AccessInformation.AccessFlags,
+                   all.all.ModeInformation.Mode, all.all.AlignmentInformation.AlignmentRequirement,
+                   all.all.StandardInformation.DeletePending, all.all.StandardInformation.NumberOfLinks);
+            CloseHandle(handle);
+        }
+        RtlFreeUnicodeString(&nt_name);
+    }
+
     printf("-- case sensitivity\n");
     handle = open_dir(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES);
     flags = 0xdeadbeef;
