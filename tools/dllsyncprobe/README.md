@@ -14,7 +14,7 @@ Word、PowerPoint 等 16 个 Office 二进制链接了 AuxUlib（`aux_ulib.lib`�
 - 主线程不持锁、持锁一次、两次、放掉一次、全放掉（`LdrLockLoaderLock`）；
 - 主线程持锁时另一个线程问（外加该线程 `LdrLockLoaderLock` 只试不等的结果，证明锁确实被占着）。
 
-各状态按实际到达的先后列出；进程退出时的两行在最后、当场直接写出，它们的先后就是加载器调用 exe 的 TLS
+各状态按实际到达的先后列出；进程退出时的两行在最后、当场直接写出（带上各自收到的 `reserved`），它们的先后就是加载器调用 exe 的 TLS
 回调与 DLL 入口点的顺序。
 
 ## 结果
@@ -23,7 +23,7 @@ Word、PowerPoint 等 16 个 Office 二进制链接了 AuxUlib（`aux_ulib.lib`�
 AuxUlib 自己的检查与现在函数的回答逐项相同。另一处差异：Wine 退出时**不以 `DLL_PROCESS_DETACH` 调用 exe
 的 TLS 回调**——只有 “DllMain, process detach at exit” 一行（上游 2020 年给 exe 补了进程附加、线程附加与
 分离，唯独没有进程分离）；MSVC 的 `__dyn_tls_dtor` 靠这一次调用析构主线程的 `thread_local` 对象。
-Windows 的结果待测（winref），据此定退出时两者的先后再改 ntdll。
+Windows 的结果待测（winref），据此定退出时两者的先后（以及 TLS 回调收到的 `reserved`）再改 ntdll。
 
 ## 构建
 

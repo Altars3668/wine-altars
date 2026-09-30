@@ -16,7 +16,7 @@
  *   - another thread while the main thread holds the loader lock
  *
  * The states are listed in the order they were reached; the two lines from process exit are written
- * as they happen, after everything else.
+ * as they happen, after everything else, with the reserved argument each callback got.
  *
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror dllsyncprobe.c -o dllsyncprobe.exe
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared dllsyncprobe_dll.c -o dllsyncprobe_dll.dll
@@ -107,7 +107,7 @@ static void put_hex(char **p, unsigned long v)
     while (n) *(*p)++ = digits[--n];
 }
 
-static void print_at_exit(const char *name)
+static void print_at_exit(const char *name, void *reserved)
 {
     struct answer a;
     char buf[256], *p = buf;
@@ -125,19 +125,20 @@ static void print_at_exit(const char *name)
     }
     put(&p, "; AuxUlib's check "); put_hex(&p, a.aux);
     put(&p, ", SameTebFlags "); put_hex(&p, a.flags);
+    put(&p, "; reserved "); put_hex(&p, (unsigned long)(ULONG_PTR)reserved);
     put(&p, "\r\n");
     WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, p - buf, &written, NULL);
 }
 
 static void NTAPI tls_callback(void *module, DWORD reason, void *reserved)
 {
-    (void)module; (void)reserved;
+    (void)module;
     switch (reason)
     {
     case DLL_PROCESS_ATTACH: ask(TLS_PROCESS_ATTACH); break;
     case DLL_THREAD_ATTACH: if (GetCurrentThreadId() == other_thread_id) ask(TLS_THREAD_ATTACH); break;
     case DLL_THREAD_DETACH: if (GetCurrentThreadId() == other_thread_id) ask(TLS_THREAD_DETACH); break;
-    case DLL_PROCESS_DETACH: print_at_exit("TLS callback, process detach"); break;
+    case DLL_PROCESS_DETACH: print_at_exit("TLS callback, process detach", reserved); break;
     }
 }
 
@@ -151,7 +152,7 @@ __declspec(dllexport) void dll_main_reached(DWORD reason, void *reserved)
     case DLL_PROCESS_ATTACH: ask(DLLMAIN_PROCESS_ATTACH); break;
     case DLL_THREAD_ATTACH: if (GetCurrentThreadId() == other_thread_id) ask(DLLMAIN_THREAD_ATTACH); break;
     case DLL_THREAD_DETACH: if (GetCurrentThreadId() == other_thread_id) ask(DLLMAIN_THREAD_DETACH); break;
-    case DLL_PROCESS_DETACH: print_at_exit(reserved ? "DllMain, process detach at exit" : "DllMain, process detach"); break;
+    case DLL_PROCESS_DETACH: print_at_exit("DllMain, process detach", reserved); break;
     }
 }
 
