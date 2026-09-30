@@ -11,4 +11,7 @@ PowerPoint 放映的笔画不出东西（`CoCreateInstance(CLSID_InkRenderer)` �
 `results/inkprobe.wine.txt`：altars-up 下只有 rtscom.dll 的 RealTimeStylus，其余 11 个类都未注册，度量全 0、没有指针设备。
 Windows 的结果（winref，SSH 会话与桌面会话各一次）决定先补哪一套、各类放在哪个 DLL。
 
-构建：`x86_64-w64-mingw32-gcc -O1 -Wall -o tools/inkprobe/inkprobe.exe tools/inkprobe/inkprobe.c -lole32 -luuid -ladvapi32 -luser32`。
+对象若有未知接口，再打印该接口虚表所在模块与偏移、每个槽的偏移；最后打印探针载入的每个模块的签名（`名字/时间戳+映像大小` 与
+`PDB名/GUID+age`），拿它可从微软符号服务器取到对应的二进制与公开符号。
+
+构建：`x86_64-w64-mingw32-gcc -O1 -Wall -o tools/inkprobe/inkprobe.exe tools/inkprobe/inkprobe.c -lole32 -loleaut32 -luuid -ladvapi32 -luser32 -lpsapi`。

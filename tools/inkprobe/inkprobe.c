@@ -8,15 +8,20 @@
  * what CoCreateInstance answers on an STA thread (the object is released at once), then the system
  * metrics an application can read about pens and touch, and the pointer devices.  Office asks
  * InkDisp, a stroke and drawing attributes for interfaces the SDK does not declare; the probe asks
- * Windows' own objects for them, and prints the metrics a stroke made by CreateStroke gives.
+ * Windows' own objects for them, and prints the metrics a stroke made by CreateStroke gives.  For an
+ * interface an object has, it prints the module and offset of its vtable and of each slot, and at
+ * the end the signature of every module the probe loaded, from which Microsoft's symbol server
+ * gives the binary and its public symbols.
  *
  * Copyright 2026 AltarsCN.  LGPL 2.1 or later, as Wine.
  */
 #define COBJMACROS
+#define _WIN32_WINNT 0x0a00
 #include <windows.h>
 #include <objbase.h>
 #include <oleauto.h>
 #include <msinkaut.h>
+#include <psapi.h>
 #include <stdio.h>
 
 static const struct { const char *name; const char *clsid; } classes[] =
@@ -46,6 +51,66 @@ static void reg_value(HKEY root, const char *path, const char *value, char *out,
         strcpy(out, "-");
 }
 
+static const char *module_name(HMODULE module, char *path, DWORD size)
+{
+    char *name;
+    if (!GetModuleFileNameA(module, path, size)) return "?";
+    name = strrchr(path, '\\');
+    return name ? name + 1 : path;
+}
+
+/* the vtable of an interface, as module+offset, and each slot while it points into the same module */
+static void print_vtable(IUnknown *iface)
+{
+    void **vtbl = *(void ***)iface;
+    HMODULE module, slot_module;
+    char path[MAX_PATH];
+    unsigned int i;
+
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (const char *)vtbl, &module))
+    {
+        printf("    vtable outside any module\n");
+        return;
+    }
+    printf("    vtable %s+%#lx\n", module_name(module, path, sizeof(path)), (unsigned long)((ULONG_PTR)vtbl - (ULONG_PTR)module));
+    for (i = 0; i < 40; i++)
+    {
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                vtbl[i], &slot_module) || slot_module != module)
+            break;
+        printf("    slot %2u +%#lx\n", i, (unsigned long)((ULONG_PTR)vtbl[i] - (ULONG_PTR)module));
+    }
+}
+
+/* where Microsoft's symbol server has a module and its public symbols */
+static void print_signature(HMODULE module)
+{
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)module + ((IMAGE_DOS_HEADER *)module)->e_lfanew);
+    IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    IMAGE_DEBUG_DIRECTORY *debug = (IMAGE_DEBUG_DIRECTORY *)((BYTE *)module + dir->VirtualAddress);
+    char path[MAX_PATH];
+    const char *name = module_name(module, path, sizeof(path));
+    unsigned int i;
+
+    printf("module %s %s/%08lX%lx", name, name, nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
+    for (i = 0; dir->VirtualAddress && i < dir->Size / sizeof(*debug); i++)
+    {
+        const struct { DWORD signature; GUID guid; DWORD age; char name[1]; } *cv;
+        const char *pdb;
+
+        if (debug[i].Type != IMAGE_DEBUG_TYPE_CODEVIEW || !debug[i].AddressOfRawData) continue;
+        cv = (const void *)((BYTE *)module + debug[i].AddressOfRawData);
+        if (cv->signature != 0x53445352) continue;
+        pdb = strrchr(cv->name, '\\') ? strrchr(cv->name, '\\') + 1 : cv->name;
+        printf(" %s/%08lX%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X%lX", pdb, cv->guid.Data1, cv->guid.Data2, cv->guid.Data3,
+               cv->guid.Data4[0], cv->guid.Data4[1], cv->guid.Data4[2], cv->guid.Data4[3],
+               cv->guid.Data4[4], cv->guid.Data4[5], cv->guid.Data4[6], cv->guid.Data4[7], cv->age);
+        break;
+    }
+    printf("\n");
+}
+
 static void query(const char *what, IUnknown *object)
 {
     static const struct { const char *name; GUID iid; } iids[] =
@@ -65,6 +130,7 @@ static void query(const char *what, IUnknown *object)
         IUnknown *unk = NULL;
         HRESULT hr = IUnknown_QueryInterface(object, &iids[i].iid, (void **)&unk);
         printf("%s QI %s %#lx\n", what, iids[i].name, hr);
+        if (SUCCEEDED(hr) && i < 4) print_vtable(unk);
         if (SUCCEEDED(hr)) IUnknown_Release(unk);
     }
 }
@@ -162,7 +228,7 @@ int main(void)
     pGetPointerDevices = (void *)GetProcAddress(GetModuleHandleA("user32.dll"), "GetPointerDevices");
     if (pGetPointerDevices)
     {
-        struct { HANDLE device; int type; UINT32 startingCursorId, maxActiveContacts; int orientation; UINT32 monitor_pad[2]; RECT r1, r2; WCHAR desc[520]; } devices[16];
+        POINTER_DEVICE_INFO devices[16];
         UINT32 count = 0;
         BOOL ret = pGetPointerDevices(&count, NULL);
         printf("GetPointerDevices(count) %d, %u devices\n", ret, count);
@@ -171,10 +237,21 @@ int main(void)
             count = 16;
             if (pGetPointerDevices(&count, devices))
                 for (i = 0; i < count; i++)
-                    printf("  device %u: type %d (1 integrated pen, 2 external pen, 3 touch, 4 touchpad), max contacts %u\n",
-                           i, devices[i].type, devices[i].maxActiveContacts);
+                    printf("  device %u: type %d (1 integrated pen, 2 external pen, 3 touch, 4 touchpad), max contacts %u, "
+                           "starting cursor %lu, orientation %lu, \"%ls\"\n", i, devices[i].pointerDeviceType,
+                           devices[i].maxActiveContacts, devices[i].startingCursorId, devices[i].displayOrientation,
+                           devices[i].productString);
         }
     }
     else printf("GetPointerDevices missing\n");
+
+    {
+        HMODULE modules[256];
+        DWORD size = 0;
+
+        if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &size))
+            for (i = 1; i < size / sizeof(HMODULE) && i < ARRAYSIZE(modules); i++)
+                print_signature(modules[i]);
+    }
     return 0;
 }
