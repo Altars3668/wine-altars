@@ -11195,8 +11195,16 @@ Excel 在数据透视表一步崩掉，普查 37 ok/41 FAIL。组合交换链的
 
 同一普查、同样调试通道的对照：改动前一轮 733 次创建桩，另有 1466 个另一类 C++ 异常与 745 次重抛；改动后组合交换链只建 24 次，
 那两类异常消失。`AirSpace::DeviceError`（Mso40UIwin32client.dll）改动前 777 个、58 串，改动后 648 个、46 串——这是另一个
-原有问题：每串之前 AirSpace 都在 D2D 命令列表上查询 `ID2D1Bitmap`（该失败的类型检查）并连调 `GetDeviceRemovedReason`，
-真正失败的调用还没找到。
+原有问题，后来查明并修掉（见下）。
+
+`AirSpace::DeviceError` 的来源：新建工作簿填数据这样的小场景全跟踪，抛出前最后一个失败的调用是同一绘制表面先
+`SuspendDraw`、再 `BeginDraw`（换一个更新矩形），我们的 dcomp 回 `DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED`，AirSpace
+连调两次 `GetDeviceRemovedReason`，抛 DeviceError，放弃这次绘制。可见的后果是 Excel 的工作表标签栏：标签位置只剩一块
+浅色矩形，没有“Sheet1”、没有绿色下划线、没有左右箭头，开始时连“+”都没有（在 :77 上截屏；:2 是 rootless Xwayland，
+截不了根窗口）。换回组合交换链之前的 dxgi/dcomp、或去掉截帧类，都一样缺，说明与今天的其它改动无关。让挂起中的那次
+绘制在同一表面再 BeginDraw 时先按 EndDraw 的方式结束（两次画的都落地），标签栏完整出现，DeviceError 归零，普查仍
+79/0（altars-up `001fbed3d99`）。drawsurfprobe 在 Wine 下的新输出已更新；Windows 上这些序列的确切 HRESULT 与哪些更新
+落地，以 winref 的 drawsurfprobe 结果为准再对齐。
 
 显示验证：`tools/compswapchainprobe` 在 200x200 窗口上用交换链表面画一个 100x100 精灵，Wine 下先后呈现红、绿、预乘的半透明红，
 都不提交，屏幕读到 0000ff、00ff00、000080，精灵外不变。创建时的描述校验、无窗口交换链上 GetDesc 的 OutputWindow、
