@@ -11153,3 +11153,35 @@ msg 测试另定：`MsgWaitForMultipleObjectsEx` 带 `MWMO_ALERTABLE`、已有�
 
 普查脚本里“错误密码被拒”原先只看有无错误，应用崩溃（462）也记成通过；现在只接受各应用的拒绝码（Word 5408、Excel 1004、
 PowerPoint E_FAIL）。
+
+### 普查里撞到的桩：命令行、WMI、圆角连接、JPEG 颜色配置、方向模糊与精灵批（altars-up `44814a09f7a`…`8045a4c38c5`）
+
+让三件套普查在 `fixme+all,err+all` 下跑（会话里第一个进程带着 WINEDEBUG 启动，Office 各进程继承），按调用次数汇总
+Office 真实使用功能时撞到的桩，挑不必等 Windows 实测、影响可见结果的补上：
+
+- `NtQueryInformationProcess(ProcessCommandLineInformation)`（类 60）原本没有；wineserver 新请求 `get_process_cmdline`
+  从目标进程 PEB 指向的参数块读命令行（进程改过的也读得到，未启动时取创建者给的），只要
+  `PROCESS_QUERY_LIMITED_INFORMATION`，排布照 `ProcessImageFileName`（`44814a09f7a`；协议版本随之 +1，装的时候 wineserver
+  与所有发请求的模块要一起换）。WMI 的 `Win32_Process.CommandLine` 因此对别的进程也有值（`43748d328a7`），并补了
+  `Win32_Process.Terminate`（Reason 即退出码，`5319ed2a6fa`）；方法参数原先不收 VT_I4 形式的 uint32（`1e928173d0a`）。
+  细节（MaximumLength、拒绝访问时的 ReturnLength、WoW64 读哪份 PEB）待 `tools/cmdlineprobe` 在 winref 实测。
+- gdiplus 的 `GdipWidenPath` 没有圆角连接（105 次/普查），画成斜切角；现在外侧用不超过 90° 的贝塞尔圆弧（`5e95082afa9`）。
+  Windows 的点列待 `tools/gdipwidenprobe` 实测后再写精确测试。
+- `IGlobalOptions::Set` 原先只打 FIXME；Office 设异常处理为 `COMGLB_EXCEPTION_DONOT_HANDLE_ANY`、STA 模态循环的输入处理，
+  现在保存下来供 Query 读回（`ec037b6cbe7`，行为本身尚未跟随）。
+- WIC 的 JPEG 解码器声明不支持颜色上下文，Office 每解一张 JPEG 就问一次；现在把 APP2 里分段的 ICC 配置按序号拼起来作为帧的
+  颜色上下文（`b39b45e3a79`），无配置时与 PNG 一样 S_OK、0 个。
+- Direct2D 的 DirectionalBlur 效果没有变换图，Excel 画它的地方什么都没有；现在复用高斯模糊的着色器，沿角度（x 轴起逆时针、
+  y 向下）做一遍（`314be4b0d12`，d2d1 测试加了只沿角度外溢的像素检查；去掉实现时这些检查全失败）。
+- `DrawSpriteBatch` 在位图目标上什么都不画（PowerPoint 25 次/普查）；现在逐个精灵经“精灵变换×当前变换”把源矩形画进目标矩形，
+  颜色的 alpha 作不透明度（`8045a4c38c5`；非白色的着色与钳到源矩形尚未做）。
+
+仍在清单上、量大但属于大工程的：`CreateSwapChainForComposition`（DirectComposition，PowerPoint 一次普查六千多次，每次失败后
+回退）与 Windows.UI.Composition 系列。d2d1 测试里 2D 仿射变换效果第 2 组（4×4 图按 0.75×2.5 缩放）的覆盖轮廓对不上，
+本次改动之前就是如此。
+
+另查明一个残留进程：PowerPoint 插入图表时以 `CREATE_SUSPENDED` 启动 `EXCEL.EXE /Automation -Embedding /K`，14 毫秒后就
+`CoCreateInstanceEx(ChartDataSourceFactory, CLSCTX_LOCAL_SERVER)`；这时类还没注册，Wine 的 combase 立刻按 LocalServer32
+另起 `EXCEL.EXE /automation -Embedding`，它只注册 Excel.Application、没有客户，PowerPoint 退出后一直不走（主线程空闲在
+消息循环里）。Windows 上是否也会多起一个、多起的会不会自己退出，由 `tools/officeautomationprobe/powerpoint-chartexcel.vbs`
+在 winref 实测后再定修法。
