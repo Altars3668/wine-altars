@@ -42,7 +42,7 @@ def main():
     ap.add_argument('pe'); ap.add_argument('pdb')
     ap.add_argument('rvas', nargs='*', help='hex RVAs, with or without 0x')
     ap.add_argument('--no-omap', action='store_true', help='use the addresses as they are')
-    ap.add_argument('--lookup', help='print the image RVAs of the publics whose names contain this')
+    ap.add_argument('--lookup', help='print the image RVAs of the publics whose names contain this ("" lists them all)')
     a = ap.parse_args()
     m = pdb_symbols.MSF(a.pdb)
     st = m.streams()
@@ -85,7 +85,7 @@ def main():
     tbl.sort()
     keys = [t[0] for t in tbl]
     print("-- %d publics" % len(tbl), file=sys.stderr)
-    if a.lookup:
+    if a.lookup is not None:
         for src, name in tbl:
             if a.lookup not in name: continue
             rva = src
