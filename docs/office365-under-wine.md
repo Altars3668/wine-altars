@@ -10995,6 +10995,11 @@ rpcrt4 在绑定的 QOS 为 `RPC_C_IMP_LEVEL_DEFAULT` 时会请求匿名级（�
   `SetFileAttributesW` 也照 Windows 以 `FILE_WRITE_ATTRIBUTES` 打开（原先只要 `SYNCHRONIZE`，靠的正是不查权限）。
 - **覆盖、替换已存在的文件取新属性**（`FILE_OVERWRITE(_IF)` 带只读、替换只读文件等，`test_NtCreateFile` 的表）。
 - `CreateFile(TRUNCATE_EXISTING)` 必须带 `GENERIC_WRITE` 位，否则 `ERROR_INVALID_PARAMETER`。
+- **删除用 POSIX 语义**（altars-up `88ce1d33585`）：Windows 10 1809 起 `DeleteFileW`/`RemoveDirectoryW` 设
+  `FileDispositionInformationEx(DELETE|POSIX_SEMANTICS)`，名字立即消失、仍打开的句柄照用，文件系统不支持时退回旧方式；
+  Wine 原先要等最后一个句柄关掉，其间还能再打开。服务器已支持 POSIX 语义，改 kernelbase 即可；对字符设备（`nul`）设删除
+  信息按设备驱动的回答给 `STATUS_INVALID_DEVICE_REQUEST`。ntdll 文件测试又去掉 9 个 todo；三件套功能普查（Word 42、
+  Excel 79、PowerPoint 55 项）前后结果一致。
 
 kernel32 文件测试 57 万项 0 失败、todo 从 243 降到 218；ntdll 的 file/directory/info 测试 0 失败，另加了“只设时间不动属性”
 “无写属性权限被拒”“只读文件可写属性打开”三组断言（随第七批在 Windows 上验证）；Office 保存回归照常。覆盖一个隐藏或
