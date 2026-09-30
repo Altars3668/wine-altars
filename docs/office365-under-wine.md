@@ -11269,9 +11269,33 @@ Office 还在墨迹对象上查询两个 SDK 里没有的接口 {49e015bc-…}�
 
 放映结束时“是否保留墨迹注释?”选“保留”，PowerPoint 要把笔画变成墨迹形状，先读每笔 X、Y 的包属性度量；这个方法原是桩，
 形状出不来（`73d3d0557ee`、`07bc82cd52c` 让笔画保存度量，StrokeBuilder 把 RTS 给的度量交给笔画）。现在幻灯片上有了
-“墨迹 1”（p14:contentPart，位置尺寸都在），但写出的 ppt/ink/ink1.xml 是空的 InkML：OART 读完点、描述、属性、逐包数据后
-新建一个 InkDisp，却没有往里放笔画，此前在原 ink 上查询 {49e015bc-…} 失败——它是否是 Windows inkobj 自己的私有接口，
-由 winref 上的 inkprobe（Windows 的 InkDisp/笔画/属性对这几个 IID 的回答）来定。
+“墨迹 1”（p14:contentPart，位置尺寸都在），但写出的 ppt/ink/ink1.xml 是空的 `<inkml:ink/>`。
+
+空 InkML 的来龙去脉（OART、PPCORE、MSO、Mso40UI 的公开符号 + bptrace/bpread，2026-09-30）：
+
+1. {49e015bc-…} 是 Office 自己的 `OInk::IInkDispAdaptor`（OART 的 `CQIPtr<IInkDispAdaptor, _GUID_49e015bc…>`），
+   {4a145a90-…}、{c673d14b-…} 是它在笔画、绘制属性上的同族接口：Office 用它们认出自己的墨迹对象，Windows 的 InkDisp
+   也不会有，不必实现。
+2. “保留”这一路本身是通的：PPCORE `InkManager::SSInkToShape` → `SaveInkStrokesForSlide` → OART `IInkDispData::Create`
+   → `InkDispData::SetInkDisp` → `ConvertInkDispToInkDisp2`（`LoadInkFromInkDisp` 逐包读我们的笔画、度量、时间戳
+   扩展属性 {8A54CF58-…}、笔刷，再 `CreateInkDispFromInk` 建成 Office 自己的墨迹，笔画都在）→ `InsertInkCommand`
+   建 `InkDrawingElement`。之后那个新建的 InkDisp 只是交给 StrokeBuilder 重新开始（`putref_Ink`）。
+3. 保存时 `InkContentPartBase::BeforeSave` 只写内容部件里现成的 InkData，没人填过：`SetInk` 从未调用，保存时也没有
+   `LoadInkFromInkDisp`。什么时候现生成、什么时候拷贝元素里存的 InkData，由 `Dr::FInkObjAvailable()`（MSO
+   `MsoFInkObjAvailable`）决定：它读 `HKCR\CLSID\{3EE60F5C-9BAD-4CD8-8E21-AD2D001D06EB}\InprocServer32`，文件存在才算
+   “墨迹平台可用”。OART 里有 27 处看它（`Art::FInkIsPossible`、`Dr::FTabletFeaturesEnabled`、
+   `InkInputTextureUser::FIsInkPossible`、保存转换等）。Wine 没注册这个类，于是 Office 以为没有墨迹平台，而 RTS 照样能画——
+   这种组合 Office 没预料到：新墨迹元素的 InkData 为空，就写出空文件。
+4. 试着在开发前缀里临时注册它（指向 inkobj.dll，试完删掉）：放映笔反而完全画不出来。原因是平台“可用”时
+   `MsoHrCoCreateInkInstance` 第一次建墨迹对象前要 `CGuidCollector::FInit` → `FCreateInkWithAllWispGuids`：建一个
+   InkDisp，把 MSO 内嵌的 303 字节 ISF（HIMETRIC 尺寸、4 个 Office GUID 的 GUID 表、墨迹空间矩形、含全部预定义与 4 个
+   自定义绘制属性的属性块、一个 0 点的笔画）交给 `IInkDisp::Load`；inkobj 的 Load 是桩，失败后所有墨迹对象都建不出来
+   （bpread：返回 0x8000FFFF），InkRenderer 没有，墨迹表面也就没有。
+5. 所以与 Windows 一致的做法是：实现 ISF 的 Load/Save（微软公开的 ISF 规范；标签数值与默认哈夫曼表取自 MIT 许可的
+   WPF 实现），再按 winref 上的实测注册 {3EE60F5C-…} 那个类。`tools/isfprobe` 在 Windows 上产出各格式、各压缩模式的
+   真实 ISF 字节作解码器的测试向量；`tools/inkprobe` 与批次里的 `reg query` 回答那个 CLSID 是什么、在哪个 DLL。
+
+同一轮里，Word 的“绘图”选项卡在临时注册后仍被隐藏，开关另有所在。
 
 仍未做：ISF 保存/载入、剪贴板、按矩形裁剪、压力改变笔宽、平板与光标对象、真正的笔和触摸输入；Word 的“绘图”选项卡在功能区
 模型里存在但被隐藏（`SM_TABLETPC`/`SM_DIGITIZER` 改成非 0 也不出现，开关另有所在）；AirSpace 的 InkDesktopHost/InkD2DRenderer
