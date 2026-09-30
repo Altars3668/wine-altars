@@ -106,7 +106,8 @@ sheet.Range("F11").Value = 0.1234
 sheet.Range("F11").NumberFormat = "0.0%"
 found = found & " | " & sheet.Range("F11").Text
 sheet.Range("F12").Value = DateSerial(2026, 9, 28)
-sheet.Range("F12").NumberFormat = "[$-804]yyyy""年""m""月""d""日"";@"
+' the Chinese date format by code points: cscript reads a script in the ANSI code page, where UTF-8 text is garbage
+sheet.Range("F12").NumberFormat = "[$-804]yyyy""" & ChrW(&H5E74) & """m""" & ChrW(&H6708) & """d""" & ChrW(&H65E5) & """;@"
 found = found & " | " & sheet.Range("F12").Text
 result "number formats", found
 
