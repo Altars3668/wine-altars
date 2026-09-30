@@ -11202,6 +11202,21 @@ Excel 在数据透视表一步崩掉，普查 37 ok/41 FAIL。组合交换链的
 都不提交，屏幕读到 0000ff、00ff00、000080，精灵外不变。创建时的描述校验、无窗口交换链上 GetDesc 的 OutputWindow、
 全屏切换、ResizeBuffers(0x0)、表面的运行时类名等细节是按文档与推断写的，待这个探针在 winref 实测后对齐。
 
+同一批网格动画还要截一个合成视觉：AirSpace（Mso40UIwin32client.dll）用 `GraphicsCaptureItem.CreateFromVisual` →
+读 `Size` → `Direct3D11CaptureFramePool.CreateFreeThreaded` → 会话 → 取帧纹理，沿途几乎每个意外的 HRESULT 都 fail-fast
+（标签 0x248864d、0x248864e、0x2488651…），只有开头激活失败时平稳退回；上游 Wine 没有这个类（每轮普查 17 次“找不到库”），
+d3d11 也没有 WinRT 互操作导出。现在都实现了：d3d11 的 `CreateDirect3D11DeviceFromDXGIDevice`/
+`CreateDirect3D11SurfaceFromDXGISurface`（altars-up `a806e88c397`）；dcomp 的视觉经私有接口 `IWineCompositionVisualCapture`
+在合成器每次绘制后把自己画进截帧缓冲（`305be6fb019`）；graphicscapture 的项、帧池（自由线程的 FrameArrived 走线程池，
+否则走创建线程的 DispatcherQueue）、帧、会话（`18b9c4b2c67`，测试端到端取帧读像素）。窗口/显示器截取还没有，
+`IsSupported` 仍答 FALSE。Excel 一轮普查建 6 个帧池（5 个自由线程，1 个 1072x1995）取 5 帧，三应用普查与之前相同
+（Word 42/0、Excel 79/0、PowerPoint 55/1）。`tools/capturevisualprobe` 在 Wine 下的输出在其 results/，Windows 的待 winref。
+
+已有前缀要补登记两个新类（新建前缀由 wineboot 自动登记）：`wine reg add
+"HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Graphics.Capture.GraphicsCaptureItem" /v DllPath
+/t REG_SZ /d C:\windows\system32\graphicscapture.dll /f`，`Direct3D11CaptureFramePool` 同样，`/reg:32` 再各一次；
+或者 `wineboot -u`。
+
 另：普查运行器若用 `env -i` 清掉 LANG，C 区域的字符集是 ASCII，PowerPoint“另存为 PNG”建不了中文名的“幻灯片1.PNG”而失败。
 altars-up `5870f57b0a7` 让 C/POSIX 区域的 Unix 名按 UTF-8 处理（ASCII 是其子集，原来能用的不变）。d2d1 测试里 2D 仿射变换效果第 2 组（4×4 图按 0.75×2.5 缩放）的覆盖轮廓对不上，
 本次改动之前就是如此。
