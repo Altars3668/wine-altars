@@ -10836,6 +10836,9 @@ Excel 单元格里的自定义函数。三个应用 33 项全部通过（AMSI �
 `msvcp140_atomic_wait.dll`（微软 STL 原版）、React Native 的 JS 引擎 `hermes.dll`、`react-native-win32.dll`、
 `WritingAssistant.exe`、WinAppSDK 的 `Microsoft.Windows.Search.dll` 都会从 system32 加载 `icu.dll`（Windows 10 起系统自带
 的 ICU），拿时区、日期与数字格式化（JS 的 `Intl`）；Outlook 的 `EMSMDB32.DLL` 还直接导入 `__std_tzdb_get_sys_info`。
+其中 `react-native-win32.dll` 与 `WritingAssistant.exe`（Word 的“编辑器”拼写语法服务）是**延迟导入** `icu.dll` 的分词函数
+（`ubrk_open/following/preceding/getRuleStatus`、`u_isalnum`、`u_strFromWCS`）：按词移动光标、双击选词、分句的第一次
+调用就会因加载不了 `icu.dll` 抛出延迟加载异常。
 而 Wine 这边：
 
 - **构建里根本没有 `icu.dll`。** 上游已经带了用 ICU 源码编成 PE 的 `icu.dll`，但它（连同自带的 libc++、dmsynth、
@@ -10854,7 +10857,8 @@ Excel 单元格里的自定义函数。三个应用 33 项全部通过（AMSI �
 
 验证：`tools/tzdbprobe` 在同一个 Wine 的 `icu.dll` 上，用 Wine 的实现与用 Office 自带的微软原版逐行相同（634 个时区、
 157 个链接、各时区的偏移、切换与短名、选项字节）；`msvcp140_atomic_wait` 测试 748 项 0 失败；装上 `icu.dll` 后 Word、
-Excel、PowerPoint 保存回归照常通过。Windows 上的对照（`tzdbprobe`、`msvcp140_atomic_wait` 测试）待 winref。
+Excel、PowerPoint 保存回归照常通过，Word 运行近三分钟（加载了新的 `msvcp140_atomic_wait`、`icu.dll` 与
+`react-native-win32.dll`）没有新的错误，启动 FIXME 从 213 条降到 199 条。Windows 上的对照（`tzdbprobe`、`msvcp140_atomic_wait` 测试）待 winref。
 
 ### PowerPoint 导出动画 GIF 之后不再响应
 
