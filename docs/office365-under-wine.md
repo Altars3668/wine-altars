@@ -10860,6 +10860,34 @@ Excel 单元格里的自定义函数。三个应用 33 项全部通过（AMSI �
 Excel、PowerPoint 保存回归照常通过，Word 运行近三分钟（加载了新的 `msvcp140_atomic_wait`、`icu.dll` 与
 `react-native-win32.dll`）没有新的错误，启动 FIXME 从 213 条降到 199 条。Windows 上的对照（`tzdbprobe`、`msvcp140_atomic_wait` 测试）待 winref。
 
+### 新树上的启动普查：还剩什么（2026-09-29 晚）
+
+在同步到上游 `abc6aebd55b`、装上 `icu.dll` 的构建上，Word、Excel、PowerPoint 各在 :2 上启动并运行两三分钟：没有崩溃，
+ERR 只剩已知的三类（C2R 服务故意加载不了的 `msoxmlmf.dll`、这个前缀禁用 `mscoree` 导致起不来的 OfficePLUS 服务、
+WinUIEdit 找的一个未注册类，winref 上查注册表待定）。FIXME 按条数排，多数是半桩或记录用途（WER、ETW 会话、
+netprofm 的网络变化通知、webservices 的 error 参数），有实际影响、待 Windows 实测后补的：
+
+- `BitmapScaler_Initialize unsupported mode 2`：WIC 缩放器只会最近邻，Excel、PowerPoint 每次启动用三次插值缩放几次
+  （`tools/wicscalerprobe`）。
+- `OaBuildVersion` 不认识 Windows 10（`tools/oaversionprobe`）；`RegQueryInfoKeyW` 不给安全描述符长度（`tools/regsecprobe`）。
+
+再用 `WINEDEBUG=warn+module` 看 Office **按名字找而找不到**的导出（这类缺口不打 FIXME，Office 默默走退路）：
+user32 `InheritWindowMonitor`（OART、写作助手）、userenv `DeriveAppContainerSidFromAppContainerName` 与
+`GetAppContainerFolderPath`（加载项框架 OSF 与 Web 沙箱）、ntdll `NtQueryDirectoryFileEx`（App-V 层探测后挂钩），以及加载
+不了的 `isolatedwindowsenvironmentutils.dll`（msoadfsb）。`tools/win10apiprobe` 量 Windows 的回答，之后再定补不补——
+只补 AppContainer 的配置文件函数而没有 AppContainer 令牌，可能把 Office 从现在能用的退路引到走不通的路上。
+
+**C2R 服务的上万次 RPC 不是空转。** 每个应用运行时服务打印约一万条 `FSCTL_PIPE_IMPERSONATE`。追下去：几乎全是
+`\\.\pipe\lrpc\AppV-ISV-…APPV-VREG_SERVER` 上同一个过程；按公开符号它是 `vreg_server_IsDuplicatedKey`，唯一调用者是
+`vreg_hooks::LookupKey`——App-V 的注册表钩子每查找一个虚拟化的键就问一次服务。Windows 上同样如此（走 ALPC）；Wine 的
+ncalrpc 是经 wineserver 的命名管道，每次往返更贵，一万次大约多出一两秒启动时间。
+
+### WinINet：`max-age` 少算了十倍（altars-up `e67210564e9`）
+
+`Cache-Control: max-age=N` 被按 `N × 10⁶` 个 100 纳秒记为过期时间（注释写的是秒），一小时的缓存只算 6 分钟。
+`tools/wininetexpprobe` 顺带看出另两处与 Windows 可能不同、待 winref 实测：`Expires: -1` 等无效日期（RFC 7234 要求当作
+已过期）落到默认的十分钟有效期上；普通请求从不读缓存，连 2038 年才过期的条目也再去服务器。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
