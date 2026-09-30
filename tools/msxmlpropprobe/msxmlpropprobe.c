@@ -22,6 +22,20 @@ static const WCHAR *props[] =
     L"NormalizeAttributeValues", L"AllowDocumentFunction", L"UseInlineSchema", L"MaxXMLSize",
 };
 
+/* the reason in UTF-8, with its line breaks written out, whatever the console's code page */
+static void print_reason(const WCHAR *reason)
+{
+    char utf8[1024];
+    int i, n = WideCharToMultiByte(CP_UTF8, 0, reason ? reason : L"", -1, utf8, sizeof(utf8), NULL, NULL);
+
+    for (i = 0; i < n && utf8[i]; i++)
+    {
+        if (utf8[i] == '\r') fputs("\\r", stdout);
+        else if (utf8[i] == '\n') fputs("\\n", stdout);
+        else putchar(utf8[i]);
+    }
+}
+
 static void load(IXMLDOMDocument2 *doc, const char *what, const WCHAR *xml)
 {
     IXMLDOMParseError *err;
@@ -39,7 +53,8 @@ static void load(IXMLDOMDocument2 *doc, const char *what, const WCHAR *xml)
         IXMLDOMParseError_get_reason(err, &reason);
         IXMLDOMParseError_get_line(err, &line);
         IXMLDOMParseError_get_linepos(err, &pos);
-        printf(", error %#lx at %ld:%ld: %ls", code, line, pos, reason ? reason : L"");
+        printf(", error %#lx at %ld:%ld: ", code, line, pos);
+        print_reason(reason);
         SysFreeString(reason);
         IXMLDOMParseError_Release(err);
     }

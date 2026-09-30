@@ -12,7 +12,9 @@
 # one, such as a whole conformance test.
 #
 # Check that the port answers before anything else, and never retry a failed login: the host
-# bans addresses that keep trying.
+# bans addresses that keep trying.  Every step goes over one connection -- the first opens it and the
+# others share its login (ControlMaster), and the waiting for a desktop task happens on the Windows
+# side -- because a burst of short ssh connections gets the address shut out as well.
 set -uo pipefail
 desktop=0
 [ "${1:-}" = --desktop ] && { desktop=1; shift; }
@@ -20,18 +22,30 @@ exe=$1; shift
 HOST="${WIN_HOST:?set WIN_HOST to the Windows machine}"
 USERNAME="${WIN_USER:?set WIN_USER to its user}"
 PORT="${WIN_PORT:-22}"
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$PORT" "$USERNAME@$HOST")
 TEMP="C:/Users/$USERNAME/AppData/Local/Temp"
 name=$(basename "$exe")
 
 timeout 5 bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null || { echo "$HOST:$PORT does not answer" >&2; exit 2; }
-scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$exe" "$USERNAME@$HOST:$TEMP/$name" || { echo "scp failed" >&2; exit 2; }
+# the control socket wants a short path
+mux=$(mktemp -d)
+MUX=(-o ControlMaster=auto -o "ControlPath=$mux/%C" -o ControlPersist=60 -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
+trap 'ssh "${MUX[@]}" -p "$PORT" -O exit "$USERNAME@$HOST" >/dev/null 2>&1; rm -rf -- "${mux:?}"' EXIT
+# scp never opens a shared connection itself (it passes ControlMaster=no), so one is opened first.
+# ConnectTimeout does not cover the key exchange, which has been seen to stall for good: the login
+# gets a minute.  WIN_SSH_LOG=<file> keeps a verbose log of it, to see where a failed one stopped.
+timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -o ControlMaster=yes \
+        ${WIN_SSH_LOG:+-v -E "$WIN_SSH_LOG"} -p "$PORT" -fN "$USERNAME@$HOST" ||
+    { echo "ssh login failed" >&2; exit 2; }
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -p "$PORT" "$USERNAME@$HOST")
+scp -q -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -P "$PORT" "$exe" "$USERNAME@$HOST:$TEMP/$name" || { echo "scp failed" >&2; exit 2; }
 
 if [ "$desktop" = 0 ]; then
-    "${SSH[@]}" "cd /d %TEMP% && $name $*" 2>&1 | tr -d '\r'
-    status=${PIPESTATUS[0]}
-    # the program goes again, as the desktop task's files do
-    "${SSH[@]}" "del /q %TEMP%\\$name" >/dev/null 2>&1 || echo "cleanup of $name failed" >&2
+    # run it and take it away again in the same connection; cmd passes the program's bytes through as
+    # they are, and "call echo %^errorlevel%" reads the exit code after the program has run
+    out=$("${SSH[@]}" "cd /d %TEMP% && $name $* & call echo WINRUN-EXIT %^errorlevel% & del /q $name" 2>&1 | tr -d '\r')
+    status=$(printf '%s\n' "$out" | sed -n 's/^WINRUN-EXIT //p' | tail -1)
+    printf '%s\n' "$out" | sed '/^WINRUN-EXIT /d'
+    case "$status" in ''|*[!0-9-]*) echo "no exit status from $name" >&2; exit 2 ;; esac
     exit "$status"
 fi
 
@@ -40,7 +54,7 @@ ps1=$(mktemp --suffix=.ps1)
 printf '%s\r\n' "\$exe = Join-Path \$env:TEMP \"$name\"" \
     "& \$exe $* 2>&1 | Out-File -Encoding ascii (Join-Path \$env:TEMP \"$tag.out\")" \
     "Set-Content -Encoding ascii -Path (Join-Path \$env:TEMP \"$tag.exit\") -Value \$LASTEXITCODE" > "$ps1"
-scp -q -o BatchMode=yes -o ConnectTimeout=10 -P "$PORT" "$ps1" "$USERNAME@$HOST:$TEMP/$tag.ps1" || { rm -f "$ps1"; echo "desktop task upload failed" >&2; exit 2; }
+scp -q -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -P "$PORT" "$ps1" "$USERNAME@$HOST:$TEMP/$tag.ps1" || { rm -f "$ps1"; echo "desktop task upload failed" >&2; exit 2; }
 rm -f "$ps1"
 # schtasks gives a task no start on battery power, and the laptop often runs on its battery: such a
 # task only sits queued until the wait runs out.  PowerShell takes the settings off it before it runs.
@@ -48,19 +62,21 @@ settings=$(printf '%s' "\$ProgressPreference = 'SilentlyContinue'; \$t = Get-Sch
     " \$t.Settings.DisallowStartIfOnBatteries = \$false; \$t.Settings.StopIfGoingOnBatteries = \$false;" \
     " Set-ScheduledTask -InputObject \$t | Out-Null" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
 "${SSH[@]}" "schtasks /create /tn $tag /tr \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Users\\$USERNAME\\AppData\\Local\\Temp\\$tag.ps1\" /sc once /st 23:59 /it >nul && powershell -NoProfile -EncodedCommand $settings >nul 2>&1 && schtasks /run /tn $tag >nul" >/dev/null 2>&1 || { echo "desktop task start failed" >&2; exit 2; }
-completed=0
-polls=$(( ${WIN_WAIT:-360} / 2 ))
-for i in $(seq 1 "$polls"); do
-    result=$("${SSH[@]}" "if exist %TEMP%\\$tag.exit (echo done) else (echo waiting)" 2>/dev/null | tr -d '\r') || { echo "desktop task polling failed" >&2; exit 2; }
-    if [ "$result" = done ]; then completed=1; break; fi
-    sleep 2
-done
-[ "$completed" = 1 ] || { echo "desktop task timed out; leaving its files for inspection" >&2; exit 124; }
-"${SSH[@]}" "type %TEMP%\\$tag.out" 2>&1 | tr -d '\r'
-output_status=${PIPESTATUS[0]}
-result=$("${SSH[@]}" "type %TEMP%\\$tag.exit" 2>/dev/null | tr -d '\r\n') || { echo "desktop task exit status unavailable" >&2; exit 2; }
-[ "$output_status" = 0 ] || { echo "desktop task output unavailable" >&2; exit 2; }
-case "$result" in ''|*[!0-9]*) echo "invalid desktop task exit status" >&2; exit 2 ;; esac
-"${SSH[@]}" "schtasks /delete /tn $tag /f >nul 2>&1 & del /q %TEMP%\\$tag.out %TEMP%\\$tag.exit %TEMP%\\$tag.ps1 %TEMP%\\$name 2>nul" >/dev/null 2>&1 || echo "desktop task cleanup failed" >&2
+# one connection waits for the task, prints its output and exit code, and cleans up after it
+wait=$(printf '%s' "\$ProgressPreference = 'SilentlyContinue'; \$t = \$env:TEMP; \$exit = Join-Path \$t '$tag.exit';" \
+    " \$deadline = (Get-Date).AddSeconds(${WIN_WAIT:-360});" \
+    " while (-not (Test-Path \$exit) -and (Get-Date) -lt \$deadline) { Start-Sleep -Milliseconds 500 };" \
+    " if (-not (Test-Path \$exit)) { 'WINRUN-TIMEOUT'; exit 124 };" \
+    " Get-Content (Join-Path \$t '$tag.out'); 'WINRUN-EXIT ' + (Get-Content \$exit | Select-Object -First 1);" \
+    " schtasks /delete /tn $tag /f | Out-Null;" \
+    " Remove-Item -Force (Join-Path \$t '$tag.out'), \$exit, (Join-Path \$t '$tag.ps1'), (Join-Path \$t '$name')" \
+    | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+out=$("${SSH[@]}" "powershell -NoProfile -EncodedCommand $wait" 2>&1 | tr -d '\r')
+case "$out" in
+*WINRUN-TIMEOUT*) echo "desktop task timed out; leaving its files for inspection" >&2; exit 124 ;;
+esac
+result=$(printf '%s\n' "$out" | sed -n 's/^WINRUN-EXIT //p' | tail -1)
+printf '%s\n' "$out" | sed '/^WINRUN-EXIT /d'
+case "$result" in ''|*[!0-9-]*) echo "invalid desktop task exit status" >&2; exit 2 ;; esac
 printf 'remote_exit_code=%s\n' "$result" >&2
 [ "$result" = 0 ]
