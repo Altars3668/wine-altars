@@ -11297,6 +11297,19 @@ Office 还在墨迹对象上查询两个 SDK 里没有的接口 {49e015bc-…}�
 
 同一轮里，Word 的“绘图”选项卡在临时注册后仍被隐藏，开关另有所在。
 
+ISF（altars-up `0d338e7d2af`）：Load 收原始 ISF、`base64:` 文本和 GIF 注释扩展里的 ISF；Save 以三种压缩模式写原始 ISF 与
+base64（GIF 输出未做）。解码覆盖 GUID 表、墨迹空间矩形、绘制属性（笔宽高的小数部分、自定义属性）、笔画描述（按钮、
+笔画属性列表）、度量、单/双精度变换表、包数据（默认哈夫曼表、带或不带 delta-delta 的比特打包）、属性数据（比特打包、
+LZ，带嵌入的 VARIANT 类型）、点属性块，未知标签按长度跳过。实现由 Claudex 按任务卡完成，我审查时改了三处：
+DrawingFlags 的位（WPF 的 `DrawingFlags.cs`：拟合曲线 0x1、忽略压力 0x4、抗锯齿 0x10，原先反了）、0 点笔画不写包数据
+（原先写了，自己都读不回）、Load 把属性拷进墨迹原有的扩展属性对象。inkobj 测试 633 项全过；MSO 那段 303 字节的 ISF
+载入得 1 笔 0 点、颜色 0x32、宽 50、4 个自定义属性，再 Save/Load 一致。
+
+在开发前缀里临时注册 {3EE60F5C-…}（指向 inkobj.dll，跑完删掉）后整条链路都通：放映里笔画出笔迹，保留得 1 个墨迹形状，
+保存的 `ppt/ink/ink1.xml` 有完整的 InkML（上下文、X/Y 通道与分辨率、时间戳、红色笔刷、一条 trace）。正式注册要等 winref
+说清那是什么类、在哪个 DLL；Word 的“绘图”选项卡还要 `AllowDevicesSansTouchSupport` 功能门或 SM_TABLETPC 非 0
+（`Mso::InkUI::IsDrawTabActive`；`MsoFInkingEnabled` 即 Mso20Win32Client 序号 50906 = 缓存的 `GetSystemMetrics(SM_TABLETPC)`）。
+
 仍未做：ISF 保存/载入、剪贴板、按矩形裁剪、压力改变笔宽、平板与光标对象、真正的笔和触摸输入；Word 的“绘图”选项卡在功能区
 模型里存在但被隐藏（`SM_TABLETPC`/`SM_DIGITIZER` 改成非 0 也不出现，开关另有所在）；AirSpace 的 InkDesktopHost/InkD2DRenderer
 也没有。各默认值、组合顺序、错误码等未实测的细节列在各提交说明里，`tools/inkprobe` 与 inkobj/rtscom 的测试在 winref 上跑后对齐。
