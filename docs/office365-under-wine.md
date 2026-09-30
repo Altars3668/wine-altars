@@ -10963,6 +10963,25 @@ loader 把它们指向一个一调用就中止进程的桩）。Word 启动时�
 `isolatedwindowsenvironmentutils.dll`、`mscoree`（前缀禁用 .NET），以及 Office 自己组件之间的版本差（`c2r64.dll` 缺
 `SaveRecording` 等、`OutlookServicing.dll` 缺序号 89），后两类 Windows 上也一样。
 
+### 命名管道服务器模拟的是客户端（altars-up `d996b6e3bc9`、`731d6d71d81`）
+
+C2R 服务每查一次虚拟注册表就 `RpcImpersonateClient` 一次（Word 启动约 1600 次），Wine 的 ncalrpc 走命名管道，
+`ImpersonateNamedPipeClient` 一直给服务器**它自己的进程令牌**（ntdll 打一条 “impersonating self” 的 FIXME）。
+kernel32 的管道测试把 Windows（NPFS）的语义写得很清楚，按它实现：
+
+- 客户端的安全服务质量（SQOS）随 `open_file_object` 请求带进服务器（kernelbase 早已把 `SECURITY_SQOS_PRESENT` 等
+  转成 `OBJECT_ATTRIBUTES.SecurityQualityOfService`，只是没人往下传）。
+- 服务器端保存客户端的安全上下文：静态跟踪在连接时复制一份；动态跟踪让客户端写入的每条消息带上写入线程当时的
+  有效令牌，服务器读到哪条就换成哪条的。没有指定 SQOS 的客户端按动态跟踪、只算已启用的特权（effective-only）。
+- 模拟时按客户端允许的级别复制，effective-only 时去掉被禁用的特权；还没有客户端、或服务器已断开它时返回
+  `STATUS_CANNOT_IMPERSONATE`；客户端关掉之后服务器仍可按最后的上下文模拟（测试要求）。
+
+顺带发现：令牌没有任何特权时，`NtQueryInformationToken(TokenPrivileges)` 在零长度缓冲区上报成功（计数本身要 4 字节），
+一到三字节的缓冲区还会越界写计数，一并修正。管道测试 38464 项 0 失败，7 个模拟相关的 todo 通过；Word、Excel、
+PowerPoint 启动与保存回归照常，错误日志没有新增。组（group）在 effective-only 下是否也去掉禁用项，测试没有覆盖，暂不动。
+rpcrt4 在绑定的 QOS 为 `RPC_C_IMP_LEVEL_DEFAULT` 时会请求匿名级（原有的 FIXME）；Wine 的访问检查不看模拟级别，所以
+暂不影响，要按级别强制时得先改这里。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
