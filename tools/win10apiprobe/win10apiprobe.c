@@ -160,6 +160,47 @@ int main(void)
         printf("derive(\"\"): %#lx\n", derive(L"", &sid));
     }
 
+    /* IEAWSDC.DLL in Excel imports GetPackagePath from kernel32 */
+    has("kernel32.dll", "GetPackagePath");
+    has("kernelbase.dll", "GetPackagePath");
+    {
+        LONG (WINAPI *package_path)(const void *, UINT32, UINT32 *, WCHAR *) =
+            (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetPackagePath");
+        LONG (WINAPI *path_by_name)(const WCHAR *, UINT32 *, WCHAR *) =
+            (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetPackagePathByFullName");
+        static const WCHAR *full_names[] = {L"WineAltars.Probe_1.0.0.0_x64__8wekyb3d8bbwe",
+                                            L"Microsoft.WindowsCalculator_1.0.0.0_x64__8wekyb3d8bbwe", L"not a full name"};
+        struct { UINT32 reserved; UINT32 arch; UINT64 version; WCHAR *name, *publisher, *resource, *publisher_id; } id =
+            { 0, 9 /* x64 */, 0x0001000000000000ull, (WCHAR *)L"WineAltars.Probe", (WCHAR *)L"CN=Nobody", NULL,
+              (WCHAR *)L"8wekyb3d8bbwe" };
+        WCHAR path[MAX_PATH];
+        UINT32 len;
+        LONG ret;
+
+        for (i = 0; path_by_name && i < ARRAYSIZE(full_names); i++)
+        {
+            len = MAX_PATH;
+            ret = path_by_name(full_names[i], &len, path);
+            printf("GetPackagePathByFullName(%ls): %ld, length %u\n", full_names[i], ret, len);
+        }
+        if (path_by_name)
+        {
+            len = MAX_PATH;
+            printf("GetPackagePathByFullName(NULL): %ld\n", path_by_name(NULL, &len, path));
+        }
+        if (package_path)
+        {
+            len = MAX_PATH;
+            ret = package_path(&id, 0, &len, path);
+            printf("GetPackagePath(no such package): %ld, length %u\n", ret, len);
+            len = MAX_PATH;
+            printf("GetPackagePath(NULL id): %ld\n", package_path(NULL, 0, &len, path));
+            printf("GetPackagePath(NULL length): %ld\n", package_path(&id, 0, NULL, path));
+            len = MAX_PATH;
+            printf("GetPackagePath(reserved 1): %ld\n", package_path(&id, 1, &len, path));
+        }
+    }
+
     inherit = (void *)GetProcAddress(GetModuleHandleA("user32.dll"), "InheritWindowMonitor");
     if (inherit)
     {
