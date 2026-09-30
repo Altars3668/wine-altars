@@ -14,7 +14,9 @@
 #
 # Check that the port answers before anything else, and never retry a failed login: the host bans
 # addresses that keep trying, and a burst of short connections as well; that is why both steps go over
-# the one connection.
+# the one connection.  The host is a laptop that sleeps (modern standby): its TCP stack answers while
+# sshd does not, so the login waits WIN_WAKE_WAIT seconds (default 300) for the banner on that one
+# connection, and tools/keepawake keeps it awake while the commands run.
 set -uo pipefail
 files=()
 while [ $# -gt 0 ] && [ "$1" != -- ]; do files+=("$1"); shift; done
@@ -24,6 +26,8 @@ HOST="${WIN_HOST:?set WIN_HOST to the Windows machine}"
 USERNAME="${WIN_USER:?set WIN_USER to its user}"
 PORT="${WIN_PORT:-22}"
 TEMP="C:/Users/$USERNAME/AppData/Local/Temp"
+WAKE="${WIN_WAKE_WAIT:-300}"
+KEEPAWAKE="$(dirname "$(realpath "$0")")/../tools/keepawake/keepawake.exe"
 tag="WineAltarsBatch_$(date +%s)_$RANDOM"
 
 timeout 5 bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null || { echo "$HOST:$PORT does not answer" >&2; exit 2; }
@@ -33,13 +37,14 @@ MUX=(-o ControlMaster=auto -o "ControlPath=$mux/%C" -o ControlPersist=60 -o Serv
 trap 'ssh "${MUX[@]}" -p "$PORT" -O exit "$USERNAME@$HOST" >/dev/null 2>&1; rm -rf -- "${mux:?}"' EXIT
 # scp never opens a shared connection itself (it passes ControlMaster=no), so one is opened first.
 # ConnectTimeout does not cover the key exchange, which has been seen to stall for good: the login
-# gets a minute.  WIN_SSH_LOG=<file> keeps a verbose log of it, to see where a failed one stopped.
-timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "${MUX[@]}" -o ControlMaster=yes \
+# gets a minute beyond the wait for the banner.  WIN_SSH_LOG=<file> keeps a verbose log of it, to see
+# where a failed one stopped.
+timeout $((WAKE + 60)) ssh -o BatchMode=yes -o ConnectTimeout="$WAKE" "${MUX[@]}" -o ControlMaster=yes \
         ${WIN_SSH_LOG:+-v -E "$WIN_SSH_LOG"} -p "$PORT" -fN "$USERNAME@$HOST" ||
     { echo "ssh login failed" >&2; exit 2; }
 stage=$(mktemp -d)
 mkdir "$stage/$tag"
-cp -- "${files[@]}" "$stage/$tag/" || { rm -rf -- "${stage:?}"; exit 2; }
+cp -- "${files[@]}" "$KEEPAWAKE" "$stage/$tag/" || { rm -rf -- "${stage:?}"; exit 2; }
 # the batch file: each command after its "=====" line, then its exit code; the echo line has cmd's
 # special characters escaped outside quotes, both lines have "%" doubled
 python3 - "$stage/$tag/winbatch-run.cmd" "$@" <<'PY' || { rm -rf -- "${stage:?}"; exit 2; }
@@ -55,10 +60,11 @@ def echoable(text):
             out.append('^')
         out.append(c)
     return ''.join(out)
-lines = ['@echo off', 'cd /d "%~dp0"']
+lines = ['@echo off', 'cd /d "%~dp0"', 'start "" /b keepawake.exe 7200 >nul 2>&1']
 for command in sys.argv[2:]:
     # "(call )" clears the error level, which cmd's own commands such as echo leave as it was
     lines += ['echo ===== ' + echoable(command), '(call )', literal(command), 'echo WINRUN-EXIT %errorlevel%']
+lines.append('taskkill /f /im keepawake.exe >nul 2>&1')
 with open(sys.argv[1], 'w', newline='') as f:
     f.write('\r\n'.join(lines) + '\r\n')
 PY
