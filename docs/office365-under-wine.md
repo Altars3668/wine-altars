@@ -11313,3 +11313,44 @@ DrawingFlags 的位（WPF 的 `DrawingFlags.cs`：拟合曲线 0x1、忽略压�
 仍未做：ISF 保存/载入、剪贴板、按矩形裁剪、压力改变笔宽、平板与光标对象、真正的笔和触摸输入；Word 的“绘图”选项卡在功能区
 模型里存在但被隐藏（`SM_TABLETPC`/`SM_DIGITIZER` 改成非 0 也不出现，开关另有所在）；AirSpace 的 InkDesktopHost/InkD2DRenderer
 也没有。各默认值、组合顺序、错误码等未实测的细节列在各提交说明里，`tools/inkprobe` 与 inkobj/rtscom 的测试在 winref 上跑后对齐。
+
+### ncalrpc 往返、ntsync 下的等待包与互斥体、邮槽的文件类型
+
+**ncalrpc（altars-up `8caf6adef4e`）。** Wine 的 ncalrpc 走消息模式的命名管道。原来收一个包要读三次管道：先读 0 字节等
+数据，再读公共头，再读其余；每次读都是 wineserver 往返（`read` 返回 PENDING，经 APC 与 `get_async_result` 取回）。现在
+连接上挂一个 `RPC_MAX_PACKET_SIZE` 的缓冲区，整条消息一次读入，头和体都从缓冲区取，仍在消息边界停下。`tools/rpcbench`
+在同一棵树、同一前缀里新旧交替测：两进程间 48 字节的一次调用，从 22 个请求、约 280 µs 降到 14 个、约 170 µs。
+Click-to-Run 的 App-V 注册表钩子每次启动 Office 约调用一万次，这就是它的意义。rpcrt4 的六组测试与 ole32 的
+marshal/compobj/moniker 全部 0 失败，普查不变。`scripts/build-winetest.sh` 现在照 makedep 读取 `EXTRADEFS`、
+`EXTRAIDLFLAGS`，并生成 server/proxy 桩和 `dlldata.c`，rpcrt4 的测试才构建得出来。
+
+**ntsync 下的等待完成包（`f179f4513e2`）。** 装上 `/dev/ntsync` 后，事件和信号量由客户端直接在内核里触发，服务端看不见；
+服务端自己设置的内部同步对象（定时器、进程、线程）也不经 `wake_up()`。昨天移植的 wait completion packet（Zhiyi Zhang
+为 React Native 写的合并请求，上游 master 与 Proton 都没有）因此一个都不投递，ntdll 的 file 测试失败 81 次。Office 自带的
+`WinAppSDK\CoreMessagingXP.dll`（DispatcherQueue）导入了 `NtAssociateWaitCompletionPacket`；一次 Word 会话会加载它，
+但实测 2.5 分钟内没有调用。
+
+现在的做法分两类：
+- 服务端自己触发的对象：设置后唤醒挂在上面的包，关联时用不阻塞的 ntsync 等待判断并消耗信号。
+- 客户端触发的事件和信号量：由做关联的进程起一个“包监视”线程（不是 Windows 线程，屏蔽全部信号），用
+  `NTSYNC_IOC_WAIT_ANY` 等目标，把等到的编号写进服务端轮询的 socket，由服务端投递。包已被取消时，服务端把消耗掉的信号
+  还回去。
+- 时序与 Windows 一致：关联要等监视线程真正开始等才返回，否则 PulseEvent 会丢；零超时地查看完成端口之前、以及取消之前，
+  先等监视线程把已触发的都报上来。
+
+ntdll file 测试 4110 项，连跑 5 次都是 0 失败；新加的 100 个包的测试会用到两个监视线程。ws2_32 sock（267 万项）、afd、
+ntdll 的 om/pipe/sync 均 0 失败。
+
+**ntsync 下被放弃的互斥体（`4c776a3db42`）。** 被拥有的互斥体的最后一个句柄一关，服务端就关了它的 ntsync 对象，拥有者
+线程死掉时无法再标记“已放弃”，靠自己的 fd 还在等它的线程永远等下去（kernel32 sync 测试 417、421 行）。现在这样的互斥体
+留到没人拥有为止，线程死亡时照样被放弃。kernel32 sync 从 2 个失败变为 0。
+
+**邮槽的 GetFileType（`e22e7cc11c7`、`4b9e903c985`）。** 服务端给邮槽两端补上卷信息查询，设备类型是 FILE_DEVICE_MAILSLOT；
+GetFileType 对它返回 FILE_TYPE_UNKNOWN，并把错误码清为 NO_ERROR（文档写明的“类型未知但调用成功”）。原先返回的是
+ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；ntdll 测试会打印这个值。节句柄上的 GetFileType
+仍是 todo：ntdll 映射视图时要从节句柄取底层文件的 fd，服务端分不出两种用途，改它需要改协议，价值不大。
+
+**winref 的待机。** 它是 S0 低电量待机（现代待机，联网）。用户要求后，登录时由 `WIN_PRELUDE` 把交流、电池两种情况的睡眠与
+休眠超时都设成“从不”（原值：交流本来就是从不，电池 3600 秒后睡眠）。现代待机中，Wi-Fi 唤醒只让 SoC 短暂醒来、不会退出
+待机，所以已经在待机里的机器要有人让它完全醒来一次；之后它就不会因闲置而睡。`scripts/winbatch.sh` 的连接能撑过约
+15 分钟的小睡，主连接断了就停下，不会为后续步骤另开登录。
