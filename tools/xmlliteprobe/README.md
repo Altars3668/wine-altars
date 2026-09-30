@@ -16,3 +16,12 @@
 - 没有 BOM、也不以 `<` 开头的文档按 UTF-8 读（单个空格是 Whitespace 节点，然后 `WC_E_ROOTELEMENT`）。
 
 Wine 原先：未闭合的文档在末尾无限重复最后一个节点（元素每次深一层），注释/CDATA/处理指令的结束符跨在两次读入的块之间时整个看不见，只有声明的 UTF-8 文档触发断言，UTF-16 的同类文档把开头读两遍；wine-src `8b58e3c` 之后只剩“无 BOM 的 UTF-16 以空格开头”两例（Windows 把其中的 NUL 字节当非法字符报 `WC_E_SYNTAX`）不同。
+
+## `xmlprops.exe`：未公开的读写器属性
+
+Office 设置读取器属性 18，SDK 的枚举只到 7；Wine 对它打 FIXME 并返回 E_NOTIMPL。探针对 IXmlReader 与 IXmlWriter
+的 0–31 号属性打印新对象上 GetProperty 的回答和值；对未声明的属性再依次 SetProperty 0、1、2，打印回答以及之后
+GetProperty 的值（两者都是 E_INVALIDARG 的不打印）。`results/xmlprops.wine.txt` 是 altars-up 的回答：读取器的 1、2、7
+以及全部未声明属性都是 E_NOTIMPL。
+
+构建：`x86_64-w64-mingw32-gcc -O1 -Wall -Wno-format -o tools/xmlliteprobe/xmlprops.exe tools/xmlliteprobe/xmlprops.c -lole32 -lxmllite -luuid`。
