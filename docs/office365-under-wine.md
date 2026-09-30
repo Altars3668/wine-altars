@@ -11354,3 +11354,32 @@ ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；
 休眠超时都设成“从不”（原值：交流本来就是从不，电池 3600 秒后睡眠）。现代待机中，Wi-Fi 唤醒只让 SoC 短暂醒来、不会退出
 待机，所以已经在待机里的机器要有人让它完全醒来一次；之后它就不会因闲置而睡。`scripts/winbatch.sh` 的连接能撑过约
 15 分钟的小睡，主连接断了就停下，不会为后续步骤另开登录。
+
+### 缩小图片的画质：WIC 缩放器与 Direct2D 的非锯齿模式
+
+用默认调试级别（err 与 fixme 全开）跑三个应用的普查，把 Office 实际碰到的 FIXME/ERR 按消息归并计数
+（`scratchpad` 里的 `fixmesweep.sh` 与 `fixmesum.py`），按命中次数找缺口。其中两项影响每张缩小显示的图片：
+
+- **WIC 缩放器（altars-up `032e3caf78f`）。** PowerPoint 用 Fant 模式调 `IWICBitmapScaler` 29 次，而 Wine 除最近邻外的模式都
+  退化成最近邻。现在对 8 位、16 位和浮点通道的格式，按目标像素中心做可分离重采样：
+  - 线性、三次（Keys，a=-1/2）分别取最近 2 个、4 个源像素；
+  - 高质量三次按缩小倍数加宽三次核；
+  - Fant 缩小时按覆盖面积平均，放大时线性；
+  - 索引与打包格式仍取最近邻。
+
+  `wincodec.idl` 补上 `WICBitmapInterpolationModeHighQualityCubic`。新测试只断言任何插值都成立的性质：常数图保持常数、阶跃放大后
+  中间像素是插值值、棋盘格缩小一半接近灰。旧实现在这些断言上全部失败。`tools/wicscaleprobe` 在各格式、各模式下打印像素，
+  等 winref 实测后对齐像素中心、边缘、舍入的细节。
+- **Direct2D（`1f5346321a6`）。** PowerPoint 以高质量三次模式画位图，Wine 除最近邻外一律每像素双线性采样一次，缩小时和线性一样
+  出锯齿。现在多重采样线性、各向异性、高质量三次这三种模式由像素着色器按纹理坐标的导数算出像素在位图上的覆盖范围，
+  在其中每个方向最多取 8 个双线性样本取平均；放大不变。新测试把 30 个纹素宽的黑白相间列缩到 8 像素，三种模式都应接近灰
+  （0x60–0xa0）；旧实现得到 0xdf、0x20 这样的锯齿值。
+
+两项都没有改变普查结果（Word 42/0、Excel 79/0、PowerPoint 55/1），PowerPoint 的缩放 FIXME 已消失。同一次归并里的其余高频项：
+- msxml 等对象上查询 `{e19c7100-9709-4db7-9373-e7b518b47086}`：出现在 80 个 Office 模块里，像是 Office 内部接口，待 winref 的
+  `reg query` 确认；
+- 另一个 Office 进程创建未注册的 `{94269c4e-071a-4116-90e6-52e557067e4e}`：同样待 winref；
+- `RoGetActivationFactory` 的 FIXME 每次调用都会打印，逐个核对后只缺 WAM 与 WinAppSDK 自己的 `Microsoft.UI.Dispatching.DispatcherQueue`
+  （后者由 Office 自带的 CoreMessagingXP 提供）；
+- msctf 的文本存储通知桩不影响输入法（Word 走 IMM）；
+- WebP 帧的颜色上下文不支持，待查 Windows 的行为。
