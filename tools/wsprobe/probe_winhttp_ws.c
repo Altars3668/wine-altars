@@ -514,7 +514,12 @@ static void run_arguments(void)
         printf("  receive(NULL, buf, 1, NULL) %lu\n", WinHttpWebSocketReceive(NULL, reason, 1, NULL, NULL));
         printf("  query(NULL, NULL) %lu\n", WinHttpWebSocketQueryCloseStatus(NULL, NULL, NULL, 0, NULL));
         printf("  query(NULL, code, NULL, 1) %lu\n", WinHttpWebSocketQueryCloseStatus(NULL, &code, NULL, 1, &read));
-        printf("  completeupgrade(NULL) %p %lu\n", WinHttpWebSocketCompleteUpgrade(NULL, 0), GetLastError());
+        {
+            HINTERNET ws = WinHttpWebSocketCompleteUpgrade(NULL, 0);
+            DWORD error = GetLastError();
+
+            printf("  completeupgrade(NULL) %p %lu\n", ws, error);
+        }
     }
 
     server_mode = 3;

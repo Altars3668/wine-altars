@@ -64,6 +64,7 @@ static void process_small( ULONG size )
 int main( void )
 {
     LANGID lang;
+    DWORD error;
 
     set_thread( MUI_LANGUAGE_NAME, L"ar-SA\0he-IL\0th-TH\0hi-IN\0en-US\0" );
     thread_list( MUI_LANGUAGE_NAME );
@@ -123,7 +124,8 @@ int main( void )
     printf( "  SetThreadUILanguage(7804) %04x, GetThreadUILanguage %04x\n", lang, GetThreadUILanguage() );
     thread_list( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES );
     lang = SetThreadUILanguage( 0x1234 );
-    printf( "  SetThreadUILanguage(1234) %04x, GetThreadUILanguage %04x error %lu\n", lang, GetThreadUILanguage(), GetLastError() );
+    error = GetLastError();
+    printf( "  SetThreadUILanguage(1234) %04x, GetThreadUILanguage %04x error %lu\n", lang, GetThreadUILanguage(), error );
     set_thread( 0, NULL );
 
     printf( "process, empty:\n" );

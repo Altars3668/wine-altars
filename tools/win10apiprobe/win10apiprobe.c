@@ -8,7 +8,8 @@
  * is isolated, the SIDs derived from a few container names (with the SHA-256 derivation computed here
  * next to them), GetAppContainerFolderPath for a SID no package has, and InheritWindowMonitor for
  * valid, missing and foreign windows.  Nothing here is about the user; the folder path is printed
- * without the profile part.
+ * without the profile part.  GFX.DLL and MSO.DLL also look up IsUserCetAvailableInEnvironment in
+ * kernel32: that is asked for each environment value, with this process's user shadow stack policy.
  *
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror win10apiprobe.c -o win10apiprobe.exe -luser32 -ladvapi32 -lbcrypt -lole32
  */
@@ -68,6 +69,11 @@ static void derive_here(const WCHAR *name, char *out)
 int main(void)
 {
     static const WCHAR *names[] = {L"microsoft.windows.cortana_cw5n1h2txyewy", L"WineAltars.Probe", L"winealtars.probe", L"a"};
+    /* the Win32 process, an SGX2 enclave, a VBS basic enclave, and values that are none of them */
+    static const DWORD environments[] = {0, 2, 0x11, 1, 3, 0x10, 0x12, 0xdeadbeef};
+    BOOL (WINAPI *cet)(DWORD);
+    DWORD error;
+    BOOL ret;
     HRESULT (WINAPI *derive)(const WCHAR *, PSID *);
     HRESULT (WINAPI *folder)(const WCHAR *, WCHAR **);
     HRESULT (WINAPI *isolated)(BOOL *);
@@ -85,6 +91,27 @@ int main(void)
     has("userenv.dll", "GetAppContainerRegistryLocation");
     has("userenv.dll", "DeleteAppContainerProfile");
     has("kernelbase.dll", "AppContainerDeriveSidFromMoniker");
+    has("kernel32.dll", "IsUserCetAvailableInEnvironment");
+    has("kernelbase.dll", "IsUserCetAvailableInEnvironment");
+
+    /* GFX.DLL and MSO.DLL (next to its sandbox settings) look this up in kernel32 */
+    cet = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsUserCetAvailableInEnvironment");
+    for (i = 0; cet && i < ARRAYSIZE(environments); i++)
+    {
+        SetLastError(0xdeadbeef);
+        ret = cet(environments[i]);
+        error = GetLastError();
+        printf("IsUserCetAvailableInEnvironment(%#lx): %d (%lu)\n", environments[i], ret, error);
+    }
+    {
+        PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY policy;
+
+        memset(&policy, 0xcc, sizeof(policy));
+        SetLastError(0xdeadbeef);
+        ret = GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &policy, sizeof(policy));
+        error = GetLastError();
+        printf("GetProcessMitigationPolicy(ProcessUserShadowStackPolicy): %d (%lu), flags %#lx\n", ret, error, policy.Flags);
+    }
 
     iwe = LoadLibraryExA("isolatedwindowsenvironmentutils.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     isolated = iwe ? (void *)GetProcAddress(iwe, "IsProcessInIsolatedWindowsEnvironment") : NULL;
@@ -139,17 +166,29 @@ int main(void)
         a = CreateWindowA("static", "a", WS_POPUP, 100, 100, 50, 50, NULL, NULL, NULL, NULL);
         b = CreateWindowA("static", "b", WS_POPUP, 0, 0, 0, 0, NULL, NULL, NULL, NULL);
         SetLastError(0xdeadbeef);
-        printf("InheritWindowMonitor(b, a): %d (%lu)\n", inherit(b, a), GetLastError());
+        ret = inherit(b, a);
+        error = GetLastError();
+        printf("InheritWindowMonitor(b, a): %d (%lu)\n", ret, error);
         SetLastError(0xdeadbeef);
-        printf("InheritWindowMonitor(b, NULL): %d (%lu)\n", inherit(b, NULL), GetLastError());
+        ret = inherit(b, NULL);
+        error = GetLastError();
+        printf("InheritWindowMonitor(b, NULL): %d (%lu)\n", ret, error);
         SetLastError(0xdeadbeef);
-        printf("InheritWindowMonitor(NULL, a): %d (%lu)\n", inherit(NULL, a), GetLastError());
+        ret = inherit(NULL, a);
+        error = GetLastError();
+        printf("InheritWindowMonitor(NULL, a): %d (%lu)\n", ret, error);
         SetLastError(0xdeadbeef);
-        printf("InheritWindowMonitor(b, desktop): %d (%lu)\n", inherit(b, GetDesktopWindow()), GetLastError());
+        ret = inherit(b, GetDesktopWindow());
+        error = GetLastError();
+        printf("InheritWindowMonitor(b, desktop): %d (%lu)\n", ret, error);
         SetLastError(0xdeadbeef);
-        printf("InheritWindowMonitor(b, shell): %d (%lu)\n", inherit(b, GetShellWindow()), GetLastError());
+        ret = inherit(b, GetShellWindow());
+        error = GetLastError();
+        printf("InheritWindowMonitor(b, shell): %d (%lu)\n", ret, error);
         SetLastError(0xdeadbeef);
-        printf("InheritWindowMonitor(b, (HWND)0x1234): %d (%lu)\n", inherit(b, (HWND)0x1234), GetLastError());
+        ret = inherit(b, (HWND)0x1234);
+        error = GetLastError();
+        printf("InheritWindowMonitor(b, (HWND)0x1234): %d (%lu)\n", ret, error);
         DestroyWindow(b);
         DestroyWindow(a);
     }
