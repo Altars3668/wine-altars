@@ -10982,6 +10982,25 @@ PowerPoint 启动与保存回归照常，错误日志没有新增。组（group�
 rpcrt4 在绑定的 QOS 为 `RPC_C_IMP_LEVEL_DEFAULT` 时会请求匿名级（原有的 FIXME）；Wine 的访问检查不看模拟级别，所以
 暂不影响，要按级别强制时得先改这里。
 
+### 文件属性：覆盖时取新属性、设时间不再清掉隐藏、只读文件能改属性（altars-up `170955e4ab0`、`35f14cf9910`、`55fe4631a90`）
+
+按上游测试里 Windows 实测的 todo 补了一串文件属性的缺口，其中一处会让用户看得见：
+
+- **`SetFileTime` 会让隐藏文件现形。** `FILE_BASIC_INFORMATION.FileAttributes` 为 0 表示“不改属性”，`SetFileTime` 正是这样
+  发的；Wine 却照样拿 0 去设属性，清掉隐藏、系统位，还给只读文件加回写权限（本地实测：隐藏文件设了时间变成 0x20）。
+  现在 0 不动属性；设基本信息也要求句柄有 `FILE_WRITE_ATTRIBUTES`（原先完全不查：fd 缓存只存了读写数据三位，现把类型字段
+  用不到的一位拿来存它）。
+- **只读文件打不开写属性权限。** 服务器把 `FILE_WRITE_ATTRIBUTES` 算作要 Unix 写权限，以写模式打开只读文件就 EACCES；
+  而 `fchmod`/`futimens` 用只读描述符就够。现在只有截断（覆盖）才要写模式，覆盖只读文件仍按 Windows 被拒；
+  `SetFileAttributesW` 也照 Windows 以 `FILE_WRITE_ATTRIBUTES` 打开（原先只要 `SYNCHRONIZE`，靠的正是不查权限）。
+- **覆盖、替换已存在的文件取新属性**（`FILE_OVERWRITE(_IF)` 带只读、替换只读文件等，`test_NtCreateFile` 的表）。
+- `CreateFile(TRUNCATE_EXISTING)` 必须带 `GENERIC_WRITE` 位，否则 `ERROR_INVALID_PARAMETER`。
+
+kernel32 文件测试 57 万项 0 失败、todo 从 243 降到 218；ntdll 的 file/directory/info 测试 0 失败，另加了“只设时间不动属性”
+“无写属性权限被拒”“只读文件可写属性打开”三组断言（随第七批在 Windows 上验证）；Office 保存回归照常。覆盖一个隐藏或
+系统文件而不带同样属性时 Windows 是否拒绝（文档这么写，Wine 的测试没覆盖）由 `tools/overwriteattrprobe` 量。
+设为 `FILE_ATTRIBUTE_NORMAL` 后 Windows 查询返回 0x80（Wine 返回 ARCHIVE）需要记录存档位，暂未做。
+
 ### PowerPoint 导出动画 GIF 之后不再响应
 
 功能普查里 PowerPoint 45 项通过，SVG 导出与原生一样“转换器未安装”；`SaveCopyAs … 40`（动画 GIF）之后 `CreateVideo`、
