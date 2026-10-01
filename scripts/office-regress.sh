@@ -11,7 +11,7 @@
 # probe reached.  The exit code is the last failing probe's, or 0.
 #
 # OFFICE_DEBUG_DISPLAY picks the X display (default 2), WINEPREFIX the prefix
-# (default ~/.wine-c2r-test).  The next application starts once the previous
+# (default ~/.wine-c2r-up).  The next application starts once the previous
 # one's process has gone: the Click-to-Run service keeps the wineserver itself
 # running, so waiting for that would wait for ever.
 

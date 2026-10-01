@@ -18,9 +18,9 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="${DIST:-/opt/wine-altars}"
-[ -x "$DIST/bin/wine" ] || DIST="$ROOT/dist-wow64"
+[ -x "$DIST/bin/wine" ] || DIST="$ROOT/dist-up"
 WINE="${WINE:-$DIST/bin/wine}"
-: "${WINEPREFIX:=$HOME/.wine-altars-office}"
+: "${WINEPREFIX:=$HOME/.wine-c2r-up}"
 export WINEPREFIX WINEDEBUG=-all
 
 say() { printf '==> %s\n' "$*"; }

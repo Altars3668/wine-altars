@@ -14,7 +14,7 @@
 #     scripts/reset-printer-devmode.sh <printer name>  # just one
 set -uo pipefail
 
-PREFIX="${WINEPREFIX:-$HOME/.wine-c2r-test}"
+PREFIX="${WINEPREFIX:-$HOME/.wine-c2r-up}"
 KEY='HKLM\System\CurrentControlSet\Control\Print\Printers'
 
 export WINEPREFIX="$PREFIX"

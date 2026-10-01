@@ -6839,8 +6839,28 @@ Exec=env "WINEPREFIX=..." "/opt/wine-altars/lib/wine/x86_64-unix/wine" "C:\...\W
 用复制而不是软链到构建目录：把整个系统指向一个 git 工作树，一次重建或一次误删就会
 带走机器上所有 Wine 程序。代价是重建之后要重跑本脚本刷新 `/opt`。
 
-这是一个**系统级改动**：机器上所有 Wine 程序都会改用这个构建。它是 CrossOver 血统的
-Wine 加上 `patches/wine` 的补丁，通常是改善或无差别，但这是你的机器，要清楚这一点。
+这是一个**系统级改动**：机器上所有 Wine 程序都会改用这个构建，各前缀在下次启动时按新版本更新。
+
+**10 月 1 日换成 altars-up（`8bf54fc4b20`，Wine master 加本项目的提交，没有 CrossOver 的改动）。** 原来的
+CrossOver 血统 11.0 整个留在 `/opt/wine-altars.prev`，`--rollback` 换回来。这一轮顺带改了：
+
+- **bin 里的每个工具都链过去。** 原来 `/usr/local/bin` 只有 wine、wineserver 和几个开发工具，`winecfg`、`wineboot`、
+  `regedit`、`msiexec`、`winepath` 仍落到 `/usr/bin` 的 wine-stable——同一个前缀被两个 Wine 轮流打开，协议号一不同
+  就起不来。现在 24 个都指向 `/opt`；脚本装前还会确认没有哪个前缀的 wineserver 还在用旧的那份。
+- **菜单项改指 `~/.wine-c2r-up`。** Word、Excel、PowerPoint、Outlook、Office 语言首选项和 18 个文件关联原来指着旧前缀
+  `~/.wine-c2r-test`（旧前缀最后一次刷新时覆盖了同名文件）。删掉新前缀里那 18 条 `FileOpenAssociations` 记录、
+  再跑 `winemenubuilder -a`，菜单项逐个 `winemenubuilder <快捷方式>` 重建。旧前缀现在没有任何入口。
+- **脚本里跑 winemenubuilder 要带上桌面会话的变量。** `env -i` 的环境里没有 `XDG_CURRENT_DESKTOP`，它只打一行
+  `Skipping .desktop file creation, no XDG-compliant desktop environment detected` 就退出码 1，什么都不写。
+  这台机器是 `XDG_CURRENT_DESKTOP=ubuntu:GNOME`。也因此此前所有测试运行都没有动过菜单。
+- **同名的关联文件归最后刷新的那个前缀。** `.application`、`.appref-ms`、`.xaml`、`.xbap` 两个前缀都有：新前缀的
+  `-a` 先把它们改指了自己，已还给原来的 `~/.wine`；`~/.wine` 更新后它的 `.crt`、`.reg` 有变化，刷新时改指了
+  `~/.wine`（用户下次开 QQ音乐时也会这样）。双击 `.reg` 导入的是它所指前缀的注册表。
+- **`~/.wine`（QQ音乐、LAV Filters）已用新 Wine 更新**：18 秒，无错误；用户目录本来就是 `user`，不受用户名
+  改动影响；更新前的注册表留在 `~/.wine/registry-before-wine-11.18/`。
+- 开发脚本的默认前缀改成 `~/.wine-c2r-up`；`word-iter.sh` 改为把 `wine-src-up` 的 DLL 部署进 `dist-up` 而不是 `/opt`。
+- 开发与日常共用 `~/.wine-c2r-up`：`dist-up` 与 `/opt` 同一提交时可以混用；改了服务器协议之后，要么先停掉那个前缀的
+  会话，要么重跑本脚本让 `/opt` 跟上，否则从菜单点开的 Office 连不上开发版留下的 wineserver。
 
 验收（干净登录环境、PATH 只有系统路径、不设任何变量）：
 
@@ -11453,8 +11473,8 @@ ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；
 - **画面比 DPI 值慢。** Word 在 4K 下重排要 6–20 秒；第一轮在两次探针结果一致时就截图，看到的是半途的画面，误以为功能区
   “慢一步”。截图要等连续两张相同。
 - **Xvfb 在最后一个客户端断开时重置**，`RESOURCE_MANAGER` 随之消失，`Xft.dpi` 就没了；测试用的 Xvfb 要加 `-noreset`。
-- **用户日常的 `/opt/wine-altars` 与 `~/.wine-c2r-test` 是旧分支**，没有这些改动；那边的权宜办法是在 winecfg 把 DPI 设成 192
-  （HKCU 的 LogPixels），代价是宿主换缩放时不跟随。
+- **用户日常的 `/opt/wine-altars` 与 `~/.wine-c2r-test` 当时是旧分支**，没有这些改动；那边的权宜办法是在 winecfg 把 DPI 设成 192
+  （HKCU 的 LogPixels），代价是宿主换缩放时不跟随。10 月 1 日起 `/opt` 已换成 altars-up，菜单也改开 `~/.wine-c2r-up`。
 - **宿主没有 `Xft.dpi` 时沿用旧值（已修，`9523a0de38b`）。** 起初没有 `Xft.dpi` 就退回系统 DPI，而系统 DPI 来自上一个宿主写进
   HKCC 的值：在 `:79`（192）上测过之后，`:2`（没有 `Xft.dpi`）上的 Outlook 也成了 2 倍。现在没有 `Xft.dpi` 就是 96，并同样写进 HKCC。
 - 没做的：`DisplayConfigGetDeviceInfo`/`SetDeviceInfo` 的 `SOURCE_DPI_SCALE`（Windows 设置改缩放用的接口，Wine 未实现，

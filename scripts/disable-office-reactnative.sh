@@ -42,7 +42,7 @@
 # which was the first of the three this host asks for).
 set -uo pipefail
 
-PREFIX="${WINEPREFIX:-$HOME/.wine-c2r-test}"
+PREFIX="${WINEPREFIX:-$HOME/.wine-c2r-up}"
 DLL="react-native-win32"
 KEY='HKCU\Software\Wine\DllOverrides'
 

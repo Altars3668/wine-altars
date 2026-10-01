@@ -2,7 +2,8 @@
 # word-iter.sh <log> [WINEDEBUG] [dll...]
 #
 # One turn of the loop the composition work ran on: deploy the named DLLs from
-# the build tree into the installed Wine, start Word on the measuring desktop
+# the build tree into the development install (dist-up, not the system Wine in
+# /opt), start Word with it on the measuring desktop
 # (:2, scripts/measure-desktop.sh), get it past the safe-mode and recovery
 # questions, wait for its window, and summarize what dcomp and seh said.
 #
@@ -22,9 +23,10 @@ log=$1; shift
 debug=warn+dcomp,fixme+dcomp,warn+seh,err+all
 if [ $# -gt 0 ]; then debug=$1; shift; fi
 dlls=("$@"); [ ${#dlls[@]} -eq 0 ] && dlls=(dcomp)
-build=$here/wine-src/build-wow64
-prefix=$HOME/.wine-c2r-test
-wine=/opt/wine-altars
+build=$here/wine-src-up/build-wow64
+prefix=$HOME/.wine-c2r-up
+wine=$here/dist-up
+export WINE=$wine/bin/wine WINEPREFIX=$prefix
 
 WINEPREFIX=$prefix $wine/bin/wineserver -k 2>/dev/null
 for dll in "${dlls[@]}"; do

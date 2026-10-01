@@ -19,11 +19,12 @@
 #   office-debug.sh close [seconds]           close Word the way its close button does
 #   office-debug.sh run tool.exe args...      run any Windows helper in the session
 #
-# WINEPREFIX defaults to ~/.wine-c2r-test and the Wine to /opt/wine-altars.
+# WINEPREFIX defaults to ~/.wine-c2r-up, the Office the menu starts, and the Wine to the
+# system one in /opt/wine-altars (scripts/install-system-wine.sh); WINE picks another.
 
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
-prefix=${WINEPREFIX:-$HOME/.wine-c2r-test}
+prefix=${WINEPREFIX:-$HOME/.wine-c2r-up}
 wine=${WINE:-/opt/wine-altars/bin/wine}
 word_exe='C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE'
 word_class=OpusApp
