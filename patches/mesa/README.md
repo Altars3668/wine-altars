@@ -2,7 +2,8 @@
 
 `0001-mesa-list-a-context-among-the-shared-ones-only-once.patch` 针对 Mesa `main`
 （2026-09 取的 `src/mesa/main/context.c` 与 `src/mesa/state_tracker/st_context.c`），
-同样的代码也在本机装的 26.0.3 和 Ubuntu 更新源里的 26.0.8 里。**尚未提交上游。**
+同样的代码也在本机装的 26.0.3 和 Ubuntu 更新源里的 26.0.8 里。**尚未提交上游**，提交方式受
+Mesa 的 AI 规定约束，见“提交上游”一节。
 
 ## 现象
 
@@ -43,9 +44,33 @@ dcomp 合成线程，它在 `render_default_device → D3D11CreateDevice → win
 ## 验证
 
 - 关掉 threaded context（`GALLIUM_THREAD=0`，出问题的遍历只在 TC 下执行）：同样的
-  启动脚本 5/5 正常，日志里没有 `0xc0000005`；开着时 7 次卡 5 次。
-- 本机缺 Mesa 的构建依赖（llvm-config、xcb-dri3/xshmfence 头文件、mako），打了补丁
-  的 libgallium 还没有实际跑过。
+  启动脚本 5/5 正常，日志里没有 `0xc0000005`；开着时 7 次卡 5 次（2026-09-29）。
+- **最小复现 `tools/mesasharerace`（2026-09-30）**：EGL surfaceless 上一个线程反复建、删
+  共享上下文，另一个线程用不同尺寸反复 `glBufferData`。同一构建目录只差这个补丁：
+  26.0.3 与 main（9ac80d5）未修版都是每次约 2.3 秒 SIGSEGV（各 3/3，系统 26.0.3 同样
+  3/3），停在 `shared.c:477`、`mov 0x10(%rax),%rdi`；补丁版 26.0.3 5 次 × 30 秒、main
+  3 次 × 30 秒无故障。依赖在 `~/.local/opt/mesa-deps`（xcb-dri3 等的 dev 包 `dpkg -x`、
+  libdrm 2.4.134 源码编译），mako 在 `~/.local/opt/mesa-venv`，补丁版装在
+  `~/.local/opt/mesa-test`（26.0.3）与 `~/.local/opt/mesa-main`，不动系统 Mesa。
+- Office 场景今天复现不出来了：系统 Mesa、开着 TC，Word 在 :2（radeonsi）冷启动 6/6 正常，
+  多半是 dcomp 改成先建默认设备再加锁（altars-up `7bd9beccfdd`）后，“一个线程建设备、另一个
+  线程在画”的重叠少了。补丁版下 Word 同样正常启动（Word 映射的是补丁版 libgallium）。
+
+## 提交上游（未提交）
+
+Mesa 的 `docs/submittingpatches.rst`（2026-09 的 main）对 AI 参与有明确要求：
+
+- 提交说明、代码注释和 GitLab 上的文字要是提交者自己的话，不能由 AI 生成；
+- AI 参与写代码必须披露：几乎全部由 AI 生成的用 `Generated-by: 工具 (模型)`，参与决策
+  或生成一部分的用 `Assisted-by:`；
+- `Co-authored-by` 只给人类合著者，不能用来标 AI。
+
+本目录补丁的提交说明、两处代码注释和 `Co-Authored-By: Claude` 行都不合这些要求，只能当研究
+材料。提交时由提交者本人：用自己的话重写提交说明（两处注释删掉或自己重写），加
+`Generated-by: Claude Code (Claude Opus 5.5)`，保留 `Cc: mesa-stable`；在自己的
+gitlab.freedesktop.org 账号下 fork mesa、推分支、开 MR，描述同样自己写，可以附
+`tools/mesasharerace` 作复现（它的注释同样出自 AI，附上时要说明）。本机没有 freedesktop 的
+登录，这一步只能由账号持有人做。
 
 ## 规避
 
