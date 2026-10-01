@@ -11526,6 +11526,15 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
   idl 里它都是 `local` 接口，Windows 上是否注册了代理待 winref 核实；WinRT 的 `Windows.UI.Composition.CompositionPath` 与
   `Windows.Foundation.Diagnostics.AsyncCausalityTracer` 还没有。
 
+### WinVerifyTrust 的验证时间（记下，未改）
+
+`tools/wintrustprobe` 量的：Wine 的 wintrust 只认旧式副署（`1.2.840.113549.1.9.6`）里的签名时间，RFC 3161 时间戳
+（`1.3.6.1.4.1.311.3.3.1`，如今微软的签名几乎都是它）完全不读；找不到时间时用的“系统时间”其实是**文件的创建时间**（2007 年
+上游的做法）。于是 VSTO 运行时的 `VSTOInstaller.exe`（证书 2024-03 已过期，创建时间 2002 年）照样验证通过，按的是一个比证书
+生效还早的时间。Windows 按时间戳的时间验证，没有有效时间戳就按当前时间，过期即 `CERT_E_EXPIRED`。Wine 这样比 Windows 宽，
+眼下不挡 Office 的任何功能；要改成一样，得先实现 RFC 3161（时间戳令牌的签名、TSA 证书链、消息摘要与签名值的对应），否则会把
+大批带时间戳的合法文件判成过期。探针已加进 winref 批次对照。
+
 ### Outlook：添加帐户成功；同步时 OST 损坏、崩溃（10 月 1 日用新构建重新同步未复现）
 
 - **登录开关是按应用的。** 只给 `word` 设了 `IsWebView2ForOneAuthEnabled` 与 `DisableBrokerForOneAuth` 时，Outlook 添加帐户走
