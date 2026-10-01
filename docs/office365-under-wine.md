@@ -11452,19 +11452,64 @@ ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；
   DLL/EXE，即被安装程序替换过的那些，它们由各自的安装程序注册；wine.inf 的两处改用它，第三方 INF 的 `RegisterDlls` 不变。
   `+setupapi` 跟踪：quartz、itss 照常 `calling DllRegisterServer`，非内置的测试 DLL 是 `not registering`；开发前缀
   `wineboot -u` 56 秒走完、不再弹框，之后 .NET 64/32 位照常。setupapi 新测试在 Windows 上同样成立（它不认识这个指令）。
-- **OfficePLUS（未完成）。** 它的服务 `MSOfficePLUSService.exe`（.NET Framework 4.7.2）现在能加载 CLR，但服务管理器报 1053
-  （没在超时内报告已启动；刚装完的 .NET 正在后台做 NGen，CLR 冷启动很慢）。三个 VSTO 加载项（LoadBehavior 3，`Manifest`
-  指向 `MSOP*Addin.vsto|vstolocal`）Excel 根本不尝试加载：诊断日志 `%TEMP%\Diagnostics\EXCEL\Primary*.log` 里只有 TCSCConv 的
-  `Office.Programmability.Addins.InternalSetConnect`，`+ole` 跟踪里没有请求 VSTO 加载器 `VSTOAddinLoader {99D651D7-…}`
-  （`vstoee.dll`，MSO.DLL 与 Mso30win32client.dll 引用它），`vstoee.dll` 也没被加载。Click-to-Run 只带了加载器部分（`vstoee.dll`、
-  `VSTO\10.0\VSTOLoader.dll`），没有 `VSTO Runtime Setup` 键，也没有 `Microsoft.Office.Tools.*` 程序集；OfficePLUS 的官方安装包
-  会连同 VSTO 运行时一起装，这里的 OfficePLUS 是随 Click-to-Run 装进来的。下一步装微软的 VSTO 运行时
-  （`vstor_redist.exe` 10.0.60910，已下载到 `~/.cache/winetricks/vstor/`），并在 winref 上查 `VSTO Runtime Setup` 与 Excel 加载项的
-  注册作对照（已加进待跑批次）。
+- **OfficePLUS（已解决，见下一节）。** 起初三个 VSTO 加载项（LoadBehavior 3，`Manifest` 指向 `MSOP*Addin.vsto|vstolocal`）Excel
+  根本不尝试加载：诊断日志 `%TEMP%\Diagnostics\EXCEL\Primary*.log` 里只有 TCSCConv 的 `Office.Programmability.Addins.InternalSetConnect`。
+  Click-to-Run 只带了 VSTO 的加载器部分（`vstoee.dll`、`VSTO\10.0\VSTOLoader.dll`），没有 `VSTO Runtime Setup` 键，也没有
+  `Microsoft.Office.Tools.*` 程序集；OfficePLUS 的官方安装包会连同 VSTO 运行时一起装，这里的 OfficePLUS 是随 Click-to-Run 装进来的。
+  装上微软的 VSTO 运行时（`vstor_redist.exe` 10.0.60910，静默安装，退出码 0）之后：用自动化把 `COMAddIns("MSOfficePLUS").Connect`
+  设为 True 能连上（2.2 秒），功能区出现 OfficePLUS 选项卡，说明运行时与加载项本身在 Wine 下可用；但正常启动 Excel 时时载时不载。
+  在 MSO.DLL 的 `HrDoBootConnections`、`FCheckLicensed`、`HrInternalSetConnect`、`HrCreateManagedAddIn` 上下断点（bptrace，
+  公开符号）确认启动时确实走到了创建托管加载项；没载上的那几次，日志里 RpcSs 没能启动。原因有二，都已修：
+  1. **RpcSs 被服务管理器的启动锁挡住（`1fac1c633e7`、`113e7f217ff`、`21ca1bcf4de`）。** services.exe 自动启动时持一把全局启动锁，
+     逐个启动、逐个等；OfficePLUS 的服务等满超时（当时 10 秒）报 1053 期间，Excel 第一次用 COM 时 combase 的
+     `StartService(RpcSs)` 等这把锁 3 秒就得到 `ERROR_SERVICE_DATABASE_LOCKED`，随即放弃，COM 与 VSTO 加载一起失败。
+     Windows 上 RpcSs 是“COM Infrastructure”组里的自动启动服务，按 `ServiceGroupOrder` 排在第三方服务前面，Wine 的排序既不看组、
+     RpcSs 也是按需启动。现在自动启动按 `ServiceGroupOrder` 的组序排（无组或列表里没有的组排最后，组内按 tag），wine.inf 把
+     RpcSs 设为“COM Infrastructure”组的自动启动并补全组序列表；顺带把等服务连上的默认超时改成 Windows 的 30 秒，
+     `ServicesPipeTimeout` 按 Windows 的 REG_DWORD 读（仍兼容以前的字符串）。之后 RpcSs 启动失败归零。
+  2. **OfficePLUS 的服务本身报 1053：Wine 的服务不在会话 0。** 见下一节。
+  另有一个测试方法造成的假象：强杀 Excel 后下次启动会弹“安全模式”询问，加载项自然不载；改为模拟关闭按钮正常退出后，
+  连续 4 次都在启动时加载。
 - **VBScript 的 `GetObject` 带类名（`05a55eebc00`）。** 检查 OfficePLUS 时发现 `GetObject(, "Excel.Application")` 报 445：Wine 只支持
   “一个路径名”的形式。现在按文档：省略路径取运行中的实例（`GetActiveObject`），空路径新建实例，给了文件则新建实例后
   `IPersistFile::Load`；找不到时 429。附带修了名字对象路径里 `obj_unk` 的引用泄漏。vbscript 的 createobj、run 测试 0 失败，
   Windows 对照已加进 winref 批次。注意 Office 要等窗口第一次失去焦点才登记到运行对象表，所以刚启动时取不到是正常的。
+
+### 服务在会话 0（altars-up `21c0210f89f`…`8bf1076d1ef`）
+
+OfficePLUS 的服务 `MSOfficePLUSService.exe`（.NET Framework 4.7.2，用 Microsoft.Extensions.Hosting.WindowsServices）每次都报 1053。
+它的 `IsWindowsService()` 判断自己是不是服务的办法是：父进程叫 `services` **且在会话 0**。Windows 从 Vista 起服务都在会话 0，用户在
+会话 1；Wine 里所有进程都在会话 1（上游 kernel32 测试 `test_services_exe` 一直是 `todo_wine`，Wine bug 52726）。判断不成立，它就当
+控制台程序跑，从不调 `StartServiceCtrlDispatcher`，服务管理器等满超时报 1053。改成和 Windows 一样，services.exe 及其服务在会话 0：
+
+- **令牌的会话（`21c0210f89f`）。** `NtSetInformationToken(TokenSessionId)` 原来是假装成功的桩。现在照 Windows：句柄要
+  `TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID`，调用方要启用 SeTcbPrivilege，用这个令牌建的进程就在那个会话。
+- **控制台会话（`ad9dfc143f4`）。** `WTSGetActiveConsoleSessionId` 原来返回调用方自己的会话，服务调用时就成了 0。现在照 Windows 读
+  `KUSER_SHARED_DATA.ActiveConsoleId`，由 wineserver 填成桌面所在的会话。
+- **窗口站按会话（`5f725403701`）。** `EnumWindowStations` 在 Windows 上只列调用方会话的窗口站，Wine 原来列全部，会话 0 一旦也有
+  `WinSta0` 就会列出两个同名的、用名字各自打开的却是自己会话的那个；跨会话新建的进程也不再沿用父进程的窗口站与桌面，而是按名字
+  连自己会话的（服务端原来查窗口站名时根目录为空，从来查不到）。
+- **会话 0 没有显示（`e334938c23d`）。** 会话 0 的 `WinSta0` 不设可见（服务端把第一个可见窗口站当作屏幕上的，硬件输入送给它），
+  会话 0 的进程按服务处理：只有服务的虚拟显示器，不起自己的 explorer 桌面进程，也不用没有的驱动去读写显示配置注册表。
+- **跨会话广播（`ec83b06df26`、`45584e84dc9`）。** mountmgr 的盘符变化、plugplay 的设备接口变化原来靠
+  `BroadcastSystemMessage`，在会话 0 里只到得了会话 0 的桌面。Windows 上会话 0 的服务用 winsta.dll 的
+  `WinStationBroadcastSystemMessage` 广播到各会话；现在实现了它（以及 `WinStationEnumerateW`，会话即 `\Sessions` 下的编号目录），
+  两处改用它广播到所有会话。winsta.h 移进 include。
+- **WTS（`f0fcc7643ff`）。** `WTSEnumerateSessions` 列出会话 0“Services”（Disconnected）与控制台会话“Console”（Active），去掉了上游
+  测试的 `todo_wine`；`WTSQuerySessionInformation` 按所问的会话回答；`WTSQueryUserToken` 原来不管问什么都返回调用方的令牌，现在照
+  文档只给启用了 SeTcbPrivilege 的调用方（SYSTEM），返回所问会话里、不带该特权的主令牌，会话 0 没有用户（`ERROR_NO_TOKEN`）。
+  服务就是这样在用户会话里启动用户看得见的程序。
+- **wineboot（`eb949e4008f`、`5bd714aa2cc`、`8bf1076d1ef`）。** services.exe 用会话 0、启用 SeTcbPrivilege 的令牌启动（它代表的
+  SYSTEM 就是这样，服务继承下去才能调 `WTSQueryUserToken`）；它与 wineboot 握手的事件改成 `Global\` 名字。顺带修了一个旧问题：
+  新前缀里以 `wineboot --init` 为命令时初始化会跑两次（第一个进程先自动建前缀，然后它自己就是 `wineboot --init`），各起一个
+  services.exe，两个服务管理器服务同一个管道、启动同样的服务；旧的 /opt 构建同样如此。现在已有服务管理器在跑就不再起第二个。
+
+验证：tasklist 里 services.exe、rpcss、plugplay、winedevice、OfficeClickToRun 与 `MSOfficePLUSService.exe` 都在会话 0“Services”，
+explorer 与程序在会话 1“Console”；`sc query "OfficePLUS Service"` 为 RUNNING；Excel 冷、热启动各一次都在 12 秒内加载 OfficePLUS
+并正常退出。新加或去掉 todo 的测试（advapi32 security 的令牌会话、kernel32 process 的服务会话与控制台会话、user32 winstation 的
+窗口站不重复、wtsapi32 的会话列表与用户令牌）0 失败；advapi32 service、user32 broadcast、ntdll om、ole32 compobj/marshal/moniker、
+rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都只有一个 services.exe。这些新测试在 Windows 上的对照
+（SSH 下是会话 0、桌面上是会话 1）已加进 winref 待跑批次：这次登录后它又进了现代待机，要有人让它完全醒来一次。
 
 ### Outlook：添加帐户成功，同步时 OST 损坏、崩溃（未解决）
 
