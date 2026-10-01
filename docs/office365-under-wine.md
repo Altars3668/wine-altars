@@ -6260,6 +6260,33 @@ MathType 版还有 `MT*` 并在版本资源里写 WIRIS），然后把它们移�
 清理后实测：启用宏打开文档不再崩溃，运行时错误 76 也消失，VBA 引擎能正常加载、
 运行、报告错误；默认设置下用户文档照常打开；项目回归 62 项全过。
 
+## 安全中心：报告同一个 clamd（2026-10-01，altars-up `e53baaa32f9`…`8bf54fc4b20`）
+
+AMSI 接上 clamd 之后，宿主机的杀毒引擎已经在替 Windows 程序扫描了，但 Windows 安全中心那一面还是空的：
+Wine 没有 `wscapi.dll`。Outlook 的对象模型防护就看它——安全中心报告防病毒软件正常时，别的程序经对象模型读邮件
+地址不提示，否则每次都弹“有一个程序正试图访问存储在 Outlook 中的电子邮件地址信息”。于是新写了 wscapi，报告的就是
+AMSI 用的那个 clamd：
+
+- **找 clamd 与 amsi 完全一样**：`WINE_AMSI_CLAMD_SOCKET`，再 clamd 自己的配置（`LocalSocket`），再发行版常见路径。
+  问它 `zVERSION`；本机配置 `EnableVersionCommand false` 时答 `COMMAND UNAVAILABLE`，就改问 `zVERSIONCOMMANDS`，
+  它的开头同样是 `ClamAV 1.5.4/28140/Thu Oct  1 02:24:38 2026`：产品版本、特征库版本、特征库生成时间（本地时间）。
+- **状态**：clamd 应答就是“开”；特征库生成不超过 7 天算“最新”，超过就“过期”（ClamAV 自己从第 7 天起告警）。
+  `WscGetSecurityProviderHealth` 对防病毒与反间谍软件据此给 GOOD 或 POOR；配置了 clamd 却连不上是 POOR，
+  一点 clamd 的痕迹都没有是 NOTMONITORED；安全中心服务本身 GOOD；防火墙、自动更新、Internet 设置、UAC 不监视。
+  一次问多个提供方时取最差的。`WscRegisterForChanges` 每 30 秒重看一次，健康或特征库状态变了就回调。
+- **产品列表**（`WSCProductList`，`IWscProduct3`）：防病毒与反间谍软件各列出一个 ClamAV，名称、开关、特征库状态、
+  特征库生成时间（作为产品状态的时间戳，HTTP 日期格式）、一个 Wine 自己的 GUID；没有修复程序路径（Windows 侧没有能
+  “修好”它的程序）。防火墙列表为空——Windows 自带防火墙在 Windows 上也不出现在这里。
+- **WMI**：`root\SecurityCenter2` 原来是空命名空间，现在 `AntiVirusProduct`、`AntiSpywareProduct`、`FirewallProduct`
+  都从产品列表取数。`productState` 没有文档，按 Windows 上第三方产品的取值：第三字节 0x04，开着时中间字节 0x10，
+  特征库过期时低字节 0x10，所以开着且最新是 266240（0x41000），与 ESET、赛门铁克等在 Windows 上的值相同。
+
+实测：开发前缀里 Outlook 读条目正文不再提示；把 `WINE_AMSI_CLAMD_SOCKET` 指到不存在的路径，提示立刻回来。
+wscapi 测试 64 项、wbemprox query 1814 项 0 失败；`tools/securitycenterprobe/securitycenter.vbs` 在 Wine 里列出
+ClamAV（266240）。还没在 winref 上对照的：各种非法参数的返回码（测试只打印）、Defender 的 `productState` 与修复路径、
+`root\SecurityCenter`（XP 时代的旧命名空间，Outlook 的 OLMAPI32 也会问它；Wine 里连不上，`0x800401E4`）在
+Windows 11 上还在不在。
+
 ## 把 MathType 和 AxMath 整个搬过来（2026-09-18）
 
 前一节把 MathType 的残留移走只是止血——产品本身没装。这一节把它和 AxMath 从原机
@@ -11565,10 +11592,11 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
 - **PST 引擎加压（`tools/officeautomationprobe/outlook-pst.vbs`）。** 只用编造的数据：1000 条张贴条目 19.4 秒写完，PST 37 MB，
   全部能读回，没有损坏。有两处还要在 Windows 上对照：读回的正文每行末尾多一个空格（条目是 HTML 格式，纯文本转 HTML 再转回来时
   多出来的，可能是 Outlook 自己的转换）；新建邮件条目不论在哪个文件夹建，存盘都进了“草稿”。
-- **对象模型防护提示。** 脚本读条目正文时 Outlook 弹“有一个程序正试图访问存储在 Outlook 中的电子邮件地址信息”，调用一直挂着等人
-  回答。Windows 上只要 Windows 安全中心报告防病毒软件正常（Defender 一直在），Outlook 就不提示；Wine 里没有安全中心的报告，
-  所以总是提示。没有真实的防病毒软件，就不该让 Wine 报“正常”；要免提示，是 Outlook 自己的策略
-  （`HKCU\Software\Policies\Microsoft\Office\16.0\Outlook\Security` 里 `PromptOOMAddressInformationAccess` 等），由用户决定。
+- **对象模型防护提示（已解决，altars-up `7f4b3330a77`）。** 脚本读条目正文时 Outlook 弹“有一个程序正试图访问存储在 Outlook 中的
+  电子邮件地址信息”，调用一直挂着等人回答。Windows 上只要 Windows 安全中心报告防病毒软件正常（Defender 一直在），Outlook 就不
+  提示；Wine 原来没有 `wscapi.dll`，所以总是提示。现在 Wine 的安全中心报告宿主的 ClamAV（就是 AMSI 交给它扫描的那个
+  clamd，见上文“安全中心”一节）：clamd 在应答、特征库不超过一周时，Outlook 不再提示；clamd 停了或特征库过期，提示照旧出现，
+  这正是 Windows 上没有可用杀毒软件时的行为，不靠关策略。
 - **自动化客户端退出时偶发崩溃（未解决）。** cscript 用完 Outlook 对象、脚本结束释放全局变量时，有时崩在 combase 的
   `ifproxy_release_public_refs`：代理管理器里的某个接口代理早已被释放，内存被字符串复用。只在 Outlook 刚做完一批写入、还忙的
   时候出现（一度 10 次 5 次），加了只记引用计数的跟踪后就不再出现，跟踪里的引用计数也完全正常；STA 的调用由
