@@ -11511,6 +11511,21 @@ explorer 与程序在会话 1“Console”；`sc query "OfficePLUS Service"` 为
 rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都只有一个 services.exe。这些新测试在 Windows 上的对照
 （SSH 下是会话 0、桌面上是会话 1）已加进 winref 待跑批次：这次登录后它又进了现代待机，要有人让它完全醒来一次。
 
+### Outlook 日志里顺带补的几处（altars-up `e60d2d5c988`、`007d67a7f2f`…`e9910d08dfc`）
+
+- **`Expires: -1` 被缓存了十分钟（`e60d2d5c988`）。** HTTP 规定无效的 `Expires` 当作过去的时间；`-1` 是“不要缓存”的惯用写法，
+  Exchange 给 Outlook 的应答里就有。WinINet 解析不了它，落到“没有过期信息，默认十分钟”，于是这样的应答会从缓存里再拿十分钟。
+  现在无效日期即已过期；网上常见的坏日期从 ERR 降为 WARN。wininet 的 http 测试加了这一例（Windows 对照已加进 winref 批次）。
+- **crypt32 每个进程一串 ERR（`007d67a7f2f`）。** 宿主有一张验证不过的根证书，它就永远是“新的”，每个进程都把缓存里的证书检查
+  一遍，Wine 自带的微软根证书等没有“来自宿主”的标记，逐个报 `CERT_FIRST_USER_PROP_ID property absent`。这是预期情形，静默跳过。
+- **机器级状态的锁改用全局名字（`d12e09a4a9a`、`5af3095bcac`、`8bc8505e381`、`e9910d08dfc`）。** crypt32 的根证书导入、fusion 与
+  sxs 的程序集缓存、winspool 的打印机初始化，保护的都是全机状态；服务挪到会话 0 后，不带 `Global\` 的名字在两个会话里是两把锁。
+  chain 测试的 2 个失败改前就有（测试证书的日期），与此无关。
+- **还缺的。** Wine 没有 Windows Search（SearchIndexer 服务、`searchapi`），Outlook 请求它的类 `{9E175B8B-F52A-11D8-B9A5-505054503030}`
+  （MSPST32 里紧挨着目录名 “SystemIndex”）失败，即时搜索只能用 Outlook 的内置搜索；`IInternetProtocol` 的封送失败，Wine 与 SDK 的
+  idl 里它都是 `local` 接口，Windows 上是否注册了代理待 winref 核实；WinRT 的 `Windows.UI.Composition.CompositionPath` 与
+  `Windows.Foundation.Diagnostics.AsyncCausalityTracer` 还没有。
+
 ### Outlook：添加帐户成功；同步时 OST 损坏、崩溃（10 月 1 日用新构建重新同步未复现）
 
 - **登录开关是按应用的。** 只给 `word` 设了 `IsWebView2ForOneAuthEnabled` 与 `DisableBrokerForOneAuth` 时，Outlook 添加帐户走
