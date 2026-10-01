@@ -11383,3 +11383,50 @@ ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；
   （后者由 Office 自带的 CoreMessagingXP 提供）；
 - msctf 的文本存储通知桩不影响输入法（Word 走 IMM）；
 - WebP 帧的颜色上下文不支持，待查 Windows 的行为。
+
+### 4K 屏上 Office 只有一半大：宿主的 Xft.dpi、显示器 DPI 与系统 DPI（altars-up `91f3d2a63b4`…`c3b58df782d`）
+
+用户的 4K 屏（物理 3840x2160，GNOME 缩放 200%）上，Word 的字体和界面只有应有大小的一半。逐层量过（`tools/dpiprobe`，
+以及读 `:0` 的 `xrdb -query`、`xrandr`、mutter 的显示配置）：
+
+- **宿主。** GNOME 50 的 Xwayland 默认原生缩放：X 客户端拿到显示器的物理像素，缩放比例只经根窗口 `RESOURCE_MANAGER`
+  里的 `Xft.dpi` 告诉客户端（200% 时 192）。GTK、Qt 都按它放大。
+- **Wine。** 系统 DPI 来自 `HKCU\Control Panel\Desktop\LogPixels`，没有就取 `HKCC\Software\Fonts\LogPixels`（wine.inf 写 96）；
+  win32u 早有按显示器的 DPI（`add_source` 的 dpi 参数），但每个驱动都传系统 DPI，也从不读 `Xft.dpi`。于是 Wine 以为这是
+  96 DPI 的 3840x2160 屏。
+- **Office。** 清单里不声明 DPI 感知，运行时把线程设为按显示器感知（v1，进程本身不感知），按 `GetDpiForWindow` 排版——96，
+  1 倍画在 4K 的物理像素上。
+- **Windows 上同样的屏。** 显示器有效 DPI 192；系统 DPI 自 1803 起按进程，取进程启动时主显示器的 DPI
+  （所以有 `GetSystemDpiForProcess`），也是 192；不感知的程序看到 1920x1080，由系统放大。
+
+改动：
+
+1. **winex11 读宿主的 DPI（`c3b58df782d`）。** 显示器的 DPI 取根窗口资源库的 `Xft.dpi`（用户在 winecfg 设过 LogPixels 时以用户为准），桌面
+   线程监听根窗口的 `RESOURCE_MANAGER`：宿主换缩放时重新枚举显示器。
+2. **系统 DPI（同一提交）。** 读到的宿主 DPI 写进 `HKCC\Software\Fonts\LogPixels`（Windows 存当前硬件配置 DPI 的地方），之后启动的进程以它
+   为系统 DPI。会话的第一个进程（冷启动的 Word）在桌面进程读到宿主 DPI 之前就定下了系统 DPI，要到下一次启动才对上：
+   这一次 Word 的样式库预览按 96 画、偏小，状态栏多出“显示器设置”按钮（Office 发现系统 DPI 与显示器 DPI 不一致才显示它），
+   下一次都没有了。
+3. **DPI 变化的通知（win32u，`6e81bdfe414`、`a38d3f0e7db`）。** 显示器的 DPI 变了，按显示器感知的顶层窗口收到 `WM_DPICHANGED`，建议矩形：最大化的不变，
+   其余保持左上角、尺寸按新旧 DPI 之比缩放；v2 窗口的子窗口树先自底向上收到 `WM_DPICHANGED_BEFOREPARENT`，事后自顶向下
+   收到 `WM_DPICHANGED_AFTERPARENT`。窗口在消息发出前已经是新 DPI。`WM_DPICHANGED` 的 lParam 是 RECT 指针，发往别的
+   进程时原先没有打包。
+4. **子窗口的 DPI（wineserver，`0625d004a5d`）。** 子窗口只在创建与换父窗口时复制一次父窗口的 DPI，顶层窗口换了 DPI 它们仍是旧值：Word
+   切到 96 后 `MsoWorkPane`、`NetUIHWND` 等子窗口仍报 192。现在顶层窗口的 DPI 一变就更新整棵子窗口树（换父窗口时被移动
+   窗口的子树也一起），显示器变化时服务器先更新各顶层窗口的 DPI。
+5. **`scale_dpi`（wineserver，`91f3d2a63b4`）。** 自 2018 年（`c5a69256769`）起把负坐标乘以无符号的比值：192 DPI 上最大化窗口的 (-4,-4) 给
+   96 DPI 的调用者换算成 22369618。改为有符号 64 位。
+
+验证：Xvfb `:79`（3840x2160，`-noreset`），`xrdb -merge` 切 `Xft.dpi`。192 下冷启动 Word 是清晰的 2 倍界面；动态切到 96 再切回
+192，顶层与全部子窗口的 DPI 一起变（`dpiprobe`），画面稳定后（6–20 秒）排版一致；之后启动的进程系统 DPI 为 192，
+不感知的视图看到 1920x1080。user32 的 monitor、sysparams、win、msg、input 与 win32u 测试前后失败清单逐条相同（Xvfb `:77`，没有 `Xft.dpi`；基线 win 的两条偶发失败新构建没有出现）。
+
+陷阱：
+- **画面比 DPI 值慢。** Word 在 4K 下重排要 6–20 秒；第一轮在两次探针结果一致时就截图，看到的是半途的画面，误以为功能区
+  “慢一步”。截图要等连续两张相同。
+- **Xvfb 在最后一个客户端断开时重置**，`RESOURCE_MANAGER` 随之消失，`Xft.dpi` 就没了；测试用的 Xvfb 要加 `-noreset`。
+- **用户日常的 `/opt/wine-altars` 与 `~/.wine-c2r-test` 是旧分支**，没有这些改动；那边的权宜办法是在 winecfg 把 DPI 设成 192
+  （HKCU 的 LogPixels），代价是宿主换缩放时不跟随。
+- 没做的：`DisplayConfigGetDeviceInfo`/`SetDeviceInfo` 的 `SOURCE_DPI_SCALE`（Windows 设置改缩放用的接口，Wine 未实现，
+  所以 monitor 测试在 Wine 里改不了缩放）；winewayland 仍把系统 DPI 当显示器 DPI（上游 MR !11101 做分数缩放）；
+  `WM_GETDPISCALEDSIZE`。
