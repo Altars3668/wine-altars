@@ -79,3 +79,9 @@ PowerPoint 的 `Run` 要带模块名，模块名随界面语言（中文是“�
 加载项，所以这里全是未连接，要看加载项得正常启动 Excel），再用 M 公式建查询（`#table` 再 `Table.AddColumn`），经
 `Microsoft.Mashup.OleDb.1` 加载到表、同步刷新，读回 A1:C3，应为 `a,b,c | 1,2,12 | 3,4,34`。不保存、不打印、不碰云服务。Power Query
 在 .NET Framework 容器进程里求值，前缀里没有 .NET 4.x 时刷新会失败。2026-10-01 装了 .NET 4.8 后在 Wine 下通过。
+
+`outlook-pst.vbs <进度日志> <条数>` 给 Outlook 的 PST 引擎加压，只用编造的数据：先用只有 PST、没有邮件帐户的配置文件启动
+Outlook（`outlook.exe /PIM <配置名>`；把 `HKCU\Software\Microsoft\Office\16.0\Outlook` 的 `ForcePSTPath` 设到前缀里的目录，
+PST 就不会落进宿主的“文档”），脚本附着上去，确认默认存储是 PST（不是帐户的 OST）后，在测试文件夹里写入指定条数的张贴条目
+（新建的邮件条目无论在哪个文件夹建，存盘都进“草稿”），再全部读回核对。读正文会触发 Outlook 的对象模型防护提示（见文档），
+要在提示里允许访问。

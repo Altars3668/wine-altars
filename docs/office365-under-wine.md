@@ -11511,7 +11511,7 @@ explorer 与程序在会话 1“Console”；`sc query "OfficePLUS Service"` 为
 rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都只有一个 services.exe。这些新测试在 Windows 上的对照
 （SSH 下是会话 0、桌面上是会话 1）已加进 winref 待跑批次：这次登录后它又进了现代待机，要有人让它完全醒来一次。
 
-### Outlook：添加帐户成功，同步时 OST 损坏、崩溃（未解决）
+### Outlook：添加帐户成功；同步时 OST 损坏、崩溃（10 月 1 日用新构建重新同步未复现）
 
 - **登录开关是按应用的。** 只给 `word` 设了 `IsWebView2ForOneAuthEnabled` 与 `DisableBrokerForOneAuth` 时，Outlook 添加帐户走
   mshtml（`BasicEmbeddedBrowser`），微软登录页报 Tag `4wp0s`、Code `-2146893805`（0x80090013，`NTE_FAIL`）。
@@ -11526,3 +11526,27 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
   下一步：跟踪这个较新的 Tardis PST 引擎在 OST 上用到的文件操作（重叠 I/O、映射视图、分配大小与稀疏区、刷新），找出与 Windows
   语义不同的那一处。损坏的 OST 留在开发前缀里（邮箱的本地缓存），复现时需要先删掉它重新同步。
 - 9 月 20 日那次首次启动同样以崩溃告终，所以本次一开始会问是否进入安全模式（选“否”）。
+- **10 月 1 日重新同步：没有复现。** 删掉损坏的 OST，用当天的 dist-up（服务在会话 0、最终路径修复等都在内）以帐户的配置文件
+  启动：OST 同样长到 16818176 字节后不再变（就是整个邮箱），状态栏“所有文件夹都是最新的。已连接到 Microsoft Exchange”，
+  15 分钟没有崩溃；正常退出再启动，状态相同，也没有再判定 OST 损坏（上次重启约 20 秒就崩在 `ScSaveMessage`）。哪一处改动起了
+  作用说不清：OST 在 AppData 下，与下面“文档”符号链接的那处无关，所以只能记为“未复现、根因未定”。
+- **新 PST 的路径无效（altars-up `6cd0a144199`、`5f2aa5c05e9`）。** 用 `/PIM` 建只有 PST 的配置文件时 Outlook 报
+  “C:\home\<用户>\Documents\Outlook 文件\…pst 文件的路径无效”。Wine 里用户的“文档”是指向宿主家目录的符号链接，
+  `FileNormalizedNameInformation` 取的是服务端 `realpath()` 出来的名字，跟着符号链接走到了 Z: 上，而
+  `GetFinalPathNameByHandle` 又把它接在打开时的 C: 后面，得到一个不存在的 `\\?\C:\home\<用户>\Documents`（`tools/finalpathprobe`
+  逐项列出）。对 Windows 程序来说这种链接就是普通目录，不是重解析点：现在从打开时的名字重新逐段查找（它已经走过真正的重解析点），
+  每段取磁盘上的大小写，不跟随宿主的符号链接；盘符照 Windows 用大写。kernel32 file、ntdll file 测试 0 失败。
+  那次失败的尝试已在用户真实的 `~/Documents/Outlook 文件` 里建了 PST，已移走；测试时把 `ForcePSTPath` 设到前缀里的
+  `C:\WineAltarsTest`。
+- **PST 引擎加压（`tools/officeautomationprobe/outlook-pst.vbs`）。** 只用编造的数据：1000 条张贴条目 19.4 秒写完，PST 37 MB，
+  全部能读回，没有损坏。有两处还要在 Windows 上对照：读回的正文每行末尾多一个空格（条目是 HTML 格式，纯文本转 HTML 再转回来时
+  多出来的，可能是 Outlook 自己的转换）；新建邮件条目不论在哪个文件夹建，存盘都进了“草稿”。
+- **对象模型防护提示。** 脚本读条目正文时 Outlook 弹“有一个程序正试图访问存储在 Outlook 中的电子邮件地址信息”，调用一直挂着等人
+  回答。Windows 上只要 Windows 安全中心报告防病毒软件正常（Defender 一直在），Outlook 就不提示；Wine 里没有安全中心的报告，
+  所以总是提示。没有真实的防病毒软件，就不该让 Wine 报“正常”；要免提示，是 Outlook 自己的策略
+  （`HKCU\Software\Policies\Microsoft\Office\16.0\Outlook\Security` 里 `PromptOOMAddressInformationAccess` 等），由用户决定。
+- **自动化客户端退出时偶发崩溃（未解决）。** cscript 用完 Outlook 对象、脚本结束释放全局变量时，有时崩在 combase 的
+  `ifproxy_release_public_refs`：代理管理器里的某个接口代理早已被释放，内存被字符串复用。只在 Outlook 刚做完一批写入、还忙的
+  时候出现（一度 10 次 5 次），加了只记引用计数的跟踪后就不再出现，跟踪里的引用计数也完全正常；STA 的调用由
+  `rpc_sendreceive_thread` 收发、主线程在模态循环里泵消息，疑为这期间的重入。不影响 Outlook 本身。
+
