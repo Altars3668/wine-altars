@@ -74,3 +74,8 @@ Office 运行宏前让 AMSI 扫描代码，所以它也验证了扫描器（clam
 写模块时 `Declare` 必须放在声明区、所有过程之前，否则 VBA 报编译错误并弹出模态对话框（自动化会一直等它）；
 PowerPoint 的 `Run` 要带模块名，模块名随界面语言（中文是“模块1”）。2026-09-29 三个应用 33 项全部通过；此前 Excel
 读过 `VBProject` 后 `Quit` 不退出，是 combase 在调用结束后才从分派线程释放存根（altars-up `53a55969585`）。
+
+`excel-powerquery.vbs <进度日志>` 看 Excel 的 Power Query 能不能用：先列出 COM 加载项及是否已连接（自动化启动的 Excel 不加载 COM
+加载项，所以这里全是未连接，要看加载项得正常启动 Excel），再用 M 公式建查询（`#table` 再 `Table.AddColumn`），经
+`Microsoft.Mashup.OleDb.1` 加载到表、同步刷新，读回 A1:C3，应为 `a,b,c | 1,2,12 | 3,4,34`。不保存、不打印、不碰云服务。Power Query
+在 .NET Framework 容器进程里求值，前缀里没有 .NET 4.x 时刷新会失败。2026-10-01 装了 .NET 4.8 后在 Wine 下通过。

@@ -23,14 +23,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WINE="${WINE:-${DIST:-$ROOT/dist-cx}/bin/wine}"
 export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
 
-KEY='HKCU\Software\Microsoft\Office\16.0\Common\ExperimentConfigs\ExternalFeatureOverrides\word'
-
-for gate in \
-    'Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled' \
-    'Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth'
-do
-    WINEDEBUG=-all "$WINE" reg add "$KEY" /v "$gate" /t REG_SZ /d true /f /reg:64 >/dev/null 2>&1
-    echo "enabled $gate"
+# The gates are read per application: with them set for Word only, Outlook still signed in through
+# mshtml when adding an account and failed with code 0x80090013 (2026-10-01).
+for app in word excel powerpoint outlook; do
+    KEY="HKCU\\Software\\Microsoft\\Office\\16.0\\Common\\ExperimentConfigs\\ExternalFeatureOverrides\\$app"
+    for gate in \
+        'Microsoft.Office.Identity.FG.IsWebView2ForOneAuthEnabled' \
+        'Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth'
+    do
+        WINEDEBUG=-all "$WINE" reg add "$KEY" /v "$gate" /t REG_SZ /d true /f /reg:64 >/dev/null 2>&1
+        echo "enabled $gate for $app"
+    done
 done
 
 echo

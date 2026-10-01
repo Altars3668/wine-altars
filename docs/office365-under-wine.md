@@ -11401,8 +11401,9 @@ ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；
 
 改动：
 
-1. **winex11 读宿主的 DPI（`c3b58df782d`）。** 显示器的 DPI 取根窗口资源库的 `Xft.dpi`（用户在 winecfg 设过 LogPixels 时以用户为准），桌面
-   线程监听根窗口的 `RESOURCE_MANAGER`：宿主换缩放时重新枚举显示器。
+1. **winex11 读宿主的 DPI（`c3b58df782d`、`9523a0de38b`）。** 显示器的 DPI 取根窗口资源库的 `Xft.dpi`（用户在 winecfg 设过
+   LogPixels 时以用户为准），没有 `Xft.dpi` 时按 X 客户端的惯例当作 96；桌面线程监听根窗口的 `RESOURCE_MANAGER`：宿主换缩放
+   时重新枚举显示器。
 2. **系统 DPI（同一提交）。** 读到的宿主 DPI 写进 `HKCC\Software\Fonts\LogPixels`（Windows 存当前硬件配置 DPI 的地方），之后启动的进程以它
    为系统 DPI。会话的第一个进程（冷启动的 Word）在桌面进程读到宿主 DPI 之前就定下了系统 DPI，要到下一次启动才对上：
    这一次 Word 的样式库预览按 96 画、偏小，状态栏多出“显示器设置”按钮（Office 发现系统 DPI 与显示器 DPI 不一致才显示它），
@@ -11427,6 +11428,56 @@ ERROR_INVALID_HANDLE。邮槽的 Characteristics 暂为 0，待 winref 实测；
 - **Xvfb 在最后一个客户端断开时重置**，`RESOURCE_MANAGER` 随之消失，`Xft.dpi` 就没了；测试用的 Xvfb 要加 `-noreset`。
 - **用户日常的 `/opt/wine-altars` 与 `~/.wine-c2r-test` 是旧分支**，没有这些改动；那边的权宜办法是在 winecfg 把 DPI 设成 192
   （HKCU 的 LogPixels），代价是宿主换缩放时不跟随。
+- **宿主没有 `Xft.dpi` 时沿用旧值（已修，`9523a0de38b`）。** 起初没有 `Xft.dpi` 就退回系统 DPI，而系统 DPI 来自上一个宿主写进
+  HKCC 的值：在 `:79`（192）上测过之后，`:2`（没有 `Xft.dpi`）上的 Outlook 也成了 2 倍。现在没有 `Xft.dpi` 就是 96，并同样写进 HKCC。
 - 没做的：`DisplayConfigGetDeviceInfo`/`SetDeviceInfo` 的 `SOURCE_DPI_SCALE`（Windows 设置改缩放用的接口，Wine 未实现，
   所以 monitor 测试在 Wine 里改不了缩放）；winewayland 仍把系统 DPI 当显示器 DPI（上游 MR !11101 做分数缩放）；
   `WM_GETDPISCALEDSIZE`。
+
+### .NET Framework 4.8、Power Query、OfficePLUS，以及装了 .NET 之后卡死的前缀更新（altars-up `286ab3b4ad6`、`05a55eebc00`）
+
+开发前缀原来没有任何 .NET（连 Wine Mono 也没有），DllOverrides 里还有 CrossOver 瓶子带来的 `mscoree=""`（禁用）。
+
+- **安装。** `winetricks -q dotnet48`（dist-up 的 Wine，`:77`）：.NET 4.8（`Release` 0x80eb1），64 位与 32 位的 C# 程序都能编译运行
+  （CLR 4.0.30319.42000，4.8.3761）。winetricks 会把 Windows 版本改成 Windows 7 SP1 且**不改回来**：装完照装前备份逐值还原
+  （64 位视图 26100/UBR 6899，32 位视图原本就是 22000/UBR 588，`Control\Windows\CSDVersion` 0），并删掉禁用 `mscoree` 的那条，
+  只留 winetricks 写的 `*mscoree=native`。
+- **Power Query 可用。** `tools/officeautomationprobe/excel-powerquery.vbs`：M 公式（`#table` 再 `Table.AddColumn`）经
+  `Microsoft.Mashup.OleDb.1` 加载到表并同步刷新，读回 `a,b,c | 1,2,12 | 3,4,34`，与预期一致；求值在 .NET 容器进程里。
+- **装了 .NET 之后，每次前缀更新都卡死（Wine bug 47144）。** wine.inf 对 `RegisterDllsSection` 里的每个 DLL 调 `DllRegisterServer`；
+  `mscoree` 被覆盖成 native 后调到的是 .NET 的垫片，它去找 2.0 运行时，弹出“This application could not be started. Do you want
+  to view information about this issue?”并一直等人回答；`wineboot` 与此间启动的所有程序（Office 也在内）都跟着等。前缀每装一次
+  新构建就会更新一次，所以这是必然发生的。修法（`286ab3b4ad6`）：setupapi 新增 Wine 专用指令 `WineRegisterDlls`（与
+  `WineFakeDlls` 同理），注册方式同 `RegisterDlls`，但跳过实际加载到的不是 Wine 内置模块（DOS 头后没有 “Wine builtin DLL”）的
+  DLL/EXE，即被安装程序替换过的那些，它们由各自的安装程序注册；wine.inf 的两处改用它，第三方 INF 的 `RegisterDlls` 不变。
+  `+setupapi` 跟踪：quartz、itss 照常 `calling DllRegisterServer`，非内置的测试 DLL 是 `not registering`；开发前缀
+  `wineboot -u` 56 秒走完、不再弹框，之后 .NET 64/32 位照常。setupapi 新测试在 Windows 上同样成立（它不认识这个指令）。
+- **OfficePLUS（未完成）。** 它的服务 `MSOfficePLUSService.exe`（.NET Framework 4.7.2）现在能加载 CLR，但服务管理器报 1053
+  （没在超时内报告已启动；刚装完的 .NET 正在后台做 NGen，CLR 冷启动很慢）。三个 VSTO 加载项（LoadBehavior 3，`Manifest`
+  指向 `MSOP*Addin.vsto|vstolocal`）Excel 根本不尝试加载：诊断日志 `%TEMP%\Diagnostics\EXCEL\Primary*.log` 里只有 TCSCConv 的
+  `Office.Programmability.Addins.InternalSetConnect`，`+ole` 跟踪里没有请求 VSTO 加载器 `VSTOAddinLoader {99D651D7-…}`
+  （`vstoee.dll`，MSO.DLL 与 Mso30win32client.dll 引用它），`vstoee.dll` 也没被加载。Click-to-Run 只带了加载器部分（`vstoee.dll`、
+  `VSTO\10.0\VSTOLoader.dll`），没有 `VSTO Runtime Setup` 键，也没有 `Microsoft.Office.Tools.*` 程序集；OfficePLUS 的官方安装包
+  会连同 VSTO 运行时一起装，这里的 OfficePLUS 是随 Click-to-Run 装进来的。下一步装微软的 VSTO 运行时
+  （`vstor_redist.exe` 10.0.60910，已下载到 `~/.cache/winetricks/vstor/`），并在 winref 上查 `VSTO Runtime Setup` 与 Excel 加载项的
+  注册作对照（已加进待跑批次）。
+- **VBScript 的 `GetObject` 带类名（`05a55eebc00`）。** 检查 OfficePLUS 时发现 `GetObject(, "Excel.Application")` 报 445：Wine 只支持
+  “一个路径名”的形式。现在按文档：省略路径取运行中的实例（`GetActiveObject`），空路径新建实例，给了文件则新建实例后
+  `IPersistFile::Load`；找不到时 429。附带修了名字对象路径里 `obj_unk` 的引用泄漏。vbscript 的 createobj、run 测试 0 失败，
+  Windows 对照已加进 winref 批次。注意 Office 要等窗口第一次失去焦点才登记到运行对象表，所以刚启动时取不到是正常的。
+
+### Outlook：添加帐户成功，同步时 OST 损坏、崩溃（未解决）
+
+- **登录开关是按应用的。** 只给 `word` 设了 `IsWebView2ForOneAuthEnabled` 与 `DisableBrokerForOneAuth` 时，Outlook 添加帐户走
+  mshtml（`BasicEmbeddedBrowser`），微软登录页报 Tag `4wp0s`、Code `-2146893805`（0x80090013，`NTE_FAIL`）。
+  `scripts/enable-native-signin.sh` 改为给 word、excel、powerpoint、outlook 都设上；之后点“连接”，Outlook 直接用前缀里现有的
+  Office 身份添加了 Outlook.com 帐户（“已成功添加帐户”），没有弹登录窗。完成页要先取消“在我的手机上也设置 Outlook Mobile”，
+  否则会经 winebrowser 打开宿主的浏览器。
+- **同步开始后崩溃。** 主窗口出现、OST 写到约 16.8 MB 后，Outlook 在 `MSPST32.DLL` 的 `BTH_Lookup+0xfde` 读空指针偏移 0xB2
+  （`TC_SetRowWithPropCache → BTH_Insert → BTH_Lookup`，旁有 `NDB::XBAccess`、`ReadWriteLock::Lock`；崩溃前同一线程调了两次
+  mlang 的 `SetMimeDBSource` 桩）。再次启动 20 秒就崩在 `ScSaveMessage+0x553`，栈上有
+  `ScPstTraceScFn(DATAID_OLK_PSTCORRUPTED_VALUES)`：Outlook 自己判定 OST 已损坏。符号来自微软符号服务器的
+  `mspst32.pdb`（`scripts/pe-pdb-id.py` + `scripts/pdb-addr2sym.py`）。字节范围锁的修复已经在新树里（`fdd5482020b`），排除。
+  下一步：跟踪这个较新的 Tardis PST 引擎在 OST 上用到的文件操作（重叠 I/O、映射视图、分配大小与稀疏区、刷新），找出与 Windows
+  语义不同的那一处。损坏的 OST 留在开发前缀里（邮箱的本地缓存），复现时需要先删掉它重新同步。
+- 9 月 20 日那次首次启动同样以崩溃告终，所以本次一开始会问是否进入安全模式（选“否”）。
