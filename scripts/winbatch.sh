@@ -73,8 +73,13 @@ def echoable(text):
     return ''.join(out)
 lines = ['@echo off', 'cd /d "%~dp0"', 'start "" /b keepawake.exe 7200 >nul 2>&1']
 for command in sys.argv[2:]:
+    # a batch file run without "call" never comes back, and the commands after it, the clean-up included, never run
+    words = command.split()
+    run = literal(command)
+    if words and words[0].strip('"').lower().endswith(('.cmd', '.bat')):
+        run = 'call ' + run
     # "(call )" clears the error level, which cmd's own commands such as echo leave as it was
-    lines += ['echo ===== ' + echoable(command), '(call )', literal(command), 'echo WINRUN-EXIT %errorlevel%']
+    lines += ['echo ===== ' + echoable(command), '(call )', run, 'echo WINRUN-EXIT %errorlevel%']
 lines.append('taskkill /f /im keepawake.exe >nul 2>&1')
 with open(sys.argv[1], 'w', newline='') as f:
     f.write('\r\n'.join(lines) + '\r\n')

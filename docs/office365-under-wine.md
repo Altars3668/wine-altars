@@ -9116,7 +9116,8 @@ Wine 原来发 WM_PRINT。现在的做法：给被打印的窗口加一个窗口
 - DirectComposition 设备（`DCompositionCreateDevice*`）。
 - PrintWindow 拷不到交换链里的内容（PW_RENDERFULLCONTENT），以及 WS_EX_NOREDIRECTIONBITMAP。
 - Windows 拼写检查 API（ISpellCheckerFactory），Word 会尝试创建它；Word 自己的拼写检查不靠它，用 Office 的
-  `PROOF\MSSP7EN.LEX`，在 Wine 下可用（`tools/officeautomationprobe/word-spell.vbs`，2026-09-28）。
+  `PROOF\MSSP7EN.LEX`，在 Wine 下可用（`tools/officeautomationprobe/word-spell.vbs`，2026-09-28）。——已实现，见文末
+  “Windows 拼写检查 API”一节。
 - 手动提交模式下，动画帧画的是当前的树，不是上次提交的那一版。
 
 ## Word 启动时的系统调用：电源通知、周期计数、DPI 托管与挂起的 I/O
@@ -11904,4 +11905,36 @@ file/directory/volume、shell32 shlfileop、scrrun、setupapi、cabinet、advpac
   （上游测试为此挂着 todo_wine）。改它要动 wineserver 的对象名和 kernelbase、dbghelp、advapi32 里解析这个名字的地方，单独做。
 - Windows 式短名（`PROGRA~1`）在 Wine 里打不开：Wine 的短名由长名散列得出（`PROGR~xx`）；前缀里 `windows`、`system32` 在
   磁盘上是小写，许多 Unix 侧代码按小写精确查找，不改。
+
+## Windows 拼写检查 API：msspellcheckingfacility 与宿主的 Hunspell（2026-10-02，altars-up `72ac49b431d`、`604ce6dbfa9`）
+
+Word 每次启动都会 `CoCreateInstance(CLSID_SpellCheckerFactory)`（`{7ab36653-…}`，Windows 上是 `MsSpellCheckingFacility.dll`，
+自由线程），取 `IUserDictionariesRegistrar`，用**空语言标签**注册 Office 的自定义词典
+`%APPDATA%\Microsoft\Office\16.0\<id>\Proofing\RoamingCustom.dic`。Wine 原来没有这个类，这是 Word 启动日志里唯一的
+ERR。逐项按 `tools/spellprobe`（第 42 批）、`regdict`（第 45 批）在 Windows 11 build 29671 上量出的行为实现：
+
+- **语言**：Wine 列出宿主 Hunspell 的词典（`/usr/share/hunspell` 等与 `DICPATH`，`en_US` 记作 `en-US`），按标签排序；
+  `IsSupported`/`CreateSpellChecker` 标签不分大小写，不做任何近似（`en`、`en_US`、前导空格都不行），空标签 E_INVALIDARG
+  （答案清零），NULL E_POINTER；检查器的 `LanguageTag` 原样返回创建时的写法。`Id` 是 `MsSpell`，`LocalizedName` 按用户
+  语言（“Microsoft Windows 拼写检查器”），没有选项（未知选项 E_INVALIDARG、值清零）。
+- **查错规则**：全大写、含数字的词、URL 与邮件地址不查；撇号（`'` 与 `’`）和连字符连成一个词，复合词只报错的那段；
+  与前一个词只隔空格、大小写不论、且前一个词拼对了，就是重复（DELETE，从第二个起）；有更正的词是 REPLACE（按原样
+  大小写匹配）；拼错是 GET_SUGGESTIONS，`ComprehensiveCheck` 在只有一个建议时直接给 REPLACE。没有替换词的错误给空串。
+  中文等非拉丁文字在英文检查器里算拼错。`Suggest` 最多 10 个，有更正的词只给更正。
+- **用户词表与 Windows 同一套文件**：添加的词在 `%APPDATA%\Microsoft\Spelling\neutral\default.dic`（所有语言共用），
+  移除的词（词典里的词也可以）在 `<语言>\default.exc`，更正在 `<语言>\default.acl`（`词|更正`），UTF-16 带 BOM；
+  忽略只对该检查器有效。文件变了就重读，修改时持跨进程互斥量“读、改、写”。变化事件：添加 1 次，移除与更正各 2 次
+  （与 Windows 计数一致）。
+- **注册用户词典**：任何语言标签都接受，空标签表示所有语言（Office 就这样用）；重复注册/注销 S_FALSE；文件不存在或扩展名
+  不是 .dic/.exc/.acl 为 E_INVALIDARG；按语言的注册与 Windows 一样存在 `HKCU\Software\Microsoft\Spelling\Dictionaries`
+  （值名是语言，REG_MULTI_SZ 是路径），空标签的不保存（Windows 也不保存，Office 每次启动重新注册）。
+- 实现：PE 侧做分词、规则与词表，Unix 侧 `dlopen` libhunspell（1.7/1.6/1.5），参数结构定宽，32 位程序共用同一张表；
+  没有 Hunspell 或词典时不支持任何语言。接口在 `include/spellcheck.idl`，IID 进了 libuuid。
+
+测试：新的 `msspellcheckingfacility` 测试在 Windows 上 364 项 0 失败（会备份并还原用户词表，跑后 winref 上三个文件仍是原样），
+Wine 上全过；32 位程序也能用；Office 三应用保存回归通过，Word 启动时那条 ERR 没有了。
+
+与 Windows 仍不同的：词典本身——Hunspell 的建议与 Windows 不同（`wrold` 有 world、wold 两个，所以综合检查给的是“取建议”
+而不是直接替换，测试里记为 todo_wine），宿主 en_US 里没有 `café`、`naïve`；Windows 有的几处延迟或缓存不照做（更正改了之后
+在本次会话里仍给旧更正、移除后再添加的词一时仍报错、注册的词典过一会儿才生效、更正成两个词后引擎所有检查都失败）。
 
