@@ -10254,7 +10254,8 @@ Office 里：普通会话中过滤器被问几十次，全是类型 0、全部�
    **这一步未经 Windows 实测**：winref 当时锁屏，锁屏会话不产生合成帧——`tools/trackerprobe/clamp.c`（复刻上面的情形：不钳位地请求一个边界随后才
    到达的位置）在 Windows 上一个回调都收不到、位置始终为 0，接了窗口目标也一样。依据只有文档的一句“Idle 与 CustomAnimation 状态下
    Position 总在 MinPosition 与 MaxPosition 之间”，以及 Word 在 Windows 上不可能这样一直藏着就地窗口。会话解锁后应先跑 `clamp.exe`
-   （`scripts/winrun.sh --desktop`）对照，再决定保留还是修正这种语义。
+   （`scripts/winrun.sh --desktop`）对照，再决定保留还是修正这种语义。**10 月 2 日已在桌面会话实测：Windows 并不保留请求的位置**，
+   这段语义已撤掉，见文末“交互跟踪器按 Windows 逐帧对齐”。
 
 4. **文档盖住了工作表的上半部分，工作表旧位置留着残影**（`4dee4a1`）。在 X 上直接截屏（Wine 的 `PrintWindow` 只拷窗口表面，与屏幕不符）
    看到：合成层画的文档（嵌入对象的预览图）盖住了 EXCEL9 的上半部分，旧位置下方露出 EXCEL9 的旧像素。`+win,+x11drv` 显示 Word 的合成
@@ -11757,3 +11758,26 @@ ca-certificates（Mozilla 的 TLS 根）已不再收前两个，后两个从来�
 在 .NET 里加载时不验 Authenticode，Office 的保存回归（Word、Excel、PowerPoint 新建、编辑、保存、退出）在新构建上全部通过。
 
 那 16 个 0x3 是 C2R/AppV 的符号链接占位文件（Wine 的重解析点），1 个 0x800b0003 是 0 字节的 eqnedt32.exe，改前改后一样。
+
+## 交互跟踪器按 Windows 逐帧对齐（2026-10-02，altars-up `5a9354331e5`、`8c771a2ab5c`）
+
+winref 的桌面会话能出合成帧之后（第 17、23、24 批），`tools/trackerprobe` 的 `inertia.c`、`clamp.c`、`requestid.c` 逐帧记下了
+InteractionTracker 的行为（`results/*.win.txt`；规律与拟合见该目录的 README）。与 Wine 原来按文档写的出入：
+
+- **惯性**：每帧按 `v/k·(1−e^(−kt))` 前进（刷新率 60.03 Hz，拟合到千分之一像素），速度低于 30 像素/秒就停，所以自然终点是
+  `(v−30)/k` 而不是 `v/k`（v=200 时差 10 像素）；缩放线性滑行、低于 0.05/秒停、速度上限 5。InertiaStateEntered 总带修饰后的
+  终点（没有修饰器时是夹进边界的自然终点）；请求加的速度不算“冲量”。
+- **越界**：惯性冲过边界后由阻尼弹簧（约 ζ 0.9、ω 15 rad/s）拉回、停在边界上；Wine 原来把曲线压缩成正好停在边界。
+- **自定义动画**不受边界约束：动画到 5000（上界 1000）就真到 5000，然后以同一请求号进入惯性（速度 0、自然终点即当前位置、
+  修饰终点为零向量）弹回边界。Wine 原来每帧夹住。
+- **空闲时的钳位**：位置请求无论 ClampingOption 是否禁用都立即夹进当时的边界，**之后边界移开也不回去**；边界推动空闲跟踪器时
+  以最近一次请求号报 ValuesChanged。Wine 为 Word 就地激活加的“保留不钳位请求的位置”与此相反（Office 的情形 Windows 停在
+  899，Wine 停在 900）。撤掉之后连同其余改动重跑 `tools/officeautomationprobe/embedevents`：Excel 的 EXCEL9 在 Word 滚动动画
+  隐藏后照样再显示、此后一直可见，就地激活的工作表画在文档里（截图核对过）——当初那 1 像素的差并不是 Word 卡住的真正原因。
+- **默认缓动**：不带缓动函数插入的关键帧，Windows 按三次贝塞尔 (0.41, 0.52)、(0, 0.94) 缓出；把每帧进度按这条曲线反解，
+  得到的帧时间正好每帧 17 毫秒。Wine 原来按线性。
+- **请求号**：缩放上下界、两种衰减率、惯性修饰器、位置调整（AdjustPosition…）各占一个请求号，位置上下界、中心点修饰器不占。
+
+改后三支探针在 Wine 上与 Windows 的状态、请求号、自然与修饰终点、停止位置一致（`results/*.wine.txt`），逐帧数值只差在帧率
+（Wine 约 58.5 Hz）。dcomp 测试加了越界、弹回与终点的断言，Windows 桌面会话 612 项 0 失败，Wine 617 项 0 失败；三应用保存回归
+通过。改的过程中还发现并修掉：空闲钳位若在帧里再要求一帧，会让合成器帧接帧地空转（边界动画期间一秒上百次回调）。

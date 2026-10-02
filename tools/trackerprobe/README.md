@@ -14,7 +14,14 @@ What a Windows.UI.Composition InteractionTracker does, in a desktop session that
   bounds frame by frame and ends at the lower one, 899 of 899..900 — clamping disabled or not.  No state callbacks: a
   position update of an idle tracker is a ValuesChanged and nothing else.
 - `inertia.c`: how it coasts, frame by frame, with every value change and the milliseconds since the request.
-  `results/inertia.win.txt` (batch 17); `results/inertia.wine.txt` is altars-up `4a8e1032545`.
+  `results/inertia.win.txt` (batch 17); `results/inertia.wine.txt` is altars-up `8c771a2ab5c`, which follows it
+  (before, Wine kept custom animations within the bounds, stretched the curve to end at a bound and coasted on to
+  v / k, and reported no modified resting position).  `results/clamp.wine.txt` is the same commit: the same states,
+  ids and final positions as Windows, frame for frame in number.
+- `requestid.c`: which setters and methods take a request id (the next request's id less the one before, less one).
+  Needs the desktop session too (the compositor is access denied outside it).  `results/requestid.win.txt` (batch 24):
+  the scale bounds, both decay rates, inertia modifiers and position adjustments do; position bounds and center point
+  modifiers do not.  `results/requestid.wine.txt` is the same since `8c771a2ab5c`.
 
 What `inertia.win.txt` says, Windows 11 build 29671 on a 60.03 Hz panel:
 
@@ -30,6 +37,8 @@ What `inertia.win.txt` says, Windows 11 build 29671 on a 60.03 Hz panel:
 - A custom animation is not kept within the bounds: it runs to 5000 past a maximum of 1000, then the tracker enters
   inertia for the same request, with no velocity, natural resting position 5000 and modified resting position (0,0,0),
   and springs back to the bound the same way.
+- A key frame inserted with no easing function eases along the cubic bezier through (0.41, 0.52) and (0, 0.94): the
+  progress of each frame, inverted through that curve, is a frame time 17 ms after the last, exactly.
 
 Build (with the tree's headers and import libraries, `probe_tracker.res` for the manifest):
 `scripts/build-probe.sh tools/trackerprobe/inertia.c tools/trackerprobe/inertia.exe combase user32 tools/trackerprobe/probe_tracker.res`
