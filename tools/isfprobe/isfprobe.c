@@ -217,7 +217,7 @@ static IInkDisp *build_ink(void)
     const WCHAR *desc3[] = {guid_x, guid_y, guid_pressure};
     IInkDrawingAttributes *attrs = NULL;
     IInkExtendedProperties *props = NULL;
-    IInkStrokeDisp *stroke = NULL;
+    IInkStrokeDisp *stroke = NULL, *first = NULL;
     VARIANT data, desc, value;
     LONG packets[21];
     IInkDisp *ink;
@@ -227,10 +227,9 @@ static IInkDisp *build_ink(void)
     if (!(ink = create_ink())) return NULL;
     data = make_longs(xy, ARRAYSIZE(xy));
     V_VT(&desc) = VT_EMPTY;
-    hr = IInkDisp_CreateStroke(ink, data, desc, &stroke);
+    hr = IInkDisp_CreateStroke(ink, data, desc, &first);
     printf("CreateStroke xy %#lx\n", hr);
     VariantClear(&data);
-    if (stroke) IInkStrokeDisp_Release(stroke);
 
     for (i = 0; i < 7; i++)
     {
@@ -245,7 +244,12 @@ static IInkDisp *build_ink(void)
     printf("CreateStroke xyp %#lx\n", hr);
     VariantClear(&data);
     VariantClear(&desc);
-    if (!stroke) return ink;
+    /* Windows takes no packet description: the attributes and properties go on the first stroke then */
+    if (stroke)
+    {
+        if (first) IInkStrokeDisp_Release(first);
+    }
+    else if (!(stroke = first)) return ink;
 
     if (SUCCEEDED(IInkStrokeDisp_get_DrawingAttributes(stroke, &attrs)))
     {
@@ -407,6 +411,25 @@ static HRESULT save(IInkDisp *ink, InkPersistenceFormat format, InkPersistenceCo
     *out = NULL;
     *size = 0;
     printf("Save format %d compression %d: %#lx vt %#x", format, mode, hr, V_VT(&data));
+    /* the base64 formats come back as a string: print it, keep its characters as the bytes to load back, and
+     * see whether Load takes the string itself */
+    if (SUCCEEDED(hr) && V_VT(&data) == VT_BSTR)
+    {
+        IInkDisp *again = create_ink();
+        UINT i, len = SysStringLen(V_BSTR(&data));
+
+        printf(", %u characters \"%.60ls\"%s\n", len, V_BSTR(&data), len > 60 ? "..." : "");
+        if (again)
+        {
+            printf("    Load of the string itself %#lx\n", IInkDisp_Load(again, data));
+            IInkDisp_Release(again);
+        }
+        *size = len;
+        *out = malloc(len + 1);
+        for (i = 0; i < len; i++) (*out)[i] = (BYTE)V_BSTR(&data)[i];
+        VariantClear(&data);
+        return hr;
+    }
     if (SUCCEEDED(hr) && V_VT(&data) == (VT_ARRAY | VT_UI1))
     {
         LONG lb, ub;

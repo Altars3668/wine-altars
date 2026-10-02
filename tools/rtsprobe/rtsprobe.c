@@ -139,7 +139,215 @@ static DWORD WINAPI watchdog(void *arg)
     ExitProcess(1);
 }
 
-int main(void)
+/* a synchronous plugin that prints what the stylus hands it; free-threaded, or the stylus refuses it */
+struct capture
+{
+    IStylusSyncPlugin IStylusSyncPlugin_iface;
+    LONG ref;
+    IUnknown *marshaler;
+    LONG events;
+};
+
+static struct capture *impl_from_capture(IStylusSyncPlugin *iface)
+{
+    return CONTAINING_RECORD(iface, struct capture, IStylusSyncPlugin_iface);
+}
+
+static HRESULT WINAPI capture_QueryInterface(IStylusSyncPlugin *iface, REFIID iid, void **out)
+{
+    struct capture *capture = impl_from_capture(iface);
+
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IStylusPlugin) || IsEqualGUID(iid, &IID_IStylusSyncPlugin))
+    {
+        *out = iface;
+        IStylusSyncPlugin_AddRef(iface);
+        return S_OK;
+    }
+    if (IsEqualGUID(iid, &IID_IMarshal) && capture->marshaler) return IUnknown_QueryInterface(capture->marshaler, iid, out);
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI capture_AddRef(IStylusSyncPlugin *iface) { return InterlockedIncrement(&impl_from_capture(iface)->ref); }
+static ULONG WINAPI capture_Release(IStylusSyncPlugin *iface) { return InterlockedDecrement(&impl_from_capture(iface)->ref); }
+
+static void print_packets(const char *what, const StylusInfo *info, ULONG count, ULONG length, const LONG *packets)
+{
+    ULONG size = count ? length / count : 0, i, j;
+
+    printf("  %s: context %lu, stylus %lu, %lu packets of %lu values on thread %s:", what, info->tcid, info->cid,
+           count, size, GetCurrentThreadId() == GetWindowThreadProcessId(GetForegroundWindow(), NULL) ? "fg" : "other");
+    for (i = 0; i < count && i < 4; i++)
+    {
+        printf(" (");
+        for (j = 0; j < size; j++) printf("%s%ld", j ? "," : "", packets[i * size + j]);
+        printf(")");
+    }
+    printf("\n");
+}
+
+static HRESULT WINAPI capture_RealTimeStylusEnabled(IStylusSyncPlugin *iface, IRealTimeStylus *rts, ULONG count,
+        const TABLET_CONTEXT_ID *tcids)
+{
+    printf("  enabled with %lu contexts\n", count);
+    return S_OK;
+}
+static HRESULT WINAPI capture_RealTimeStylusDisabled(IStylusSyncPlugin *iface, IRealTimeStylus *rts, ULONG count,
+        const TABLET_CONTEXT_ID *tcids) { return S_OK; }
+static HRESULT WINAPI capture_StylusInRange(IStylusSyncPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
+        STYLUS_ID sid) { printf("  in range: context %lu, stylus %lu\n", tcid, sid); return S_OK; }
+static HRESULT WINAPI capture_StylusOutOfRange(IStylusSyncPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
+        STYLUS_ID sid) { printf("  out of range: context %lu, stylus %lu\n", tcid, sid); return S_OK; }
+static HRESULT WINAPI capture_StylusDown(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
+        ULONG count, LONG *packet, LONG **changed)
+{
+    InterlockedIncrement(&impl_from_capture(iface)->events);
+    print_packets("down", info, 1, count, packet);
+    return S_OK;
+}
+static HRESULT WINAPI capture_StylusUp(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
+        ULONG count, LONG *packet, LONG **changed)
+{
+    InterlockedIncrement(&impl_from_capture(iface)->events);
+    print_packets("up", info, 1, count, packet);
+    return S_OK;
+}
+static HRESULT WINAPI capture_StylusButtonDown(IStylusSyncPlugin *iface, IRealTimeStylus *rts, STYLUS_ID sid,
+        const GUID *button, POINT *pos) { return S_OK; }
+static HRESULT WINAPI capture_StylusButtonUp(IStylusSyncPlugin *iface, IRealTimeStylus *rts, STYLUS_ID sid,
+        const GUID *button, POINT *pos) { return S_OK; }
+static HRESULT WINAPI capture_InAirPackets(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
+        ULONG count, ULONG length, LONG *packets, ULONG *changed_count, LONG **changed)
+{
+    InterlockedIncrement(&impl_from_capture(iface)->events);
+    print_packets("in air", info, count, length, packets);
+    return S_OK;
+}
+static HRESULT WINAPI capture_Packets(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
+        ULONG count, ULONG length, LONG *packets, ULONG *changed_count, LONG **changed)
+{
+    InterlockedIncrement(&impl_from_capture(iface)->events);
+    print_packets("packets", info, count, length, packets);
+    return S_OK;
+}
+static HRESULT WINAPI capture_CustomStylusDataAdded(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const GUID *guid,
+        ULONG size, const BYTE *data) { return S_OK; }
+static HRESULT WINAPI capture_SystemEvent(IStylusSyncPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
+        STYLUS_ID sid, SYSTEM_EVENT event, SYSTEM_EVENT_DATA data) { return S_OK; }
+static HRESULT WINAPI capture_TabletAdded(IStylusSyncPlugin *iface, IRealTimeStylus *rts, IInkTablet *tablet)
+{ return S_OK; }
+static HRESULT WINAPI capture_TabletRemoved(IStylusSyncPlugin *iface, IRealTimeStylus *rts, LONG index)
+{ return S_OK; }
+static HRESULT WINAPI capture_Error(IStylusSyncPlugin *iface, IRealTimeStylus *rts, IStylusPlugin *plugin,
+        RealTimeStylusDataInterest interest, HRESULT error, LONG_PTR *key)
+{ printf("  error %#lx\n", error); return S_OK; }
+static HRESULT WINAPI capture_UpdateMapping(IStylusSyncPlugin *iface, IRealTimeStylus *rts) { return S_OK; }
+static HRESULT WINAPI capture_DataInterest(IStylusSyncPlugin *iface, RealTimeStylusDataInterest *interest)
+{
+    *interest = RTSDI_StylusDown | RTSDI_Packets | RTSDI_StylusUp | RTSDI_InAirPackets | RTSDI_StylusInRange |
+                RTSDI_StylusOutOfRange | RTSDI_RealTimeStylusEnabled | RTSDI_Error;
+    return S_OK;
+}
+
+static const IStylusSyncPluginVtbl capture_vtbl =
+{
+    capture_QueryInterface, capture_AddRef, capture_Release, capture_RealTimeStylusEnabled,
+    capture_RealTimeStylusDisabled, capture_StylusInRange, capture_StylusOutOfRange, capture_StylusDown,
+    capture_StylusUp, capture_StylusButtonDown, capture_StylusButtonUp, capture_InAirPackets, capture_Packets,
+    capture_CustomStylusDataAdded, capture_SystemEvent, capture_TabletAdded, capture_TabletRemoved, capture_Error,
+    capture_UpdateMapping, capture_DataInterest,
+};
+
+static void pump(DWORD ms)
+{
+    DWORD end = GetTickCount() + ms;
+    MSG msg;
+
+    while ((LONG)(end - GetTickCount()) > 0)
+    {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 10, QS_ALLINPUT);
+    }
+}
+
+static void send_mouse(int x, int y, DWORD flags)
+{
+    INPUT input = {INPUT_MOUSE};
+
+    input.mi.dx = MulDiv(x, 65535, GetSystemMetrics(SM_CXSCREEN) - 1);
+    input.mi.dy = MulDiv(y, 65535, GetSystemMetrics(SM_CYSCREEN) - 1);
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | flags;
+    SendInput(1, &input, sizeof(input));
+}
+
+/* What the mouse gives a plugin, in which units: drags across the window with input made here, only the mouse,
+ * and puts the cursor back afterwards.  Run with "drag". */
+static void drag(void)
+{
+    static const POINT path[] = {{40, 40}, {60, 50}, {80, 60}, {120, 80}};
+    struct capture capture = {{&capture_vtbl}, 1};
+    TABLET_CONTEXT_ID *tcids = NULL;
+    PACKET_PROPERTY *properties;
+    IRealTimeStylus *rts;
+    POINT cursor, origin = {0, 0};
+    ULONG count = 0, n, i;
+    FLOAT sx, sy;
+    HWND hwnd;
+    HRESULT hr;
+
+    /* SS_NOTIFY: a static control is otherwise transparent to the mouse, and the clicks would land on whatever
+     * window is under it */
+    hwnd = CreateWindowExW(WS_EX_TOPMOST, L"static", L"rtsprobe drag", WS_POPUP | WS_VISIBLE | WS_BORDER | SS_NOTIFY,
+                           200, 200, 300, 200, NULL, NULL, NULL, NULL);
+    UpdateWindow(hwnd);
+    ClientToScreen(hwnd, &origin);
+    printf("drag: window client origin %ld,%ld on the screen, screen %dx%d, %d dpi\n", origin.x, origin.y,
+           GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), GetDeviceCaps(GetDC(NULL), LOGPIXELSX));
+    hr = CoCreateInstance(&CLSID_RealTimeStylus, NULL, CLSCTX_INPROC_SERVER, &IID_IRealTimeStylus, (void **)&rts);
+    if (FAILED(hr)) { DestroyWindow(hwnd); return; }
+    CoCreateFreeThreadedMarshaler((IUnknown *)&capture.IStylusSyncPlugin_iface, &capture.marshaler);
+    hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 0, &capture.IStylusSyncPlugin_iface);
+    printf("  AddStylusSyncPlugin %#lx\n", hr);
+    IRealTimeStylus_put_HWND(rts, (HANDLE_PTR)hwnd);
+    hr = IRealTimeStylus_put_Enabled(rts, TRUE);
+    printf("  Enabled %#lx\n", hr);
+    if (SUCCEEDED(IRealTimeStylus_GetAllTabletContextIds(rts, &count, &tcids)))
+    {
+        for (i = 0; i < count; i++)
+        {
+            properties = NULL;
+            n = 0;
+            if (SUCCEEDED(IRealTimeStylus_GetPacketDescriptionData(rts, tcids[i], &sx, &sy, &n, &properties)))
+                printf("  context %lu: scale %f x %f, %lu properties\n", tcids[i], sx, sy, n);
+            CoTaskMemFree(properties);
+        }
+        CoTaskMemFree(tcids);
+    }
+    pump(200);
+    GetCursorPos(&cursor);
+    for (i = 0; i < ARRAY_SIZE(path); i++)
+    {
+        printf("  mouse %s at client %ld,%ld, screen %ld,%ld\n", !i ? "down" : i + 1 < ARRAY_SIZE(path) ? "move" : "up",
+               path[i].x, path[i].y, origin.x + path[i].x, origin.y + path[i].y);
+        send_mouse(origin.x + path[i].x, origin.y + path[i].y,
+                   !i ? MOUSEEVENTF_LEFTDOWN : i + 1 < ARRAY_SIZE(path) ? 0 : MOUSEEVENTF_LEFTUP);
+        pump(150);
+    }
+    send_mouse(cursor.x, cursor.y, 0);
+    pump(200);
+    printf("  %ld events\n", capture.events);
+    IRealTimeStylus_put_Enabled(rts, FALSE);
+    IRealTimeStylus_RemoveAllStylusSyncPlugins(rts);
+    IRealTimeStylus_Release(rts);
+    if (capture.marshaler) IUnknown_Release(capture.marshaler);
+    DestroyWindow(hwnd);
+}
+
+int main(int argc, char **argv)
 {
     IRealTimeStylus *rts, *rts2;
     IStrokeBuilder *builder;
@@ -157,6 +365,12 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (argc > 1 && !strcmp(argv[1], "drag"))
+    {
+        drag();
+        CoUninitialize();
+        return 0;
+    }
     hwnd = CreateWindowW(L"static", L"rtsprobe", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 300, 200, NULL, NULL, NULL, NULL);
     hwnd2 = CreateWindowW(L"static", L"rtsprobe 2", WS_OVERLAPPEDWINDOW, 100, 100, 300, 200, NULL, NULL, NULL, NULL);
 
