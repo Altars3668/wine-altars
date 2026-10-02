@@ -11696,9 +11696,10 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
 **只记下、没有改的。**
 
 - 最新 Windows 对末尾带反斜杠的文件名给 STATUS_NOT_A_DIRECTORY（ERROR_DIRECTORY），上游 ntdll/kernel32 的 file 测试因此各有
-  一两处失败；与 Office 无关。
+  一两处失败；与 Office 无关。——已照做，见“文件名与属性”一节。
 - `GetFinalPathNameByHandle` 的“打开时的名字”、`FileNameInformation` 和 `NtQueryObject` 在 Windows 11 上也给磁盘上的大小写，
-  `NtQueryObject` 给 `\Device\HarddiskVolumeN\...`；Wine 给打开时的大小写和 `\??\C:\...`。
+  `NtQueryObject` 给 `\Device\HarddiskVolumeN\...`；Wine 给打开时的大小写和 `\??\C:\...`。——大小写已照做（同一节），
+  `\Device\HarddiskVolumeN` 还没有。
 - WinVerifyTrust 按 RFC 3161 时间戳的时间验证（VSTOInstaller.exe 按 2023-07-03）——已照做，见下一节。
 
 ## 签名与时间戳：RFC 3161、副署与 Authenticode 策略（2026-10-02，altars-up `b676d2c2087`…`c2a255dc096`）
@@ -11839,3 +11840,68 @@ createobj/run/vbscript 也全过；Office 三应用保存回归通过。
 直接调用的 C++ 客户端在 Wine 里拿不到 `IErrorInfo`（脚本经 `Invoke` 拿得到）；`SWbemLastError` 的扩展状态要 WMI 核心支持；
 对不存在的类 Windows 报 WBEM_E_INVALID_CLASS，Wine 有意返回空结果；系统消息表（kernelbase 的 winerror.mc）措辞与覆盖面
 与 Windows 不同，许多 COM/RPC 码没有文本；Wine 的 WMI 类表本身比 Windows 少属性和方法。
+
+## 文件名与属性：末尾反斜杠、磁盘大小写、存档属性（2026-10-02，altars-up `b6be22fee26`）
+
+这一节的结论由三个探针在 winref（Windows 11 build 29671）上测得：`tools/finalpathprobe/trailingprobe`（第 36 批）对每个文件函数
+试“文件名后跟反斜杠”（`f.txt\`）、“把文件当目录用”（`f.txt\x`）、“新名字后跟反斜杠”（`n.txt\`）；`finalpathprobe` 用不同
+大小写打开同一个文件（第 36 批）；`tools/fileattrprobe/archiveprobe` 测存档属性何时回来（第 38 批）。结果都存在各自的
+`results` 里，Windows 与 Wine 逐行对照。
+
+**末尾反斜杠。** Windows 11 上，文件名后面跟反斜杠就不再是目录名：打开、新建（连 `CREATE_NEW` 也是）、查属性、复制、移动、
+删除，一律 STATUS_NOT_A_DIRECTORY（ERROR_DIRECTORY，267）；只有“用它建目录”是 STATUS_OBJECT_NAME_COLLISION。新名字后跟反斜杠时，
+除了目录什么也建不出来；“把文件当目录用”是路径不存在。Wine 原来给 STATUS_OBJECT_NAME_INVALID（ERROR_INVALID_NAME，123），
+`GetFileAttributes` 还给 3——这是 Windows 11 以前的行为，上游测试里已有 Windows ARM64 测试机给出新码的痕迹。现在 ntdll 逐段查找
+时，若最后一段后有反斜杠而找到的是文件，就回 NOT_A_DIRECTORY（符号链接指向“文件\”也一样）；新建时名字末尾有反斜杠而不是建目录，
+同样回 NOT_A_DIRECTORY。上游测试中预期旧码的地方（ntdll path 的 `test_nt_names`、ntdll file 的符号链接、kernel32 的
+`_lcreat("testfi/")` 和 `CreateSymbolicLink` 到“…\”）改成以新码为准、旧码记为 broken——这些正是 Windows 11 上原有的失败。
+scrrun 的 `MoveFolder` 靠“源名加反斜杠再移动”判断源是不是文件夹，原来只认 ERROR_INVALID_NAME，现在也认 ERROR_DIRECTORY
+（Windows 上 scrrun 测试同样 0 失败）。
+
+**只读访问的 supersede。** 探针顺带测出：`FILE_SUPERSEDE` 只要读权限也会把文件清空成新文件，只读文件也照样替换（上游测试
+早就写着只读文件可被 supersede）。Wine 原来按只读方式打开、`ftruncate` 静默失败，文件原样留着。现在 wineserver 遇到“截断但没有
+写权限”的打开，临时给属主加写位、另开一个可写描述符截断、再还原权限；新属性随后由 ntdll 设上。
+
+**打开时的名字取磁盘上的大小写。** Windows 的 `FileNameInformation`、`NtQueryObject` 与 `GetFinalPathNameByHandle(FILE_NAME_OPENED)`
+都由文件系统按磁盘上的名字拼出：`casedir\mixedcase.txt` 打开，三者都是 `CaseDir\MixedCase.txt`；用短名打开则保留短名、
+按磁盘上的存法大写（`\PROGRA~1\COMMON~1`）。Wine 原来把调用者给的名字原样交给 wineserver，三者都是打开时的写法。现在
+`NtCreateFile` 在交给服务器之前，把 NT 名逐段换成 Unix 名里找到的磁盘写法（长度相同、不区分大小写相等时），短名大写，盘符大写。
+**模块名不动**：Windows 的 `GetModuleFileName` 保留 `LoadLibrary` 时的写法，所以只改交给服务器的那份名字，不改
+`get_nt_and_unix_names`（加载器也用它）。kernel32 file 测试里一处查符号链接打开名的 todo_wine 因此通过。
+
+**存档属性与其他属性（Windows 的规则，全部实测）。**
+
+- 没有任何属性的文件，`GetFileAttributes`、`FindFirstFile`、`FileBasicInformation` 都报 `FILE_ATTRIBUTE_NORMAL`（0x80）；隐藏、
+  只读、临时各自单独成立（0x2、0x1、0x100）。目录只有在设置后才带存档属性（0x30），并一直保留。
+- 存档属性被清掉之后，这些操作会让它回来：改大小（立即）、改名、覆盖或截断、写备用数据流、建硬链接，以及写入数据——写入要到
+  flush 或关闭之后才看得到。只打开写不写、读、改时间都不会。复制出来的新文件带它，原文件不变。
+- Wine 原来：文件一律报 0x20，xattr（`user.DOSATTRIB`）只存隐藏和系统；目录不能带存档属性；临时属性存不住；还有一个次序 bug——
+  先 `fchmod` 去写位、再删 xattr，而 `user.*` xattr 的增删要写权限，所以“隐藏文件改成只读”后仍然隐藏。
+- 现在：xattr 里存隐藏、系统、存档、临时、脱机、不索引；没有 xattr 时文件默认带存档、目录不带；存的值等于默认值就删掉 xattr。
+  改 xattr 在改权限之前做，只读文件临时加属主写位。新建、覆盖、supersede 的文件总带存档属性；写入、改大小、改名、建硬链接后，
+  若 xattr 记着“已清除”就把存档属性加回来。解析不了的 xattr（Samba 4 的二进制格式）一律不改写，以免毁掉 Samba 的元数据。
+  上游 ntdll 测试里 5 处相关的 todo_wine 因此通过（`FILE_ATTRIBUTE_NORMAL`、只有系统、只有隐藏、带重解析点的隐藏+系统）。
+- Office 回归里 Excel 和 PowerPoint 存出的文件现在带 `0x2020`（存档 + 不索引）：Office 建文件时自己要的属性，以前被丢掉。
+
+**其他顺带补上的。** `SetFileValidData`（`FileValidDataLengthInformation`）要求启用 `SeManageVolumePrivilege`，否则
+STATUS_PRIVILEGE_NOT_HELD；检查放在取得句柄之后、看长度之前（Windows I/O 管理器的次序）。winref 上 ssh 会话的令牌所有特权都已启用，
+所以那里得到的是 87，测试记为 broken。`GetVolumePathName` 保留盘符的写法（`c:\windows` 在 `c:\` 上），原来一律改成大写；
+上游测试的对比本就允许大小写不同，预期值改成 Windows 11 的。advapi32 已认识 `SeCreateSymbolicLinkPrivilege`，ntdll 与 kernel32
+测试里两处查这个特权的 todo_wine 去掉。
+
+测试：Windows 上 ntdll file 4153 项、ntdll path 1012 项、kernel32 file 572811 项、kernel32 volume 875 项、scrrun filesystem
+8940 项全部 0 失败（新加的末尾反斜杠、supersede、名字大小写、存档属性测试都在内）；Wine 上 ntdll file/directory、kernel32
+file/directory/volume、shell32 shlfileop、scrrun、setupapi、cabinet、advpack、msi（install/package/action）、shlwapi path 全过。
+探针对照：`trailingprobe` 与 Windows 逐行相同；`archiveprobe` 只差两行（见下）。Office 三应用保存回归通过。
+
+仍差的：
+
+- 写入后存档属性立刻可见，Windows 要等 flush 或关闭：要做到一样，需要在句柄上记“已修改”，而 ntdll 的句柄缓存 64 位已满，
+  为这一点时差另建一张表不值得。
+- Wine 没有备用数据流：`a.txt:s` 在宿主上是一个名为 `a.txt:s` 的独立文件，写它不影响 `a.txt`。Office 的“网络标记”
+  （`Zone.Identifier` 流）因此也落不到文件上——这是一个独立的大缺口。
+- `NtQueryObject` 给 `\??\X:\…`，Windows 给 `\Device\HarddiskVolumeN\…`；`GetMappedFileName`、`GetProcessImageFileName` 也一样
+  （上游测试为此挂着 todo_wine）。改它要动 wineserver 的对象名和 kernelbase、dbghelp、advapi32 里解析这个名字的地方，单独做。
+- Windows 式短名（`PROGRA~1`）在 Wine 里打不开：Wine 的短名由长名散列得出（`PROGR~xx`）；前缀里 `windows`、`system32` 在
+  磁盘上是小写，许多 Unix 侧代码按小写精确查找，不改。
+
