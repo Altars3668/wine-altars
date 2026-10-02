@@ -11573,7 +11573,7 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
   idl 里它都是 `local` 接口，Windows 上是否注册了代理待 winref 核实；WinRT 的 `Windows.UI.Composition.CompositionPath` 与
   `Windows.Foundation.Diagnostics.AsyncCausalityTracer` 还没有。
 
-### WinVerifyTrust 的验证时间（记下，未改）
+### WinVerifyTrust 的验证时间（10 月 2 日已改，见文末“签名与时间戳”）
 
 `tools/wintrustprobe` 量的：Wine 的 wintrust 只认旧式副署（`1.2.840.113549.1.9.6`）里的签名时间，RFC 3161 时间戳
 （`1.3.6.1.4.1.311.3.3.1`，如今微软的签名几乎都是它）完全不读；找不到时间时用的“系统时间”其实是**文件的创建时间**（2007 年
@@ -11688,8 +11688,9 @@ WBEM_E_NOT_FOUND；Wine 也还没有 `Path_.IsClass` 和 `SystemProperties_`（`
 第一次绘制必须覆盖整张表面，而探针先只画一角；改成先整张画一次之后才测到真实的状态机：同一表面再 BeginDraw，不论挂起
 没有，都先结束手上那次（AirSpace 的“画、挂起、再画、再画”三块都留下）；同一时间只画一张表面；绘制中 Resize 结束这次绘制；
 次序不对的调用是 COR_E_INVALIDOPERATION（0x80131509），不是 DirectComposition 的错误码。dcomp 照此改，新测试
-`test_drawing_surface` 走一遍这些状态，在 Windows 的桌面会话里通过（第 14 批；同一文件里交互跟踪器等几项早先的测试在
-29671 上另有 5 处失败，待查）。winref 下午换到了本机所在的局域网（192.0.2.10，sshd 在 22 端口）。改后 Excel 打开工作簿、关闭都正常；
+`test_drawing_surface` 走一遍这些状态，在 Windows 的桌面会话里通过（第 14 批；同一文件里早先的测试在 29671 上另有 5 处
+失败：效果工厂刚建好时 LoadStatus 是 Pending（还在编译），激活工厂的 GetRuntimeClassName 是 WRL 的 E_ILLEGAL_METHOD_CALL、
+不动输出——`4a8e1032545` 照此改，四个工厂一样；其余两处是交互跟踪器，见文末）。winref 下午换到了本机所在的局域网（192.0.2.10，sshd 在 22 端口）。改后 Excel 打开工作簿、关闭都正常；
 诊断日志里这次没有 AirSpace 事件，当初每次启动约 34 次的 CompositionErrorActivity 没法在本机复核。
 
 **只记下、没有改的。**
@@ -11698,5 +11699,61 @@ WBEM_E_NOT_FOUND；Wine 也还没有 `Path_.IsClass` 和 `SystemProperties_`（`
   一两处失败；与 Office 无关。
 - `GetFinalPathNameByHandle` 的“打开时的名字”、`FileNameInformation` 和 `NtQueryObject` 在 Windows 11 上也给磁盘上的大小写，
   `NtQueryObject` 给 `\Device\HarddiskVolumeN\...`；Wine 给打开时的大小写和 `\??\C:\...`。
-- WinVerifyTrust 按 RFC 3161 时间戳的时间验证（VSTOInstaller.exe 按 2023-07-03）；Wine 的 crypt32 还没有 `TIMESTAMP_INFO` 的
-  解码和 `CryptVerifyTimeStampSignature`，要补齐才能照做（见上文“WinVerifyTrust 的验证时间”）。
+- WinVerifyTrust 按 RFC 3161 时间戳的时间验证（VSTOInstaller.exe 按 2023-07-03）——已照做，见下一节。
+
+## 签名与时间戳：RFC 3161、副署与 Authenticode 策略（2026-10-02，altars-up `b676d2c2087`…`c2a255dc096`）
+
+Office 的二进制几乎都是微软用一年期证书签的，签名里带 RFC 3161 时间戳（未认证属性 `1.3.6.1.4.1.311.3.3.1`，值是一个
+CMS 签名的时间戳令牌，签的是 TSTInfo，TSTInfo 里的消息印记是签名者加密摘要的哈希）。证书过期之后，Windows 按时间戳的时间
+验证签名。`tools/wintrustprobe` 在 winref（第 16、18、20、21 批）量到的：
+
+- VSTOInstaller.exe（证书 2024-03 过期）：WinVerifyTrust 为 0，签名者按 2023-07-03 07:14:34.074 验证（毫秒都在）；时间戳
+  本身作为一个副署者出现，类型 0x10（SGNR_TYPE_TIMESTAMP）、证书链三张、链状态 0、验证时间相同。旧式副署
+  （`1.2.840.113549.1.9.6`，msdia100.dll、2015 年的 api-ms-win-crt）同样是类型 0x10 的副署者。
+- 把它的时间戳从签名里剪掉（`VSTOInstaller-notimestamp.exe`，签名本身仍有效），WinVerifyTrust 是 CERT_E_EXPIRED，按调用时的
+  当前时间验证；再把文件的创建时间设到证书有效期内，结果不变——Windows 不看文件时间。
+- `CryptVerifyTimeStampSignature`：返回的上下文是一块内存，装着整个令牌和解码好的 TSTInfo；签名者证书从令牌自带的证书里找，
+  返回的证书存储里只有证书（微软令牌里那张 Thales TSS 的属性证书不算）；数据不对是 NTE_BAD_HASH；不给数据就不查印记；
+  截短一字节是 CRYPT_E_ASN1_EOD；把 TSTInfo 当令牌传是 CRYPT_E_ASN1_BADTAG；TSTInfo 在签名后被改过是 CRYPT_E_HASH_VALUE。
+- `TIMESTAMP_INFO` 的解码（`tools/wintrustprobe/tstinfoprobe`，手工构造的 TSTInfo 每个可选部分单独出现）：序列号与 nonce 按
+  小端，TSA 名字给 GeneralName 的编码，时间精确到毫秒（多出的位数截掉，“.5”是 500 毫秒），大小与 crypt32 惯常的 8 字节对齐
+  一致；**精度字段无论哪种写法，Windows 都为它留出空间，却始终把 `pvAccuracy` 置空**。`TIMESTAMP_INFO` 也能编码（原样往返），
+  `TIMESTAMP_REQUEST` 编码、`TIMESTAMP_RESPONSE` 解码。
+
+Wine 原来的情形比“没实现时间戳”更糟，几处缺陷叠在一起：
+
+- wintrust 根本不读 RFC 3161 时间戳；找不到时间时用的是**文件的创建时间**（2007 年起），旧式副署的时间未经验证就采用；
+  `CryptMsgVerifyCountersignatureEncoded(Ex)` 是桩。
+- **Authenticode 策略对 SHA-256 签发的证书根本不执行**：取证书签名哈希（禁用列表检查要用）的缓冲区是 20 字节，SHA-256 放不下，
+  失败后连链策略一起跳过且不报错——如今所有证书都是 SHA-256 签的，于是过期、根不受信、自签名一律通过；那个哈希还被当成字节
+  而不是 `CRYPT_HASH_BLOB` 传给 `CertFindCertificateInStore`，禁用列表也从没起过作用。
+- crypt32 的签名消息对“非 data”内容整段（连标签和长度）做哈希、整段返回，令牌里的 TSTInfo 取出来还包在 OCTET STRING 里；
+  而且**从不比较 messageDigest 属性与内容的哈希**——签名只覆盖认证属性，内容换成什么都能通过（Authenticode 的
+  SpcIndirectData 也一样）。
+- 数组解码器跳过不认识的元素时不计入已解码长度：微软令牌的证书集合最后是一张属性证书（`[1]`），于是它被当成 CRL 集合，
+  解码失败，消息的证书存储也就打不开。
+- DER 长度超出数据时，短格式差一个字节、长格式（计数器在读长度字节时已用完）都不报 EOD，后面才报 CORRUPT。
+- GeneralizedTime 的小数秒按“最多三位的毫秒数”读：“.5”是 5 毫秒，不足三位时把 Z 当数字读而失败。
+- UTF8String 解码时结尾的 null 写在两倍长度处（越界），可写长度按“字节数减 CERT_NAME_VALUE 的大小”算，会变成负数。
+
+改动（每个提交的说明里写着对应的实测）：`b676d2c2087` 长度检查；`96e480a73ce` 数组跳过元素；`7ccd430404b` UTF8String；
+`128fb6acc9c` 小数秒；`9dd82e22dc6` RFC 3161 的四种结构（测试即 Windows 的回答，Windows 上 0 失败）；`c8f9069017e` 签名
+内容按 PKCS #7/CMS 取值做哈希、CMS 内容去掉 OCTET STRING 返回、检查 messageDigest（缺了是 CRYPT_E_AUTH_ATTR_MISSING，
+不符是 CRYPT_E_HASH_VALUE）；`9e089d64e7c` 副署验证；`32700d9c888` `CryptVerifyTimeStampSignature`（`CryptRetrieveTimeStamp`
+要联网向时间戳机构请求，仍是桩）；wintrust `41f0190dd40` 按调用时间而不是文件时间、指定了验证时间的证书按那个时间；
+`b77f6c65567` 两种时间戳都作为副署者保存、各自验证、各自按时间戳时间建“时间戳签名”用途的链，签名者按第一个签名与链都成立的
+时间戳的时间验证，否则按调用时间；`c2a255dc096` 策略检查。之后 `tools/wintrustprobe` 在 Wine 上与 Windows 逐行相同
+（`results/*.wine.txt` 对 `*.win.txt`），只差下面这一处。
+
+**根证书存储的缺口（待定）。** `tools/wintrustprobe/trustscan` 扫了前缀里 Office、共享组件和 OfficePLUS 的 1705 个二进制
+（`results/trustscan.wine.txt`）：改前 1663 个通过，改后 1657 个——多出的 6 个是 CERT_E_UNTRUSTEDROOT，都是第三方签名的 .NET
+库（.NET Foundation 的 OpenXML SDK、Json.NET、Windows Community Toolkit，Azure 签的 OpenTelemetry），根是 DigiCert High
+Assurance EV Root CA、DigiCert Assured ID Root CA、DigiCert CS RSA4096 Root G5、Microsoft RSA Services Root CA 2021。宿主的
+ca-certificates（Mozilla 的 TLS 根）已不再收前两个，后两个从来只用于代码签名。改前它们“通过”只是因为策略根本没执行。winref 上这些根
+在 `LocalMachine\AuthRoot` 里（36 张，Root 里 51 张）：那是 Windows **自动根证书更新**按需下载的——
+`HKLM\SOFTWARE\Microsoft\SystemCertificates\AuthRoot\AutoUpdate` 里存着 206718 字节的 authroot.stl（微软签名的 CTL，
+列出受信根的 SHA-1 指纹与用途）和同步时间；链到一个不在存储里的根时，crypt32 查这张 CTL，在列就从 `ctldl.windowsupdate.com` 取证书放进 AuthRoot。Wine 没有这个
+机制。要与 Windows 一致就得实现它（运行时会联网访问微软的服务器，这是要用户定的事），或者随 Wine 带一份 CTL 快照。这 6 个库
+在 .NET 里加载时不验 Authenticode，Office 的保存回归（Word、Excel、PowerPoint 新建、编辑、保存、退出）在新构建上全部通过。
+
+那 16 个 0x3 是 C2R/AppV 的符号链接占位文件（Wine 的重解析点），1 个 0x800b0003 是 0 字节的 eqnedt32.exe，改前改后一样。
