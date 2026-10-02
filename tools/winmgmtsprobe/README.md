@@ -9,8 +9,13 @@ class that is not registered.
 
     winmgmtsprobe.exe
 
-Under Wine (altars-up `8bf54fc4b20`) the class object lacks `IParseDisplayName`: `E_NOINTERFACE` in process,
-`REGDB_E_CLASSNOTREG` with `CLSCTX_ALL` once ole32 has also tried a local server, and ole32 prints three ERR lines
-before its fallback through `IClassFactory` parses the name.  The parse gives a pointer moniker (kind 5).
+On Windows 11 (`results/winmgmtsprobe.win.txt`) the class object lacks `IParseDisplayName` too, and says
+`E_NOINTERFACE` in every context; `MkParseDisplayName` gets one through `IClassFactory` and returns a pointer
+moniker (kind 5).  Wine said `REGDB_E_CLASSNOTREG` with `CLSCTX_ALL`, once it had also tried a local server, with
+three ERR lines on the way; since altars-up `23fa620648c` it answers as Windows does.
+
+`classobject.vbs` asks what a class path gives (`results/classobject.win.txt`): on Windows the class itself, with
+`Path_.IsClass` true, `__GENUS` 1 and every property null, for classes with instances and without; Wine gives the
+first instance, or `WBEM_E_NOT_FOUND` when there is none, and has no `Path_.IsClass` or `SystemProperties_` yet.
 
 Build: `x86_64-w64-mingw32-gcc -O2 -Wall -municode -o winmgmtsprobe.exe winmgmtsprobe.c -lole32 -luuid`

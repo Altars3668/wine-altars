@@ -1,5 +1,6 @@
 ' What Windows Security Center tells WMI: every instance of the product classes in root\SecurityCenter2, with
-' all their properties, and whether the old root\SecurityCenter of Windows XP still answers.  Prints only.
+' all their properties, whether the old root\SecurityCenter of Windows XP still answers, and the properties
+' and CIM types of every class in both.  Prints only.
 ' Usage: cscript //nologo securitycenter.vbs
 Option Explicit
 Dim ns, cls, svc, items, item, prop, line
@@ -37,5 +38,32 @@ Sub show(namespace, classes)
     Next
 End Sub
 
+' the classes themselves: every property with its CIM type
+Sub schema(namespace, classes)
+    Dim c, obj, p
+    On Error Resume Next
+    Set svc = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\" & namespace)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+    For Each c In classes
+        Set obj = svc.Get(c)
+        If Err.Number <> 0 Then
+            WScript.Echo namespace & " " & c & " class: " & Hex(Err.Number) & " " & Err.Description
+            Err.Clear
+        Else
+            line = ""
+            For Each p In obj.Properties_
+                line = line & " " & p.Name & ":" & p.CIMType
+                If p.IsArray Then line = line & "[]"
+            Next
+            WScript.Echo namespace & " " & c & " class:" & line
+        End If
+    Next
+End Sub
+
 show "root\SecurityCenter2", Array("AntiVirusProduct", "AntiSpywareProduct", "FirewallProduct")
 show "root\SecurityCenter", Array("AntiVirusProduct", "FirewallProduct")
+schema "root\SecurityCenter2", Array("AntiVirusProduct", "AntiSpywareProduct", "FirewallProduct")
+schema "root\SecurityCenter", Array("AntiVirusProduct", "AntiSpywareProduct", "FirewallProduct")

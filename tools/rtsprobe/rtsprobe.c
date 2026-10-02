@@ -184,9 +184,11 @@ int main(void)
     hr = IRealTimeStylus_put_Enabled(rts, TRUE);
     printf("Enabled without a window %#lx\n", hr);
     print_contexts(rts);
+    tablet = (IInkTablet *)0xdeadbeef;
     hr = IRealTimeStylus_GetTablet(rts, &tablet);
-    printf("GetTablet in all-tablets mode %#lx\n", hr);
-    if (SUCCEEDED(hr)) IInkTablet_Release(tablet);
+    printf("GetTablet in all-tablets mode %#lx, tablet %s\n", hr, tablet == (IInkTablet *)0xdeadbeef ? "untouched"
+           : tablet ? "set" : "NULL");
+    if (SUCCEEDED(hr) && tablet && tablet != (IInkTablet *)0xdeadbeef) IInkTablet_Release(tablet);
 
     hr = IRealTimeStylus_put_HWND(rts, (HANDLE_PTR)hwnd);
     printf("put_HWND %#lx\n", hr);

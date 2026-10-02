@@ -57,6 +57,22 @@ static surface_t *make_surface(int width, int height)
     hr = ICompositionDrawingSurface_QueryInterface(surface, &IID_ICompositionDrawingSurfaceInterop2, (void **)&interop);
     if (FAILED(hr)) printf("QI ICompositionDrawingSurfaceInterop2 %#lx\n", hr);
     ICompositionDrawingSurface_Release(surface);
+    /* a new surface's first draw has to cover all of it: clear it, so the sequences start from a drawn surface */
+    if (interop)
+    {
+        ID2D1DeviceContext *dc = NULL;
+        D2D1_COLOR_F clear = {0.0f, 0.0f, 0.0f, 0.0f};
+        POINT offset;
+
+        hr = ICompositionDrawingSurfaceInterop2_BeginDraw(interop, NULL, &IID_ID2D1DeviceContext, (void **)&dc, &offset);
+        if (SUCCEEDED(hr))
+        {
+            ID2D1DeviceContext_Clear(dc, &clear);
+            ID2D1DeviceContext_Release(dc);
+            hr = ICompositionDrawingSurfaceInterop2_EndDraw(interop);
+        }
+        if (FAILED(hr)) printf("first draw of the whole surface %#lx\n", hr);
+    }
     return interop;
 }
 
@@ -193,6 +209,104 @@ static void pixels(surface_t *s, const POINT *points, int count)
     }
 }
 
+/* what BeginDraw takes at all: the size a surface got, no update rectangle, a DXGI surface, and a graphics
+ * device made from the Direct3D device rather than the Direct2D one */
+static void diagnose_surface(const char *what, ICompositionGraphicsDevice *device)
+{
+    ICompositionDrawingSurface *surface = NULL;
+    ICompositionDrawingSurface2 *surface2;
+    surface_t *s = NULL;
+    Size size = {128, 64}, got = {-1, -1};
+    SizeInt32 got32 = {-1, -1};
+    RECT rect = {0, 0, 32, 32};
+    POINT offset = {-1, -1};
+    IUnknown *object;
+    HRESULT hr;
+
+    hr = ICompositionGraphicsDevice_CreateDrawingSurface(device, size, DirectXPixelFormat_B8G8R8A8UIntNormalized,
+            DirectXAlphaMode_Premultiplied, &surface);
+    printf("  %s: CreateDrawingSurface %#lx\n", what, hr);
+    if (FAILED(hr)) return;
+    hr = ICompositionDrawingSurface_get_Size(surface, &got);
+    printf("  %s: get_Size %#lx, %.1f x %.1f\n", what, hr, got.Width, got.Height);
+    if (SUCCEEDED(ICompositionDrawingSurface_QueryInterface(surface, &IID_ICompositionDrawingSurface2, (void **)&surface2)))
+    {
+        hr = ICompositionDrawingSurface2_get_SizeInt32(surface2, &got32);
+        printf("  %s: get_SizeInt32 %#lx, %d x %d\n", what, hr, got32.Width, got32.Height);
+        ICompositionDrawingSurface2_Release(surface2);
+    }
+    ICompositionDrawingSurface_QueryInterface(surface, &IID_ICompositionDrawingSurfaceInterop2, (void **)&s);
+    ICompositionDrawingSurface_Release(surface);
+    if (!s) return;
+
+    object = NULL;
+    hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, NULL, &IID_ID2D1DeviceContext, (void **)&object, &offset);
+    printf("  %s: BeginDraw(no rectangle, ID2D1DeviceContext) %#lx, offset %ld,%ld\n", what, hr, offset.x, offset.y);
+    if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+    object = NULL;
+    hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, &rect, &IID_IDXGISurface, (void **)&object, &offset);
+    printf("  %s: BeginDraw(rectangle, IDXGISurface) %#lx, offset %ld,%ld\n", what, hr, offset.x, offset.y);
+    if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+    object = NULL;
+    hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, &rect, &IID_ID2D1DeviceContext, (void **)&object, &offset);
+    printf("  %s: BeginDraw(rectangle, ID2D1DeviceContext) %#lx, offset %ld,%ld\n", what, hr, offset.x, offset.y);
+    if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+    object = NULL;
+    hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, &rect, &IID_ID3D11Texture2D, (void **)&object, &offset);
+    printf("  %s: BeginDraw(rectangle, ID3D11Texture2D) %#lx, offset %ld,%ld\n", what, hr, offset.x, offset.y);
+    if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+    ICompositionDrawingSurfaceInterop2_Release(s);
+}
+
+static ICompositorInterop *compositor_interop;
+
+static void diagnose(void)
+{
+    ICompositionGraphicsDevice *device3d = NULL;
+    ICompositionDrawingSurface *surface = NULL;
+    surface_t *s = NULL;
+    Size size = {128, 64};
+    RECT part = {0, 0, 32, 32}, whole = {0, 0, 128, 64};
+    POINT offset;
+    IUnknown *object;
+    HRESULT hr;
+
+    printf("the first draw of a new surface:\n");
+    hr = ICompositionGraphicsDevice_CreateDrawingSurface(graphics, size, DirectXPixelFormat_B8G8R8A8UIntNormalized,
+            DirectXAlphaMode_Premultiplied, &surface);
+    if (SUCCEEDED(hr))
+    {
+        ICompositionDrawingSurface_QueryInterface(surface, &IID_ICompositionDrawingSurfaceInterop2, (void **)&s);
+        ICompositionDrawingSurface_Release(surface);
+    }
+    if (s)
+    {
+        object = NULL;
+        hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, &part, &IID_ID2D1DeviceContext, (void **)&object, &offset);
+        printf("  part (0,0)-(32,32): %#lx\n", hr);
+        if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+        object = NULL;
+        hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, &whole, &IID_ID2D1DeviceContext, (void **)&object, &offset);
+        printf("  all of it as a rectangle: %#lx\n", hr);
+        if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+        object = NULL;
+        hr = ICompositionDrawingSurfaceInterop2_BeginDraw(s, &part, &IID_ID2D1DeviceContext, (void **)&object, &offset);
+        printf("  then the part: %#lx\n", hr);
+        if (SUCCEEDED(hr)) { IUnknown_Release(object); ICompositionDrawingSurfaceInterop2_EndDraw(s); }
+        ICompositionDrawingSurfaceInterop2_Release(s);
+    }
+
+    printf("what BeginDraw takes:\n");
+    diagnose_surface("Direct2D device", graphics);
+    hr = ICompositorInterop_CreateGraphicsDevice(compositor_interop, (IUnknown *)d3d, &device3d);
+    printf("  CreateGraphicsDevice(Direct3D device) %#lx\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        diagnose_surface("Direct3D device", device3d);
+        ICompositionGraphicsDevice_Release(device3d);
+    }
+}
+
 static void release(surface_t *s)
 {
     if (s) ICompositionDrawingSurfaceInterop2_Release(s);
@@ -235,6 +349,7 @@ int main(void)
     IInspectable_Release(inspectable);
     ICompositorController_get_Compositor(controller, &compositor);
     ICompositor_QueryInterface(compositor, &IID_ICompositorInterop, (void **)&interop);
+    compositor_interop = interop;
 
     hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
                            D3D11_SDK_VERSION, &d3d, &level, &immediate);
@@ -251,6 +366,8 @@ int main(void)
     hr = ICompositorInterop_CreateGraphicsDevice(interop, (IUnknown *)d2d, &graphics);
     printf("CreateGraphicsDevice %#lx\n", hr);
     if (FAILED(hr)) return 1;
+
+    diagnose();
 
     printf("begin twice on one surface:\n");
     s1 = make_surface(128, 64);

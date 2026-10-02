@@ -6285,7 +6285,7 @@ AMSI 用的那个 clamd：
 wscapi 测试 64 项、wbemprox query 1814 项 0 失败；`tools/securitycenterprobe/securitycenter.vbs` 在 Wine 里列出
 ClamAV（266240）。还没在 winref 上对照的：各种非法参数的返回码（测试只打印）、Defender 的 `productState` 与修复路径、
 `root\SecurityCenter`（XP 时代的旧命名空间，Outlook 的 OLMAPI32 也会问它；Wine 里连不上，`0x800401E4`）在
-Windows 11 上还在不在。
+Windows 11 上还在不在。这些 10 月 2 日都在 winref 上对照过了，见文末“按 winref 实测对齐”一节。
 
 ## 把 MathType 和 AxMath 整个搬过来（2026-09-18）
 
@@ -11622,3 +11622,73 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
   时候出现（一度 10 次 5 次），加了只记引用计数的跟踪后就不再出现，跟踪里的引用计数也完全正常；STA 的调用由
   `rpc_sendreceive_thread` 收发、主线程在模态循环里泵消息，疑为这期间的重入。不影响 Outlook 本身。
 
+## 按 winref 实测对齐：安全中心、COM、媒体基础、墨迹与合成表面（2026-10-02，altars-up `23fa620648c`…`b9a41218b1b`）
+
+10 月 1 日夜里的第 11 批（89 条命令）和今天的第 12、13 批，把前几天按文档写的几处逐项放到 Windows 11（build 29671）上对照，
+凡是测到的都照 Windows 改，测试也改成断言测到的值；Windows 比 Wine 收得更紧、而 Wine 有理由更宽的地方，测试用 todo_wine
+写明。
+
+**安全中心（`ba249c4e867`、`5163567b70e`、`b49415181d2`、`5751bbdade2`）。**
+
+- WSC 与 WMI 不是一一对应：WMI 叫 Defender “Windows Defender”，产品列表给本地化的“Microsoft Defender 防病毒”，GUID 相同
+  （`{D68DDC3A-831F-4fae-9E44-DA132C1ACF46}`）；Windows 自带防火墙在产品列表里、GUID 是字符串 `"NULL"`，WMI 的
+  `FirewallProduct` 里没有它；反间谍软件列表是空的（Defender 不算），反间谍提供方的健康照样 GOOD。wbemprox 的测试改为按 GUID
+  配对、只数有 GUID 的产品；ClamAV 也只算防病毒。
+- 返回码：不指定提供方的健康是 S_OK、GOOD；Initialize 之前 Count 是 OLE_E_BLANK、Item 是 E_INVALIDARG；Defender 不是
+  “默认产品”；设置子状态“无需操作”，到期天数 ~0u。
+- wscapi.dll 还以数据形式导出 `CLSID_WSCProductList`、`CLSID_WSCDefaultProduct`、`IID_IWSCProductList`、
+  `IID_IWSCDefaultProduct`、`IID_IWscProduct`、`LIBID_wscAPILib`，链接 wscapi.lib 的程序从 DLL 导入它们，Wine 现在也导出；
+  ProgID `wscAPI.WSCProductList(.1)` 也注册了。脚本在 Windows 上能建对象，但每次调用都是 0x8002801D：DLL 里的类型库写着
+  2.0、注册的是 1.0。Wine 照样回答。Windows 把类注册成单元线程并给接口注册了代理；Wine 没有代理，仍是 both，不然 wbemprox
+  的多线程单元就拿不到它。
+- `root\SecurityCenter` 在 Windows 11 上还在：`AntiVirusProduct`、`AntiSpywareProduct`、`FirewallProduct` 三个类（各自的
+  属性与 CIM 类型见 `tools/securitycenterprobe/results`），没有实例。Wine 原来连这个命名空间都没有，现在有了，查询给 0 个实例。
+
+**`winmgmts:` 的三行 ERR（`23fa620648c`）。** Windows 上 WinMGMTS 的类对象同样没有 `IParseDisplayName`，而且在
+`CLSCTX_ALL` 下也只答 E_NOINTERFACE；`MkParseDisplayName` 经 `IClassFactory` 拿到它，结果是指针 moniker。Wine 原来在进程内
+服务器答了 E_NOINTERFACE 之后又去找本地服务器、远程服务器，最后报 REGDB_E_CLASSNOTREG，一路三行 ERR。现在进程内服务器的
+回答优先，这类“没有那个接口”只记 WARN。wbemdisp 新测试 `test_class_object` 在 Windows 上通过。
+
+**WMI 的脚本接口。** `SWbemProperty.IsArray` 原是桩，`CIMType` 遇到数组就失败，脚本逐个列属性时每个都报 445；现在数组给
+元素类型、IsArray 为真（`11ca5c8d0d1`，`ChassisTypes` 与 `Manufacturer` 在 Windows 上对照过）。还没改的：类路径在 Windows
+上给的是类本身（`Path_.IsClass` 为真、`__GENUS` 为 1、属性全为 null，没有实例的类也一样），Wine 给第一个实例，没有实例就
+WBEM_E_NOT_FOUND；Wine 也还没有 `Path_.IsClass` 和 `SystemProperties_`（`tools/winmgmtsprobe/classobject.vbs`）。
+
+**媒体基础的工作队列（`2730b306e7b`）。** Windows 的工作队列线程自己进入多线程单元（长函数队列进入它自己的单线程单元），
+上游 mfplat 测试 `test_queue_com_state` 一直这么写着 todo_wine。Wine 的线程只在启动时建的隐式 MTA 里。现在 rtworkq 的工作
+线程第一次执行任务时进入相应的单元，留在里面直到线程退出；九个队列的子测试全部通过。
+
+**传感器活动监视器（`6ab3cc49dfb`）。** `MFCreateSensorActivityMonitor` 先看 COM（没初始化是 CO_E_NOTINITIALIZED，输出不动），
+再看媒体基础（没 MFStartup 是 MF_E_SHUTDOWN，即那时分配工作队列的回答，输出清零），然后才看参数（没有回调是 E_INVALIDARG）；
+重复 Start 是 MF_E_INVALIDREQUEST；报告从媒体基础的多线程队列来。测试在 Windows 的两个会话里 78 项 0 失败。
+
+**墨迹（`d3f15163f46`、`f90bbb1127f`、`b75cca840e0`、`b9a41218b1b`）。**
+
+- RealTimeStylus 只收自由线程的同步插件：它先问插件要封送器（IStdMarshalInfo、IMarshal），不是自由线程封送器就 E_INVALIDARG，
+  连 DataInterest 都不调；StrokeBuilder 只是异步插件。没有窗口时启用 0x80280005、启用中换窗口 0x80280006，启用前没有平板上下文，
+  全部平板模式下 `GetTablet` 给 S_OK 和空指针。
+- InkDisp：`GetBoundingBox` 的矩形右下开区间，笔宽一半向下取整向外扩（1000..3000 的点在默认 53 宽的笔下是 974..3027）；
+  `ScaleToRectangle` 保留笔宽，把点映射进内缩半个笔宽的矩形，0.5 取偶；X/Y 的默认度量是 INT_MIN..INT_MAX；不是 ISF 的流
+  （版本不对、长度超出）是 E_UNEXPECTED，内容坏是 E_INVALIDARG；空数组 Load 什么也不做；不认识的保存格式照 ISF 存；
+  空墨迹存 GIF 是 E_UNEXPECTED；字符串数组不能当扩展属性；按钮位不在 GetPacketData 里。
+- 还没跟上的：鼠标“平板”在 Windows 上用屏幕像素作逻辑范围、按显示器物理尺寸给分辨率，并有平板对象（`\\.\DISPLAY1`）；
+  Wine 用 himetric、`GetTabletFromTabletContextId` 是 E_NOTIMPL。DynamicRenderer、GestureRecognizer 两个类 Wine 没有。
+  GIF 持久化没有实现。CreateStroke 在 Windows 上拒绝任何包描述，但 rtscom 的 StrokeBuilder 要靠它建带压力的笔画，Wine 仍接受；
+  缺 X 或 Y 的笔画在 Windows 上取不到点。两条手写的 ISF 样例（LZ 压缩的属性、扩展变换）Windows 解出的不同，要换成 Windows
+  自己编出的样例（`tools/isfprobe` 的输出）。
+
+**Excel 的合成绘制表面（`23afc3b16f3`）。** `tools/drawsurfprobe` 第一次在 Windows 上全是 E_INVALIDARG，原因是新表面的
+第一次绘制必须覆盖整张表面，而探针先只画一角；改成先整张画一次之后才测到真实的状态机：同一表面再 BeginDraw，不论挂起
+没有，都先结束手上那次（AirSpace 的“画、挂起、再画、再画”三块都留下）；同一时间只画一张表面；绘制中 Resize 结束这次绘制；
+次序不对的调用是 COR_E_INVALIDOPERATION（0x80131509），不是 DirectComposition 的错误码。dcomp 照此改，新测试
+`test_drawing_surface` 走一遍这些状态（还没在 Windows 上跑：winref 下午起又连不上）。改后 Excel 打开工作簿、关闭都正常；
+诊断日志里这次没有 AirSpace 事件，当初每次启动约 34 次的 CompositionErrorActivity 没法在本机复核。
+
+**只记下、没有改的。**
+
+- 最新 Windows 对末尾带反斜杠的文件名给 STATUS_NOT_A_DIRECTORY（ERROR_DIRECTORY），上游 ntdll/kernel32 的 file 测试因此各有
+  一两处失败；与 Office 无关。
+- `GetFinalPathNameByHandle` 的“打开时的名字”、`FileNameInformation` 和 `NtQueryObject` 在 Windows 11 上也给磁盘上的大小写，
+  `NtQueryObject` 给 `\Device\HarddiskVolumeN\...`；Wine 给打开时的大小写和 `\??\C:\...`。
+- WinVerifyTrust 按 RFC 3161 时间戳的时间验证（VSTOInstaller.exe 按 2023-07-03）；Wine 的 crypt32 还没有 `TIMESTAMP_INFO` 的
+  解码和 `CryptVerifyTimeStampSignature`，要补齐才能照做（见上文“WinVerifyTrust 的验证时间”）。
