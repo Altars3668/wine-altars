@@ -11651,9 +11651,8 @@ rpcrt4 rpc/server、kernel32 sync 也都 0 失败；全新前缀两种建法都�
 回答优先，这类“没有那个接口”只记 WARN。wbemdisp 新测试 `test_class_object` 在 Windows 上通过。
 
 **WMI 的脚本接口。** `SWbemProperty.IsArray` 原是桩，`CIMType` 遇到数组就失败，脚本逐个列属性时每个都报 445；现在数组给
-元素类型、IsArray 为真（`11ca5c8d0d1`，`ChassisTypes` 与 `Manufacturer` 在 Windows 上对照过）。还没改的：类路径在 Windows
-上给的是类本身（`Path_.IsClass` 为真、`__GENUS` 为 1、属性全为 null，没有实例的类也一样），Wine 给第一个实例，没有实例就
-WBEM_E_NOT_FOUND；Wine 也还没有 `Path_.IsClass` 和 `SystemProperties_`（`tools/winmgmtsprobe/classobject.vbs`）。
+元素类型、IsArray 为真（`11ca5c8d0d1`，`ChassisTypes` 与 `Manufacturer` 在 Windows 上对照过）。类路径给类本身、
+`Path_.IsClass` 与 `SystemProperties_` 后来按 Windows 补上了，见“WMI 路径、对象路径与脚本对象”。
 
 **媒体基础的工作队列（`2730b306e7b`）。** Windows 的工作队列线程自己进入多线程单元（长函数队列进入它自己的单线程单元），
 上游 mfplat 测试 `test_queue_com_state` 一直这么写着 todo_wine。Wine 的线程只在启动时建的隐式 MTA 里。现在 rtworkq 的工作
@@ -11781,3 +11780,43 @@ InteractionTracker 的行为（`results/*.win.txt`；规律与拟合见该目录
 改后三支探针在 Wine 上与 Windows 的状态、请求号、自然与修饰终点、停止位置一致（`results/*.wine.txt`），逐帧数值只差在帧率
 （Wine 约 58.5 Hz）。dcomp 测试加了越界、弹回与终点的断言，Windows 桌面会话 612 项 0 失败，Wine 617 项 0 失败；三应用保存回归
 通过。改的过程中还发现并修掉：空闲钳位若在帧里再要求一帧，会让合成器帧接帧地空转（边界动画期间一秒上百次回调）。
+
+## WMI 路径、对象路径与脚本对象（2026-10-02，altars-up `f156a72b9ec`、`3079386d816`、`b3999412b70`）
+
+起因是脚本里的 `Path_` 几乎全是桩（`IsClass`、`Keys`、`Server`… 都是 E_NOTIMPL），`SystemProperties_` 不存在。第 25～30 批在
+winref 上把三层都量了一遍（`tools/winmgmtsprobe`，README 有每支探针的结论），按量到的补齐：
+
+- **wmiutils 的路径键**：键值有类型——双引号或单引号字符串（反斜杠只转义引号和反斜杠，`\t` 之类整条路径无效）、十进制数
+  （放得下就是 sint32，负数放不下是 sint64，否则 uint64）、十六进制（一律 uint64）、true/false、花括号里的引用；空格、空名、
+  `+5`、`1.5`、未闭合的引号都使整条路径无效。引号里的逗号、冒号、反斜杠属于值——Wine 原来见到值里的反斜杠就把它当命名空间，
+  `Class.A="back\\slash"` 会解析错。写回文本时数字一律十进制（`0x10` 变 `16`）、布尔小写、字符串双引号转义。没有命名空间的路径
+  前面不带冒号（Wine 原来给 `:Win32_LogicalDisk…`、`\\.:…`）；有命名空间才补 `\\.`。`GetKey`/`GetKey2`/`SetKey`/`SetKey2`/
+  `RemoveKey`/`MakeSingleton`/`GetInfo`/`GetText` 原来全是桩。`GetKey2` 是把 `GetKey` 给的字节按键的类型读（所以带文本标志读
+  数字键会读出字符码，Windows 就是这样）；`SetKey2` 给数字类型传 BSTR，读的是字符串的字节（`"7"` 当 uint32 读成 55）。
+- **wbemprox**：类路径给类本身（genus 1、属性全 null），不存在的类 WBEM_E_NOT_FOUND（Wine 原来在这里空指针崩溃）；系统属性按
+  Windows 的顺序，补了 `__SUPERCLASS`/`__DYNASTY`（Wine 没有类层次，给 null）。**查询结果的路径**：原始 COM 的 `ExecQuery`
+  只要列了属性，`__PATH`/`__SERVER`/`__NAMESPACE` 就是 null，列全了键才有 `__RELPATH`（单例总有 `Class=@`）；
+  `WBEM_FLAG_ENSURE_LOCATABLE` 把键补进投影并给出完整路径——而脚本层的 `ExecQuery` 不论传什么标志都带它，所以脚本拿到的对象
+  总有键和路径。数字字面量与字符串属性按数字的文字比较（`Win32_Process WHERE Handle = 4`，Wine 原来查不到）。结果的命名空间
+  按所在命名空间给：`ROOT\SecurityCenter2` 的杀毒产品原来被写成 `ROOT\CIMV2`，按 `__PATH` 再 `Get` 就落到错的命名空间；完整
+  路径里的服务器可以写 `.`（Wine 原来只认计算机名）、命名空间按连接的比较。设备类的键拼成 `DeviceID`（`MSFT_PhysicalDisk` 本来
+  就是 `DeviceId`，不动）。`IWbemContext` 的名字表、枚举、删除原来是桩；按测到的语义实现（插入顺序，删不存在的名字回 S_FALSE，
+  枚举外 `Next` 是 WBEM_E_UNEXPECTED）。
+- **wbemdisp**：`SWbemObject` 是 `ISWbemObjectEx`，`SystemProperties_` 按 `__PATH` 在前、`__GENUS` 在后列出。
+  `WbemScripting.SWbemObjectPath` 可以创建，所有属性和设置器按 wmiutils 的路径实现，不成路径的文本返回 WBEM_E_FAILED 且不改
+  原值；对象自己的 `Path_` 每次新建、只读（WBEM_E_READ_ONLY）。`Keys` 是取出时的副本，改它会写回路径（改某个键的 `Value`
+  会写回然后**报 WBEM_E_FAILED**——Windows 就是这样）。`DisplayName` 按
+  `WINMGMTS:{authenticationLevel=…,impersonationLevel=…,authority=…,(特权,!特权)}[locale=…]!路径` 只写设置过的部分，
+  读入也按这个语法；独立路径的安全级别未设置时读取报 WBEM_E_FAILED。定位器、连接、对象的安全设置现在各自保留（原来每次
+  `Security_` 都新建一个默认对象，设了也白设）：连接继承定位器的，对象和它的路径继承连接的；`winmgmts:` 名字对象的
+  `{…}`、`[locale=…]` 也真正生效。特权集合按编号 1～27 保存和枚举，`Add` 越界 WBEM_E_INVALID_PARAMETER，`AddAsString` 只认
+  `Se…Privilege` 全名。`SWbemNamedValueSet` 的计数、枚举、克隆、删除、命名值的读写原来都是桩。`Methods_.Count` 补上。
+
+测试：wmiutils 1412 项、wbemprox services 91 项、wbemdisp 431 项（Wine 371 项）在 Windows 上都是 0 失败，新加的
+`test_locatable` 在 Windows 通过（query 测试在 winref 上的其余失败是机器相关的老测试）；Wine 上四组全过。探针对照：`pathprobe`
+只剩 Windows 未初始化的字节，`contextprobe`、`pathobject.vbs` 完全相同。Office 三应用保存回归通过。
+
+还差的（都量过了）：Windows 的每个脚本对象都答 `IProvideClassInfo`，`TypeName` 因此是 `SWbemServicesEx`、`SWbemObjectEx`、
+`SWbemNamedValue`… 而 Wine 给接口名，连接对象还应是 `ISWbemServicesEx`；实例路径里的命名空间 Windows 照搬连接时的写法
+（`root\cimv2` 或 `ROOT\CIMV2`），Wine 一律 `ROOT\CIMV2`；脚本报错时 Windows 带描述文字（“找不到”），Wine 不设
+`IErrorInfo`；advapi32 的 `LookupPrivilegeDisplayNameW` 是桩，特权的显示名为空；Wine 的 WMI 类表本身比 Windows 少属性和方法。
