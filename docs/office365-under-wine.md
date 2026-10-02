@@ -11816,7 +11816,26 @@ winref 上把三层都量了一遍（`tools/winmgmtsprobe`，README 有每支探
 `test_locatable` 在 Windows 通过（query 测试在 winref 上的其余失败是机器相关的老测试）；Wine 上四组全过。探针对照：`pathprobe`
 只剩 Windows 未初始化的字节，`contextprobe`、`pathobject.vbs` 完全相同。Office 三应用保存回归通过。
 
-还差的（都量过了）：Windows 的每个脚本对象都答 `IProvideClassInfo`，`TypeName` 因此是 `SWbemServicesEx`、`SWbemObjectEx`、
-`SWbemNamedValue`… 而 Wine 给接口名，连接对象还应是 `ISWbemServicesEx`；实例路径里的命名空间 Windows 照搬连接时的写法
-（`root\cimv2` 或 `ROOT\CIMV2`），Wine 一律 `ROOT\CIMV2`；脚本报错时 Windows 带描述文字（“找不到”），Wine 不设
-`IErrorInfo`；advapi32 的 `LookupPrivilegeDisplayNameW` 是桩，特权的显示名为空；Wine 的 WMI 类表本身比 Windows 少属性和方法。
+随后补上（altars-up `1929d3edcbb`…`e47e1b979c4`，第 31～35 批）：
+
+- **类名与错误详情**：每个脚本对象都答 `IProvideClassInfo`（`TypeName` 给 `SWbemServicesEx`、`SWbemObjectEx`、
+  `SWbemNamedValue`…，这些 coclass 都进了类型库），连接对象是 `ISWbemServicesEx`（`Put` 20、`PutAsync` 21）。脚本里的调用
+  失败时，`Err.Description` 是 wmiutils 的状态文本、换行变空格（“找不到 ”），`Err.Source` 是失败的类名——与 Windows 逐字一致。
+  `ExecQuery` 默认带 `wbemFlagReturnImmediately`，查询错误推迟到枚举时才报、且不带描述；对象集合的 `Item`、`Security_` 补上。
+  `SWbemLastError` 注册了，没有扩展状态时创建返回 E_FAIL（Windows 同样）。
+- **wmiutils 的状态文本**：`IWbemStatusCodeText` 原来只回“Error code: 0x…”。现在按 winref 上 en-US 与 zh-CN 的
+  wmiutils.dll.mui 读出的 189 条消息生成消息表和中文翻译；WMI 以外的码用系统消息，只接受 lcid 0，
+  `WBEMSTATUS_FORMAT_NO_NEWLINE` 把换行变空格，设施名按设施码给 `WMI`/`Interface`/`Win32`/`<Null>`/`General`…
+- **VBScript**：`GetObject` 原把任何解析失败都改成 MK_E_SYNTAX，现在对象解析器自己的错误原样给脚本（WMI 的 8004100E）；
+  `CreateObject` 在没有安全管理器的宿主（cscript）里给出类工厂自己的错误（E_FAIL），并补上漏掉的类工厂释放。
+- **特权**：`LookupPrivilegeDisplayName` 原是桩；按测到的长度约定实现，中英文文本都是 Windows 的（中文逐条实测）。
+  `LookupPrivilegeValue` 原来只认到第 30 号，补到 36 号（`SeCreateSymbolicLinkPrivilege` 等），失败时 LUID 清零；
+  wineserver 的管理员令牌补上 Windows 管理员有的 33～36 号（默认禁用），`AdjustTokenPrivileges` 启用符号链接特权因此成功。
+
+测试：wbemdisp 469 项、wmiutils 1450 项在 Windows 上 0 失败，advapi32 新测试在 Windows 通过；Wine 上各组全过，vbscript 的
+createobj/run/vbscript 也全过；Office 三应用保存回归通过。
+
+仍差的：实例路径里的命名空间 Windows 照搬连接时的拼写（`root\cimv2` 或 `ROOT\CIMV2`），Wine 一律 `ROOT\CIMV2`；通过 vtable
+直接调用的 C++ 客户端在 Wine 里拿不到 `IErrorInfo`（脚本经 `Invoke` 拿得到）；`SWbemLastError` 的扩展状态要 WMI 核心支持；
+对不存在的类 Windows 报 WBEM_E_INVALID_CLASS，Wine 有意返回空结果；系统消息表（kernelbase 的 winerror.mc）措辞与覆盖面
+与 Windows 不同，许多 COM/RPC 码没有文本；Wine 的 WMI 类表本身比 Windows 少属性和方法。

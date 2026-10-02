@@ -46,10 +46,29 @@ Windows 11 build 29671 (winref, batches 25 to 30); the Wine results are altars-u
   `WBEM_FLAG_ENSURE_LOCATABLE`, on the probe's own process; and the namespace an instance's path has when the
   connection spells it in capitals.
 - `classinfo.c`: what each scripting object says it is: Windows answers `IProvideClassInfo` with its class
-  (`SWbemServicesEx`, `SWbemObjectEx`, `SWbemNamedValue`...), which is what `TypeName` prints; Wine has no
-  `IProvideClassInfo` yet.
+  (`SWbemServicesEx`, `SWbemObjectEx`, `SWbemNamedValue`...), which is what `TypeName` prints.  Since altars-up
+  `e47e1b979c4` Wine does too; it differs where its tables have no method and no qualifier to ask.
+
+## Errors and status texts
+
+Windows 11 build 29671 (batches 31, 33 and 34); Wine is altars-up `e47e1b979c4`.
+
+- `errorinfo.c`: a failing call's `IErrorInfo` (`ISupportErrorInfo` answers S_OK): the description is wmiutils' text
+  with its line break a space, the source and the GUID the class's; and `ISWbemServicesEx`'s DISPIDs, `Put` 20 and
+  `PutAsync` 21.  Wine gives a script the same through `Invoke`; a caller of the vtable gets no `IErrorInfo` there.
+- `errors.vbs`: what a script's `Err` holds for each failure, and `SWbemLastError`: a query asked to return at once
+  (the default) fails when its results are asked for, with no text; `GetObject` of a namespace that is none is WMI's
+  `8004100E`.  Wine differs where WMI itself would have extended status (`SWbemLastError` then holds the operation, its
+  parameter and the provider) and for a class that does not exist, which Wine's queries answer with no results.
+- `msgdump.c`: every message of a message table, as its language resource file has it; here
+  `wbem\en-US\wmiutils.dll.mui` and `wbem\zh-CN\wmiutils.dll.mui`, 189 messages each, which wmiutils' `wmiutils.mc`
+  and its translation are.
+- `statustext.c`: `IWbemStatusCodeText` for codes of every facility, in every locale, with and without
+  `WBEMSTATUS_FORMAT_NO_NEWLINE`.  Wine's text is the same for WMI's codes; for the others it is the system's, whose
+  wording and coverage are kernelbase's own (most COM and RPC codes have no text there yet).
 
 Build the C probes with `x86_64-w64-mingw32-gcc -O2 -Wall -o <probe>.exe <probe>.c -lole32 -loleaut32 -luuid`
-(`-lwbemuuid` for `locatable.c`); run the scripts with `cscript //nologo <script>.vbs`.
+(`-lwbemuuid` for `locatable.c`, `-municode` and nothing else for `msgdump.c`); run the scripts with
+`cscript //nologo <script>.vbs`.
 
 Build: `x86_64-w64-mingw32-gcc -O2 -Wall -municode -o winmgmtsprobe.exe winmgmtsprobe.c -lole32 -luuid`
