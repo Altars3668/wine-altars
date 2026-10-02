@@ -11938,3 +11938,44 @@ Wine 上全过；32 位程序也能用；Office 三应用保存回归通过，Wo
 而不是直接替换，测试里记为 todo_wine），宿主 en_US 里没有 `café`、`naïve`；Windows 有的几处延迟或缓存不照做（更正改了之后
 在本次会话里仍给旧更正、移除后再添加的词一时仍报错、注册的词典过一会儿才生效、更正成两个词后引擎所有检查都失败）。
 
+
+## Word 启动时的 fixme 逐项补齐：注册表、网络、重启恢复、图形、指针、Web 服务与事件跟踪（2026-10-02，altars-up `6ec740aaac2`…`cb9a2430fbd`）
+
+Word 每次启动打出几十条 `fixme`。按“Word 怎么问就怎么问、再问一圈周边”的办法，`tools/startupgapsprobe` 的探针在
+Windows 11 build 29671 上量出规则（第 55–76 批），Wine 照着实现，同一个探针在 Wine 下的输出与 Windows 逐行对比。
+排序先做会改变行为的（注册表、网络、崩溃恢复、图形），再做事件跟踪，最后是只是噪声的小函数（第 8、9 项，未完）。
+
+- **注册表**（`6ec740aaac2`）：`RegQueryInfoKey` 的安全描述符大小是所有者、组和 DACL 的大小，句柄不能读时为 0；
+  大小为 0 的类缓冲保持 0。
+- **网络**（`e62eefcc98e`、`76e29831cd2`、`6665c775bc6`、`172b2f07a3f`、`e6168bdbda9`）：没载波的接口算断开；IP Helper 的
+  变化通知由一个线程等 NSI 通知、逐行告诉注册者，初始通知在注册线程上、调用返回前，每个地址族一次（连通性提示的在线程上、
+  稍后）。网络列表管理器把网络当作注册表里的配置文件（按网关识别，名字“网络”“网络 2”…），连接是“开着的接口”，有网关才算
+  上互联网；主机的变化刷新状态并在各自套间里告诉接收器。接口像 Windows 一样注册：NETWORKLIST 类型库的接口走类型库封送，
+  费用接口走代理类 `{DCB00009}`，否则别的套间里的接收器 `Advise` 不上（`CoMarshalInterface` 回 `E_NOINTERFACE`）。
+- **重启与恢复、WER、Restart Manager**（`6b8e020103b`、`077f2f30e37`、`19214a1f699`）：注册的数据放在 PEB 的
+  `WerRegistrationData` 指的 0x968 字节块里，布局照 Windows 11 x64，别的进程照样能读；命令行、恢复回调、WER 文件/内存块/
+  元数据/运行时异常模块的上限和错误码按实测；进程崩溃时先跑恢复回调（每次 `ApplicationRecoveryInProgress` 再给一个间隔），
+  运行满一分钟又注册了重启的就重启。`FileProcessIdsUsingFileInformation` 由服务器遍历所有进程的句柄与映射；Restart Manager
+  的会话存在 `HKCU\Software\Microsoft\RestartManager`，`RmGetList`/`RmShutdown`/`RmRestart` 按实测给状态。
+- **图形**（`2defe20f09e`、`644c425c979`、`15ce537d955`、`3408bf9d6c6`）：`CheckFeatureSupport` 回答 Windows 11 知道的每一项、
+  只认自己的结构大小（`D3D11_OPTIONS2` 例外）；GDI 兼容表面 `ReleaseDC` 只保留脏矩形内 GDI 画的，带丢弃的 `GetDC` 从全零开始，
+  重复 `GetDC` 等为 `DXGI_ERROR_INVALID_CALL`；Direct2D 只在绘制中给 DC，表面目标拒绝直通 alpha，默认文字抗锯齿只在不透明目标
+  上是 ClearType；DirectWrite 默认参数 1.8/0.5/1.0/1.0/RGB，按显示器读 `Avalon.Graphics` 下 ClearType 调谐器留的值。
+- **指针设备**（`cccb591332d`）：没有触摸屏和笔的机器上，`GetPointerDevices` 问数目给 0、给数组则
+  `ERROR_SYSTEM_DEVICE_NOT_FOUND`；原来缺的 `GetPointerDevice`、`GetPointerDeviceCursors` 一调用就结束进程。
+- **Web Services**（`4ba16dad110`、`6b83fddd876`）：畸形输入让读取器进入故障状态（之后各调用 `WS_E_OBJECT_FAULTED`，
+  `WsReadType` 仍先查参数）；`WS_ERROR` 里放 Windows 放的字符串（行列、错因，中英文逐字一致）；SSL 传输安全绑定照做，
+  证书回调在 `WsOpenChannel` 时问、服务代理到第一次调用才问。
+- **事件跟踪与事件源**（`a090989a977`、`cb9a2430fbd`）：Word 为自己开的私有进程内会话（`v2_WINWORD:…`，循环日志
+  `%TEMP%\Outlook Logging\WINWORD_…-32.etl`，10 MB）原来只是返回成功的桩，九个提供程序从不被启用。现在 ntdll 在进程内维护
+  会话：启动时按 Windows 的顺序校验，`EnableTraceEx2` 按“私有当场、其他稍后”告诉提供程序所有会话合起来的级别与关键字，
+  经典提供程序拿到 Windows 那样打包的记录器句柄；事件按 Windows 的格式写进日志文件（Windows 的 `tracerpt` 能读，第 75 批），
+  或交给进程内的实时消费者；`OpenTrace`/`ProcessTrace` 也能读日志文件。Word 启动、关闭后它的日志文件里有两个 Office 提供程序的
+  13 条事件。事件日志与事件源有了真实句柄，服务器名与源名按实测校验。规则细节见 `tools/startupgapsprobe/README.md`。
+
+测试：新的 advapi32 `trace` 测试在 Windows 上 374 项 0 失败、Wine 上全过；`eventlog` 测试去掉了 27 个已通过的 todo_wine，0 失败；
+各探针（`etw`…`etw5`）Wine 与 Windows 逐行相同，只差环境（记录器号、处理器数、`elevated`）。
+
+与 Windows 仍不同的：会话只在本进程内（别的进程看不见、控制不了，`QueryAllTraces` 只列本进程的）；Windows 按处理器分缓冲区，
+这里一个会话一个缓冲区（实时消费者因此可能少收到一次 `BufferCallback`）；不在进程内的旧式私有记录器 Windows 要等一分钟才
+返回 1460，这里立即返回；事件日志本身（`ReportEvent` 写、`ReadEventLog` 读）仍是桩。
