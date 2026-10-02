@@ -290,6 +290,8 @@ static void drag(void)
 {
     static const POINT path[] = {{40, 40}, {60, 50}, {80, 60}, {120, 80}};
     struct capture capture = {{&capture_vtbl}, 1};
+    IStrokeBuilder *builder = NULL;
+    IInkDisp *ink = NULL;
     TABLET_CONTEXT_ID *tcids = NULL;
     PACKET_PROPERTY *properties;
     IRealTimeStylus *rts;
@@ -312,6 +314,19 @@ static void drag(void)
     CoCreateFreeThreadedMarshaler((IUnknown *)&capture.IStylusSyncPlugin_iface, &capture.marshaler);
     hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 0, &capture.IStylusSyncPlugin_iface);
     printf("  AddStylusSyncPlugin %#lx\n", hr);
+    /* and the stroke builder, to see which points the stroke gets */
+    if (SUCCEEDED(CoCreateInstance(&CLSID_StrokeBuilder, NULL, CLSCTX_INPROC_SERVER, &IID_IStrokeBuilder, (void **)&builder)))
+    {
+        IStylusAsyncPlugin *async;
+
+        IStrokeBuilder_get_Ink(builder, &ink);
+        if (SUCCEEDED(IStrokeBuilder_QueryInterface(builder, &IID_IStylusAsyncPlugin, (void **)&async)))
+        {
+            hr = IRealTimeStylus_AddStylusAsyncPlugin(rts, 0, async);
+            printf("  AddStylusAsyncPlugin(StrokeBuilder) %#lx\n", hr);
+            IStylusAsyncPlugin_Release(async);
+        }
+    }
     IRealTimeStylus_put_HWND(rts, (HANDLE_PTR)hwnd);
     hr = IRealTimeStylus_put_Enabled(rts, TRUE);
     printf("  Enabled %#lx\n", hr);
@@ -340,6 +355,37 @@ static void drag(void)
     send_mouse(cursor.x, cursor.y, 0);
     pump(200);
     printf("  %ld events\n", capture.events);
+    if (ink)
+    {
+        IInkStrokes *strokes = NULL;
+        IInkStrokeDisp *stroke;
+        LONG n = 0, k, lower, upper, *values;
+        VARIANT v;
+
+        IInkDisp_get_Strokes(ink, &strokes);
+        if (strokes) IInkStrokes_get_Count(strokes, &n);
+        printf("  the stroke builder's ink has %ld strokes\n", n);
+        for (k = 0; k < n; k++)
+        {
+            if (FAILED(IInkStrokes_Item(strokes, k, &stroke))) continue;
+            VariantInit(&v);
+            if (SUCCEEDED(IInkStrokeDisp_GetPacketData(stroke, 0, -1, &v)) && V_VT(&v) == (VT_ARRAY | VT_I4))
+            {
+                SafeArrayGetLBound(V_ARRAY(&v), 1, &lower);
+                SafeArrayGetUBound(V_ARRAY(&v), 1, &upper);
+                SafeArrayAccessData(V_ARRAY(&v), (void **)&values);
+                printf("  stroke %ld: %ld values:", k, upper - lower + 1);
+                for (i = 0; i <= (ULONG)(upper - lower) && i < 16; i++) printf(" %ld", values[i]);
+                printf("\n");
+                SafeArrayUnaccessData(V_ARRAY(&v));
+            }
+            VariantClear(&v);
+            IInkStrokeDisp_Release(stroke);
+        }
+        if (strokes) IInkStrokes_Release(strokes);
+        IInkDisp_Release(ink);
+    }
+    if (builder) IStrokeBuilder_Release(builder);
     IRealTimeStylus_put_Enabled(rts, FALSE);
     IRealTimeStylus_RemoveAllStylusSyncPlugins(rts);
     IRealTimeStylus_Release(rts);

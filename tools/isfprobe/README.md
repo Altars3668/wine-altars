@@ -12,3 +12,8 @@ inkobj 原先不实现 `Save`/`Load`。探针用已知的点建两笔（X、Y �
 Windows 保存出的 ISF 字节就是 Wine 解码器的测试向量。`results/isfprobe.wine.txt`：实现之前的 altars-up（全是 E_NOTIMPL）。
 
 构建：`x86_64-w64-mingw32-gcc -O1 -Wall -o tools/isfprobe/isfprobe.exe tools/isfprobe/isfprobe.c -lole32 -loleaut32 -luuid -luser32`。
+
+`results/isfprobe.win.txt`（winref，第 14 批）：Windows 不收 CreateStroke 的包描述，属性就加在第一笔上；默认与“最大压缩”存出
+160 字节，“不压缩”172 字节，这两份就是 `dlls/inkobj/tests` 的 `test_windows_isf` 的样例。Base64 两种格式存出的是字符串
+（`base64:`、编码、算进长度的结尾 null），Load 直接收字符串；流里先有一个持久化格式标签（base64 为 0x10000）。
+往有笔画的墨迹里 Load 是 E_INVALIDARG。`results/isfprobe.wine.txt`：altars-up `9b92b002e77`。

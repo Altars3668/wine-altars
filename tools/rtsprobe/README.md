@@ -17,3 +17,8 @@ X/Y/PacketStatus 支持、NormalPressure 不支持）；Wine 用 0..50800 的 hi
 
 构建（用 Wine 树里生成的 rtscom.h，MinGW 没有这个头）：
 `WINE_BUILD=$PWD/wine-src-up/build-wow64 scripts/build-probe.sh tools/rtsprobe/rtsprobe.c tools/rtsprobe/rtsprobe.exe ole32 oleaut32 user32 uuid`。
+
+`rtsprobe.exe drag` 在探针自己的置顶窗口里用 SendInput 拖一下鼠标（只动鼠标，结束后光标放回原处），打印一个聚合了自由线程
+封送器的同步插件收到的每个事件和包，以及同时挂着的 StrokeBuilder 建出的笔画。`results/rtsprobe-drag.win.txt`（winref 桌面会话）
+与 `rtsprobe-drag.wine.txt`（altars-up `73a3972c421`）：包都是相对客户区的 himetric；Windows 在 RTS 自己的线程上回调，
+按下时不发空中包（Wine 先收到移动消息，多一个），其余事件与笔画逐点相同。

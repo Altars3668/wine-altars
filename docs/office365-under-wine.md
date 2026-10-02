@@ -11671,8 +11671,15 @@ WBEM_E_NOT_FOUND；Wine 也还没有 `Path_.IsClass` 和 `SystemProperties_`（`
   `ScaleToRectangle` 保留笔宽，把点映射进内缩半个笔宽的矩形，0.5 取偶；X/Y 的默认度量是 INT_MIN..INT_MAX；不是 ISF 的流
   （版本不对、长度超出）是 E_UNEXPECTED，内容坏是 E_INVALIDARG；空数组 Load 什么也不做；不认识的保存格式照 ISF 存；
   空墨迹存 GIF 是 E_UNEXPECTED；字符串数组不能当扩展属性；按钮位不在 GetPacketData 里。
-- 还没跟上的：鼠标“平板”在 Windows 上用屏幕像素作逻辑范围、按显示器物理尺寸给分辨率，并有平板对象（`\\.\DISPLAY1`）；
-  Wine 用 himetric、`GetTabletFromTabletContextId` 是 E_NOTIMPL。DynamicRenderer、GestureRecognizer 两个类 Wine 没有。
+- 鼠标拖动（`rtsprobe drag`，第 15 批，`9b92b002e77`、`73a3972c421`）：Windows 交给同步插件的包同样是相对窗口客户区的
+  himetric（客户区 40,40 是 1058,1058），与 Wine 一致；次序是 StylusInRange、按下点的 StylusDown、**同一点再一个 Packets**、
+  每次移动一个 Packets、StylusUp，回调在 RTS 自己的线程上。StrokeBuilder 的笔画是按下点加全部包，首点两次、末点一次。
+  Wine 原来按下后不发 Packets、StrokeBuilder 抬起时又补一个末点，现在与 Windows 逐点相同。
+- Base64 两种格式在 Windows 上 Save 出的是字符串：`base64:` 加编码，长度把结尾的 null 也算上；编码的流头部之后先记一个
+  持久化格式标签（tag 28，base64 是 0x10000，GIF 注释里的是 1）。Load 直接收这个字符串；往有笔画的墨迹里再 Load 是
+  E_INVALIDARG。两份 Windows 自己存的 ISF（带三处、四种类型的扩展属性）作为测试样例，Wine 解出的与 Windows 报的一致。
+- 还没跟上的：鼠标“平板”的描述在 Windows 上用屏幕像素作逻辑范围、按显示器物理尺寸给分辨率，并有平板对象
+  （`\\.\DISPLAY1`）；Wine 用 himetric、`GetTabletFromTabletContextId` 是 E_NOTIMPL（包本身的单位两边相同）。DynamicRenderer、GestureRecognizer 两个类 Wine 没有。
   GIF 持久化没有实现。CreateStroke 在 Windows 上拒绝任何包描述，但 rtscom 的 StrokeBuilder 要靠它建带压力的笔画，Wine 仍接受；
   缺 X 或 Y 的笔画在 Windows 上取不到点。两条手写的 ISF 样例（LZ 压缩的属性、扩展变换）Windows 解出的不同，要换成 Windows
   自己编出的样例（`tools/isfprobe` 的输出）。
@@ -11681,7 +11688,8 @@ WBEM_E_NOT_FOUND；Wine 也还没有 `Path_.IsClass` 和 `SystemProperties_`（`
 第一次绘制必须覆盖整张表面，而探针先只画一角；改成先整张画一次之后才测到真实的状态机：同一表面再 BeginDraw，不论挂起
 没有，都先结束手上那次（AirSpace 的“画、挂起、再画、再画”三块都留下）；同一时间只画一张表面；绘制中 Resize 结束这次绘制；
 次序不对的调用是 COR_E_INVALIDOPERATION（0x80131509），不是 DirectComposition 的错误码。dcomp 照此改，新测试
-`test_drawing_surface` 走一遍这些状态（还没在 Windows 上跑：winref 下午起又连不上）。改后 Excel 打开工作簿、关闭都正常；
+`test_drawing_surface` 走一遍这些状态，在 Windows 的桌面会话里通过（第 14 批；同一文件里交互跟踪器等几项早先的测试在
+29671 上另有 5 处失败，待查）。winref 下午换到了本机所在的局域网（192.0.2.10，sshd 在 22 端口）。改后 Excel 打开工作簿、关闭都正常；
 诊断日志里这次没有 AirSpace 事件，当初每次启动约 34 次的 CompositionErrorActivity 没法在本机复核。
 
 **只记下、没有改的。**
