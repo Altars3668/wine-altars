@@ -12023,3 +12023,43 @@ propsys、msctf、opengl32 等在 Wine 上 0 失败；`misc`…`misc4` 与 Windo
 `DOMDocument60` 的 `IMarshal`、核心上下文里的线型、粗粒度 `QueryUnbiasedInterruptTime` 不走。Word 启动还剩：wininet 的
 Cookie 属性（Secure、HttpOnly、SameSite）、事件日志写入（`ReportEventW` 仍是桩）、D3D10 接口仿真、某个窗口的 D3D 呈现
 走 GDI 回退且 blit 失败、一处 noexcept 函数抛出异常——下一步逐个查。
+
+## Word 退出码 3：FH4 的 catch 状态，以及 Cookie、堆与已销毁窗口的呈现（2026-10-02，altars-up `602da6db9f1`…`e73c2701894`）
+
+上一节末尾剩下的几类里，这四处当天补完（`tools/startupgapsprobe` 的 `misc5` 在 Windows 11 上量，第 81–83 批）。
+
+- **退出码 3**（`e73c2701894`）：Word 每次关闭都以 3 退出，日志最后一行是 `err:seh:check_noexcept noexcept function
+  propagating exception`。链是用 bptrace 的栈回溯在抛出点量出来的：wwlib 的关闭例程调 `ExitProcess` →
+  `LdrShutdownProcess` → MSO 的 `DllMain` 跑 CRT 的 atexit 表 → MSO 里 `OfficeVoice::GetVoiceRoamingSettings()` 的函数内
+  静态对象析构 → 它持有的听写语言漫游设置（`Roaming::RoamingObject`）析构 → Mso30 的 `GetRoamingManager` →
+  `RoamingManager::GetInstance`：管理器在两秒前的有序关闭里已经 `Uninit`，于是抛 `Roaming::RoamingNotInitializedException`。
+  这在 Windows 上同样会抛：`VoiceRoamingSettings::UnInit` 只出现在虚表里，整个 Office 没有一处调用（只有 WWLIB 导入
+  `GetVoiceRoamingSettings`，用的是取/设声音的两个槽）。Windows 靠的是析构函数里的 `catch (...)`（覆盖状态 1–3，调用处是 2）：
+  里面的 `Roaming::HandleRoamingCacheExceptionTag` 再 `throw;`，按类型分类，`catch (const RoamingNotInitializedException&)`
+  接住，析构函数正常走完。Wine 的 `__CxxFrameHandler4` 在那一帧用了状态 0：它把“下一个处理器从哪个状态找起”放在 FLS 里
+  交接，约定 -2 表示按 IP 求，只在 DLL_THREAD_ATTACH 时设 -2；而进程退出时 `LdrShutdownProcess` 先清掉所有线程的 FLS
+  值再发 DLL_PROCESS_DETACH，读到的是 NULL，即 0；vcruntime140_1 载入之前就在跑的线程也从没被设过。对照实验很干净：
+  同一流程只把 vcruntime140_1 换成 Office 自带的原生版，退出码 0（两次），换回内置版 3（两次）。改法：状态偏移 2 存，
+  NULL 即 -2，线程附加时不再需要设。ucrtbase 新测试 `test___CxxFrameHandler4` 在运行时生成一个带 FH4 表的函数
+  （`catch (...)` 只覆盖调用处的状态 1，外面再包一层 `__C_specific_handler`，漏掉时返回异常码而不是让进程崩），在主线程、
+  载入后建的线程、载入前就在跑的线程里各跑一次：Windows 11 用原生 vcruntime140_1 三者都捕获（第 83 批，44 项 0 失败），
+  Wine 修前第三种漏掉。修后 Word 连续三次关闭退出码 0，断点确认走的正是抛出 → 分类 catch → 析构函数的 continuation。
+- **Cookie**（`d4644bbd51d`）：带 Secure 的 Cookie 原来照常保存、打一条 FIXME，SameSite 是不认识的选项。Windows 11 上
+  Secure 的 Cookie 无论在哪设的都只给 https；SameSite 不管写什么都收下、Cookie 照存；HttpOnly 的不带 `INTERNET_COOKIE_HTTPONLY`
+  设不进去（返回 5，`COOKIE_STATE_REJECT`），取时也要带这个标志才给。探针只用 `*.invalid` 域上的会话 Cookie，结束时过期掉。
+- **堆的性能数字**（`cd7169ca82b`）：Word 问 `HeapExtendedInformation` 的 0x80000000 级别。Windows 11 给每个堆 160 字节：
+  地址、保留与提交、段数、提交中在用的与空闲的（两者加起来就是提交量）、空闲块数、单独分配的大块；不指定堆时按进程堆在先、
+  其余按创建先后逐个给。级别 0–2 给堆本身，不指定堆时给全部堆的保留、提交与个数；缓冲只够请求头是参数错误，不够放答案时
+  `STATUS_BUFFER_TOO_SMALL` 并给出所需大小。
+- **已销毁窗口的呈现**（`602da6db9f1`）：Word 向自己已经销毁的窗口（启动画面就是一个）的交换链呈现。那时设备上下文已不属于
+  任何窗口，wined3d 退到备用窗口、走 GDI 呈现，失败（`Failed to blit`），前面还有一条把原因说成缺 GL 上下文的 FIXME。
+  现在向已销毁的窗口呈现悄悄地什么也不做，设备上下文与窗口对不上时打 WARN。
+
+工具：bptrace 的 `BPTRACE_WALK` 改为从目标进程内存里读各模块的 `.pdata`（dbghelp 要打开模块文件，而 C2R 模块报的路径在磁盘上
+不存在，回溯在第 0 帧就停），断点可写成 `模块!RVA`、一次附加跨几个模块；新脚本 `scripts/pe-xrefs.py`（谁用 rip 相对寻址或直接
+调用碰到某个 RVA）、`pe-importers.py`（谁按名或按序号导入某个函数，含延迟导入）、`pe-fh4.py`（解出一个函数的 FH4 表与某地址
+处的状态）。`build-winetest.sh` 按 makedep 选 C 运行库（测试导入哪个用哪个，否则 msvcrt），C 运行库自己的测试加
+`-fno-builtin`，统一 `-mlong-double-64`：msvcrt、msvcr90、msvcr120、ucrtbase 的测试从此能编，且在 Wine 上 0 失败。
+
+Word 启动还剩：事件日志写入（`ReportEventW` 仍是桩）、D3D10 接口仿真（`SwapDeviceContextState`）、关闭时两条
+`CoReleaseMarshalData` 错误。

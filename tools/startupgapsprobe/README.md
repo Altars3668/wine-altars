@@ -27,6 +27,7 @@ Word（Microsoft 365，16.0.20326）在 Wine 里启动一次，会打出几十�
 | `misc2` | 窗口的输入范围、要求签名目标的加载 | `misc2.win.txt` |
 | `misc3` | 私有对象安全的设置与转换、空令牌、性能信息的长度、其余缓解选项与子进程策略、XmlWriter 属性 | `misc3.win.txt` |
 | `misc4` | `SetFileShortName` 与短名（自己在当前目录建文件、用完删除） | `misc4.win.txt` |
+| `misc5` | 堆扩展信息的各级别（Word 问 0x80000000）、Cookie 的 Secure/HttpOnly/SameSite（只用 `*.invalid` 域的会话 Cookie，结束时过期） | `misc5.win.txt` |
 
 ## 事件跟踪（ETW）
 
@@ -78,7 +79,7 @@ Wine 原来的 `StartTrace` 什么也不做、返回成功，`EnableTraceEx2` �
 
 ## 小函数（第 8、9 项）
 
-`misc`…`misc4` 量到、Wine 照做的规则，细节见各结果文件：
+`misc`…`misc5` 量到、Wine 照做的规则，细节见各结果文件：
 
 - **缓解策略**：创建选项每两位一组，1 开、2 关、3 是第三种（动态代码“线程可退出”=3、非微软二进制“允许商店”=6、
   字体“审计”=2、强制重定位“要求重定位”加 `DisallowStrippedImages`）；关掉自底向上 ASLR 连高熵一起关；影子栈开时
@@ -93,6 +94,12 @@ Wine 原来的 `StartTrace` 什么也不做、返回成功，`EnableTraceEx2` �
   （九个字符、空格、加号、两个点都 87），转大写；与目录里别的文件的长名或短名相同 183，与自己的长名相同可以；空串去掉短名，
   之后按旧短名打开 2、`FileAlternateNameInformation` 为 `STATUS_OBJECT_NAME_NOT_FOUND`。8.3 长名的文件被另给短名后，
   `FindFirstFile` 报那个短名，`GetShortPathName` 仍给长名。
+- **堆扩展信息**：请求头 40 字节，缓冲不超过它是 `STATUS_INVALID_PARAMETER`；级别 0–2 给 `HEAP_INFORMATION`（共 88 字节），
+  不指定堆时给全部堆的保留、提交、个数（72）；0x80000000 每个堆 160 字节（地址、保留、提交、段数、在用、空闲、空闲块数、
+  大块），不指定堆时进程堆在先、其余按创建先后；放不下时 `STATUS_BUFFER_TOO_SMALL` 并给所需大小。级别 3 起与 0x80000001
+  给区域与块，未做。
+- **Cookie**：Secure 的只给 https（在 http 上设的也一样）；SameSite 任何值都收、不影响保存；HttpOnly 的要
+  `INTERNET_COOKIE_HTTPONLY` 才设得进、取得到。
 - **性能信息**：小于 312 字节 → `STATUS_INFO_LENGTH_MISMATCH`、长度 376；312 到 376 之间按给的长度填、返回该长度；更大给 376。
 - **XmlWriter**：`CompactEmptyElement` 非零写 `<b/>`；一致性级别只收 0–2（否则 `E_INVALIDARG`）；布尔属性存为 0/1。
 - **输入范围**：只能给本线程的窗口设；`IS_DEFAULT` 去掉；`SetInputScopes` 给了短语、正则、SRGS 就追加 -1/-2/-3；

@@ -20,7 +20,20 @@ crt0=libs/winecrt0/x86_64-windows/libwinecrt0.a; [ -f $crt0 ] || crt0=dlls/winec
 rtlib=libs/compiler-rt/x86_64-windows/libcompiler-rt.a; [ -f $rtlib ] || rtlib=
 # a variable of the tests' Makefile.in
 makevar() { sed -n "s/^$1 *= *//p" ../dlls/$dll/tests/Makefile.in; }
-FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt -D_UCRT -D_CRT_NON_CONFORMING_WCSTOK -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mcx16 -mcmodel=small -g -O2 $(makevar EXTRADEFS)"
+imports=$(grep '^IMPORTS' ../dlls/$dll/tests/Makefile.in | cut -d= -f2)
+# the C runtime the tests import, msvcrt when they name none, as makedep has it (msvcrt's tests look into its
+# FILE, ucrtbase's want the conforming wcstok); it is linked after winecrt0, which needs it too
+crtimp=$(for i in $imports; do case $i in ucrtbase|msvcr*) echo $i;; esac; done | head -1)
+crtimp=${crtimp:-msvcrt}
+crtlib=dlls/$crtimp/x86_64-windows/lib$crtimp.a
+case $crtimp in
+ucrt*) crtdef=-D_UCRT;;
+msvcrt) crtdef=-D_MSVCR_VER=0;;
+*) crtdef=-D_MSVCR_VER=${crtimp#msvcr};;
+esac
+# a C runtime's own tests are built without the compiler's builtins, which would answer for strcmp or log10
+nobuiltin=; case $dll in msvcr*|ucrt*) nobuiltin=-fno-builtin;; esac
+FLAGS="-Idlls/$dll/tests -I../dlls/$dll/tests -Iinclude -I../include -I../include/msvcrt $crtdef -D__WINESRC__ -D__WINE_PE_BUILD -Wall -fno-strict-aliasing -Wno-packed-not-aligned -mlong-double-64 -mcx16 -mcmodel=small -g -O2 $nobuiltin $(makevar EXTRADEFS)"
 list=$(sed -n '/^SOURCES/,/^$/p' ../dlls/$dll/tests/Makefile.in)
 srcs=$(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.c\b')
 # A source marked "#pragma makedep testdll" is a helper module the tests load from a TESTDLL resource (ole32's
@@ -73,21 +86,20 @@ for rc in $(echo "$list" | grep -oE '[A-Za-z0-9_.]+\.rc\b'); do
         -I../include/msvcrt -D_MSVCR_VER=0 -D__WINESRC__ ../dlls/$dll/tests/$rc
     res="$res $O/${rc%.rc}.res"
 done
-imports=$(grep '^IMPORTS' ../dlls/$dll/tests/Makefile.in | cut -d= -f2)
 # never a delay-import library (libX.delay.a): a module the tests import that way is not loaded until its
 # first call, and GetModuleHandle() on it at the start of a test answers NULL
 import_libs() {
     local d f
     for d in "$@"; do f=dlls/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=libs/$d/x86_64-windows/lib$d.a; [ -f $f ] || f=$(ls dlls/$d/x86_64-windows/*.a 2>/dev/null | /usr/bin/grep -v '\.delay\.a$' | head -1); [ -n "$f" ] || f=$(ls dlls/*/x86_64-windows/lib$d.a 2>/dev/null | head -1); [ -n "$f" ] && echo $f; done
 }
-defaults="$crt0 $rtlib dlls/ucrtbase/x86_64-windows/libucrtbase.a dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a"
+defaults="$crt0 $rtlib $crtlib dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a"
 for t in $testdlls; do
     timports=$(sed -n "s/^${t}_IMPORTS *= *//p" ../dlls/$dll/tests/Makefile.in); [ -n "$timports" ] || timports=$imports
     tflags=$(sed -n "s/^${t}_EXTRADLLFLAGS *= *//p" ../dlls/$dll/tests/Makefile.in)
     ext=.dll; link=-shared; case " $tflags " in *" -mconsole "*) ext=.exe; link=;; esac
     # a module without the default libraries has no C runtime of its own (a driver takes ntoskrnl's)
     tdefaults=$defaults; tcflags=$FLAGS
-    case " $tflags " in *" -nodefaultlibs "*) tdefaults=$rtlib; tcflags=${FLAGS/-D_UCRT/-D_MSVCR_VER=0};; esac
+    case " $tflags " in *" -nodefaultlibs "*) tdefaults=$rtlib; tcflags=${FLAGS/$crtdef/-D_MSVCR_VER=0};; esac
     x86_64-w64-mingw32-gcc -c -o $O/$t.o ../dlls/$dll/tests/$t.c $tcflags
     spec=; [ -f ../dlls/$dll/tests/$t.spec ] && spec=../dlls/$dll/tests/$t.spec
     fname=; case $t in *.*) fname=-Wb,-F,$t$ext;; esac
