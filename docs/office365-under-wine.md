@@ -12149,7 +12149,9 @@ Office 用 D3D10.1 设备画（Word 载入 d3d10_1.dll），Direct2D 在它上�
   级别与来源（越界 `E_INVALIDARG`），状态处理器收下、按任何 token 移除都是 S_OK。combase 照做，类经 `classes.idl` 登记。
 - `RevokeDragDrop` 对已销毁的窗口、MXXMLWriter 被问 `{e19c7100-9709-4db7-9373-e7b518b47086}`：`oledead`（第 118 批）显示 Wine 的行为已经与
   Windows 相同（`DRAGDROP_E_INVALIDHWND`、放置目标的引用 Windows 也不放；`E_NOINTERFACE`），只是不该打 ERR，改为 WARN。
-- 还留着：`Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll` 装不上——这个路径不在前缀的注册表里，Office 的安装目录里也没有，是
-  C2R 的 App-V 层在 Office 进程里给 Office XML MIME 过滤器（`{807583E5-5146-11D5-A672-00B0D022E945}`）的；Windows 上那里同样没有这个文件。
-  它间歇出现、跟着网络活动，还没能稳定重现。`RoGetActivationFactory` 在没初始化 COM 的线程上的 `ensure_mta`、Word 退出时 cscript 释放
-  代理撞上的 `get_stub_manager_from_ipid` 是上游有意留的诊断，没动。
+- `Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll` 装不上：不是缺口。前面查过（见上文 “`apartment_add_dll couldn't load in-process dll
+  "...\ClickToRun\msoxmlmf.dll"`” 一条）：它来自 OfficeClickToRun.exe，内嵌清单故意把 InfoPath 的 XML MIME 过滤器
+  `{807583E5-5146-11D5-A672-00B0D022E945}` 声明在自己目录里一个不存在的 `msoxmlmf.dll` 上，Windows 上同样加载失败，只是不打日志；
+  10 月 3 日对当前安装又核对了一遍清单。间歇出现是因为它跟着 C2R 服务绑定清单文件的时机走，日志进了 Word 的输出是因为服务继承了
+  第一个拉起会话的进程的 stderr。`RoGetActivationFactory` 在没初始化 COM 的线程上的 `ensure_mta`、Word 退出时 cscript 释放代理撞上的
+  `get_stub_manager_from_ipid` 是上游有意留的诊断，没动。
