@@ -12119,3 +12119,28 @@ wevtapi（Vista 以来的事件日志 API）除了几个函数也是桩。规则
 （内部版本号、计算机名、事件条数）。
 
 Word 启动时剩下的 FIXME 只有 D3D10 接口仿真（`SwapDeviceContextState`）。
+
+## D3D10 接口仿真：另一个接口的调用被丢弃（2026-10-03，altars-up `86dae43b2ac`…`43339ce9dba`）
+
+Word 启动时最后一条 FIXME 是 d3d11 `SwapDeviceContextState` 的 “D3D10 interface emulation not fully implemented yet!”。
+Office 用 D3D10.1 设备画（Word 载入 d3d10_1.dll），Direct2D 在它上面换入自己的 D3D11 上下文状态、画完再换回，换回 D3D10
+状态时打出这一条。`tools/startupgapsprobe` 的 `d3d10emu`、`d3d10emu2` 在 Windows 11 上量了两个方向（第 114–115 批）：模拟
+`ID3D10Device` 的状态在用时，立即上下文的 D3D11 调用凡是设置、绘制、计算、拷贝、更新、清除、`GenerateMips`、`ClearState`
+都被丢掉，读状态得到空状态的值（视口个数 0、混合因子全 1、采样掩码全 1，只有 `PSGetSamplers` 不写输出），`Map`/`Unmap`
+与查询照常；D3D11 状态在用时，`ID3D10Device` 的同类调用一样被丢掉。Wine 原来两边都照做。
+
+- **d3d11**（`43339ce9dba`）：照 Windows 丢弃；D3D10 方法里转调 D3D11 方法的几个改调不检查的函数体。顺带改一个旧错：经
+  `D3D11CoreCreateDevice` 建的设备，第一个状态被标成模拟 `ID3D10Device1`（状态在设备里建好之后才知道它是 D3D11 设备）——
+  原来只影响那条 FIXME，照做之后就会让每个 D3D11 设备的调用都被丢掉。共享表面的拷贝是 d3d11 自己做的，不经检查。
+- **Wine 自己在应用的设备上做的事**（`86dae43b2ac`…`435a78fa89b`）先改为换入自己的状态，否则在 Office 的 D3D10.1 设备上会被
+  丢掉：d2d1 位图的拷贝与清除、覆盖遮罩的清除；dcomp 绘图表面的图块读写与清除、纹理镜像；dxgi 合成交换链呈现时的拷贝；
+  mfplat DXGI 表面缓冲的拷贝；mfmediaengine 的传帧（它原来还把自己的着色器、缓冲、目标留在应用的上下文里）。
+
+验证：d3d11 测试里原来 todo 的 47 项全过，其余与改前相同（6 项改前就失败，是本机 GL 驱动的）；d3d10core 0 失败；d2d1、dxgi
+与改前相同；dcomp、mfmediaengine 0 失败；mfplat 改前改后都在同一处被宿主媒体库的崩溃打断。两个探针在 Wine 下与 Windows
+逐行相同。Word 启动与关闭（退出码 0）、经自动化输入的正文、PowerPoint 新建的幻灯片都画得正确，三个保存回归通过；Word 启动
+时一条 FIXME 也不剩了。
+
+经自动化驱动时日志里还有几条 err，留作下一步：`Windows.Foundation.Diagnostics.AsyncCausalityTracer` 没有注册；一个 CLSID 的
+进程内服务器指向 `Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll`（文件在 `root\vfs\…\OFFICE16` 下）；MXXMLWriter 不认识
+接口 `{e19c7100-9709-4db7-9373-e7b518b47086}`；`RevokeDragDrop` 拿到已销毁的窗口。

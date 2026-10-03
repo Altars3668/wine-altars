@@ -36,6 +36,7 @@ Word（Microsoft 365，16.0.20326）在 Wine 里启动一次，会打出几十�
 | `evtsub` | 订阅：已有的事件与信号、`EvtNext` 等不等、说完没有之后再问、信号谁来复位、回调在哪个线程 | `evtsub.win.txt` |
 | `evtrender` | `EvtRender` 把值放在缓冲区哪里（系统、用户、路径上下文，经典事件的字符串数组，二进制，写到多远），哪些路径组合建得成上下文 | `evtrender.win.txt` |
 | `evtmsg` | `EvtFormatMessage` 的消息、级别、任务、关键字（用户语言与英文、结尾 NUL）、按编号取消息、XML 的呈现部分；netevent.dll 里事件日志服务各事件的中英文消息 | `evtmsg.win.txt` |
+| `d3d10emu`、`d3d10emu2` | D3D11 设备的上下文状态模拟 `ID3D10Device` 时另一个接口的调用：哪些被丢弃（清除、更新、拷贝、`GenerateMips`、`ClearState`、状态的设与取），哪些照常（`Map`、查询）；只用自己的设备与资源 | `d3d10emu.win.txt`、`d3d10emu2.win.txt` |
 
 ## 事件跟踪（ETW）
 
