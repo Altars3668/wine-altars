@@ -12063,3 +12063,26 @@ Cookie 属性（Secure、HttpOnly、SameSite）、事件日志写入（`ReportEv
 
 Word 启动还剩：事件日志写入（`ReportEventW` 仍是桩）、D3D10 接口仿真（`SwapDeviceContextState`）、关闭时两条
 `CoReleaseMarshalData` 错误。
+
+### Word 退出时的两条 COM 错误：断开之后的释放、ROT 与 GIT（altars-up `0ab0953efa8`…`6f9748683d6`）
+
+Word 关闭时先对自己的对象 `CoDisconnectObject`，再撤销它们的 ROT 登记、拖放目标和 GIT cookie。Wine 在撤销时
+`CoReleaseMarshalData` 找不到 stub manager，打两条 ERR、返回 `RPC_E_INVALID_OBJREF`（bptrace 在 combase 下断看到调用者是
+ole32 的 `rot_entry_delete`、`RevokeDragDrop` 与 GIT 的撤销）。`tools/startupgapsprobe` 的 `comrel` 在 Windows 11 上量了这一类
+（第 84–86 批），结果与 Wine 差了好几处，按实测改：
+
+- `CoReleaseMarshalData` 对已断开、已释放过、apartment 已结束的数据一律 S_OK（`696cbe39224`）。
+- marshal 对象的 IUnknown 只加一个引用（stub manager 的），Wine 原来多加一个接口桩的（`0ab0953efa8`）；同一提交里
+  `AGILEREFERENCE_DELAYEDMARSHAL` 的 agile reference 改为一直持有对象、创建线程直接取对象、其它线程（同 apartment 的也算）才
+  marshal——原来 marshal 后放掉对象，测试里靠那个多出的引用凑对了数。roapi、usrmarshal 测试里原来 todo 的引用计数随之相符。
+- ROT 把断开对象的登记当作不存在：`IsRunning` S_FALSE、`GetObject`/`GetTimeOfLastChange` 为 `MK_E_UNAVAILABLE`、枚举不列、
+  只有 `Revoke` 还认得 cookie（`696cbe39224`）。存活与否由 combase 按 OBJREF 的 OXID/OID 查 stub manager，不去 unmarshal
+  （跨 apartment 的 unmarshal 要 RemAddRef，所属 STA 不泵消息就会卡住）。
+- GIT 登记只持有接口、不建 stub；本 apartment 取回对象本身，别的 apartment 第一次来取时经登记 apartment 的
+  `IContextCallback` 在那里 TABLESTRONG marshal；断开只丢 stub 不丢表里的引用，之后本 apartment 照样取得到、别的
+  apartment 得 `CO_E_OBJNOTREG`，撤销 S_OK（`6f9748683d6`）。
+
+`comrel` 在修改后的 Wine 上与 Windows 逐行相同（引用计数、跨 apartment 的代理、断开后的各个返回值）。ole32 新测试
+（`test_release_marshal_data_disconnected`、`test_globalinterfacetable_disconnect`、`test_ROT_disconnected`）单独编成程序在
+Windows 11 上 58 项 0 失败（第 87 批）；ole32 全部测试、combase roapi/string 在 Wine 上 0 失败。Word 的日志从此一条 ERR 也没有，
+启动只剩 `ReportEventW` 与 D3D10 接口仿真两条 FIXME。

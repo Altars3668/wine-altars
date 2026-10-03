@@ -266,6 +266,9 @@ int main(int argc, char **argv)
                         if (!sym_init && !(sym_init = SymInitialize(proc, NULL, FALSE)))
                             printf("    SymInitialize failed, error %lu\n", GetLastError());
                         load_modules(pid);
+                        /* the trap reports the address after the int3; at a function's first byte that would
+                         * read as one prolog instruction already run, and the unwind would go wrong */
+                        wctx.Rip = bps[which].addr;
                         frame.AddrPC.Offset = wctx.Rip; frame.AddrPC.Mode = AddrModeFlat;
                         frame.AddrStack.Offset = wctx.Rsp; frame.AddrStack.Mode = AddrModeFlat;
                         frame.AddrFrame.Offset = wctx.Rsp; frame.AddrFrame.Mode = AddrModeFlat;
