@@ -23,7 +23,10 @@ Word（Microsoft 365，16.0.20326）在 Wine 里启动一次，会打出几十�
 | `pointer` | 指针设备函数（要用户桌面） | `pointer.win.txt` |
 | `ws`、`ws2`、`ws3`、`ws4` | Web Services 的错误串、读取器故障、SSL 绑定 | `ws*.win.txt` |
 | `etw`…`etw5`、`etlwrite`、`etlread` | 事件跟踪会话、提供程序、日志文件、消费者、事件源 | `etw*.win.txt`、`etlread-tracerpt.win.txt` |
-| `misc`、`fileusers`、`unsigned` | 其余小函数（第 8 项） | `misc.win.txt` |
+| `misc`、`fileusers`、`unsigned` | 其余小函数（第 8、9 项） | `misc.win.txt` |
+| `misc2` | 窗口的输入范围、要求签名目标的加载 | `misc2.win.txt` |
+| `misc3` | 私有对象安全的设置与转换、空令牌、性能信息的长度、其余缓解选项与子进程策略、XmlWriter 属性 | `misc3.win.txt` |
+| `misc4` | `SetFileShortName` 与短名（自己在当前目录建文件、用完删除） | `misc4.win.txt` |
 
 ## 事件跟踪（ETW）
 
@@ -72,3 +75,27 @@ Wine 原来的 `StartTrace` 什么也不做、返回成功，`EnableTraceEx2` �
 `ERROR_INVALID_HANDLE`）。本机的名字（计算机名、`\\` 加计算机名、DNS 名、`localhost`）当本机，其他服务器 → 1722；
 没有或空的源名 → 87；`Security` → 5；`DeregisterEventSource(NULL)` 返回 FALSE 且不动最后错误。`ReadEventLog` 先查缓冲
 与两个大小指针（87），再查句柄（6），再查读法与方向各有且只有一个（87）。
+
+## 小函数（第 8、9 项）
+
+`misc`…`misc4` 量到、Wine 照做的规则，细节见各结果文件：
+
+- **缓解策略**：创建选项每两位一组，1 开、2 关、3 是第三种（动态代码“线程可退出”=3、非微软二进制“允许商店”=6、
+  字体“审计”=2、强制重定位“要求重定位”加 `DisallowStrippedImages`）；关掉自底向上 ASLR 连高熵一起关；影子栈开时
+  上下文 IP 校验一并打开（0x105）；限制核心共享=0x10、FSCTL=4（系统调用策略）；其余选项（加载器完整性、模块篡改、XFG、
+  指针认证、第 60 位）问不出变化。子进程策略只收 4 字节：1 限制（再建进程得 367）、5 限制但允许安全进程，2、4、8 无效果。
+  SEHOP 默认为 1，指针认证在 x64 上是 `ERROR_NOT_SUPPORTED`。
+- **私有对象安全**：所有者/组取创建者的、否则令牌的；即使创建者全给了也要令牌（1008），只有所有者没有组时是 1308。
+  无创建者 DACL 时取父对象传下来的、再没有取令牌默认 DACL（通用权限映射）；自动继承把父对象的 ACE 加 `ID` 放在自己的后面。
+  设置时：DACL 不给就是 NULL DACL，自动继承保留旧的继承 ACE（受保护的除外），修改里带 `ID` 的 ACE 在自动继承时丢掉、
+  否则照留；所有者要令牌（没有令牌 1307）但不查是谁；SACL 与标签不要特权；未知标志忽略；成功时描述符换新指针。
+- **短名**：`SetFileShortNameW` 自己取得还原特权（持有即可，不必事先启用）；句柄要有 DELETE（否则 5）；名字须合法 8.3
+  （九个字符、空格、加号、两个点都 87），转大写；与目录里别的文件的长名或短名相同 183，与自己的长名相同可以；空串去掉短名，
+  之后按旧短名打开 2、`FileAlternateNameInformation` 为 `STATUS_OBJECT_NAME_NOT_FOUND`。8.3 长名的文件被另给短名后，
+  `FindFirstFile` 报那个短名，`GetShortPathName` 仍给长名。
+- **性能信息**：小于 312 字节 → `STATUS_INFO_LENGTH_MISMATCH`、长度 376；312 到 376 之间按给的长度填、返回该长度；更大给 376。
+- **XmlWriter**：`CompactEmptyElement` 非零写 `<b/>`；一致性级别只收 0–2（否则 `E_INVALIDARG`）；布尔属性存为 0/1。
+- **输入范围**：只能给本线程的窗口设；`IS_DEFAULT` 去掉；`SetInputScopes` 给了短语、正则、SRGS 就追加 -1/-2/-3；
+  `SetInputScopeXML` 存为 [-4]；`TF_GetInputScope` 对无范围的窗口 `S_FALSE`，无效/已销毁窗口 `E_INVALIDARG`。
+- **签名目标**：自身无签名的进程用 `LOAD_LIBRARY_REQUIRE_SIGNED_TARGET` 装任何还没装过的库都是 577（即使是微软签名的），
+  已装过的直接成功；相对名加 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` 是 87（KnownDLLs 例外，仍是 577）。

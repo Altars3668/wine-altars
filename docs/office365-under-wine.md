@@ -11943,7 +11943,7 @@ Wine 上全过；32 位程序也能用；Office 三应用保存回归通过，Wo
 
 Word 每次启动打出几十条 `fixme`。按“Word 怎么问就怎么问、再问一圈周边”的办法，`tools/startupgapsprobe` 的探针在
 Windows 11 build 29671 上量出规则（第 55–76 批），Wine 照着实现，同一个探针在 Wine 下的输出与 Windows 逐行对比。
-排序先做会改变行为的（注册表、网络、崩溃恢复、图形），再做事件跟踪，最后是只是噪声的小函数（第 8、9 项，未完）。
+排序先做会改变行为的（注册表、网络、崩溃恢复、图形），再做事件跟踪，最后是只是噪声的小函数（第 8、9 项，见下一节）。
 
 - **注册表**（`6ec740aaac2`）：`RegQueryInfoKey` 的安全描述符大小是所有者、组和 DACL 的大小，句柄不能读时为 0；
   大小为 0 的类缓冲保持 0。
@@ -11979,3 +11979,47 @@ Windows 11 build 29671 上量出规则（第 55–76 批），Wine 照着实现�
 与 Windows 仍不同的：会话只在本进程内（别的进程看不见、控制不了，`QueryAllTraces` 只列本进程的）；Windows 按处理器分缓冲区，
 这里一个会话一个缓冲区（实时消费者因此可能少收到一次 `BufferCallback`）；不在进程内的旧式私有记录器 Windows 要等一分钟才
 返回 1460，这里立即返回；事件日志本身（`ReportEvent` 写、`ReadEventLog` 读）仍是桩。
+
+## Word 启动时的 fixme 补齐（续）：小函数与其余（2026-10-02，altars-up `2ac922706c6`…`daa727b433f`）
+
+第 8、9 项是 Word 启动时问到、Wine 只有桩或半实现的小函数。仍是先量后做：`tools/startupgapsprobe` 的 `misc`、`misc2`、`misc3`、
+`misc4` 在 Windows 11 上量（第 77–80 批），Wine 下逐行对比。做完后 Word 启动只剩下面“仍不同”里的五类 fixme（原来几十条）。
+
+- **性能与功耗信息**（`2ac922706c6`）：`SystemPerformanceInformation` 是 Windows 10 起的 376 字节，旧的 312 字节仍收，介于两者的
+  按给的长度填；新计数取自 Linux（脏页与阈值、共享内存、页表、可驻留页、上下文切换、缺页、内核内存当作分页/非分页池）。
+  `SystemPowerCapabilities` 报本机的电源键、盖子、睡眠状态（deep 是 S3，只有 s2idle 是现代待机）、能恢复的休眠、背光、温控、
+  RTC 唤醒、UPS、转动的磁盘，不再是一台 XP 台式机的值；结构补上 XP/10 加的字段，不留未初始化字节。
+- **缓解策略**（`76696a4b564`，协议改动）：进程的策略存在服务器里，别的进程问得到；创建时给的选项按 Windows 11 的换算变成
+  策略（26 个选项逐个量过：两位一组的开/关/第三种，高熵 ASLR 跟随自底向上 ASLR，影子栈连带上下文 IP 校验）；子进程策略
+  受限的进程再建进程得 `ERROR_CHILD_PROCESS_BLOCKED`（367），该属性只收 4 字节。默认策略加上 SEHOP，指针认证只在 ARM64。
+- **持久线程**（`e81d2844471`）：`WT_EXECUTEINPERSISTENTTHREAD` 和持久环境的工作在每个池一个、永不退出、可警报等待的线程上跑，
+  排给它的 APC 在那里执行。
+- **私有对象安全**（`d5015b5941d`）：`CreatePrivateObjectSecurity(Ex)` 原来给 Everyone 全权限，`SetPrivateObjectSecurity(Ex)`
+  什么也不做却返回成功。现在所有者/组/DACL/SACL 的来源、继承（容器既生效又继续传的 ACE 在需要映射时拆成两条）、令牌默认
+  DACL、自动继承、保护、标签、空令牌的错误都按实测；`ConvertToAutoInheritPrivateObjectSecurity`、`RtlQuerySecurityObject`
+  也做了。顺带修了 SDDL：输出认识强制标签（`ML`、`NR/NW/NX`）和其余 ACE 类型、对象 GUID，NULL ACL 写 `NO_ACCESS_CONTROL`，
+  SACL 用自己的控制位；解析把 `NO_ACCESS_CONTROL` 读成 NULL ACL、SACL 的标志落到 SACL 位上。
+- **短名**（`b942c116e0a`）：`SetFileShortNameW` 像 Windows 一样在调用期间临时启用还原特权（`RtlAcquirePrivilege`，新实现），
+  要能删除的句柄、合法 8.3 名、目录里没有别的文件用着（长名或短名，183），转大写，空串去掉短名。短名存在文件的扩展属性里，
+  目录打上标记，列目录和按短名查找只在有标记的目录里读属性；`FileAlternateNameInformation`、`GetShortPathName`
+  （本身是 8.3 的部分保持原样）都按实测。参数错误的 `NtQueryInformationFile` 不动 I/O 状态块。
+- **小函数**：`LOAD_LIBRARY_REQUIRE_SIGNED_TARGET`（自身无签名的进程装不了未装过的库，577）、精确中断时间、带唤醒上下文的
+  可等待计时器、无包进程的包 ID、MUI 版本信息、堆扩展信息（级别 1）、窗口的输入范围与 `TF_GetInputScope`、文本存储的
+  编辑事务、数组与 blob 转字符串、工作组的加入信息与 AAD、WinHTTP 的 IPv6 快速回退、WMI 代理的安全毯、COM 激活失败的
+  错误码与 `MULTI_QI`、`OaBuildVersion`（50.5014）、xmllite 的读写属性与紧凑空元素（`<b/>`）、调试 OpenGL 上下文、
+  `RpcMgmtEnableIdleCleanup`、type_info 名字随模块释放、许可值（`Kernel-ProductInfo`、`Container-License-Mode` 等，
+  `wineboot -u` 后生效）。只是噪声的（SAX 读取器的其他接口、`RoGetActivationFactory`、`DllDebugObjectRPCHook`、
+  GDI 呈现与线型）改成只在真丢了东西时说。
+- **xmllite 写入器与 Windows 11 不同的一处**：没有打开的元素时 `WriteEndElement`/`WriteFullEndElement` 先返回 `E_INVALIDARG`
+  且不改状态（Wine 的测试原按旧 Windows 写，在 Windows 11 上 29 处失败）；测试改为以 Windows 11 为准、旧值算 broken。
+
+测试：kernelbase `process` 新增的创建策略测试在 Windows 上 175 项 0 失败；xmllite `writer` 2815 项、`reader` 9059 项、advapi32
+`security` 3782 项、kernel32 `file`（含新的短名测试）、`path`、`process`、ntdll `file`/`directory`/`info`/`threadpool`、
+propsys、msctf、opengl32 等在 Wine 上 0 失败；`misc`…`misc4` 与 Windows 逐行相同，只差环境与下面列的几处。Word 保存回归
+（启动、新建、编辑、保存、关闭、退出）在新版本上通过。
+
+与 Windows 仍不同的：Wine 管理员令牌的默认所有者是 513 组而不是 Administrators（私有对象的所有者因此不同）；自动生成的短名
+是 Wine 的散列（`SFN4~2UB`）而不是 `~1` 编号；`RtlQueryHeapInformation` 的 0x80000001 类和扩展信息的 0x80000000 级别、
+`DOMDocument60` 的 `IMarshal`、核心上下文里的线型、粗粒度 `QueryUnbiasedInterruptTime` 不走。Word 启动还剩：wininet 的
+Cookie 属性（Secure、HttpOnly、SameSite）、事件日志写入（`ReportEventW` 仍是桩）、D3D10 接口仿真、某个窗口的 D3D 呈现
+走 GDI 回退且 blit 失败、一处 noexcept 函数抛出异常——下一步逐个查。
