@@ -12141,6 +12141,15 @@ Office 用 D3D10.1 设备画（Word 载入 d3d10_1.dll），Direct2D 在它上�
 逐行相同。Word 启动与关闭（退出码 0）、经自动化输入的正文、PowerPoint 新建的幻灯片都画得正确，三个保存回归通过；Word 启动
 时一条 FIXME 也不剩了。
 
-经自动化驱动时日志里还有几条 err，留作下一步：`Windows.Foundation.Diagnostics.AsyncCausalityTracer` 没有注册；一个 CLSID 的
-进程内服务器指向 `Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll`（文件在 `root\vfs\…\OFFICE16` 下）；MXXMLWriter 不认识
-接口 `{e19c7100-9709-4db7-9373-e7b518b47086}`；`RevokeDragDrop` 拿到已销毁的窗口。
+经自动化驱动、或 Word 跑得久一些时，日志里还有几条 err，随后处理（altars-up `04c80c52c27`…`d71573adee6`）：
+
+- `Windows.Foundation.Diagnostics.AsyncCausalityTracer`：Windows 上由 combase.dll 提供（`ActivatableClassId` 的 `DllPath`），Wine 没有这个
+  类。`causality` 量了 Windows 11（第 116–117 批）：只有工厂一个对象，agile，实现 `IActivationFactory` 与
+  `IAsyncCausalityTracerStatics`，`GetRuntimeClassName` 是 `E_ILLEGAL_METHOD_CALL`，`ActivateInstance` 是 `E_NOTIMPL`；各个 Trace 只查
+  级别与来源（越界 `E_INVALIDARG`），状态处理器收下、按任何 token 移除都是 S_OK。combase 照做，类经 `classes.idl` 登记。
+- `RevokeDragDrop` 对已销毁的窗口、MXXMLWriter 被问 `{e19c7100-9709-4db7-9373-e7b518b47086}`：`oledead`（第 118 批）显示 Wine 的行为已经与
+  Windows 相同（`DRAGDROP_E_INVALIDHWND`、放置目标的引用 Windows 也不放；`E_NOINTERFACE`），只是不该打 ERR，改为 WARN。
+- 还留着：`Common Files\Microsoft Shared\ClickToRun\msoxmlmf.dll` 装不上——这个路径不在前缀的注册表里，Office 的安装目录里也没有，是
+  C2R 的 App-V 层在 Office 进程里给 Office XML MIME 过滤器（`{807583E5-5146-11D5-A672-00B0D022E945}`）的；Windows 上那里同样没有这个文件。
+  它间歇出现、跟着网络活动，还没能稳定重现。`RoGetActivationFactory` 在没初始化 COM 的线程上的 `ensure_mta`、Word 退出时 cscript 释放
+  代理撞上的 `get_stub_manager_from_ipid` 是上游有意留的诊断，没动。

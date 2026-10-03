@@ -37,6 +37,8 @@ Word（Microsoft 365，16.0.20326）在 Wine 里启动一次，会打出几十�
 | `evtrender` | `EvtRender` 把值放在缓冲区哪里（系统、用户、路径上下文，经典事件的字符串数组，二进制，写到多远），哪些路径组合建得成上下文 | `evtrender.win.txt` |
 | `evtmsg` | `EvtFormatMessage` 的消息、级别、任务、关键字（用户语言与英文、结尾 NUL）、按编号取消息、XML 的呈现部分；netevent.dll 里事件日志服务各事件的中英文消息 | `evtmsg.win.txt` |
 | `d3d10emu`、`d3d10emu2` | D3D11 设备的上下文状态模拟 `ID3D10Device` 时另一个接口的调用：哪些被丢弃（清除、更新、拷贝、`GenerateMips`、`ClearState`、状态的设与取），哪些照常（`Map`、查询）；只用自己的设备与资源 | `d3d10emu.win.txt`、`d3d10emu2.win.txt` |
+| `causality` | `Windows.Foundation.Diagnostics.AsyncCausalityTracer` 的工厂：实现哪些接口、类名、信任级别、各方法的返回（记一个虚构的操作，只有跟踪会话看得到） | `causality.win.txt` |
+| `oledead` | 对已销毁的窗口 `RegisterDragDrop`/`RevokeDragDrop` 返回什么、放置目标的引用何时放掉；MXXMLWriter60 等对 Office 问的一个接口的回答（只用自己的窗口与对象） | `oledead.win.txt` |
 
 ## 事件跟踪（ETW）
 
