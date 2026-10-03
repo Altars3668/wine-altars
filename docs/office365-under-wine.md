@@ -12137,7 +12137,7 @@ Office 用 D3D10.1 设备画（Word 载入 d3d10_1.dll），Direct2D 在它上�
   mfplat DXGI 表面缓冲的拷贝；mfmediaengine 的传帧（它原来还把自己的着色器、缓冲、目标留在应用的上下文里）。
 
 验证：d3d11 测试里原来 todo 的 47 项全过，其余与改前相同（6 项改前就失败，是本机 GL 驱动的）；d3d10core 0 失败；d2d1、dxgi
-与改前相同；dcomp、mfmediaengine 0 失败；mfplat 改前改后都在同一处被宿主媒体库的崩溃打断。两个探针在 Wine 下与 Windows
+与改前相同；dcomp、mfmediaengine 0 失败；mfplat 改前改后都在同一处崩溃（不是宿主媒体库，是 Wine 自己的 D3D12 缓冲，见下文）。两个探针在 Wine 下与 Windows
 逐行相同。Word 启动与关闭（退出码 0）、经自动化输入的正文、PowerPoint 新建的幻灯片都画得正确，三个保存回归通过；Word 启动
 时一条 FIXME 也不剩了。
 
@@ -12155,3 +12155,9 @@ Office 用 D3D10.1 设备画（Word 载入 d3d10_1.dll），Direct2D 在它上�
   10 月 3 日对当前安装又核对了一遍清单。间歇出现是因为它跟着 C2R 服务绑定清单文件的时机走，日志进了 Word 的输出是因为服务继承了
   第一个拉起会话的进程的 stderr。`RoGetActivationFactory` 在没初始化 COM 的线程上的 `ensure_mta`、Word 退出时 cscript 释放代理撞上的
   `get_stub_manager_from_ipid` 是上游有意留的诊断，没动。
+- mfplat 测试在 :77 上崩溃（交给 Claudex 查，`fbff0a5a7a1`）：死在宿主线程里，是 Mesa lavapipe（`libvulkan_lvp.so`）的空指针，
+  起因却在 Wine。D3D12 表面缓冲写入后，`Unlock2D` 在缓冲自己的复制队列上把数据拷进纹理，没人等这次拷贝；紧接着释放缓冲，就把上传
+  资源、命令列表和分配器在拷贝途中放掉了。释放前等缓冲自己的 fence 到最后提交的值即可：写入的拷贝不等外部同步对象，读取的拷贝在
+  `Lock` 里本来就等，所以不会卡死。新测试在缓冲释放后读回纹理，Windows 11 上写入的数据同样留在纹理里（第 120 批）。修后全量 mfplat
+  在 :77 跑完，剩下的失败都是 `mfplat.c:1658` 的旧失败（以冒号、斜杠开头的路径）。全量 `trace+d3d,trace+vulkan` 会改变时序让崩溃消失，
+  要用窄的诊断（析构时 fence 的完成值小于提交值）和去掉修复的反向对照来定位。
