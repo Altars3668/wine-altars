@@ -12086,3 +12086,36 @@ ole32 的 `rot_entry_delete`、`RevokeDragDrop` 与 GIT 的撤销）。`tools/st
 （`test_release_marshal_data_disconnected`、`test_globalinterfacetable_disconnect`、`test_ROT_disconnected`）单独编成程序在
 Windows 11 上 58 项 0 失败（第 87 批）；ole32 全部测试、combase roapi/string 在 Wine 上 0 失败。Word 的日志从此一条 ERR 也没有，
 启动只剩 `ReportEventW` 与 D3D10 接口仿真两条 FIXME。
+
+## 事件日志：经典日志的读写，以及 wevtapi 的查询、订阅、渲染与格式化（2026-10-02，altars-up `886d72dfbf5`…`cc575565116`）
+
+altars-up 这天变基到了 Wine 11.19（`455e3509b98`）；变基前的分支留作 `altars-up-pre-1119`，前面各节到“Word 退出码 3”为止的
+提交号指的是它。
+
+Word 启动时向 Application 日志报一条事件（`ReportEventW`），Wine 原来什么也不写；`ReadEventLog`、计数、备份、清空都是桩，
+wevtapi（Vista 以来的事件日志 API）除了几个函数也是桩。规则都在 Windows 11 上量（`tools/startupgapsprobe` 的 `evtread`、
+`evtapi`、`evtquery`、`evtlimits`、`evtsub`、`evtrender`、`evtmsg`，第 88–113 批，全部只读），细则见探针 README 的“事件日志”。
+
+- **经典日志**（`886d72dfbf5`）：每个日志一个经典格式的文件（`system32\winevt\Logs\<日志>.evt`），所有进程共用，每次访问
+  前后一个命名互斥体，`NotifyChangeEventLog` 靠一个命名事件。来源写进同名的日志、键里列着它的日志，否则 Application。记录
+  的布局、读的移动、错误码照 Windows；清空后编号接着走；快超过 MaxSize 时丢最旧的。事件日志服务启动时写 6009、6005，停止时
+  写 6006，与 Windows 相同。Word 的那条事件进了 OAlerts。顺带：ntdll 给每个线程分 TLS 槽时跳过没有 TEB 或已退出的线程
+  （`9f4b719565b`，原来偶尔打一条 ERR）。
+- **netevent.dll**（`c262aad3d0d`）：事件日志服务各事件（6005、6006、6008、6009、6011、6013）的消息表，英文原文与简体中文翻译
+  （zh_CN.po），登记为 System 日志里 EventLog 来源的 `EventMessageFile`。
+- **wevtapi**（`cc575565116`）：建在经典日志之上。查询（通道、文件、结构化查询与 Suppress）、XPath（`band()`、`timediff()`、
+  `!=`、位置与 `position()`，括号 24 层、谓词 21 层、连接 23 项的上限）、`EvtNext`/`EvtSeek`、订阅（拉取与回调）、渲染（XML、
+  系统/用户/路径上下文）、书签、格式化（消息、级别、任务、关键字按发布者的语言，`RenderingInfo`）、日志信息、清空与导出、
+  通道枚举与通道配置、本机会话。几处 Windows 自己的怪规则照做了：位置作存在测试只看第一个元素；和数字比较时 `"10.00."`
+  不算 10；订阅里已有的事件不置信号、`EvtNext` 从不等待，说完没有之后再问是 `ERROR_INVALID_OPERATION`；渲染值时清零整个缓冲区；
+  上下文的路径成树，祖先路径后加是 87。没有照做的：位置配 `!=` `<` `>` 的结果（Windows 自相矛盾）；还有 5000 项的 `or` 查询
+  会让 Windows 的事件日志服务崩溃（量上限时在 winref 上撞到一次，服务停了约两分钟后由服务控制管理器重启；之后的探针都限在
+  小值）。
+
+还不一样的：经典记录里没有进程号与线程号，Wine 的 `Execution` 给 0（Windows 对别的进程报来的事件给那个进程号、线程号 0，
+服务自己的事件给服务的线程号）；日志文件路径是 `.evt` 不是 `.evtx`；通道只有经典日志；用户上下文里那张指针表的内容（Windows 的
+指向别处，Wine 指向缓冲区里的字符串）。wevtapi 测试在 Wine 上 387 项 0 失败，单独编成程序在 Windows 11 上 236 项 0 失败（第
+113 批，不含会写 HKLM 的通道配置测试）；各探针在 Wine 下的输出与 Windows 逐行对过，剩下的差别都是上面这些与数据本身
+（内部版本号、计算机名、事件条数）。
+
+Word 启动时剩下的 FIXME 只有 D3D10 接口仿真（`SwapDeviceContextState`）。

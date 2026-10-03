@@ -29,6 +29,13 @@ Word（Microsoft 365，16.0.20326）在 Wine 里启动一次，会打出几十�
 | `misc4` | `SetFileShortName` 与短名（自己在当前目录建文件、用完删除） | `misc4.win.txt` |
 | `comrel` | `CoDisconnectObject` 之后的 `CoReleaseMarshalData`、引用计数，ROT、拖放、GIT 的撤销与跨 apartment 取接口（只用自己的对象，ROT 登记用自己的项目名并撤销） | `comrel.win.txt` |
 | `misc5` | 堆扩展信息的各级别（Word 问 0x80000000）、Cookie 的 Secure/HttpOnly/SameSite（只用 `*.invalid` 域的会话 Cookie，结束时过期） | `misc5.win.txt` |
+| `evtread` | 经典事件日志：记录的布局、顺序读与定位读怎么移动、错误码，wevtapi 给经典事件的 XML 形状（字符串只给长度） | `evtread.win.txt` |
+| `evtapi` | wevtapi：查询的错误码、XPath 子集、结构化查询与 Suppress、渲染、格式化、日志信息、通道与通道配置 | `evtapi.win.txt` |
+| `evtquery` | 事件日志 XPath 的位置、位置上的 `!=` `<` `>`、数字与字符串的比较、存在测试（给各查询选中的条数相对总数） | `evtquery.win.txt` |
+| `evtlimits` | 查询能嵌套多深、能连多少项（小步逼近上限；5000 项的 `or` 会让 Windows 事件日志服务崩溃，不要加大） | `evtlimits.win.txt` |
+| `evtsub` | 订阅：已有的事件与信号、`EvtNext` 等不等、说完没有之后再问、信号谁来复位、回调在哪个线程 | `evtsub.win.txt` |
+| `evtrender` | `EvtRender` 把值放在缓冲区哪里（系统、用户、路径上下文，经典事件的字符串数组，二进制，写到多远），哪些路径组合建得成上下文 | `evtrender.win.txt` |
+| `evtmsg` | `EvtFormatMessage` 的消息、级别、任务、关键字（用户语言与英文、结尾 NUL）、按编号取消息、XML 的呈现部分；netevent.dll 里事件日志服务各事件的中英文消息 | `evtmsg.win.txt` |
 
 ## 事件跟踪（ETW）
 
@@ -112,3 +119,26 @@ Wine 原来的 `StartTrace` 什么也不做、返回成功，`EnableTraceEx2` �
   `SetInputScopeXML` 存为 [-4]；`TF_GetInputScope` 对无范围的窗口 `S_FALSE`，无效/已销毁窗口 `E_INVALIDARG`。
 - **签名目标**：自身无签名的进程用 `LOAD_LIBRARY_REQUIRE_SIGNED_TARGET` 装任何还没装过的库都是 577（即使是微软签名的），
   已装过的直接成功；相对名加 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` 是 87（KnownDLLs 例外，仍是 577）。
+
+## 事件日志
+
+`evtread`…`evtmsg` 量到、Wine 照做的规则（都只读；事件日志探针一律不调用 `ReportEvent`，查询保持在上限附近的小值）：
+
+- **经典日志**：记录里用户 SID 在计算机名之后的下一个 8 字节边界，字符串与数据紧随其后，整条补齐到 8 字节、末尾是长度；
+  顺序读从上次给出的那条接着读（两个方向都是），定位读从给的记录号开始，越界 87，读到头 38，放不下一条 122 并给所需大小；
+  清空后编号接着往上走。事件日志服务启动时写 6009（版本）与 6005，停止时写 6006。
+- **查询**：没有该通道 15007、没有该文件 2、两个路径标志都给 87、XPath 不给路径 15000，坏 XPath、不认识的函数、`not()` 都是
+  15001；支持 `band()`、`timediff()`、`!=`、`position()`，`band()` 的参数只能是路径或数字。位置比较时是那个位置上的元素，作存在
+  测试时只看第一个元素（`EventData[Data[1]]` 成立、`EventData[Data[2]]` 永不成立）；位置配 `!=` `<` `>` 的结果在 Windows 上
+  自相矛盾（同一事件 `Data[3]>29670` 假、`Data[3]>29671` 真），不照做。和数字比较时，整个是数字的字符串按数值比，其余按字符串
+  比（`"10.00."` 不等于 10）。括号最多 24 层、谓词最多 21 层、`or` 或 `and` 连起来的最多 23 项，超过即 15001。
+- **订阅**：订阅前已有的事件立刻就能用 `EvtNext` 取到，但不置信号；`EvtNext` 从不等待（timeout 给 `INFINITE` 也一样）；说完
+  `ERROR_NO_MORE_ITEMS` 之后、新事件来之前再问是 `ERROR_INVALID_OPERATION`；Windows 不复位信号；回调在订阅自己的线程上调用；
+  对回调订阅调 `EvtNext` 是 6，信号与回调同时给是 87。
+- **渲染**：每个值的数据从变体数组之后的下一个 8 字节边界放，总大小也补到 8 的倍数；系统上下文的字符串 Count 是字符数；
+  路径 `Event/EventData/Data` 是字符串数组（先指针表、字符串紧接其后），用户上下文把这个数组拆成单个值、仍留着指针表的位置、
+  Count 含结尾 NUL；二进制照给，非叶子元素是 Null；整个缓冲区都被清零（XML 只写用到的部分）。上下文的路径构成一棵树：后加的
+  元素路径若已在树里（重复，或是先前路径的祖先）建上下文 87，重复的属性路径第二个给 Null。
+- **格式化**：消息去掉末尾的 CRLF 后跟两个 NUL，级别、任务也是两个，关键字三个，按编号取的消息不填插入、两个 NUL；
+  XML 的 `RenderingInfo` 只有 Message、Level、Task、Keywords，`Culture` 随语言；没有发布者的消息 15027，Opcode、Channel、
+  Provider 15028。locale 0 用用户界面语言（winref 上是简体中文：信息、无、经典、错误、警告），0x409 是英文。
