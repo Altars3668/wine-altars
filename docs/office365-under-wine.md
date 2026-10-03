@@ -12167,3 +12167,16 @@ Office 用 D3D10.1 设备画（Word 载入 d3d10_1.dll），Direct2D 在它上�
   前面目录不存在就是“路径未找到”；`.` 在中间段是“路径未找到”（上游测试把这一种记作 broken，期望的是旧版 Windows 的
   “名称无效”）。照做之后 mfplat 全量 0 失败，ntdll 里链接目标中途带 `.`、kernel32 里删掉盘符定义后再打开这两条上游 todo 也通过了。
   UNC 服务器名带冒号（`\\file:\…`）随网络环境变（这台 Windows 是 64，上游测试机是 53），没动。
+
+## 前缀更新时冒出来的 FIXME，与 RoGetParameterizedTypeInstanceIID（2026-10-03，altars-up `c645e671272`）
+
+dist-up 换了 wine.inf 之后，第一次启动 Word 会先做前缀更新（`wineboot -u`），服务进程跟着重启，它们的 FIXME 也打进了 Word 的日志：
+`RpcServerRegisterIf3` 的安全描述符、mountmgr 伪造的存储设备属性、`CoInitializeSecurity`、`LoadUserProfileW`、RAS 枚举、
+`SystemLeapSecondInformation`、`BCryptGetFipsAlgorithmMode`、msxml 的 `NewParser` 与 `putref_schemas`，还有四个进程调用
+`RoGetParameterizedTypeInstanceIID`（桩，回 `E_NOTIMPL`）。之后正常冷启动 Word，一条 err/fixme 都没有。
+
+- **`RoGetParameterizedTypeInstanceIID`**：.NET 的 WinRT 互操作用它算 `IVector<String>` 这类参数化类型实例的 IID；上游和 CrossOver
+  都是桩。`tools/paramiidprobe` 在 Windows 11 上量了签名的写法、14 个基本类型、定位器被问到的顺序和各种错误（第 125 批），
+  combase 照做：签名在 WinRT 命名空间下做 SHA-1 得第 5 版 UUID（bcrypt 延迟导入），`RoParameterizedTypeExtraGetTypeSignature`、
+  `RoFreeParameterizedTypeExtra` 一并实现。新测试在 Windows 上 0 失败（第 126 批）。
+- 其余几条留在表里，按对 Office 的影响排后面处理。
