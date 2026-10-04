@@ -12,14 +12,41 @@
 
 /* 看门狗只结束本探针；超时不是测量成功。 */
 static HANDLE probe_stop_event, probe_watchdog_thread;
+static CRITICAL_SECTION probe_scene_cs;
+static BOOL probe_scene_active;
+static DWORD probe_scene_deadline;
+
+static inline void probe_scene_begin(DWORD timeout_ms)
+{
+    EnterCriticalSection(&probe_scene_cs);
+    probe_scene_deadline = GetTickCount() + timeout_ms;
+    probe_scene_active = TRUE;
+    LeaveCriticalSection(&probe_scene_cs);
+}
+
+static inline void probe_scene_end(void)
+{
+    EnterCriticalSection(&probe_scene_cs);
+    probe_scene_active = FALSE;
+    LeaveCriticalSection(&probe_scene_cs);
+}
 
 static DWORD WINAPI probe_watchdog(void *unused)
 {
+    DWORD begin = GetTickCount(), now;
+    BOOL scene_timeout;
     (void)unused;
-    if (WaitForSingleObject(probe_stop_event, 27000) == WAIT_TIMEOUT)
+    while (WaitForSingleObject(probe_stop_event, 100) == WAIT_TIMEOUT)
     {
-        printf("safety_timeout=1 exit=124\ndone\n");
-        ExitProcess(124);
+        now = GetTickCount();
+        EnterCriticalSection(&probe_scene_cs);
+        scene_timeout = probe_scene_active && (LONG)(now - probe_scene_deadline) >= 0;
+        LeaveCriticalSection(&probe_scene_cs);
+        if (scene_timeout || now - begin >= 27000)
+        {
+            printf("safety_timeout=1 scene_timeout=%u exit=124\ndone\n", scene_timeout);
+            ExitProcess(124);
+        }
     }
     return 0;
 }
@@ -27,6 +54,7 @@ static DWORD WINAPI probe_watchdog(void *unused)
 static inline BOOL probe_start(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    InitializeCriticalSection(&probe_scene_cs);
     probe_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (probe_stop_event)
         probe_watchdog_thread = CreateThread(NULL, 0, probe_watchdog, NULL, 0, NULL);
@@ -34,6 +62,7 @@ static inline BOOL probe_start(void)
     {
         printf("watchdog_setup_failed gle=%lu\ndone\n", GetLastError());
         if (probe_stop_event) CloseHandle(probe_stop_event);
+        DeleteCriticalSection(&probe_scene_cs);
         return FALSE;
     }
     return TRUE;
@@ -45,6 +74,7 @@ static inline int probe_done(int status)
     WaitForSingleObject(probe_watchdog_thread, 1000);
     CloseHandle(probe_watchdog_thread);
     CloseHandle(probe_stop_event);
+    DeleteCriticalSection(&probe_scene_cs);
     puts("done");
     return status;
 }

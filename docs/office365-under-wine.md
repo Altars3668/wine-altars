@@ -12179,4 +12179,5 @@ dist-up 换了 wine.inf 之后，第一次启动 Word 会先做前缀更新（`w
   都是桩。`tools/paramiidprobe` 在 Windows 11 上量了签名的写法、14 个基本类型、定位器被问到的顺序和各种错误（第 125 批），
   combase 照做：签名在 WinRT 命名空间下做 SHA-1 得第 5 版 UUID（bcrypt 延迟导入），`RoParameterizedTypeExtraGetTypeSignature`、
   `RoFreeParameterizedTypeExtra` 一并实现。新测试在 Windows 上 0 失败（第 126 批）。
-- 其余几条留在表里，按对 Office 的影响排后面处理。
+- 当时其余几条还未实现；同日后续原生测量、权限根因、三组修复和真实应用回归见
+  [Office 前缀更新诊断：原生验证与修复](office-prefixupdate-20261003.md)，不要将此处历史状态当成当前待办。
