@@ -145,11 +145,19 @@ entityrefs、valuespaces 三段现在除 reason 原文外与 Windows 完全一�
 在中文环境下跑探针，reasons、epilog、validation、entityrefs、valuespaces 各段的 reason 与 Windows 逐字相同；只剩
 E_FAIL 等四条系统消息是 Wine 全局的中文译法（见探针 README）。
 
-## 12. 还没做的
+## 12. 设了边框色的圆角窗口的角上像素
+
+| 提交 | 内容 |
+|---|---|
+| `c883cf11f07` | winex11：阴影窗口在被形状去掉的角上像素里按覆盖比例画窗口的边框色、叠在阴影上 |
+| `9c0fe75bb77` | win32u：设了边框色的圆角窗口把角上部分在外的像素都留给驱动画（它们都在边框圆弧上） |
+
+dwmframe 探针在 Xvfb + xcompmgr 上与 Windows 比：round-616161、round-red、layered-roundsmall-616161（Office 下拉面板的设置）
+连角上一圈的最大差由 55、53、39 降到 4、7、3。
+
+## 13. 还没做的
 
 - msxml 的 `IMarshal`（自由线程封送器）：有意不做，见上。
 - 系统消息的中文措辞：E_FAIL、E_OUTOFMEMORY、E_INVALIDARG、E_ACCESSDENIED 等是 Wine 全局译法，与 Windows 不同，涉及所有程序，没有改。
-- 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
-- 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
-- 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
+- `DWMWA_COLOR_NONE` 的圆角窗口角上几个抗锯齿像素：内容的颜色驱动不知道，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
 - 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
