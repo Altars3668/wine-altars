@@ -180,6 +180,20 @@ static void keys_of_iterable( const char *label, IIterable_IKeyValuePair_HSTRING
     IIterator_IKeyValuePair_HSTRING_IJsonValue_Release( iterator );
 }
 
+/* the keys of an object as its iterator hands them out, on one line */
+static void keys_only( const char *label, IJsonObject *object )
+{
+    IIterable_IKeyValuePair_HSTRING_IJsonValue *iterable;
+
+    if (FAILED(IJsonObject_QueryInterface( object, &IID_IIterable_IKeyValuePair_HSTRING_IJsonValue, (void **)&iterable )))
+    {
+        printf( "%s: no IIterable\n", label );
+        return;
+    }
+    keys_of_iterable( label, iterable );
+    IIterable_IKeyValuePair_HSTRING_IJsonValue_Release( iterable );
+}
+
 static void keys( const char *label, IJsonObject *object )
 {
     IIterable_IKeyValuePair_HSTRING_IJsonValue *iterable;
@@ -398,6 +412,7 @@ static void errors(void)
             if (got && got != SENTINEL) IJsonValue_Release( got );
             /* does the view follow the object? */
             set_number( object, L"v", 9 );
+            size = 0xdeadbeef;
             hr = IMapView_HSTRING_IJsonValue_get_Size( view, &size );
             printf( "view size after a later insertion: %#lx %u\n", hr, size );
             IMapView_HSTRING_IJsonValue_Release( view );
@@ -1064,6 +1079,87 @@ static void split(void)
     }
 }
 
+/* the iteration order of bigger objects: how the hash table behind it grows and shrinks */
+static void hash_order(void)
+{
+    static const unsigned int sizes[] = { 16, 17, 18, 19, 20, 24, 25, 26, 33, 34, 35, 36, 37, 40, 50, 51, 52,
+                                          60, 70, 71, 72, 73, 100, 150, 200, 300, 500 };
+    IMap_HSTRING_IJsonValue *map;
+    IJsonObject *object;
+    unsigned int i, k;
+    char label[64];
+
+    printf( "== hash order\n" );
+    for (k = 0; k < ARRAY_SIZE(sizes); k++)
+    {
+        if (!(object = activate( L"Windows.Data.Json.JsonObject", &IID_IJsonObject ))) return;
+        for (i = 0; i < sizes[k]; i++)
+        {
+            WCHAR name[8];
+            swprintf( name, ARRAY_SIZE(name), L"k%u", i );
+            set_number( object, name, i );
+        }
+        sprintf( label, "%u names k0.. in order, iterated", sizes[k] );
+        keys_only( label, object );
+        IJsonObject_Release( object );
+    }
+
+    /* 40 names, then 30 of them removed, then 5 added: does it shrink? */
+    if (!(object = activate( L"Windows.Data.Json.JsonObject", &IID_IJsonObject ))) return;
+    for (i = 0; i < 40; i++)
+    {
+        WCHAR name[8];
+        swprintf( name, ARRAY_SIZE(name), L"k%u", i );
+        set_number( object, name, i );
+    }
+    if (SUCCEEDED(IJsonObject_QueryInterface( object, &IID_IMap_HSTRING_IJsonValue, (void **)&map )))
+    {
+        for (i = 0; i < 30; i++)
+        {
+            WCHAR name[8];
+            HSTRING str;
+            swprintf( name, ARRAY_SIZE(name), L"k%u", i );
+            str = hs( name );
+            IMap_HSTRING_IJsonValue_Remove( map, str );
+            WindowsDeleteString( str );
+        }
+        keys_only( "40 names, k0..k29 removed, iterated", object );
+        for (i = 40; i < 45; i++)
+        {
+            WCHAR name[8];
+            swprintf( name, ARRAY_SIZE(name), L"k%u", i );
+            set_number( object, name, i );
+        }
+        keys_only( "then k40..k44 added, iterated", object );
+        IMap_HSTRING_IJsonValue_Clear( map );
+        set_number( object, L"b", 1 );
+        set_number( object, L"a", 2 );
+        set_number( object, L"c", 3 );
+        keys_only( "cleared, then b a c, iterated", object );
+        IMap_HSTRING_IJsonValue_Release( map );
+    }
+    IJsonObject_Release( object );
+
+    /* the same names through Parse, in the reverse order */
+    {
+        WCHAR text[1024], *p = text;
+        HRESULT hr;
+        HSTRING str;
+
+        p += swprintf( p, 8, L"{" );
+        for (i = 20; i-- > 0;) p += swprintf( p, 16, L"\"k%u\":0%s", i, i ? L"," : L"" );
+        swprintf( p, 4, L"}" );
+        str = hs( text );
+        hr = IJsonObjectStatics_Parse( object_statics, str, &object );
+        WindowsDeleteString( str );
+        if (SUCCEEDED(hr))
+        {
+            keys_only( "parsed k19..k0, iterated", object );
+            IJsonObject_Release( object );
+        }
+    }
+}
+
 int main(void)
 {
     RoInitialize( RO_INIT_MULTITHREADED );
@@ -1083,6 +1179,7 @@ int main(void)
     statuses();
     more();
     split();
+    hash_order();
 
     fflush( stdout );
     return 0;
