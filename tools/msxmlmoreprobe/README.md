@@ -24,7 +24,7 @@ msxmlmore [interfaces] [reasons] [pending] [blocks] [entities] [epilog] [validat
 | entityrefs | 实体引用的更多细节：DTD 里实体节点的子节点、text、xml；空白与 xml:space；属性里的引用；哪些修改被拒；克隆；XPath 与 XSL 模式下的选择；经引用的校验；实体文本里的错误 |
 | valuespaces | normalize 合并什么；node() 里有没有 DOCTYPE；属性与文本的值和 text 的空白；resolveExternals 的默认值与外部实体的加载；外部实体与 notation 的标识与 xml |
 
-## 结论（Windows 11 29671，results/windows-29671.txt；Wine 为 results/wine-def826471c0.txt）
+## 结论（Windows 11 29671，results/windows-29671.txt；Wine 为 results/wine-8730e9538e4.txt，在 `LANG=zh_CN.UTF-8` 下跑，与 winref 的界面语言一致）
 
 接口：
 - MSXML 3.0 与自由线程 3.0 **不提供** `IXMLDOMDocument3`，6.0 提供（altars-up `37ad0e3e213` 照此实现，3.0 文档的 IDispatch
@@ -49,8 +49,13 @@ msxmlmore [interfaces] [reasons] [pending] [blocks] [entities] [epilog] [validat
   其余文本报在开头。
 - 不在开头的 XML 声明（序言里注释之后、正文里、根元素之后都一样）：`<?xml ` 是 `0xC00CE557`（报在名字上），`<?xml?>`
   是 `0xC00CE507`（报在名字后），`<?XML` 是 `0xC00CE576`（`7d7e2f14ce6`）；`<?xml-stylesheet ...?>` 正常。
-- reason 是带参数的中文原文，如“结束标记 'b' 与开始标记 'a' 不匹配。”；非 XML 的错误用系统消息（“未指定的错误”“拒绝访问。”）。
-  3.0 与 6.0 措辞略有不同。Wine 仍是英文、不带参数，个别是 “error”——还没做。
+- reason 是带参数的中文原文，如“结束标记 'b' 与开始标记 'a' 不匹配。”，以 `\r\n` 结尾；3.0 与 6.0 的措辞多处不同
+  （“属性重复。”/“重复属性。”、引号“x”/'x'），6.0 的校验错误还点出元素名（“根据父元素 'r' 的内容模型，元素 'b' 为意外元素。”），
+  破坏内容模型的再加一行“预期: a。”（6.0 “要求: a。”，内容不完整时只有 6.0 加）。6.0 对已加载文档 validate() 时根元素名不符
+  的 reason 是空串。altars-up `8730e9538e4` 照此实现：消息表新增 3.0、6.0 两套（英文相同而中文不同的用 wmc 的
+  `#msgctxt#msxml6#` 区分），读取器与校验记下名字交给 DOM，中文取自 Windows。非 XML 的错误用系统消息：Wine 原来没有
+  E_ABORT、STG_E_ACCESSDENIED 的消息（`ace9661e905` 补上）；E_FAIL、E_OUTOFMEMORY、E_INVALIDARG、E_ACCESSDENIED 的中文是
+  Wine 全局的译法（“调用失败。”“访问被拒绝。”…），与 Windows（“未指定的错误”“拒绝访问。”…）不同，没有改。
 - 流读失败时 load 返回 `S_FALSE`，唯独 `E_ACCESSDENIED`（0x80070005）直接返回该错误（`bc4d55d3ccb`）。
 
 DTD 校验（altars-up `72207003cd2`、`e7a811081f3`、`452c34eb44f`）：Windows 边读边校验，报遇到的第一个错误，位置就是它的

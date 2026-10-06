@@ -135,9 +135,19 @@ DWM 阴影：第 169 批在白、灰、黑三种背景上截了 64 px 边距的�
 entityrefs、valuespaces 三段现在除 reason 原文外与 Windows 完全一致（entities 原来差 268 行）。msxml3 全部测试 0 失败
 （domdoc 46410 项，新增约 570 项，全部取自 Windows 实测）。
 
-## 11. 还没做的
+## 11. msxml 的 reason 原文
+
+| 提交 | 内容 |
+|---|---|
+| `ace9661e905` | kernelbase：补上 E_ABORT、STG_E_ACCESSDENIED 的系统消息（Windows 有，Wine 的 FormatMessage 找不到） |
+| `8730e9538e4` | msxml3：加载出错的 reason 按版本措辞、点出名字，内容模型出错时加“预期/要求”一行；中文逐字取自 Windows |
+
+在中文环境下跑探针，reasons、epilog、validation、entityrefs、valuespaces 各段的 reason 与 Windows 逐字相同；只剩
+E_FAIL 等四条系统消息是 Wine 全局的中文译法（见探针 README）。
+
+## 12. 还没做的
 
 - msxml 的 `IMarshal`（自由线程封送器）：有意不做，见上。
-- reason 原文：Windows 是带参数的中文，Wine 是英文、不带参数（msxml3 的消息表只有英文）。
+- 系统消息的中文措辞：E_FAIL、E_OUTOFMEMORY、E_INVALIDARG、E_ACCESSDENIED 等是 Wine 全局译法，与 Windows 不同，涉及所有程序，没有改。
 - 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
 - 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
