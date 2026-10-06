@@ -1,64 +1,64 @@
 #!/usr/bin/python3 -I
-"""manualduplex - CUPS backend: print on both sides with a printer that cannot.
+"""manualduplex - CUPS pre-filter: print on both sides with a printer that cannot.
 
-Device URI:   manualduplex:/<queue>[?slot=<InputSlot>]
+Installed as /usr/lib/cups/filter/manualduplex and named in the queue's PPD
+(see mkppd.py):
 
-<queue> is the CUPS queue that really prints (an IPP Everywhere queue for the
-printer).  The queue using this backend is a front for it: its PPD is the real
-one plus a Duplex option and a PDF pass-through (see mkppd.py), so native
-programs offer "two-sided, long edge / short edge", and its pdftopdf has
-already done the layout (n-up, page ranges, scaling, orientation) by the time
-the job gets here as a PDF of sheet sides.
+    *cupsPreFilter: "application/vnd.cups-pdf 0 manualduplex"
 
-A one-sided job is passed on to <queue> as it is.  A two-sided job becomes the
-same pair of jobs Wine's print processor sends for a printer without a
-duplexer (wineps.drv, printproc.c: PrintDocumentOnPrintProcessor), so the two
-paths cannot disagree about what ends up on paper:
+cupsd then runs it between pdftopdf and the rasteriser, on the PDF of sheet
+sides pdftopdf has made: page ranges, n-up, scaling, orientation and copies
+are already applied, and for a two-sided job with more than one copy pdftopdf
+has collated them and given each copy an even number of sides.
 
-  1.  page-set=odd                                  the fronts, first to last
-  2.  page-set=even outputorder=reverse             the backs, last to first,
-      InputSlot=<slot> (Manual)                     through the manual feeder
+The queue stays the printer's only queue.  Its PPD has a Duplex option, so
+Edge/Chromium, GTK, LibreOffice and Word under Wine offer "two-sided, long
+edge / short edge".  A one-sided job passes through.  A two-sided job is
+printed the way Wine's print processor prints manual duplex for a printer
+without a duplexer (wineps.drv, printproc.c), as two jobs:
+
+  1.  this job: the fronts, sides 1, 3, 5, ...         passed on from here
+  2.  a new job on the same queue: all sides again,     queued from here
+      page-set=even outputorder=reverse InputSlot=Manual,
+      turned 180 degrees for binding on the long edge
 
 What makes it work is the printer, not this program.  The second job asks for
 media-source=manual (the ipp backend maps InputSlot=Manual through the PPD),
 and the printer holds it at its own "load paper" prompt -- the green arrow --
-until the stack is back in the tray and the button is pressed.
+until the stack is back in the tray and the button is pressed.  It is queued
+at the highest priority, so the backs come straight after their fronts even
+when other jobs are waiting.
 
 The stack comes out face down and goes back in as it came out, moved and not
 turned over or round.  So the sheet printed last is on top and is fed first:
 the backs go in reverse order, and with an odd number of sides pdftopdf makes
-the "even" half up with a blank page, which the reversal puts first, on the
+the "even" half up with a blank one, which the reversal puts first, on the
 sheet that has no back.  And the edge that left the printer first goes back
 in last, so a back printed as it is lines up with its front for binding on
 the short edge; binding on the long edge needs the backs turned 180 degrees,
-which is done here on the PDF (qpdf --rotate) before the real queue lays the
-pages on the sheet -- so it holds for landscape pages too.
+which is done here on the PDF -- so it holds for landscape pages too.
 
-Copies and collation go to both jobs, as Wine does, so the real queue repeats
-each half the same way and the halves still meet sheet for sheet.  A job of
-a single side has no back and is printed as a one-sided job.
+The job's own sides/Duplex options still reach the backend.  The ipp backend
+asks the printer with Validate-Job first, the printer answers that two-sided
+is not supported, and the backend sends the fronts one-sided.  The Duplex
+choices in the PPD carry no PostScript, so the raster says one-sided as well.
 
-Needs qpdf and lp.  Runs as the unprivileged CUPS user (install it 0755).
+Needs qpdf and lp.  Runs as the unprivileged CUPS user.
 """
-import os, re, signal, subprocess, sys, tempfile
-from urllib.parse import unquote, urlsplit, parse_qs
+import os, re, shutil, signal, subprocess, sys, tempfile
 
-CUPS_BACKEND_OK, CUPS_BACKEND_FAILED, CUPS_BACKEND_CANCEL = 0, 1, 5
+MARK = "manualduplex-pass"          # tags the backs job this filter queues
 
-# The paper and the print engine: these describe how the real queue should
-# print, so they go to it.  Everything else -- n-up, page ranges, scaling,
-# orientation, mirroring, page-set -- pdftopdf on this queue has already
-# applied, and must not be applied twice.
+# The paper and the print engine: these describe how the backs should be
+# printed, so they go to the second job.  Everything else -- n-up, page
+# ranges, scaling, orientation, mirroring, copies -- pdftopdf has applied to
+# the sides this filter sees, and must not be applied twice.
 FORWARD = {
     "PageSize", "PageRegion", "media", "MediaType", "media-type",
-    "InputSlot", "media-source",
     "ColorModel", "print-color-mode", "output-mode",
     "cupsPrintQuality", "print-quality", "Resolution", "printer-resolution",
     "print-content-optimize", "OutputBin", "output-bin",
-    "collate", "Collate", "multiple-document-handling",
 }
-SOURCE = {"InputSlot", "media-source"}
-MARK = "manualduplex-pass"          # tags the jobs this backend submits
 
 
 def log(level, msg):
@@ -156,120 +156,94 @@ def qpdf(*args):
     return r.stdout
 
 
-def submit(target, user, title, copies, opts, path, label):
-    cmd = ["lp", "-d", target, "-U", user, "-t", title, "-n", str(copies)]
-    for name, value in opts.items():
+def queue_backs(printer, user, title, opts, path):
+    """Queue the second pass on this printer, owned by the job's user."""
+    o = {k: v for k, v in opts.items() if k in FORWARD}
+    o.update({"InputSlot": "Manual", "page-set": "even", "outputorder": "reverse",
+              "sides": "one-sided", MARK: "2"})
+    cmd = ["lp", "-d", printer, "-U", user, "-t", "%s (2/2)" % title, "-n", "1", "-q", "100"]
+    for name, value in o.items():
         cmd += ["-o", option_arg(name, value)]
     cmd.append(path)
-    log("DEBUG", "%s: %s" % (label, " ".join(cmd)))
+    log("DEBUG", "manualduplex: %s" % " ".join(cmd))
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
-        raise RuntimeError("lp (%s): %s" % (label, (r.stderr or r.stdout).strip()))
+        raise RuntimeError("lp: %s" % (r.stderr or r.stdout).strip())
     m = re.search(r"request id is (\S+)", r.stdout)
     return m.group(1) if m else "?"
 
 
+def send(path):
+    with open(path, "rb") as f:
+        shutil.copyfileobj(f, sys.stdout.buffer, 1 << 20)
+    sys.stdout.buffer.flush()
+
+
 def main(argv):
-    if len(argv) == 1:
-        # device discovery: nothing to discover, queues name their target
-        print('direct manualduplex "Unknown" "Manual duplex via another queue"')
-        return CUPS_BACKEND_OK
     if len(argv) not in (6, 7):
         log("ERROR", "usage: manualduplex job-id user title copies options [file]")
-        return CUPS_BACKEND_FAILED
-
+        return 1
     job_id, user, title, copies, options = argv[1:6]
-    uri = urlsplit(os.environ.get("DEVICE_URI", ""))
-    target = unquote(uri.path.strip("/")) or unquote(uri.netloc)
-    slot = parse_qs(uri.query).get("slot", ["Manual"])[0]
-    if not target:
-        log("ERROR", "DEVICE_URI names no queue (manualduplex:/<queue>)")
-        return CUPS_BACKEND_FAILED
-    if target == os.environ.get("PRINTER"):
-        log("ERROR", "manualduplex: %s points at itself" % target)
-        return CUPS_BACKEND_FAILED
-    try:
-        copies = max(int(copies), 1)
-    except ValueError:
-        copies = 1
     opts = parse_options(options)
-    log("DEBUG", "manualduplex: target %s, copies %d, options %s" % (target, copies, options))
+    mode = duplex_mode(opts)
+    printer = os.environ.get("PRINTER", "")
 
-    tmpdir = os.environ.get("TMPDIR") or tempfile.gettempdir()
-    work = tempfile.mkdtemp(prefix="manualduplex-%s-" % job_id, dir=tmpdir)
-    signal.signal(signal.SIGTERM, lambda *a: sys.exit(CUPS_BACKEND_FAILED))
+    work = tempfile.mkdtemp(prefix="manualduplex-%s-" % job_id,
+                            dir=os.environ.get("TMPDIR") or None)
+    # cupsd stops a cancelled job with SIGTERM: leave through the finally
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     try:
         if len(argv) == 7:
             doc = argv[6]
         else:
             doc = os.path.join(work, "job.pdf")
             with open(doc, "wb") as f:
-                while True:
-                    chunk = sys.stdin.buffer.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+                shutil.copyfileobj(sys.stdin.buffer, f, 1 << 20)
 
-        base = {k: v for k, v in opts.items() if k in FORWARD}
-        mode = duplex_mode(opts)
+        if not mode or MARK in opts:
+            send(doc)
+            return 0
         with open(doc, "rb") as f:
-            is_pdf = b"%PDF-" in f.read(1024)
-
-        sides = None
-        if mode and not is_pdf:
-            log("WARNING", "manualduplex: the job is not a PDF (raw?), printing it one-sided as it is")
-        elif mode and MARK not in opts:
-            try:
-                sides = int(qpdf("--show-npages", doc).strip())
-            except (RuntimeError, ValueError) as e:
-                log("WARNING", "manualduplex: cannot count the pages (%s), printing one-sided" % e)
-
-        if not mode or sides is None or sides < 2:
-            # Nothing to turn over: one job, as it came.
-            if mode and sides == 1:
-                log("INFO", "Only one page: nothing to print on the back")
-            o = dict(base)
-            o[MARK] = "0"
-            if not is_pdf:
-                o["raw"] = "true"
-            jid = submit(target, user, title, copies, o, doc, "one-sided")
-            log("INFO", "Sent to %s as %s" % (target, jid))
-            return CUPS_BACKEND_OK
-
-        backs = doc
-        if mode == "long":
-            backs = os.path.join(work, "backs.pdf")
-            qpdf("--rotate=+180", doc, backs)
-
-        front = dict(base)
-        front["page-set"] = "odd"
-        front[MARK] = "1"
-        back = {k: v for k, v in base.items() if k not in SOURCE}
-        back["InputSlot"] = slot
-        back["page-set"] = "even"
-        back["outputorder"] = "reverse"
-        back[MARK] = "2"
-
-        sheets = (sides + 1) // 2
-        j1 = submit(target, user, "%s (1/2)" % title, copies, front, doc, "fronts")
+            if b"%PDF-" not in f.read(1024):
+                log("WARNING", "manualduplex: the job is not a PDF, printing it one-sided")
+                send(doc)
+                return 0
+        if not printer:
+            log("WARNING", "manualduplex: PRINTER is not set, printing one-sided")
+            send(doc)
+            return 0
         try:
-            j2 = submit(target, user, "%s (2/2)" % title, copies, back, backs, "backs")
+            sides = int(qpdf("--show-npages", doc).strip())
+        except (RuntimeError, ValueError) as e:
+            log("WARNING", "manualduplex: cannot count the sides (%s), printing one-sided" % e)
+            send(doc)
+            return 0
+        if sides < 2:
+            log("INFO", "Only one page: nothing to print on the back")
+            send(doc)
+            return 0
+
+        try:
+            fronts = os.path.join(work, "fronts.pdf")
+            qpdf(doc, "--pages", ".", "1-z:odd", "--", fronts)
+            backs = doc
+            if mode == "long":
+                backs = os.path.join(work, "backs.pdf")
+                qpdf("--rotate=+180", doc, backs)
+            jid = queue_backs(printer, user, title, opts, backs)
         except RuntimeError as e:
-            # Not FAILED: with the usual retry-job error policy that would
-            # queue the fronts a second time.
-            log("ERROR", "manualduplex: %s; the fronts are queued as %s, cancel that by hand" % (e, j1))
-            return CUPS_BACKEND_CANCEL
-        log("INFO", "%d sheet(s), %s edge: fronts %s, backs %s through the manual feeder. "
-                    "Put the printed stack back in the tray as it came out and press the button "
-                    "when the printer asks" % (sheets, mode, j1, j2))
-        return CUPS_BACKEND_OK
-    except RuntimeError as e:
-        log("ERROR", "manualduplex: %s" % e)
-        return CUPS_BACKEND_FAILED
+            # Better every page on one side than half the document.
+            log("ERROR", "manualduplex: %s; printing all pages one-sided" % e)
+            send(doc)
+            return 0
+
+        log("INFO", "%d sheet(s): printing the fronts; the backs follow as job %s through "
+                    "the manual feeder. Put the printed stack back in the tray as it came out "
+                    "and press the button when the printer asks" % ((sides + 1) // 2, jid))
+        send(fronts)
+        return 0
     finally:
-        for name in os.listdir(work):
-            os.unlink(os.path.join(work, name))
-        os.rmdir(work)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

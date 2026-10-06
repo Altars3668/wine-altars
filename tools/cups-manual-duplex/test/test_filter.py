@@ -1,7 +1,7 @@
 #!/usr/bin/python3
-"""Unit checks for the manualduplex backend's own logic (no CUPS needed).
+"""Unit checks for the manualduplex filter's own logic (no CUPS needed).
 
-    python3 -I test/test_backend.py
+    python3 -I test/test_filter.py
 """
 import importlib.machinery, importlib.util, os, sys
 
@@ -20,7 +20,7 @@ def check(what, got, want):
     else:
         print("ok   %s" % what)
 
-# The option strings cupsd hands a backend, parsed as cupsParseOptions() does.
+# The option strings cupsd hands a filter, parsed as cupsParseOptions() does.
 check("plain", md.parse_options("PageSize=A4 sides=two-sided-long-edge"),
       {"PageSize": "A4", "sides": "two-sided-long-edge"})
 check("booleans", md.parse_options("collate nofit-to-page"),

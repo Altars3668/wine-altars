@@ -1,22 +1,23 @@
 #!/bin/bash
-# uninstall.sh - remove a queue made by install.sh, and the backend once
-# nothing uses it.
+# uninstall.sh - put back the queue install.sh changed, and remove the
+# filter once no queue uses it.
 #
-#   uninstall.sh [--name NAME] [--keep-backend]
+#   uninstall.sh [--target QUEUE] [--keep-filter]
 #
-# NAME defaults to the one install.sh recorded (if there is just one).  If
-# install.sh made NAME the system default, the old default comes back.  Only
-# queues whose device is manualduplex: are touched; the real queue never is.
+# QUEUE defaults to the one install.sh recorded (if there is just one).  Its
+# original PPD and device URI come back from ~/.local/state/cups-manual-duplex/.
+# cups-browsed may then make a queue of its own for the printer again, as it
+# did before.
 set -euo pipefail
 unset -f grep 2>/dev/null || true
-backend=/usr/lib/cups/backend/manualduplex
+filter=/usr/lib/cups/filter/manualduplex
 state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/cups-manual-duplex
 
-name=; keep_backend=0
+target=; keep_filter=0
 while [ $# -gt 0 ]; do
     case $1 in
-        --name) name=$2; shift 2 ;;
-        --keep-backend) keep_backend=1; shift ;;
+        --target) target=$2; shift 2 ;;
+        --keep-filter) keep_filter=1; shift ;;
         -h|--help) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option $1" >&2; exit 1 ;;
     esac
@@ -24,47 +25,40 @@ done
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
+converted() {   # converted <queue>: its PPD is one mkppd.py made
+    curl -fsS "http://localhost:631/printers/$1.ppd" 2>/dev/null | grep -q '^\*% manualduplex:'
+}
 
-if [ -z "$name" ]; then
-    mapfile -t recorded < <(ls "$state_dir"/*.env 2>/dev/null)
-    [ ${#recorded[@]} = 1 ] || die "say which queue: --name NAME (recorded: ${#recorded[@]})"
-    name=$(sed -n 's/^NAME=//p' "${recorded[0]}")
+if [ -z "$target" ]; then
+    mapfile -t recorded < <(grep -l '^TARGET=' "$state_dir"/*.env 2>/dev/null)
+    [ ${#recorded[@]} = 1 ] || die "say which queue: --target QUEUE (recorded: ${#recorded[@]})"
+    target=$(sed -n 's/^TARGET=//p' "${recorded[0]}")
 fi
 
-OLD_DEFAULT=; MADE_DEFAULT=0
-if [ -f "$state_dir/$name.env" ]; then
-    while IFS='=' read -r key value; do
-        case $key in
-            OLD_DEFAULT) OLD_DEFAULT=$value ;;
-            MADE_DEFAULT) MADE_DEFAULT=$value ;;
-        esac
-    done < "$state_dir/$name.env"
-fi
-
-if lpstat -v "$name" > /dev/null 2>&1; then
-    case "$(lpstat -v "$name")" in
-        *": manualduplex:"*) ;;
-        *) die "$name is not a manual-duplex queue; not touching it" ;;
-    esac
-    current=$(lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')
-    if [ "$current" = "$name" ] && [ "$MADE_DEFAULT" = 1 ] && [ -n "$OLD_DEFAULT" ] &&
-       lpstat -v "$OLD_DEFAULT" > /dev/null 2>&1; then
-        say "system default back to $OLD_DEFAULT"
-        lpadmin -d "$OLD_DEFAULT"
+if converted "$target"; then
+    orig_uri=$(sed -n 's/^ORIG_URI=//p' "$state_dir/$target.env" 2>/dev/null || true)
+    [ -n "$orig_uri" ] && [ -f "$state_dir/$target.ppd" ] ||
+        die "the original PPD or device URI of $target is not in $state_dir"
+    say "queue $target: back to $orig_uri and its original PPD"
+    if ! out=$(lpadmin -p "$target" -v "$orig_uri" -P "$state_dir/$target.ppd" 2>&1); then
+        die "lpadmin failed: $out"
     fi
-    say "removing queue $name"
-    lpadmin -x "$name"
+    printf '%s\n' "$out" | grep -v -e 'Printer drivers are deprecated' -e '^$' >&2 || true
 else
-    say "no queue $name"
+    say "$target is not converted; nothing to put back"
 fi
-rm -f "$state_dir/$name.env"
+rm -f "$state_dir/$target.env"
 
-if [ $keep_backend = 0 ] && [ -e "$backend" ]; then
-    if lpstat -v 2>/dev/null | grep -q ': manualduplex:'; then
-        say "backend kept: other queues still use it"
+if [ $keep_filter = 0 ] && [ -e "$filter" ]; then
+    used=0
+    for q in $(lpstat -v 2>/dev/null | awk '{ n = $3; sub(/:$/, "", n); print n }'); do
+        if converted "$q"; then used=1; fi
+    done
+    if [ $used = 1 ]; then
+        say "filter kept: other queues still use it"
     else
-        say "removing $backend (sudo)"
-        sudo rm -f "$backend" || die "could not remove it; run: sudo rm -f $backend"
+        say "removing $filter (sudo)"
+        sudo rm -f "$filter" || die "could not remove it; run: sudo rm -f $filter"
     fi
 fi
 say "done"

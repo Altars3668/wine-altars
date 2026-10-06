@@ -8,7 +8,8 @@ edge, starting at the top-left corner) back out of the raster a printer gets.
 For each page it prints the page number, the sheet corner nearest the first
 square -- that corner is where the top-left of the page landed on the sheet --
 and the media position the raster header asks for (4 is the manual feeder in
-the PPDs CUPS generates).
+the PPDs CUPS generates).  --duplex prints instead the duplex mode each page
+header asks for (1 is one-sided).
 
   TL  upright                      BR  turned 180 degrees
   TR / BL  turned a quarter, as landscape pages are put on portrait sheets
@@ -27,7 +28,7 @@ def pages(path):
     pos = 12
     while pos + 32 <= len(d):
         hdr = d[pos:pos + 32]
-        bpp, position = hdr[0], hdr[5]
+        bpp, duplex, position = hdr[0], hdr[2], hdr[5]
         w, h, dpi = struct.unpack(">III", hdr[12:24])
         pos += 32
         bpc = max(bpp // 8, 1)
@@ -59,7 +60,7 @@ def pages(path):
                 for yy in range(y, min(y + rep, h)):
                     rows[yy] = runs
             y += rep
-        yield w, h, dpi, position, rows
+        yield w, h, dpi, position, rows, duplex
 
 def blobs(rows):
     """Connected dark regions, as bounding boxes with their pixel counts."""
@@ -118,7 +119,7 @@ def describe(w, h, dpi, rows):
 
 def summary(path):
     out = []
-    for w, h, dpi, position, rows in pages(path):
+    for w, h, dpi, position, rows, _ in pages(path):
         n, corner = describe(w, h, dpi, rows)
         out.append(("b" if n is None else "%d@%s" % (n, corner), position, w, h, dpi))
     return out
@@ -126,6 +127,10 @@ def summary(path):
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     short = "--short" in sys.argv
+    if "--duplex" in sys.argv:
+        for path in args:
+            print(" ".join(sorted({str(p[5]) for p in pages(path)})))
+        sys.exit(0)
     for path in args:
         res = summary(path)
         if short:

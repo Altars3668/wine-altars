@@ -1,34 +1,38 @@
 #!/bin/bash
-# install.sh - a two-sided CUPS queue for a printer without a duplexer.
+# install.sh - two-sided printing on a printer without a duplexer, on its own queue.
 #
-#   install.sh [--target QUEUE] [--name NAME] [--info TEXT] [--default]
+#   install.sh [--target QUEUE] [--uri DEVICE-URI]
 #
-# Creates a new queue NAME (default: Duplex_<QUEUE>) in front of the real
-# queue QUEUE (default: the system default).  Native programs -- Edge,
-# Chromium, GTK, LibreOffice -- then offer two-sided printing, long or short
-# edge, on NAME; a two-sided job there becomes two jobs on QUEUE, the second
-# through the manual feeder, exactly as Wine prints manual duplex (see
-# README.md).  QUEUE itself is not changed, so Wine and anything else that
-# prints to it behave as before.
+# Changes QUEUE (default: the system default) in place.  Its PPD gets a
+# Duplex option and the manualduplex pre-filter (mkppd.py): Edge, Chromium,
+# GTK, LibreOffice and Word under Wine then offer two-sided printing, long or
+# short edge, and a two-sided job prints the fronts, then the backs through
+# the manual feeder, exactly as Wine prints manual duplex (see README.md).
+# The name, paper, trays, defaults and description of the queue stay.
 #
-#   --default   also make NAME the system default (uninstall.sh puts back
-#               the old one)
+# Its device URI becomes the printer's dnssd:// address (or DEVICE-URI).
+# With it, cups-browsed and libcups know that this queue is that printer:
+# cups-browsed makes no queue of its own for it, and print dialogs do not list
+# it a second time from the network.  One printer is shown as one printer.
 #
-# Needs sudo once, to put the backend in /usr/lib/cups/backend; the queue is
-# made with lpadmin, which the lpadmin group may use.  Undo: uninstall.sh.
+# An earlier version of this tool made a second queue in front of QUEUE;
+# that queue and its backend are removed.
+#
+# Needs sudo once, to put the filter in /usr/lib/cups/filter.  The original
+# PPD and device URI are kept in ~/.local/state/cups-manual-duplex/; undo
+# with uninstall.sh.
 set -euo pipefail
 unset -f grep 2>/dev/null || true
 here=$(cd "$(dirname "$0")" && pwd)
-backend_dir=/usr/lib/cups/backend
+filter=/usr/lib/cups/filter/manualduplex
+old_backend=/usr/lib/cups/backend/manualduplex
 state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/cups-manual-duplex
 
-target=; name=; info=; make_default=0
+target=; uri=
 while [ $# -gt 0 ]; do
     case $1 in
         --target) target=$2; shift 2 ;;
-        --name) name=$2; shift 2 ;;
-        --info) info=$2; shift 2 ;;
-        --default) make_default=1; shift ;;
+        --uri) uri=$2; shift 2 ;;
         -h|--help) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option $1" >&2; exit 1 ;;
     esac
@@ -36,94 +40,129 @@ done
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
+device_of() { lpstat -v "$1" 2>/dev/null | sed -n 's/^device for [^:]*: //p'; }
+ppd_of() {      # ppd_of <queue> <file>
+    curl -fsS -o "$2" "http://localhost:631/printers/$1.ppd" 2>/dev/null ||
+        curl -fsS --unix-socket /run/cups/cups.sock -o "$2" "http://localhost/printers/$1.ppd"
+}
+service_of() {  # service_of <dnssd uri>: the DNS-SD instance name in it
+    /usr/bin/python3 -I -c 'import sys, urllib.parse as u
+h = u.urlsplit(sys.argv[1]).netloc
+print(u.unquote(h.split("._ipp")[0]))' "$1"
+}
+queue_name_of() {   # what libcups and cups-browsed call a queue for a DNS-SD name
+    /usr/bin/python3 -I -c 'import sys
+n = ""
+for c in sys.argv[1]:
+    n += c if c.isascii() and c.isalnum() else ("" if n.endswith("_") else "_")
+print(n[:-1] if len(n) > 1 and n.endswith("_") else n)' "$1"
+}
 
-old_default=$(lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')
-if [ -z "$target" ] && [ -n "$old_default" ]; then
-    target=$old_default
-    # the default may be a front queue made earlier with --default
-    front_of=$(lpstat -v "$target" 2>/dev/null | sed -n 's/^device for [^:]*: manualduplex:\/\([^?]*\).*/\1/p')
-    if [ -n "$front_of" ]; then name=${name:-$target}; target=$front_of; fi
-fi
-[ -n "$target" ] || die "no --target and no system default queue"
-lpstat -v "$target" > /dev/null 2>&1 || die "no such queue: $target"
-# Edge lists printers by queue name and cuts it to about 25 characters, so
-# what tells the queues apart has to come first.
-name=${name:-Duplex_${target}}
-[ "$name" != "$target" ] || die "--name must differ from --target"
-for tool in qpdf lp lpadmin curl /usr/bin/python3; do
+for tool in qpdf lp lpadmin lpinfo ippfind ipptool curl /usr/bin/python3; do
     command -v "$tool" > /dev/null || die "missing $tool"
 done
 
-work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+[ -n "$target" ] || target=$(lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')
+[ -n "$target" ] || die "no --target and no system default queue"
+lpstat -v "$target" > /dev/null 2>&1 || die "no such queue: $target"
+case "$(device_of "$target")" in
+    manualduplex:/*)    # a front queue of the earlier version: use what it fronted
+        t=$(device_of "$target"); t=${t#manualduplex:/}; target=${t%%\?*}
+        lpstat -v "$target" > /dev/null 2>&1 || die "no such queue: $target" ;;
+esac
+mapfile -t fronts < <(lpstat -v 2>/dev/null | awk -v t="manualduplex:/$target" \
+    '{ d = $NF; sub(/\?.*/, "", d); if (d == t) { n = $3; sub(/:$/, "", n); print n } }')
 
-say "real queue: $target ($(lpstat -v "$target" | sed 's/^device for [^:]*: //'))"
-curl -fsS -o "$work/target.ppd" "http://localhost:631/printers/$target.ppd" 2>/dev/null ||
-    curl -fsS --unix-socket /run/cups/cups.sock -o "$work/target.ppd" "http://localhost/printers/$target.ppd" ||
-    die "cannot read the PPD of $target"
-grep -qE '^\*(InputSlot Manual|ManualFeed True)' "$work/target.ppd" ||
-    die "$target has no manual feeder (InputSlot Manual) to hold the second side"
-/usr/bin/python3 -I "$here/mkppd.py" "$work/target.ppd" > "$work/front.ppd"
-
-# Keep what the real queue looked like, for reference; it is not changed.
 mkdir -p "$state_dir"
-cp "$work/target.ppd" "$state_dir/$target.ppd"
-lpoptions -p "$target" > "$state_dir/$target.lpoptions" 2>/dev/null || true
-
-if cmp -s "$here/manualduplex" "$backend_dir/manualduplex"; then
-    say "backend $backend_dir/manualduplex is current"
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+ppd_of "$target" "$work/current.ppd" || die "cannot read the PPD of $target"
+if grep -q '^\*% manualduplex:' "$work/current.ppd"; then
+    # converted before: start again from what it was then
+    [ -f "$state_dir/$target.ppd" ] && [ -f "$state_dir/$target.env" ] ||
+        die "$target was converted before, but its original PPD is not in $state_dir"
+    orig_uri=$(sed -n 's/^ORIG_URI=//p' "$state_dir/$target.env")
 else
-    say "installing $backend_dir/manualduplex (sudo)"
-    sudo install -o root -g root -m 0755 "$here/manualduplex" "$backend_dir/manualduplex" ||
-        die "could not install the backend; run: sudo install -o root -g root -m 0755 $here/manualduplex $backend_dir/manualduplex"
+    cp "$work/current.ppd" "$state_dir/$target.ppd"
+    orig_uri=$(device_of "$target")
+    lpoptions -p "$target" > "$state_dir/$target.lpoptions" 2>/dev/null || true
+fi
+[ -n "$orig_uri" ] || die "no original device URI for $target"
+/usr/bin/python3 -I "$here/mkppd.py" "$state_dir/$target.ppd" > "$work/queue.ppd" ||
+    die "mkppd.py refused the PPD of $target"
+
+if [ -z "$uri" ]; then
+    case $orig_uri in
+        dnssd://*) uri=$orig_uri ;;
+        *)  # find the printer's DNS-SD address by its UUID
+            uuid=$(ipptool -tv "$orig_uri" get-printer-attributes.test 2>/dev/null |
+                   sed -nE 's/^ +printer-uuid \(uri\) = urn:uuid:([^ ]+)$/\1/p' | head -1 || true)
+            if [ -n "$uuid" ]; then
+                uri=$(lpinfo --include-schemes dnssd -v 2>/dev/null | awk '{ print $2 }' |
+                      grep -F "uuid=$uuid" | head -1 || true)
+            fi ;;
+    esac
+    # libcups lists the printer under IPPS when it offers IPPS, and only
+    # recognises a queue as that printer when the queue says IPPS too
+    if [[ $uri == dnssd://*._ipp._tcp.* ]] &&
+       ippfind -T 5 _ipps._tcp -N "$(service_of "$uri")" -q 2>/dev/null; then
+        uri=${uri/._ipp._tcp./._ipps._tcp.}
+    fi
+    if [ -z "$uri" ]; then
+        uri=$orig_uri
+        say "no dnssd:// address found for the printer: keeping $uri (dialogs may list the printer twice)"
+    fi
 fi
 
-if lpstat -v "$name" > /dev/null 2>&1; then
-    case "$(lpstat -v "$name")" in
-        *": manualduplex:"*) say "$name exists already: updating it" ;;
-        *) die "a queue named $name already exists and is not a manual-duplex queue" ;;
-    esac
+if cmp -s "$here/manualduplex" "$filter"; then
+    say "filter $filter is current"
+else
+    say "installing $filter (sudo)"
+    sudo install -o root -g root -m 0755 "$here/manualduplex" "$filter" ||
+        die "could not install the filter; run: sudo install -o root -g root -m 0755 $here/manualduplex $filter"
 fi
-if [ -z "$info" ]; then
-    info=$(lpstat -l -p "$target" | sed -n 's/^[[:space:]]*Description: //p' | head -1)
-    info=${info% (*}              # "(HP Driver)" and the like no longer apply
-    info="${info:-$target} (手动双面)"
-fi
-location=$(lpstat -l -p "$target" | sed -n 's/^[[:space:]]*Location: //p' | head -1)
-say "queue $name -> manualduplex:/$target"
+
+say "queue $target: $(device_of "$target") -> $uri"
 # (lpadmin warns that PPD files are deprecated; CUPS 2.x still uses them)
-if ! out=$(lpadmin -p "$name" -E -v "manualduplex:/$target" -P "$work/front.ppd" \
-               -D "$info" -L "${location:-}" -o printer-is-shared=false 2>&1); then
+if ! out=$(lpadmin -p "$target" -v "$uri" -P "$work/queue.ppd" 2>&1); then
     die "lpadmin failed: $out"
 fi
 printf '%s\n' "$out" | grep -v -e 'Printer drivers are deprecated' -e '^$' >&2 || true
-lpstat -v "$name" > /dev/null 2>&1 || die "lpadmin did not create $name"
-
-# Run again over an earlier --default install: keep what the default was
-# before that, or uninstall.sh could not put it back.
-made_default=$make_default
-if [ -f "$state_dir/$name.env" ] && grep -qx 'MADE_DEFAULT=1' "$state_dir/$name.env"; then
-    old_default=$(sed -n 's/^OLD_DEFAULT=//p' "$state_dir/$name.env")
-    made_default=1
-fi
 {
     echo "TARGET=$target"
-    echo "NAME=$name"
-    echo "OLD_DEFAULT=$old_default"
-    echo "MADE_DEFAULT=$made_default"
+    echo "ORIG_URI=$orig_uri"
+    echo "URI=$uri"
     echo "DATE=$(date -Iseconds)"
-} > "$state_dir/$name.env"
+} > "$state_dir/$target.env"
 # so that undoing does not depend on this checkout still being here
 install -m 0755 "$here/uninstall.sh" "$state_dir/uninstall.sh"
 
-if [ $make_default = 1 ]; then
-    say "making $name the system default (was $old_default)"
-    lpadmin -d "$name"
+default=$(lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')
+for q in "${fronts[@]}"; do
+    say "removing $q, the front queue of the earlier version"
+    lpadmin -x "$q"
+    rm -f "$state_dir/$q.env"
+    [ "$default" != "$q" ] || { say "system default: $target"; lpadmin -d "$target"; }
+done
+if [ -e "$old_backend" ] && ! lpstat -v 2>/dev/null | grep -q ': manualduplex:'; then
+    say "removing $old_backend, the backend of the earlier version (sudo)"
+    sudo rm -f "$old_backend" || say "could not remove $old_backend; nothing uses it"
+fi
+# cups-browsed made a queue of its own for the printer while ours pointed at
+# an address it did not recognise; now that ours names the printer, it goes
+if [[ $uri == dnssd://* ]]; then
+    cb=$(queue_name_of "$(service_of "$uri")")
+    if [ "$cb" != "$target" ] && [ "$(device_of "$cb")" = "implicitclass://$cb/" ]; then
+        say "removing $cb, cups-browsed's queue for the same printer"
+        lpadmin -x "$cb"
+    fi
 fi
 
 say "result"
-lpstat -v "$name" | sed 's/^/    /'
-lpoptions -p "$name" -l | grep -E '^Duplex' | sed 's/^/    /'
-ipptool -tv "ipp://localhost/printers/$name" get-printer-attributes.test 2>/dev/null |
+lpstat -v "$target" | sed 's/^/    /'
+lpoptions -p "$target" -l | grep -E '^Duplex' | sed 's/^/    /'
+ipptool -tv "ipp://localhost/printers/$target" get-printer-attributes.test 2>/dev/null |
     grep -E '^\s+sides-supported' | sed 's/^ */    /' || true
-echo "    state and a copy of $target's PPD: $state_dir"
-echo "    undo: $state_dir/uninstall.sh --name $name"
+echo "    what print dialogs offer (lpstat -e, network included):"
+lpstat -e | sed 's/^/      /'
+echo "    original PPD and device URI: $state_dir"
+echo "    undo: $state_dir/uninstall.sh"
