@@ -151,3 +151,5 @@ E_FAIL 等四条系统消息是 Wine 全局的中文译法（见探针 README）
 - 系统消息的中文措辞：E_FAIL、E_OUTOFMEMORY、E_INVALIDARG、E_ACCESSDENIED 等是 Wine 全局译法，与 Windows 不同，涉及所有程序，没有改。
 - 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
 - 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
+- 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
+- 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
