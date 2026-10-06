@@ -6,6 +6,11 @@
  *   pending      loading from a stream that answers E_PENDING: what load returns, when it reads again
  *   blocks       the sizes msxml asks Read for, with streams that hand out the data in various pieces
  *   entities     the nodes a document holds for references to entities declared in its DTD
+ *   epilog       what may follow the root element, and the errors for what may not
+ *   validation   the code and position of each kind of DTD validation error, at load and from validate()
+ *   methods      what the less common interfaces answer: IMarshal, IProvideClassInfo, IOleCommandTarget,
+ *                IServiceProvider, IPersistMoniker
+ *   spaces       which spaces a document keeps without validating, by the content its DTD declares
  *
  * Text is printed with everything outside printable ASCII as \uXXXX.  No files, no network; streams
  * are the probe's own objects, and no output pointer is passed that has not been seen to be safe.
@@ -611,19 +616,32 @@ static void print_xml_text( const char *what, IXMLDOMNode *node )
 
 static void section_entities( void )
 {
-    static const struct { const char *name; const WCHAR *xml; } sources[] =
+    /* the first time with validateOnParse off; the second with the elements declared, validating */
+    static const struct { const char *name; const WCHAR *xml; } sources[2][3] =
     {
-        { "internal entities",
-          L"<!DOCTYPE r [<!ENTITY e \"x\"><!ENTITY m \"<b>y</b>\"><!ENTITY n \"a&e;b\"><!ENTITY s \"\">]>"
-          L"<r a=\"1&e;2\" c=\"&n;\">p&e;q&m;s&n;&s;&#65;&amp;</r>" },
-        { "whitespace entity", L"<!DOCTYPE r [<!ENTITY w \" \">]><r>&w;<b/>&w;</r>" },
-        { "entity at top level", L"<!DOCTYPE r [<!ENTITY e \"x\">]><r>&e;</r>" },
+        {
+            { "internal entities",
+              L"<!DOCTYPE r [<!ENTITY e \"x\"><!ENTITY m \"<b>y</b>\"><!ENTITY n \"a&e;b\"><!ENTITY s \"\">]>"
+              L"<r a=\"1&e;2\" c=\"&n;\">p&e;q&m;s&n;&s;&#65;&amp;</r>" },
+            { "whitespace entity", L"<!DOCTYPE r [<!ENTITY w \" \">]><r>&w;<b/>&w;</r>" },
+            { "entity at top level", L"<!DOCTYPE r [<!ENTITY e \"x\">]><r>&e;</r>" },
+        },
+        {
+            { "internal entities, declared",
+              L"<!DOCTYPE r [<!ELEMENT r ANY><!ELEMENT b ANY><!ATTLIST r a CDATA #IMPLIED c CDATA #IMPLIED>"
+              L"<!ENTITY e \"x\"><!ENTITY m \"<b>y</b>\"><!ENTITY n \"a&e;b\"><!ENTITY s \"\">]>"
+              L"<r a=\"1&e;2\" c=\"&n;\">p&e;q&m;s&n;&s;&#65;&amp;</r>" },
+            { "whitespace entity, declared",
+              L"<!DOCTYPE r [<!ELEMENT r (b)*><!ELEMENT b EMPTY><!ENTITY w \" \">]><r>&w;<b/>&w;</r>" },
+            { "entity at top level, declared", L"<!DOCTYPE r [<!ELEMENT r ANY><!ENTITY e \"x\">]><r>&e;</r>" },
+        },
     };
-    unsigned int v, i;
+    unsigned int v, i, mode;
 
     printf( "== entities\n" );
+    for (mode = 0; mode < 2; mode++)
     for (v = 0; v < ARRAYSIZE(versions); v++)
-    for (i = 0; i < ARRAYSIZE(sources); i++)
+    for (i = 0; i < ARRAYSIZE(sources[0]); i++)
     {
         IXMLDOMDocument2 *doc = create_doc( versions[v].clsid );
         IXMLDOMElement *root = NULL;
@@ -631,8 +649,10 @@ static void section_entities( void )
         HRESULT hr;
 
         if (!doc) break;
-        hr = IXMLDOMDocument2_loadXML( doc, (BSTR)sources[i].xml, &ok );
-        printf( "%s %s: loadXML hr %#lx ok %d\n", versions[v].name, sources[i].name, hr, ok );
+        if (!mode) IXMLDOMDocument2_put_validateOnParse( doc, VARIANT_FALSE );
+        hr = IXMLDOMDocument2_loadXML( doc, (BSTR)sources[mode][i].xml, &ok );
+        printf( "%s %s%s: loadXML hr %#lx ok %d\n", versions[v].name, sources[mode][i].name,
+                mode ? "" : " (validateOnParse off)", hr, ok );
         if (hr != S_OK) print_parse_error( doc );
         if (hr == S_OK && SUCCEEDED(IXMLDOMDocument2_get_documentElement( doc, &root )) && root)
         {
@@ -736,16 +756,496 @@ static void section_entities( void )
     }
 }
 
+/*** epilog ***/
+
+static void section_epilog( void )
+{
+    static const struct { const char *name; const WCHAR *xml; } sources[] =
+    {
+        { "text after", L"<a/>text" },
+        { "end tag after", L"<a/></b>" },
+        { "entity after", L"<a/>&amp;" },
+        { "character reference after", L"<a/>&#65;" },
+        { "doctype after", L"<a/><!DOCTYPE a>" },
+        { "cdata end after", L"<a/>]]>" },
+        { "cdata section after", L"<a/><![CDATA[x]]>" },
+        { "< at the end", L"<a/><" },
+        { "second root on line 2", L"<a/>\n<b/>" },
+        { "control character after", L"<a/>\x01" },
+        { "spaces, comment, pi after", L"<a/> <!--c--> <?p q?> " },
+        { "text before", L"text<a/>" },
+        { "declaration after", L"<a/><?xml version='1.0'?>" },
+        { "comment then two roots", L"<!--c--><a/><b/>" },
+        { "declaration in content", L"<a><?xml version='1.0'?></a>" },
+        { "declaration after a comment", L"<!--c--><?xml version='1.0'?><a/>" },
+        { "XML declaration after", L"<a/><?XML version='1.0'?>" },
+        { "xml pi with nothing after", L"<a/><?xml?>" },
+        { "xml-stylesheet after (fine)", L"<a/><?xml-stylesheet href='x'?>" },
+    };
+    unsigned int v, i;
+
+    printf( "== epilog\n" );
+    for (v = 0; v < ARRAYSIZE(versions); v++)
+    for (i = 0; i < ARRAYSIZE(sources); i++)
+    {
+        IXMLDOMDocument2 *doc = create_doc( versions[v].clsid );
+        VARIANT_BOOL ok = 0x55;
+        HRESULT hr;
+
+        if (!doc) break;
+        hr = IXMLDOMDocument2_loadXML( doc, (BSTR)sources[i].xml, &ok );
+        printf( "%s %-26s loadXML hr %#lx ok %d\n", versions[v].name, sources[i].name, hr, ok );
+        if (hr != S_OK) print_parse_error( doc );
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+/*** validation ***/
+
+static void print_error_object( IXMLDOMParseError *error )
+{
+    LONG code = 0, line = 0, linepos = 0, filepos = 0;
+    BSTR reason = NULL, src = NULL;
+
+    IXMLDOMParseError_get_errorCode( error, &code );
+    IXMLDOMParseError_get_reason( error, &reason );
+    IXMLDOMParseError_get_line( error, &line );
+    IXMLDOMParseError_get_linepos( error, &linepos );
+    IXMLDOMParseError_get_filepos( error, &filepos );
+    IXMLDOMParseError_get_srcText( error, &src );
+    printf( "    error %#lx line %ld linepos %ld filepos %ld reason ", code, line, linepos, filepos );
+    put_bstr( reason );
+    printf( " src " );
+    put_bstr( src );
+    printf( "\n" );
+    SysFreeString( reason );
+    SysFreeString( src );
+}
+
+static void section_validation( void )
+{
+    static const struct { const char *name; const WCHAR *xml; } sources[] =
+    {
+        { "undeclared root", L"<!DOCTYPE r [<!ELEMENT a ANY>]><r/>" },
+        { "undeclared child", L"<!DOCTYPE r [<!ELEMENT r ANY>]><r><x/></r>" },
+        { "root not the doctype's", L"<!DOCTYPE r [<!ELEMENT r ANY><!ELEMENT s ANY>]><s/>" },
+        { "no children", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r></r>" },
+        { "only a space", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r> </r>" },
+        { "too few children", L"<!DOCTYPE r [<!ELEMENT r (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><r><a/></r>" },
+        { "wrong child", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><r><b/></r>" },
+        { "one child too many", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r><a/><a/></r>" },
+        { "text among elements", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r>t<a/></r>" },
+        { "EMPTY with an element", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ELEMENT a EMPTY>]><r><a/></r>" },
+        { "EMPTY with text", L"<!DOCTYPE r [<!ELEMENT r EMPTY>]><r>t</r>" },
+        { "EMPTY with a space", L"<!DOCTYPE r [<!ELEMENT r EMPTY>]><r> </r>" },
+        { "PCDATA with an element", L"<!DOCTYPE r [<!ELEMENT r (#PCDATA)><!ELEMENT a EMPTY>]><r><a/></r>" },
+        { "mixed, another element",
+          L"<!DOCTYPE r [<!ELEMENT r (#PCDATA|a)*><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><r>t<b/></r>" },
+        { "undeclared attribute", L"<!DOCTYPE r [<!ELEMENT r EMPTY>]><r x='1'/>" },
+        { "required attribute missing", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x CDATA #REQUIRED>]><r/>" },
+        { "not the fixed value", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x CDATA #FIXED 'a'>]><r x='b'/>" },
+        { "not an allowed value", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x (a|b) #IMPLIED>]><r x='c'/>" },
+        { "IDREF to no ID", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x IDREF #IMPLIED>]><r x='i'/>" },
+        { "ID twice",
+          L"<!DOCTYPE r [<!ELEMENT r (a,a)><!ELEMENT a EMPTY><!ATTLIST a i ID #IMPLIED>]><r><a i='x'/><a i='x'/></r>" },
+        { "ID not a name", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r i ID #IMPLIED>]><r i='1x'/>" },
+        { "NMTOKEN with a space", L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x NMTOKEN #IMPLIED>]><r x='a b'/>" },
+        { "three problems", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r y='1'><b/></r>" },
+        { "on line 6", L"<!DOCTYPE r [\n<!ELEMENT r (a)>\n<!ELEMENT a EMPTY>\n]>\n<r>\n  <b/>\n</r>" },
+        { "valid", L"<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r><a/></r>" },
+        { "no DTD", L"<r><x/></r>" },
+    };
+    unsigned int v, i;
+
+    printf( "== validation\n" );
+    for (v = 0; v < ARRAYSIZE(versions); v++)
+    for (i = 0; i < ARRAYSIZE(sources); i++)
+    {
+        IXMLDOMParseError *error = NULL;
+        IXMLDOMDocument2 *doc = create_doc( versions[v].clsid );
+        VARIANT_BOOL ok = 0x55;
+        HRESULT hr;
+
+        if (!doc) break;
+        hr = IXMLDOMDocument2_loadXML( doc, (BSTR)sources[i].xml, &ok );
+        printf( "%s %-28s loadXML hr %#lx ok %d\n", versions[v].name, sources[i].name, hr, ok );
+        if (hr != S_OK) print_parse_error( doc );
+        IXMLDOMDocument2_Release( doc );
+
+        if (!(doc = create_doc( versions[v].clsid ))) break;
+        IXMLDOMDocument2_put_validateOnParse( doc, VARIANT_FALSE );
+        hr = IXMLDOMDocument2_loadXML( doc, (BSTR)sources[i].xml, &ok );
+        if (hr == S_OK)
+        {
+            hr = IXMLDOMDocument2_validate( doc, &error );
+            printf( "    loaded without validating, then validate() hr %#lx\n", hr );
+            if (error)
+            {
+                print_error_object( error );
+                IXMLDOMParseError_Release( error );
+            }
+        }
+        else printf( "    loadXML without validating hr %#lx\n", hr );
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+/*** spaces ***/
+
+static void section_spaces( void )
+{
+    static const struct { const char *name; const WCHAR *xml; } sources[] =
+    {
+        { "EMPTY", L"<!DOCTYPE r [<!ELEMENT r EMPTY>]><r> </r>" },
+        { "ANY", L"<!DOCTYPE r [<!ELEMENT r ANY><!ELEMENT a EMPTY>]><r> <a/> </r>" },
+        { "(#PCDATA)", L"<!DOCTYPE r [<!ELEMENT r (#PCDATA)>]><r> </r>" },
+        { "(a)*", L"<!DOCTYPE r [<!ELEMENT r (a)*><!ELEMENT a EMPTY>]><r> <a/> </r>" },
+        { "(#PCDATA|a)*", L"<!DOCTYPE r [<!ELEMENT r (#PCDATA|a)*><!ELEMENT a EMPTY>]><r> <a/> </r>" },
+        { "undeclared", L"<!DOCTYPE r [<!ELEMENT a EMPTY>]><r> <a/> </r>" },
+        { "no DTD", L"<r> <a/> </r>" },
+    };
+    unsigned int v, i;
+
+    printf( "== spaces\n" );
+    for (v = 0; v < ARRAYSIZE(versions); v++)
+    for (i = 0; i < ARRAYSIZE(sources); i++)
+    {
+        IXMLDOMDocument2 *doc = create_doc( versions[v].clsid );
+        IXMLDOMElement *root = NULL;
+        IXMLDOMNodeList *list = NULL;
+        VARIANT_BOOL ok = 0x55;
+        LONG length = -1;
+        HRESULT hr;
+        BSTR xml = NULL;
+
+        if (!doc) break;
+        IXMLDOMDocument2_put_validateOnParse( doc, VARIANT_FALSE );
+        hr = IXMLDOMDocument2_loadXML( doc, (BSTR)sources[i].xml, &ok );
+        printf( "%s %-14s loadXML hr %#lx ok %d", versions[v].name, sources[i].name, hr, ok );
+        if (hr == S_OK && SUCCEEDED(IXMLDOMDocument2_get_documentElement( doc, &root )) && root)
+        {
+            if (SUCCEEDED(IXMLDOMElement_get_childNodes( root, &list )) && list)
+            {
+                IXMLDOMNodeList_get_length( list, &length );
+                IXMLDOMNodeList_Release( list );
+            }
+            IXMLDOMElement_get_xml( root, &xml );
+            printf( ", the element has %ld children: ", length );
+            put_bstr( xml );
+            SysFreeString( xml );
+            IXMLDOMElement_Release( root );
+        }
+        printf( "\n" );
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+/*** methods ***/
+
+DEFINE_GUID( CLSID_InProcFreeMarshaler_probe, 0x0000033a, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 );
+DEFINE_GUID( SID_SContainerDispatch_probe, 0xb722be00, 0x4e68, 0x101b, 0xa2, 0xbc, 0x00, 0xaa, 0x00, 0x40, 0x47, 0x70 );
+DEFINE_GUID( IID_IInternetSecurityManager_probe, 0x79eac9ee, 0xbaf9, 0x11ce, 0x8c, 0x82, 0x00, 0xaa, 0x00, 0x4b, 0xa9, 0x0b );
+DEFINE_GUID( IID_IBindHost_probe, 0xfc4801a1, 0x2ba9, 0x11cf, 0xa2, 0x29, 0x00, 0xaa, 0x00, 0x3d, 0x73, 0x52 );
+DEFINE_GUID( GUID_unknown_probe, 0x12345678, 0x1234, 0x1234, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34 );
+
+static void put_guid( const GUID *guid )
+{
+    WCHAR str[40];
+    StringFromGUID2( guid, str, ARRAYSIZE(str) );
+    put_text( str, -1 );
+}
+
+static void put_type_name( ITypeInfo *ti )
+{
+    BSTR name = NULL;
+    ITypeInfo_GetDocumentation( ti, MEMBERID_NIL, &name, NULL, NULL, NULL );
+    put_bstr( name );
+    SysFreeString( name );
+}
+
+static void methods_marshal( IUnknown *unk )
+{
+    static const struct { DWORD ctx; const char *name; } contexts[] =
+    {
+        { MSHCTX_INPROC, "MSHCTX_INPROC" }, { MSHCTX_LOCAL, "MSHCTX_LOCAL" },
+    };
+    IMarshal *marshal = NULL;
+    unsigned int i;
+
+    if (FAILED(IUnknown_QueryInterface( unk, &IID_IMarshal, (void **)&marshal ))) return;
+    for (i = 0; i < ARRAYSIZE(contexts); i++)
+    {
+        CLSID clsid = GUID_NULL;
+        DWORD size = 0xdeadbeef;
+        HRESULT hr;
+
+        hr = IMarshal_GetUnmarshalClass( marshal, &IID_IUnknown, unk, contexts[i].ctx, NULL, MSHLFLAGS_NORMAL, &clsid );
+        printf( "  IMarshal::GetUnmarshalClass(%s) hr %#lx ", contexts[i].name, hr );
+        put_guid( &clsid );
+        if (IsEqualGUID( &clsid, &CLSID_InProcFreeMarshaler_probe )) printf( " (the free-threaded marshaler)" );
+        hr = IMarshal_GetMarshalSizeMax( marshal, &IID_IUnknown, unk, contexts[i].ctx, NULL, MSHLFLAGS_NORMAL, &size );
+        printf( ", GetMarshalSizeMax hr %#lx %lu\n", hr, size );
+    }
+    IMarshal_Release( marshal );
+}
+
+static void methods_classinfo( IUnknown *unk )
+{
+    IProvideClassInfo *info = NULL;
+    IProvideClassInfo2 *info2 = NULL;
+    ITypeInfo *ti = NULL;
+    TYPEATTR *attr = NULL;
+    HRESULT hr;
+    UINT i;
+
+    if (FAILED(IUnknown_QueryInterface( unk, &IID_IProvideClassInfo, (void **)&info ))) return;
+    hr = IProvideClassInfo_GetClassInfo( info, &ti );
+    printf( "  IProvideClassInfo::GetClassInfo hr %#lx", hr );
+    if (SUCCEEDED(hr) && ti && SUCCEEDED(ITypeInfo_GetTypeAttr( ti, &attr )))
+    {
+        printf( " " );
+        put_type_name( ti );
+        printf( " " );
+        put_guid( &attr->guid );
+        printf( " kind %u, %u interfaces\n", attr->typekind, attr->cImplTypes );
+        for (i = 0; i < attr->cImplTypes; i++)
+        {
+            ITypeInfo *impl = NULL;
+            HREFTYPE ref;
+            INT flags = 0;
+
+            ITypeInfo_GetImplTypeFlags( ti, i, &flags );
+            if (SUCCEEDED(ITypeInfo_GetRefTypeOfImplType( ti, i, &ref )) &&
+                SUCCEEDED(ITypeInfo_GetRefTypeInfo( ti, ref, &impl )))
+            {
+                printf( "    implements " );
+                put_type_name( impl );
+                printf( " flags %#x\n", flags );
+                ITypeInfo_Release( impl );
+            }
+        }
+        ITypeInfo_ReleaseTypeAttr( ti, attr );
+    }
+    else printf( "\n" );
+    if (ti) ITypeInfo_Release( ti );
+    if (SUCCEEDED(IUnknown_QueryInterface( unk, &IID_IProvideClassInfo2, (void **)&info2 )))
+    {
+        GUID guid = GUID_NULL;
+        hr = IProvideClassInfo2_GetGUID( info2, GUIDKIND_DEFAULT_SOURCE_DISP_IID, &guid );
+        printf( "  IProvideClassInfo2::GetGUID(default source) hr %#lx ", hr );
+        put_guid( &guid );
+        printf( "\n" );
+        IProvideClassInfo2_Release( info2 );
+    }
+    else printf( "  no IProvideClassInfo2\n" );
+    IProvideClassInfo_Release( info );
+}
+
+static void methods_command_target( IUnknown *unk )
+{
+    IOleCommandTarget *target = NULL;
+    OLECMD cmd;
+    HRESULT hr, first = 0xdeadbeef;
+    unsigned int id;
+    BOOL any = FALSE;
+
+    if (FAILED(IUnknown_QueryInterface( unk, &IID_IOleCommandTarget, (void **)&target ))) return;
+    printf( "  IOleCommandTarget::QueryStatus(NULL group), commands 1-70 that are not plain hr 0 flags 0:" );
+    for (id = 1; id <= 70; id++)
+    {
+        cmd.cmdID = id;
+        cmd.cmdf = 0;
+        hr = IOleCommandTarget_QueryStatus( target, NULL, 1, &cmd, NULL );
+        if (id == 1) first = hr;
+        if (hr != S_OK || cmd.cmdf)
+        {
+            printf( " %u:%#lx/%#lx", id, hr, cmd.cmdf );
+            any = TRUE;
+        }
+    }
+    printf( "%s (command 1 hr %#lx)\n", any ? "" : " none", first );
+    cmd.cmdID = 1;
+    cmd.cmdf = 0;
+    hr = IOleCommandTarget_QueryStatus( target, &GUID_unknown_probe, 1, &cmd, NULL );
+    printf( "  QueryStatus(unknown group) hr %#lx flags %#lx\n", hr, cmd.cmdf );
+    hr = IOleCommandTarget_Exec( target, &GUID_unknown_probe, 1, 0, NULL, NULL );
+    printf( "  Exec(unknown group) hr %#lx\n", hr );
+    hr = IOleCommandTarget_Exec( target, NULL, OLECMDID_STOP, OLECMDEXECOPT_DONTPROMPTUSER, NULL, NULL );
+    printf( "  Exec(NULL, OLECMDID_STOP) hr %#lx\n", hr );
+    IOleCommandTarget_Release( target );
+}
+
+static void methods_service_provider( IUnknown *unk )
+{
+    static const struct { const GUID *sid; const char *name; } services[] =
+    {
+        { &IID_IUnknown, "IID_IUnknown" },
+        { &SID_SContainerDispatch_probe, "SID_SContainerDispatch" },
+        { &IID_IXMLDOMDocument, "IID_IXMLDOMDocument" },
+        { &IID_IInternetSecurityManager_probe, "SID_SInternetSecurityManager" },
+        { &IID_IBindHost_probe, "SID_SBindHost" },
+        { &IID_IServiceProvider, "IID_IServiceProvider" },
+    };
+    IServiceProvider *provider = NULL;
+    unsigned int i;
+
+    if (FAILED(IUnknown_QueryInterface( unk, &IID_IServiceProvider, (void **)&provider ))) return;
+    for (i = 0; i < ARRAYSIZE(services); i++)
+    {
+        IUnknown *out = (void *)0xdeadbeef;
+        HRESULT hr = IServiceProvider_QueryService( provider, services[i].sid, &IID_IUnknown, (void **)&out );
+        printf( "  IServiceProvider::QueryService(%s, IID_IUnknown) hr %#lx out %s\n", services[i].name, hr,
+                out == (void *)0xdeadbeef ? "untouched" : !out ? "NULL" : out == unk ? "the document" : "another object" );
+        if (SUCCEEDED(hr) && out && out != (void *)0xdeadbeef) IUnknown_Release( out );
+    }
+    IServiceProvider_Release( provider );
+}
+
+static ULONG moniker_refs( IMoniker *moniker )
+{
+    IMoniker_AddRef( moniker );
+    return IMoniker_Release( moniker );
+}
+
+static void print_doc_state( IUnknown *unk, const char *when )
+{
+    IXMLDOMDocument2 *doc = NULL;
+    IXMLDOMElement *root = NULL;
+    LONG state = -1;
+
+    if (FAILED(IUnknown_QueryInterface( unk, &IID_IXMLDOMDocument2, (void **)&doc ))) return;
+    IXMLDOMDocument2_get_readyState( doc, &state );
+    IXMLDOMDocument2_get_documentElement( doc, &root );
+    printf( "    %s: readyState %ld root %s\n", when, state, root ? "yes" : "no" );
+    if (root) IXMLDOMElement_Release( root );
+    IXMLDOMDocument2_Release( doc );
+}
+
+static void methods_persist_moniker( IUnknown *unk, const CLSID *clsid, const WCHAR *path )
+{
+    IPersistMoniker *persist = NULL;
+    IPersistStreamInit *init = NULL;
+    IMoniker *moniker = NULL, *current = NULL;
+    IUnknown *doc2 = NULL;
+    CLSID id;
+    HRESULT hr;
+    int sync;
+
+    if (FAILED(IUnknown_QueryInterface( unk, &IID_IPersistMoniker, (void **)&persist ))) return;
+    id = GUID_NULL;
+    hr = IPersistMoniker_GetClassID( persist, &id );
+    printf( "  IPersistMoniker::GetClassID hr %#lx ", hr );
+    put_guid( &id );
+    if (SUCCEEDED(IUnknown_QueryInterface( unk, &IID_IPersistStreamInit, (void **)&init )))
+    {
+        CLSID id2 = GUID_NULL;
+        hr = IPersistStreamInit_GetClassID( init, &id2 );
+        printf( " (IPersistStreamInit::GetClassID hr %#lx %s)", hr, IsEqualGUID( &id, &id2 ) ? "the same" : "another" );
+        IPersistStreamInit_Release( init );
+    }
+    printf( "\n" );
+    printf( "  IsDirty hr %#lx\n", IPersistMoniker_IsDirty( persist ) );
+    current = (void *)0xdeadbeef;
+    hr = IPersistMoniker_GetCurMoniker( persist, &current );
+    printf( "  GetCurMoniker before loading hr %#lx out %s\n", hr,
+            current == (void *)0xdeadbeef ? "untouched" : current ? "set" : "NULL" );
+    IPersistMoniker_Release( persist );
+
+    if (FAILED(CreateFileMoniker( path, &moniker ))) { printf( "  no file moniker\n" ); return; }
+    /* load it fully available, and not, each into a new document; the moniker's references as its
+     * own AddRef and Release count them tell what the document does with it (nothing it hands
+     * back is released here: an earlier run that did so freed the moniker under it) */
+    for (sync = 1; sync >= 0; sync--)
+    {
+        if (FAILED(CoCreateInstance( clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&doc2 ))) break;
+        if (SUCCEEDED(IUnknown_QueryInterface( doc2, &IID_IPersistMoniker, (void **)&persist )))
+        {
+            printf( "  moniker refs before Load %lu\n", moniker_refs( moniker ) );
+            hr = IPersistMoniker_Load( persist, sync, moniker, NULL, 0 );
+            printf( "  Load(fFullyAvailable %d, a file moniker, no bind context) hr %#lx, moniker refs %lu\n", sync, hr,
+                    moniker_refs( moniker ) );
+            print_doc_state( doc2, "right after" );
+            pump( 1000 );
+            print_doc_state( doc2, "after 1 s of messages" );
+            current = NULL;
+            hr = IPersistMoniker_GetCurMoniker( persist, &current );
+            printf( "    GetCurMoniker hr %#lx: %s, moniker refs %lu\n", hr, !current ? "NULL" :
+                    current == moniker ? "the same moniker" : IMoniker_IsEqual( current, moniker ) == S_OK ?
+                    "an equal moniker" : "another moniker", moniker_refs( moniker ) );
+            printf( "    IsDirty hr %#lx\n", IPersistMoniker_IsDirty( persist ) );
+            IPersistMoniker_Release( persist );
+        }
+        IUnknown_Release( doc2 );
+        printf( "    moniker refs after the document is released %lu\n", moniker_refs( moniker ) );
+    }
+    /* with a bind context */
+    if (SUCCEEDED(CoCreateInstance( clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&doc2 )))
+    {
+        IBindCtx *bc = NULL;
+
+        if (SUCCEEDED(CreateBindCtx( 0, &bc )) &&
+            SUCCEEDED(IUnknown_QueryInterface( doc2, &IID_IPersistMoniker, (void **)&persist )))
+        {
+            hr = IPersistMoniker_Load( persist, TRUE, moniker, bc, 0 );
+            printf( "  Load(fFullyAvailable 1, a file moniker, a bind context) hr %#lx, moniker refs %lu\n", hr,
+                    moniker_refs( moniker ) );
+            print_doc_state( doc2, "right after" );
+            pump( 1000 );
+            print_doc_state( doc2, "after 1 s of messages" );
+            IPersistMoniker_Release( persist );
+        }
+        if (bc) IBindCtx_Release( bc );
+        IUnknown_Release( doc2 );
+        printf( "    moniker refs after the document is released %lu\n", moniker_refs( moniker ) );
+    }
+    /* the moniker is not released: it may still be held */
+}
+
+static void section_methods( void )
+{
+    static const char xml[] = "<r a='1'/>";
+    WCHAR dir[MAX_PATH], path[MAX_PATH];
+    unsigned int i;
+    HANDLE file;
+    DWORD written;
+
+    printf( "== methods\n" );
+    GetTempPathW( ARRAYSIZE(dir), dir );
+    swprintf( path, ARRAYSIZE(path), L"%smsxmlmore-probe-%lu.xml", dir, GetCurrentProcessId() );
+    file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) { printf( "no temporary file\n" ); return; }
+    WriteFile( file, xml, sizeof(xml) - 1, &written, NULL );
+    CloseHandle( file );
+
+    for (i = 0; i < ARRAYSIZE(docs); i++)
+    {
+        IUnknown *unk = NULL;
+
+        if (FAILED(CoCreateInstance( docs[i].clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk )))
+            continue;
+        printf( "%s\n", docs[i].name );
+        methods_marshal( unk );
+        methods_classinfo( unk );
+        methods_command_target( unk );
+        methods_service_provider( unk );
+        methods_persist_moniker( unk, docs[i].clsid, path );
+        IUnknown_Release( unk );
+    }
+    DeleteFileW( path );
+}
+
 int main( int argc, char **argv )
 {
     static const struct { const char *name; void (*func)(void); } sections[] =
     {
         { "interfaces", section_interfaces }, { "reasons", section_reasons }, { "pending", section_pending },
-        { "blocks", section_blocks }, { "entities", section_entities },
+        { "blocks", section_blocks }, { "entities", section_entities }, { "epilog", section_epilog },
+        { "validation", section_validation }, { "methods", section_methods }, { "spaces", section_spaces },
     };
     unsigned int i;
     int j;
 
+    setvbuf( stdout, NULL, _IONBF, 0 );    /* a hang shows where it is */
     CoInitialize( NULL );
     for (i = 0; i < ARRAYSIZE(sections); i++)
     {

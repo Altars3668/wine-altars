@@ -5,8 +5,10 @@
  *
  * Shows a mid-grey backdrop and on it twelve white pop-ups, topmost and not activated, with their
  * DWM transitions disabled, waits for the DWM to settle, and prints for each its window facts and
- * a PNG of the screen around it (PNG-BEGIN <name> <w>x<h> ... PNG-END, base64).  Everything is gone
- * after about two seconds.  It refuses to run while someone is using the machine (input in the last
+ * a PNG of the screen around it (PNG-BEGIN <name> <w>x<h> ... PNG-END, base64).  Then the same on a
+ * black and on a white backdrop for the pop-ups with no border colour set, which tell the colour of
+ * the default border from its translucency (their names end in @black and @white).  Each backdrop is
+ * gone after about two seconds.  It refuses to run while someone is using the machine (input in the last
  * two minutes, or a locked desktop) unless given -force.
  *
  *   dwmframe [-force]
@@ -163,14 +165,85 @@ static void pump( DWORD ms )
     }
 }
 
+/* one backdrop: the pop-ups on it, their facts and the screen around each */
+static void run_pass( COLORREF color, const char *suffix, RECT area, POINT origin, int cell_w, int cell_h,
+                      int win_w, int win_h, int margin, int columns )
+{
+    HWND backdrop, windows[ARRAYSIZE(variants)];
+    HBRUSH brush;
+    int i;
+
+    brush = CreateSolidBrush( color );
+    backdrop = CreateWindowExW( WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"DwmFrameBackdrop", L"backdrop",
+                                WS_POPUP, area.left, area.top, area.right - area.left, area.bottom - area.top,
+                                NULL, NULL, NULL, NULL );
+    {
+        BOOL disable = TRUE;
+        DWORD corner = CORNER_DONOTROUND;
+        DwmSetWindowAttribute( backdrop, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable) );
+        DwmSetWindowAttribute( backdrop, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner) );
+    }
+    SetClassLongPtrW( backdrop, GCLP_HBRBACKGROUND, (LONG_PTR)brush );
+    ShowWindow( backdrop, SW_SHOWNOACTIVATE );
+
+    for (i = 0; i < ARRAYSIZE(variants); i++)
+    {
+        const struct variant *v = &variants[i];
+        int x = origin.x + (i % columns) * cell_w + margin, y = origin.y + (i / columns) * cell_h + margin;
+        BOOL disable = TRUE;
+
+        windows[i] = NULL;
+        if (*suffix && v->border != COLOR_UNSET && v->border != COLOR_NONE) continue;
+        windows[i] = CreateWindowExW( WS_EX_TOPMOST | WS_EX_NOACTIVATE | v->ex_style,
+                                      v->dropshadow ? L"DwmFramePopupShadow" : L"DwmFramePopup", L"popup",
+                                      WS_POPUP | WS_CLIPSIBLINGS, x, y, win_w, win_h, backdrop, NULL, NULL, NULL );
+        DwmSetWindowAttribute( windows[i], DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable) );
+        DwmSetWindowAttribute( windows[i], DWMWA_WINDOW_CORNER_PREFERENCE, &v->corner, sizeof(v->corner) );
+        if (v->border != COLOR_UNSET)
+            DwmSetWindowAttribute( windows[i], DWMWA_BORDER_COLOR, &v->border, sizeof(v->border) );
+        if (v->ex_style & WS_EX_LAYERED) SetLayeredWindowAttributes( windows[i], 0, 255, LWA_ALPHA );
+        ShowWindow( windows[i], SW_SHOWNOACTIVATE );
+        UpdateWindow( windows[i] );
+    }
+    pump( 1200 );
+
+    for (i = 0; i < ARRAYSIZE(variants); i++)
+    {
+        const struct variant *v = &variants[i];
+        RECT rc, frame, cell;
+        DWORD thickness = 0xdeadbeef;
+        char name[64];
+        HRESULT hr;
+
+        if (!windows[i]) continue;
+        sprintf( name, "%s%s", v->name, suffix );
+        GetWindowRect( windows[i], &rc );
+        hr = DwmGetWindowAttribute( windows[i], DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame) );
+        printf( "%s: window (%ld,%ld)-(%ld,%ld) ex %#lx class %s corner %lu border ", name, rc.left, rc.top,
+                rc.right, rc.bottom, v->ex_style, v->dropshadow ? "CS_DROPSHADOW" : "plain", v->corner );
+        if (v->border == COLOR_UNSET) printf( "unset" );
+        else if (v->border == COLOR_NONE) printf( "none" );
+        else printf( "%#lx", v->border );
+        printf( ", frame bounds hr %#lx (%ld,%ld)-(%ld,%ld)", hr, frame.left, frame.top, frame.right, frame.bottom );
+        hr = DwmGetWindowAttribute( windows[i], DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, &thickness, sizeof(thickness) );
+        printf( ", visible border thickness hr %#lx %lu\n", hr, thickness );
+        cell = rc;
+        InflateRect( &cell, margin, margin );
+        capture( name, cell );
+    }
+
+    for (i = 0; i < ARRAYSIZE(variants); i++) if (windows[i]) DestroyWindow( windows[i] );
+    DestroyWindow( backdrop );
+    DeleteObject( brush );
+}
+
 int main( int argc, char **argv )
 {
     WNDCLASSW cls = { 0 };
-    HWND backdrop, windows[ARRAYSIZE(variants)];
     BOOL force = argc > 1 && !strcmp( argv[1], "-force" );
     RECT work, area;
     POINT origin;
-    int i, cell_w, cell_h, win_w, win_h, margin, columns = 4;
+    int cell_w, cell_h, win_w, win_h, margin, columns = 4;
     HDESK desk;
 
     SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
@@ -217,7 +290,7 @@ int main( int argc, char **argv )
 
     win_w = scale( 160 );
     win_h = scale( 110 );
-    margin = scale( 32 );
+    margin = scale( 64 );   /* the bottom of a ROUND shadow reaches past 32 */
     cell_w = win_w + 2 * margin;
     cell_h = win_h + 2 * margin;
     origin.x = work.left + scale( 60 );
@@ -227,7 +300,6 @@ int main( int argc, char **argv )
 
     cls.lpfnWndProc = wndproc;
     cls.hCursor = LoadCursorW( NULL, (const WCHAR *)IDC_ARROW );
-    cls.hbrBackground = CreateSolidBrush( RGB( 0x80, 0x80, 0x80 ) );
     cls.lpszClassName = L"DwmFrameBackdrop";
     RegisterClassW( &cls );
     cls.hbrBackground = GetStockObject( WHITE_BRUSH );
@@ -237,60 +309,9 @@ int main( int argc, char **argv )
     cls.lpszClassName = L"DwmFramePopupShadow";
     RegisterClassW( &cls );
 
-    backdrop = CreateWindowExW( WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"DwmFrameBackdrop", L"backdrop",
-                                WS_POPUP, area.left, area.top, area.right - area.left, area.bottom - area.top,
-                                NULL, NULL, NULL, NULL );
-    {
-        BOOL disable = TRUE;
-        DWORD corner = CORNER_DONOTROUND;
-        DwmSetWindowAttribute( backdrop, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable) );
-        DwmSetWindowAttribute( backdrop, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner) );
-    }
-    ShowWindow( backdrop, SW_SHOWNOACTIVATE );
-
-    for (i = 0; i < ARRAYSIZE(variants); i++)
-    {
-        const struct variant *v = &variants[i];
-        int x = origin.x + (i % columns) * cell_w + margin, y = origin.y + (i / columns) * cell_h + margin;
-        BOOL disable = TRUE;
-
-        windows[i] = CreateWindowExW( WS_EX_TOPMOST | WS_EX_NOACTIVATE | v->ex_style,
-                                      v->dropshadow ? L"DwmFramePopupShadow" : L"DwmFramePopup", L"popup",
-                                      WS_POPUP | WS_CLIPSIBLINGS, x, y, win_w, win_h, backdrop, NULL, NULL, NULL );
-        DwmSetWindowAttribute( windows[i], DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable) );
-        DwmSetWindowAttribute( windows[i], DWMWA_WINDOW_CORNER_PREFERENCE, &v->corner, sizeof(v->corner) );
-        if (v->border != COLOR_UNSET)
-            DwmSetWindowAttribute( windows[i], DWMWA_BORDER_COLOR, &v->border, sizeof(v->border) );
-        if (v->ex_style & WS_EX_LAYERED) SetLayeredWindowAttributes( windows[i], 0, 255, LWA_ALPHA );
-        ShowWindow( windows[i], SW_SHOWNOACTIVATE );
-        UpdateWindow( windows[i] );
-    }
-    pump( 1200 );
-
-    for (i = 0; i < ARRAYSIZE(variants); i++)
-    {
-        const struct variant *v = &variants[i];
-        RECT rc, frame, cell;
-        DWORD thickness = 0xdeadbeef;
-        HRESULT hr;
-
-        GetWindowRect( windows[i], &rc );
-        hr = DwmGetWindowAttribute( windows[i], DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame) );
-        printf( "%s: window (%ld,%ld)-(%ld,%ld) ex %#lx class %s corner %lu border ", v->name, rc.left, rc.top,
-                rc.right, rc.bottom, v->ex_style, v->dropshadow ? "CS_DROPSHADOW" : "plain", v->corner );
-        if (v->border == COLOR_UNSET) printf( "unset" );
-        else if (v->border == COLOR_NONE) printf( "none" );
-        else printf( "%#lx", v->border );
-        printf( ", frame bounds hr %#lx (%ld,%ld)-(%ld,%ld)", hr, frame.left, frame.top, frame.right, frame.bottom );
-        hr = DwmGetWindowAttribute( windows[i], DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, &thickness, sizeof(thickness) );
-        printf( ", visible border thickness hr %#lx %lu\n", hr, thickness );
-        cell = rc;
-        InflateRect( &cell, margin, margin );
-        capture( v->name, cell );
-    }
-
-    for (i = 0; i < ARRAYSIZE(variants); i++) DestroyWindow( windows[i] );
-    DestroyWindow( backdrop );
+    run_pass( RGB( 0x80, 0x80, 0x80 ), "", area, origin, cell_w, cell_h, win_w, win_h, margin, columns );
+    run_pass( RGB( 0, 0, 0 ), "@black", area, origin, cell_w, cell_h, win_w, win_h, margin, columns );
+    run_pass( RGB( 0xff, 0xff, 0xff ), "@white", area, origin, cell_w, cell_h, win_w, win_h, margin, columns );
     CoUninitialize();
     return 0;
 }

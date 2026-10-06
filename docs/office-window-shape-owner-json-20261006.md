@@ -8,6 +8,7 @@
 > 没做的做了。
 
 改动都在 wine-src-up 的 `altars-up` 分支，已推送；`dist-up` 已更新（含协议改动后的 wineserver），`/opt` 要重新安装才生效。
+第 6–9 节是同一天接着做的部分。
 
 | 提交 | 内容 |
 |---|---|
@@ -65,10 +66,47 @@ Windows 写出（Stringify）用加入顺序，迭代对象和视图却用它内
 对话框打开时标题栏与内容相连（差 6 px），用窗口管理器挪动、快速连续拖动，内容都立即跟上。需要用户描述当时的操作。
 搭隔离 Shell 时它把扩展更新装进了用户的真实扩展目录（blur-my-shell 72→74，用户决定保留）。
 
-## 6. 已测、待做（第 167 批探针）
+## 6. msxml：坏文档、根元素之后、DTD 校验、E_PENDING、接口（第 167、168 批，tools/msxmlmoreprobe）
 
-- msxml（tools/msxmlmoreprobe）：3.0 不该提供 `IXMLDOMDocument3`；缺 `IPersistMoniker`、`IProvideClassInfo`、`IOleCommandTarget`、
-  `IServiceProvider`、`IMarshal`；未定义实体、控制字符、两个根元素 Wine 都接受了；parseError 的位置与 srcText；
-  `E_PENDING` 挂起语义；`E_ACCESSDENIED` 直接返回；不做 DTD 校验；实体引用节点（待重测）。
-- DWM（tools/dwmframeprobe）：圆角弹出窗口的阴影（ROUND 与 ROUNDSMALL 大小不同）与默认边框。
+| 提交 | 内容 |
+|---|---|
+| `f943304d0da` | msxml3：读取器的缓冲区在移动或增长后于数据末尾终止（后面几项依赖它） |
+| `29dd3a40a14` | 未定义实体、文本里的控制字符、第二个根元素按 Windows 报错；位置、srcText、filepos；空 `loadXML` 记缺根 |
+| `bc4d55d3ccb` | 流拒绝访问时 `load()` 原样返回 `E_ACCESSDENIED` |
+| `d3a2b898381` | 流连续两次 `E_PENDING` 时挂起：load 成功、readyState 3、持有流 |
+| `37ad0e3e213` | `IXMLDOMDocument3` 只给 MSXML 6.0；3.0 文档的 IDispatch 用 IXMLDOMDocument2 |
+| `72207003cd2` | 校验用的 libxml2 文档里补上元素的属性声明链（`xmlCopyDtd` 丢了它，缺必需属性一直查不出） |
+| `e7a811081f3` | DTD 校验错误用 MSXML 的代码（Wine 测试里十个 todo_wine 通过） |
+| `56757fe71dc` | 根元素之后不能有的内容各报各的错、报在 Windows 停下的地方 |
+| `452c34eb44f` | DTD 校验错误按读的顺序取第一个，报在读取器遇到它的位置（与 SAX 定位器在相应事件上的位置相同） |
+
+每个提交都带了 Windows 实测出的测试；msxml3 全部测试（domdoc 45358 项等）0 失败，改动前的构建在新测试上失败。
+探针的 reasons、pending、epilog、validation 段与 Windows 逐行相同（不计 reason 原文与读块大小），只差 6.0 保留 EMPTY 元素
+空格的那一处。细节见 [tools/msxmlmoreprobe/README.md](../tools/msxmlmoreprobe/README.md)。
+
+## 7. 窗口：跨进程设拥有者不再卡住，WPF_RESTORETOMAXIMIZED（第 168 批，tools/ownerprobe）
+
+| 提交 | 内容 |
+|---|---|
+| `a7ee2db407f` | 跨进程 `SetWindowLongPtr(GWLP_HWNDPARENT)` 直接改服务端、通知对方线程，不再同步等它；别的线程问服务端 |
+| `9a6d1602ec0` | `WPF_RESTORETOMAXIMIZED`：最大化期间报，否则只在从最大化最小化或带标志最小化地 `SetWindowPlacement` 之后报 |
+
+新探针段里发现：对方线程不处理消息时，跨进程设拥有者在 Wine 里一直等（Windows 立即返回）；`WPF_RESTORETOMAXIMIZED`
+上一轮我让它一最大化就置位，结果“最大化、还原”之后还在。ownerprobe 现在与 Windows 只差最小化位置和服务会话的可见性。
+user32 的 win、msg 测试与改动前对比：没有新增失败，新加的测试在改动前失败。
+
+## 8. JSON：Split 两半（第 168 批）
+
+`IMapView.Split` 两半按视图的哈希表顺序切开，Wine 已经如此；jsonprobe 与 Windows 逐行相同（含上次未初始化的那一行）。
+
+## 9. 还没做的
+
+- DWM 阴影与默认边框：第 167 批截图的边距不够、灰底分辨率只有 1/128；dwmframe 已改为 64 px 边距并加黑、白背景，
+  第 168 批时有人在用那台电脑，探针按设计拒绝运行，待下一批。拿到数据后按截图做九宫格阴影（四角取实测，四边沿窗口拉伸），
+  在 winex11 里给圆角弹出窗口配一个 ARGB 窗口垫在下面，只在合成管理器运行时启用。
+- msxml 实体引用节点：结构已测清（见探针 README），Wine 仍把实体展开成文本；要让读取器把属性值里的原始引用交给 DOM 构建器。
+- msxml 的 `IPersistMoniker`、`IProvideClassInfo`、`IOleCommandTarget`、`IServiceProvider`、`IMarshal`：第 168 批只测到
+  一个类（探针自身的引用计数错误使它崩溃，已修），待下一批。
+- reason 原文：Windows 是带参数的中文，Wine 是英文、不带参数。
+- 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
 - 桌面上 Word/Excel/PowerPoint/Outlook 的图标原先仍指向退役的 `~/.wine-c2r-test`，已按用户要求改指 `~/.wine-c2r-up`。

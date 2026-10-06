@@ -8,6 +8,9 @@
  *
  *   ownerprobe            the whole run (starts itself again as the other process)
  *
+ * Also when WPF_RESTORETOMAXIMIZED is set and cleared, and what a window of another process whose
+ * thread takes no messages says its owner is once that owner is destroyed.
+ *
  * Copyright 2026 AltarsCN.  LGPL 2.1 or later, as Wine.
  */
 #include <stdio.h>
@@ -87,22 +90,42 @@ static void child_step( HWND hwnd, int step )
     print_placement( "(its own)", &wp );
 }
 
+/* a window of the other process on a thread that takes no messages until it is released */
+static HWND stuck_window;
+static HANDLE stuck_ready, stuck_release;
+
+static DWORD WINAPI stuck_proc( void *arg )
+{
+    stuck_window = create( L"OwnerProbeStuckWindow", 0 );
+    SetEvent( stuck_ready );
+    WaitForSingleObject( stuck_release, INFINITE );
+    DestroyWindow( stuck_window );
+    return 0;
+}
+
 static int child( void )
 {
     HANDLE query = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeQuery" );
     HANDLE answered = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeAnswered" );
     HANDLE quit = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeQuit" );
     HANDLE step_event = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeStep" );
-    HANDLE events[3] = { query, quit, step_event };
+    HANDLE make_stuck = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeMakeStuck" );
+    HANDLE query_stuck = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeQueryStuck" );
+    HANDLE release_stuck = OpenEventW( EVENT_ALL_ACCESS, FALSE, L"OwnerProbeReleaseStuck" );
+    HANDLE events[6] = { query, quit, step_event, make_stuck, query_stuck, release_stuck };
+    HANDLE stuck_thread = NULL;
     int step = 0;
     HWND hwnd = create( L"OwnerProbeChildWindow", 0 );
     MSG msg;
 
-    if (!query || !answered || !quit || !step_event || !hwnd) return 1;
+    if (!query || !answered || !quit || !step_event || !make_stuck || !query_stuck || !release_stuck || !hwnd)
+        return 1;
+    stuck_ready = CreateEventW( NULL, FALSE, FALSE, NULL );
+    stuck_release = CreateEventW( NULL, FALSE, FALSE, NULL );
     SetEvent( answered );
     for (;;)
     {
-        DWORD ret = MsgWaitForMultipleObjects( 3, events, FALSE, INFINITE, QS_ALLINPUT );
+        DWORD ret = MsgWaitForMultipleObjects( 6, events, FALSE, INFINITE, QS_ALLINPUT );
         if (ret == WAIT_OBJECT_0)
         {
             HWND owner = GetWindow( hwnd, GW_OWNER );
@@ -117,10 +140,137 @@ static int child( void )
             child_step( hwnd, step++ );
             SetEvent( answered );
         }
+        else if (ret == WAIT_OBJECT_0 + 3)
+        {
+            stuck_thread = CreateThread( NULL, 0, stuck_proc, NULL, 0, NULL );
+            WaitForSingleObject( stuck_ready, 5000 );
+            SetEvent( answered );
+        }
+        else if (ret == WAIT_OBJECT_0 + 4)
+        {
+            /* asked from this process's main thread, which does take messages */
+            HWND owner = GetWindow( stuck_window, GW_OWNER );
+            LONG_PTR parent = GetWindowLongPtrW( stuck_window, GWLP_HWNDPARENT );
+            printf( "  %-40s IsWindow %d GW_OWNER %s GWLP_HWNDPARENT %s, IsWindow(owner) %d\n",
+                    "(another thread of its process)", IsWindow( stuck_window ), owner ? "set" : "NULL",
+                    parent ? "set" : "NULL", owner ? IsWindow( owner ) : -1 );
+            fflush( stdout );
+            SetEvent( answered );
+        }
+        else if (ret == WAIT_OBJECT_0 + 5)
+        {
+            SetEvent( stuck_release );
+            if (stuck_thread) WaitForSingleObject( stuck_thread, 5000 );
+            SetEvent( answered );
+        }
         else while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
     }
     DestroyWindow( hwnd );
     return 0;
+}
+
+/* WPF_RESTORETOMAXIMIZED, in this process: what sets and clears it, and what restoring then does */
+enum { OP_NONE, OP_SHOW, OP_PLACE, OP_MOVE };
+
+struct op { int kind; int cmd; UINT flags; };
+
+static void print_state( const char *what, HWND hwnd )
+{
+    WINDOWPLACEMENT wp = { sizeof(wp) };
+    GetWindowPlacement( hwnd, &wp );
+    printf( "    %-34s flags %#x showCmd %u zoomed %d iconic %d visible %d\n", what, wp.flags, wp.showCmd,
+            IsZoomed( hwnd ), IsIconic( hwnd ), IsWindowVisible( hwnd ) );
+    fflush( stdout );
+}
+
+static void do_op( HWND hwnd, const struct op *op )
+{
+    WINDOWPLACEMENT wp = { sizeof(wp) };
+
+    switch (op->kind)
+    {
+    case OP_SHOW:
+        ShowWindow( hwnd, op->cmd );
+        break;
+    case OP_PLACE:
+        GetWindowPlacement( hwnd, &wp );
+        wp.flags = op->flags;
+        wp.showCmd = op->cmd;
+        SetWindowPlacement( hwnd, &wp );
+        break;
+    case OP_MOVE:
+        SetWindowPos( hwnd, 0, 130, 140, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+        break;
+    }
+}
+
+static const char *op_name( const struct op *op, char *buf )
+{
+    static const char *cmds[] = { "SW_HIDE", "SW_SHOWNORMAL", "SW_SHOWMINIMIZED", "SW_SHOWMAXIMIZED",
+                                  "SW_SHOWNOACTIVATE", "SW_SHOW", "SW_MINIMIZE", "SW_SHOWMINNOACTIVE",
+                                  "SW_SHOWNA", "SW_RESTORE" };
+    const char *cmd = op->cmd >= 0 && op->cmd < ARRAYSIZE(cmds) ? cmds[op->cmd] : "?";
+    switch (op->kind)
+    {
+    case OP_SHOW: sprintf( buf, "ShowWindow(%s)", cmd ); break;
+    case OP_PLACE: sprintf( buf, "SetWindowPlacement(%s, flags %#x)", cmd, op->flags ); break;
+    case OP_MOVE: sprintf( buf, "SetWindowPos (move)" ); break;
+    default: sprintf( buf, "nothing" ); break;
+    }
+    return buf;
+}
+
+static void restore_max_flag( void )
+{
+    static const struct
+    {
+        const char *start;      /* how the window gets to where the operation starts */
+        int prep[2];            /* ShowWindow commands, after showing it normally; -1 for none */
+        struct op op;
+        BOOL then_restore;      /* then ShowWindow(SW_RESTORE) */
+    }
+    tests[] =
+    {
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_PLACE, SW_SHOWNOACTIVATE, WPF_RESTORETOMAXIMIZED } },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_PLACE, SW_SHOWNOACTIVATE, 0 } },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_PLACE, SW_SHOWNORMAL, WPF_RESTORETOMAXIMIZED } },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_PLACE, SW_SHOWMINIMIZED, WPF_RESTORETOMAXIMIZED }, TRUE },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_PLACE, SW_SHOWMINIMIZED, 0 }, TRUE },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_SHOW, SW_SHOWNORMAL } },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_SHOW, SW_MINIMIZE }, TRUE },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_MOVE } },
+        { "maximized, restored", { SW_MAXIMIZE, SW_RESTORE }, { OP_SHOW, SW_HIDE } },
+        { "normal", { -1, -1 }, { OP_PLACE, SW_SHOWMINIMIZED, WPF_RESTORETOMAXIMIZED }, TRUE },
+        { "normal", { -1, -1 }, { OP_PLACE, SW_SHOWNOACTIVATE, WPF_RESTORETOMAXIMIZED } },
+        { "normal", { -1, -1 }, { OP_PLACE, SW_SHOWMAXIMIZED, 0 } },
+        { "maximized", { SW_MAXIMIZE, -1 }, { OP_PLACE, SW_SHOWMAXIMIZED, 0 } },
+        { "maximized", { SW_MAXIMIZE, -1 }, { OP_PLACE, SW_SHOWNOACTIVATE, WPF_RESTORETOMAXIMIZED } },
+        { "maximized", { SW_MAXIMIZE, -1 }, { OP_SHOW, SW_MINIMIZE }, TRUE },
+        { "minimized from maximized", { SW_MAXIMIZE, SW_MINIMIZE }, { OP_PLACE, SW_SHOWMINIMIZED, 0 }, TRUE },
+        { "minimized from maximized", { SW_MAXIMIZE, SW_MINIMIZE }, { OP_PLACE, SW_SHOWMINNOACTIVE, 0 }, TRUE },
+        { "minimized from normal", { SW_MINIMIZE, -1 }, { OP_PLACE, SW_SHOWMINIMIZED, WPF_RESTORETOMAXIMIZED }, TRUE },
+    };
+    unsigned int i, j;
+    char buf[80];
+
+    printf( "WPF_RESTORETOMAXIMIZED in this process\n" );
+    for (i = 0; i < ARRAYSIZE(tests); i++)
+    {
+        HWND hwnd = CreateWindowExW( 0, class_name, L"placement", WS_OVERLAPPEDWINDOW, 100, 120, 300, 200,
+                                     0, 0, NULL, NULL );
+        ShowWindow( hwnd, SW_SHOWNOACTIVATE );
+        for (j = 0; j < 2; j++) if (tests[i].prep[j] >= 0) ShowWindow( hwnd, tests[i].prep[j] );
+        printf( "  %s, then %s\n", tests[i].start, op_name( &tests[i].op, buf ) );
+        print_state( "before", hwnd );
+        do_op( hwnd, &tests[i].op );
+        print_state( "after", hwnd );
+        if (tests[i].then_restore)
+        {
+            ShowWindow( hwnd, SW_RESTORE );
+            print_state( "then ShowWindow(SW_RESTORE)", hwnd );
+        }
+        DestroyWindow( hwnd );
+    }
 }
 
 static void ask_child( HANDLE query, HANDLE answered )
@@ -134,13 +284,14 @@ int main( int argc, char **argv )
 {
     WNDCLASSW cls = { 0 };
     struct thread_args args;
-    HANDLE query, answered, quit, thread, step_event;
+    HANDLE query, answered, quit, thread, step_event, make_stuck, query_stuck, release_stuck;
     PROCESS_INFORMATION pi;
     STARTUPINFOW si = { sizeof(si) };
     WCHAR cmd[MAX_PATH + 16];
     HWND owner, owned, other;
     LONG_PTR prev;
 
+    setvbuf( stdout, NULL, _IONBF, 0 );    /* a hang shows where it is */
     cls.lpfnWndProc = wndproc;
     cls.lpszClassName = class_name;
     RegisterClassW( &cls );
@@ -174,6 +325,9 @@ int main( int argc, char **argv )
     answered = CreateEventW( NULL, FALSE, FALSE, L"OwnerProbeAnswered" );
     quit = CreateEventW( NULL, TRUE, FALSE, L"OwnerProbeQuit" );
     step_event = CreateEventW( NULL, FALSE, FALSE, L"OwnerProbeStep" );
+    make_stuck = CreateEventW( NULL, FALSE, FALSE, L"OwnerProbeMakeStuck" );
+    query_stuck = CreateEventW( NULL, FALSE, FALSE, L"OwnerProbeQueryStuck" );
+    release_stuck = CreateEventW( NULL, FALSE, FALSE, L"OwnerProbeReleaseStuck" );
     GetModuleFileNameW( NULL, cmd, MAX_PATH );
     wcscat( cmd, L" child" );
     {
@@ -252,9 +406,39 @@ int main( int argc, char **argv )
         WaitForSingleObject( answered, 5000 );
     }
 
+    printf( "another process, the owned window's thread taking no messages\n" );
+    {
+        DWORD start, took;
+        HWND stuck;
+
+        SetEvent( make_stuck );
+        WaitForSingleObject( answered, 5000 );
+        stuck = FindWindowW( class_name, L"OwnerProbeStuckWindow" );
+        printf( "  found its window: %d\n", stuck != NULL );
+        owner = create( L"owner", 0 );
+        SetLastError( 0xdeadbeef );
+        prev = SetWindowLongPtrW( stuck, GWLP_HWNDPARENT, (LONG_PTR)owner );
+        printf( "  SetWindowLongPtr(GWLP_HWNDPARENT): returned %s, error %lu\n", prev ? "non-NULL" : "NULL",
+                GetLastError() );
+        show_owner( "after setting the owner", stuck, owner );
+        SetEvent( query_stuck );
+        WaitForSingleObject( answered, 5000 );
+        start = GetTickCount();
+        DestroyWindow( owner );
+        took = GetTickCount() - start;
+        printf( "  DestroyWindow(owner) returned %s\n", took < 1000 ? "within a second" : "after a second or more" );
+        show_owner( "after DestroyWindow(owner)", stuck, owner );
+        SetEvent( query_stuck );
+        WaitForSingleObject( answered, 5000 );
+        SetEvent( release_stuck );
+        WaitForSingleObject( answered, 5000 );
+    }
+
     SetEvent( quit );
     WaitForSingleObject( pi.hProcess, 5000 );
     CloseHandle( pi.hProcess );
     CloseHandle( pi.hThread );
+
+    restore_max_flag();
     return 0;
 }

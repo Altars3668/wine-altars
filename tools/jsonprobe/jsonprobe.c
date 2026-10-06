@@ -1070,6 +1070,23 @@ static void split(void)
             if (SUCCEEDED(hr) && second && second != SENTINEL) IMapView_HSTRING_IJsonValue_get_Size( second, &second_size );
             printf( "split of %u: %#lx first %s %d second %s %d\n", sizes[i], hr, out_state( first ), (int)first_size,
                     out_state( second ), (int)second_size );
+            /* which members each half has, and in what order: the view's own order, or the order they were added */
+            if (sizes[i] == 17 || sizes[i] == 33)
+            {
+                IIterable_IKeyValuePair_HSTRING_IJsonValue *iterable;
+                IMapView_HSTRING_IJsonValue *halves[3] = { view, first, second };
+                static const char *labels[3] = { "  the view", "  first half", "  second half" };
+                for (j = 0; j < 3; j++)
+                {
+                    if (FAILED(hr) || !halves[j] || halves[j] == SENTINEL) continue;
+                    if (SUCCEEDED(IMapView_HSTRING_IJsonValue_QueryInterface( halves[j],
+                            &IID_IIterable_IKeyValuePair_HSTRING_IJsonValue, (void **)&iterable )))
+                    {
+                        keys_of_iterable( labels[j], iterable );
+                        IIterable_IKeyValuePair_HSTRING_IJsonValue_Release( iterable );
+                    }
+                }
+            }
             if (SUCCEEDED(hr) && first && first != SENTINEL) IMapView_HSTRING_IJsonValue_Release( first );
             if (SUCCEEDED(hr) && second && second != SENTINEL) IMapView_HSTRING_IJsonValue_Release( second );
             IMapView_HSTRING_IJsonValue_Release( view );

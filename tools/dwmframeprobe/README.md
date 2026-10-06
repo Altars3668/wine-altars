@@ -1,8 +1,9 @@
 # dwmframe：Windows 11 的 DWM 在弹出窗口四周画什么
 
 回答“Office 的下拉面板在 Windows 上有阴影、有边框，Wine 下没有”到底该画成什么样。在中灰（0x80）背景上短暂显示 12 个白色
-弹出窗口（置顶、不激活、关掉 DWM 过渡动画），等 DWM 稳定后截下每个窗口四周 32 px（96 dpi 下）的屏幕，约两秒后全部关掉。
-两分钟内有人用过键盘鼠标或桌面锁着就拒绝运行（`-force` 例外）。
+弹出窗口（置顶、不激活、关掉 DWM 过渡动画），等 DWM 稳定后截下每个窗口四周 64 px（96 dpi 下）的屏幕，约两秒后全部关掉；
+再在黑色、白色背景上各显示一遍不设边框色的那几个（名字后缀 `@black`、`@white`），用来分出默认边框的颜色与透明度，
+也让阴影的分辨率从灰底的 1/128 提高到 1/255。两分钟内有人用过键盘鼠标或桌面锁着就拒绝运行（`-force` 例外）。
 
 ```
 scripts/winbatch.sh tools/dwmframeprobe/dwmframe.exe scripts/win-deskrun.ps1 -- \
@@ -29,4 +30,6 @@ scripts/winbatch.sh tools/dwmframeprobe/dwmframe.exe scripts/win-deskrun.ps1 -- 
   颜色与透明度要在黑、白背景上再测才能定。
 - `CS_DROPSHADOW` 的直角窗口是经典的右下硬阴影，约 5 px（71、86、106、121、126）。
 
-Wine 现在只画圆角与给定颜色的边框（altars-up `13af402977c`、`dc64c3f9fb8`），阴影与默认边框都还没有。
+Wine 现在只画圆角与给定颜色的边框（altars-up `13af402977c`、`dc64c3f9fb8`），阴影与默认边框都还没有。第 167 批的边距
+（32 px）不够：ROUND 的阴影到下方 32 px 处仍暗 8.6%，相邻格子也互相串影；第 168 批时有人在用那台电脑，探针拒绝运行，
+加大边距、加黑白背景的一批待下次。
