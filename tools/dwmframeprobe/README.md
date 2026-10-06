@@ -41,10 +41,14 @@ winex11 给 override-redirect 的圆角窗口在其正下方配一个 ARGB 的 o
 默认边框时在那一圈画 0.40 的灰色。需要合成管理器（mutter 在用户的 Xwayland 上持有 `_NET_WM_CM_S0`）；
 mutter 50 对带形状的无边框窗口不画它自己的阴影，所以不会重复。受管窗口、逐像素透明的窗口、虚拟桌面不画。
 
+`CS_DROPSHADOW`（直角窗口，打开“窗口下显示阴影”时，Windows 默认开、Wine 默认关）：Windows 11 只在窗口右侧和下方画柔和的
+黑影，拟合得一块从窗口左上角向内 7 px 到右下角外 2 px 的矩形、σ 1.217 px 的模糊、透明度 0.497（96 dpi），均方根误差
+0.06/255。altars-up `359e8dbb15b` 照此画，与 Windows 最大差 2/255。圆角窗口带 `CS_DROPSHADOW` 时只有 DWM 的阴影。
+
 设了边框色的圆角窗口（Office 的下拉面板是 0x616161）：Windows 把角上部分在外的像素按覆盖比例把边框色混在背后之上。
 altars-up `c883cf11f07`、`9c0fe75bb77` 让 win32u 把这些像素从窗口形状里去掉，由阴影窗口按覆盖比例画边框色、叠在阴影上
 （它们都在边框的圆弧上，内容就是边框色）。
 
-`results/wine-9c0fe75bb77.txt` 与 `-sheet.png` 是在 Xvfb + xcompmgr 上的输出：窗口外与 Windows 的均方根差 0.3–0.7/255、
+`results/wine-359e8dbb15b.txt` 与 `-sheet.png` 是在 Xvfb + xcompmgr 上的输出（前缀里打开了“窗口下显示阴影”）：窗口外与 Windows 的均方根差 0.3–0.7/255、
 最大 2–8；默认边框那一圈在灰底上最大差 2；设了边框色的窗口连角上一圈最大差 3–7（原来 39–55）。只剩
 `DWMWA_COLOR_NONE` 的窗口角上几个像素：那里是窗口内容按覆盖比例混在背后，驱动不知道内容的颜色，Wine 的形状是二值的。在仿用户环境的隔离 GNOME Shell（mutter 50.1）里，阴影窗口按边距定位、紧贴在各自的弹出窗口之下。
