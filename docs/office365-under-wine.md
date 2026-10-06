@@ -12183,3 +12183,23 @@ dist-up 换了 wine.inf 之后，第一次启动 Word 会先做前缀更新（`w
   [Office 前缀更新诊断：原生验证与修复](office-prefixupdate-20261003.md)，不要将此处历史状态当成当前待办。
 - 2026-10-04 继续处理 Word 启动日志里的其余诊断（FIPS 策略、AI_FQDN、证书 link、WsAbortServiceProxy 与 WinHTTP 同步取消），
   原生测量、失败尝试和验证见 [Office 剩余功能修复：第一批](office-rest-fixes-20261004.md)。
+
+## 弹出面板闪退、下拉菜单卡顿，与打印机只显示一台（2026-10-06）
+
+- **标题栏“只读 · 兼容性模式 · 已保存”的面板黑一下就关**（altars-up `e9be6140953`）：Office 用 `SWP_NOACTIVATE`
+  显示面板，winex11 把它映射成 override-redirect；随后被激活，下一次 `SetWindowPos` 又因“它是激活窗口”把它改成托管，
+  撤销映射再映射，期间窗口管理器把焦点给了自己的窗口，Wine 把前台设成桌面，Office 关掉面板。修后已映射的非托管窗口
+  只因激活不再改托管。修前 10 次 5 次提前关闭，修后 0/10。
+- **下拉菜单展开慢**（altars-up `8b24432f92e`）：Office 给每个淡入的弹出窗口做一次 Windows.Graphics.Capture，每次新建
+  Direct2D 设备，Wine 的 d2d1 每个设备都用 vkd3d-shader 现场编译形状着色器。改为进程级缓存后，打印页下拉菜单从
+  0.7–2.9 秒降到 61–95 ms，标题栏面板从约 400 ms 降到 70–83 ms。
+  根因、测量方法和前后对照见 [Office 弹出面板：闪一下就关、展开慢](office-popup-focus-latency-20261006.md)。
+- **打印机只显示一台，原生程序也能手动双面**：`tools/cups-manual-duplex` 把手动双面做成打印机自己队列里的 CUPS 预过滤器，
+  不再另建队列；队列的设备 URI 改为打印机的 `dnssd://…._ipps._tcp.local/`，cups-browsed 和 libcups 因而认出它就是那台
+  打印机，不再各列一个。Edge 的打印面板与 Word 的打印机列表都只剩一台，且都有“双面打印 长边/短边翻转”。
+- **Word 里残留旧打印机**：Wine 的 winspool 在调用进程里同步 CUPS 打印机、写打印机注册表；在 Click-to-Run 的 Office 进程里，
+  这些写入被 Office 的 App-V 注册表虚拟化写进 `HKLM\Software\Microsoft\Office\ClickToRun\REGISTRY\MACHINE`，Word 与前缀里
+  其他程序看到的打印机就不一样了，CUPS 里删掉的打印机还留在 Word 里。Windows 上这些键由 spoolsv 写，Office 从不写。
+  `scripts/office-print-passthrough.sh` 把 `HKLM\SYSTEM\CurrentControlSet\Control\Print` 加进 Click-to-Run 的
+  `PassThroughPaths`（它本来就放行 crypt32、TCPIP、Xerox 等系统键），并删掉虚拟副本；Office 更新可能改写这个值，
+  `--check` 可查是否要重做。
