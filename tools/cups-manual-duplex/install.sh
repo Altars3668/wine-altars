@@ -3,7 +3,7 @@
 #
 #   install.sh [--target QUEUE] [--name NAME] [--info TEXT] [--default]
 #
-# Creates a new queue NAME (default: <QUEUE>_Duplex) in front of the real
+# Creates a new queue NAME (default: Duplex_<QUEUE>) in front of the real
 # queue QUEUE (default: the system default).  Native programs -- Edge,
 # Chromium, GTK, LibreOffice -- then offer two-sided printing, long or short
 # edge, on NAME; a two-sided job there becomes two jobs on QUEUE, the second
@@ -46,7 +46,9 @@ if [ -z "$target" ] && [ -n "$old_default" ]; then
 fi
 [ -n "$target" ] || die "no --target and no system default queue"
 lpstat -v "$target" > /dev/null 2>&1 || die "no such queue: $target"
-name=${name:-${target}_Duplex}
+# Edge lists printers by queue name and cuts it to about 25 characters, so
+# what tells the queues apart has to come first.
+name=${name:-Duplex_${target}}
 [ "$name" != "$target" ] || die "--name must differ from --target"
 for tool in qpdf lp lpadmin curl /usr/bin/python3; do
     command -v "$tool" > /dev/null || die "missing $tool"
@@ -84,7 +86,7 @@ fi
 if [ -z "$info" ]; then
     info=$(lpstat -l -p "$target" | sed -n 's/^[[:space:]]*Description: //p' | head -1)
     info=${info% (*}              # "(HP Driver)" and the like no longer apply
-    info="${info:-$target} (2-sided)"
+    info="${info:-$target} (手动双面)"
 fi
 location=$(lpstat -l -p "$target" | sed -n 's/^[[:space:]]*Location: //p' | head -1)
 say "queue $name -> manualduplex:/$target"

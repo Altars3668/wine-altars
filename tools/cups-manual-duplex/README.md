@@ -20,7 +20,7 @@ Windows 的 HP 驱动和 Wine 的 wineps.drv（`dlls/wineps.drv/printproc.c`，�
 
 这里把同一套机制搬到 CUPS 层：
 
-| | Wine（打到原队列） | 本方案（打到 `_Duplex` 队列） |
+| | Wine（打到原队列） | 本方案（打到 `Duplex_` 队列） |
 |---|---|---|
 | 何时自己做双面 | PPD 没有 `*Duplex` 时（`manual_duplex_wanted()`） | 作业带 `sides=two-sided-*` 或 `Duplex=DuplexNoTumble/DuplexTumble` |
 | 第一遍 | `page-set=odd` | 相同 |
@@ -41,11 +41,11 @@ Windows 的 HP 驱动和 Wine 的 wineps.drv（`dlls/wineps.drv/printproc.c`，�
 5 页、长边装订时：第一遍依次打印 1、3、5；第二遍依次打印空白、4、2，内容都转 180°。
 
 ```
-原生程序 ──► <队列>_Duplex（PPD = 真 PPD + Duplex 选项；过滤只跑 pdftopdf）
+原生程序 ──► Duplex_<队列>（PPD = 真 PPD + Duplex 选项；过滤只跑 pdftopdf）
                  └─ backend manualduplex：单面作业原样转交；双面作业拆成上面两个作业
             ──► <队列>（不改动：pdftopdf → gstoraster → URF → ipp backend）──► 打印机
 Word/Wine ──► 原队列：Wine 自己打两遍
-          └─► _Duplex 队列：PPD 有 Duplex，Wine 只发一个带 sides 的作业，由这里拆
+          └─► Duplex_ 队列：PPD 有 Duplex，Wine 只发一个带 sides 的作业，由这里拆
 ```
 
 ## 文件
@@ -62,9 +62,9 @@ Word/Wine ──► 原队列：Wine 自己打两遍
 ## 安装与回退
 
 ```sh
-tools/cups-manual-duplex/install.sh                 # 默认：系统默认队列 → <它>_Duplex
+tools/cups-manual-duplex/install.sh                 # 默认：系统默认队列 → Duplex_<它>
 tools/cups-manual-duplex/install.sh --default       # 同时把新队列设为系统默认
-~/.local/state/cups-manual-duplex/uninstall.sh --name HP_LaserJet_Tank_MFP_1005w_Duplex
+~/.local/state/cups-manual-duplex/uninstall.sh --name Duplex_HP_LaserJet_Tank_MFP_1005w
 ```
 
 `install.sh` 只新增两样东西：`/usr/lib/cups/backend/manualduplex`（需 sudo，0755，由 CUPS 以
@@ -79,10 +79,13 @@ lp 用户运行）和一个队列（lpadmin 组即可）。原队列不改；它
 
 ## 用法
 
-- **Edge / Chromium**：打印时目标选“HP LaserJet Tank MFP 1005w (2-sided)”，打开“双面打印”，
-  选择长边或短边翻转。Chromium 读 PPD 的 Duplex 选项，CUPS 也会公布
-  `sides-supported = one-sided,two-sided-long-edge,two-sided-short-edge`。
-- **GTK**：在“页面设置”里的“双面”中选择；**LibreOffice**：在打印机属性里设置 Duplex。
+- **Edge**（2026-10-06 在 Edge Dev 152 上实测，临时配置文件、测试显示，两条队列暂时拒收作业，没有出纸）：
+  Edge 自己的打印面板按**队列名**列出打印机，不用描述，并截到约 25 个字符。所以默认队列名以 `Duplex_`
+  开头：列表里是“Duplex_HP_LaserJet_Tank_M…”，否则三条都显示成“HP_LaserJet_Tank_MFP_1005…”，分不出来。
+  选中它后面板多出“双面打印”，可选“单面打印”“双面打印 长边翻转”“双面打印 短边翻转”；选原队列时没有这一项。
+  依据是 CUPS 为新队列公布的 `sides-supported = one-sided,two-sided-long-edge,two-sided-short-edge`。
+- **GTK**（显示描述“…（手动双面）”）：在“页面设置”里的“双面”中选择；**LibreOffice**：在打印机属性里设置
+  Duplex。这两项按 PPD 推断，未在界面上实测。
 - **在打印机上**：先打印奇数面。第二个作业到达后，打印机亮起手动进纸提示（绿箭头）。
   把出纸盒里的整叠纸拿起来，不翻面、不调头，原样平移放回纸盒，然后按键。
 
@@ -103,7 +106,7 @@ lp 用户运行）和一个队列（lpadmin 组即可）。原队列不改；它
 ## cups-browsed
 
 cups-browsed 只管理自己建的队列，即 printers.conf 里带 `Option cups-browsed true` 的队列，
-例如 `HP_LaserJet_Tank_MFP_1005w_FBDBF2`。用 lpadmin 手工建的队列不在其列：原队列和 `_Duplex`
+例如 `HP_LaserJet_Tank_MFP_1005w_FBDBF2`。用 lpadmin 手工建的队列不在其列：原队列和 `Duplex_`
 都没有这个标记，所以不会被覆盖。CUPS 也不会自动重建手工队列的 PPD。
 
 ## 测试（不费纸，不碰真打印机）
