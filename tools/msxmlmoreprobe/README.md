@@ -1,12 +1,13 @@
 # msxmlmore：msxml 文档还有哪些地方和 Windows 不一样
 
 接着 `tools/msxmlstreamprobe`、`tools/msxmlimportprobe`，把剩下的未知点一次问完。不联网；流都是探针自己的对象
-（堆上分配、不释放：msxml 可能在加载返回后还持有它）；methods 段在 %TEMP% 写一个小 XML 文件，用完删掉。
+（堆上分配、不释放：msxml 可能在加载返回后还持有它）；methods 段在 %TEMP% 写一个小 XML 文件，用完删掉；valuespaces 段
+让 msxml 去取 %TEMP% 下一个不存在的文件（看下载失败报什么）。
 文本里 ASCII 以外的字符一律写成 `\uXXXX`。
 
 ```
 msxmlmore [interfaces] [reasons] [pending] [blocks] [entities] [epilog] [validation] [methods] [spaces]
-                                                                                    （服务会话即可）
+          [entityrefs] [valuespaces]                                               （服务会话即可）
 ```
 
 | 段 | 问什么 |
@@ -20,8 +21,10 @@ msxmlmore [interfaces] [reasons] [pending] [blocks] [entities] [epilog] [validat
 | validation | 26 个文档：每种 DTD 校验错误在加载时（validateOnParse）的代码与位置，及不校验加载后 validate() 的结果 |
 | methods | IMarshal、IProvideClassInfo、IOleCommandTarget、IServiceProvider、IPersistMoniker 各方法的回答 |
 | spaces | 不校验时，各种内容模型（EMPTY、ANY、#PCDATA、元素、混合、未声明、无 DTD）下文档保留哪些空白 |
+| entityrefs | 实体引用的更多细节：DTD 里实体节点的子节点、text、xml；空白与 xml:space；属性里的引用；哪些修改被拒；克隆；XPath 与 XSL 模式下的选择；经引用的校验；实体文本里的错误 |
+| valuespaces | normalize 合并什么；node() 里有没有 DOCTYPE；属性与文本的值和 text 的空白；resolveExternals 的默认值与外部实体的加载；外部实体与 notation 的标识与 xml |
 
-## 结论（Windows 11 29671，results/windows-29671.txt；Wine 为 results/wine-767ba961357.txt）
+## 结论（Windows 11 29671，results/windows-29671.txt；Wine 为 results/wine-def826471c0.txt）
 
 接口：
 - MSXML 3.0 与自由线程 3.0 **不提供** `IXMLDOMDocument3`，6.0 提供（altars-up `37ad0e3e213` 照此实现，3.0 文档的 IDispatch
@@ -69,7 +72,24 @@ SAX 定位器在相应事件上给的位置——
 6.0 每次给 1 字节时前八次是 4094、4093…。逐字节复刻要模拟它的分词器，功能上没有意义，不做。加载 VT_UNKNOWN 时 Windows
 先对源对象 QI 两次 `IXMLDOMDocument`（`IPersistStreamInit::Load` 一次）。
 
-实体引用节点：内部实体的引用（属性值里也一样）在 DOM 里是只读的 entityref 节点，子节点是替换内容，可以嵌套；空实体是没有
-子节点的 entityref；字符引用与预定义实体只是文本，并入相邻文本；`appendChild`、改其文本的 `put_nodeValue` 都是 `E_FAIL`；
-`createEntityReference` 给声明过的实体填入替换内容，未声明的没有子节点，`get_text` 是空串而不是 NULL。3.0 与 6.0、校验与否
-结构相同，只有对根元素 `selectNodes("text()")` 3.0 是 7、6.0 是 8。Wine 把实体展开成文本——还没做。
+实体引用（第 169、170 批；altars-up `303abd68397`、`def826471c0`）：
+- DTD 读完时，MSXML 把每个内部实体的替换文本**单独**解析成该实体声明节点（doctype 的子节点）的子节点：没用到的实体里引用了
+  未声明的实体也报错（`0xC00CE002`，行列与 srcText 都是相对替换文本的，如 “&zz;” 的 1:2）。实体节点的 text 像元素一样去掉
+  首尾空白；xml 是 `<!ENTITY e "x">`，只写文本子节点和引用（`<b>y</b>` 写成 `""`，注释和 PI 不写）。
+- 正文与属性值里的引用是只读的 entityref 节点，子节点是声明节点子节点的副本：所以引用所在处的 xml:space 不起作用，
+  只含空白的实体（`" "`）引用后没有子节点，在属性里值也是空串；只有文档的 preserveWhiteSpace 才保留。字符引用与预定义实体
+  并入相邻文本。引用前后被丢的空白让序列化像元素一样换行缩进（`<r>\r\n\t&e;\r\n\t<b/>\r\n</r>`），`a&w;b` 的 text 是 “a b”。
+- 引用本身的子节点表不能改（appendChild/insertBefore/replaceChild/removeChild/put_text 都是 `E_FAIL`），里面的节点也不能改
+  （put_nodeValue、put_data、appendData、setAttribute……）；引用本身可以移走、换父节点。深克隆：3.0 的副本可改、6.0 仍只读；
+  浅克隆：3.0 没有子节点、6.0 重新带上实体的子节点。`createEntityReference` 带上声明的子节点（只读），未声明的没有子节点、text 是空串。
+- XPath：6.0 透过所有引用，3.0 只透过不在别的引用里的那一层（里层引用连同其内容都看不见）；从引用本身出发的查询，6.0 一律
+  `E_FAIL`，3.0 的 XPath 选其内容 `E_FAIL`。校验看引用代表的内容，错误位置在引用处（`&` 之后）。属性值里的实体带来 `<`
+  报 `0xC00CE506`，位置在起始标记结束处。
+- 剩下的只有 reason 原文。
+
+值与声明（第 170 批）：normalize 合并相邻文本（含子元素里的），CDATA 不并、空文本保留；3.0 的 XSL 模式下 `node()` 包含
+DOCTYPE，XPath 不含；属性的 text 在不保留空白时去掉首尾空白（nodeValue 是原值），文本节点的 nodeValue 也是原值；
+3.0 的 resolveExternals 默认为真、6.0 为假，打开时 DTD 结束处就加载所有外部实体（用不用都加载），失败时 3.0 报
+`0x800C0006`（URLOpenBlockingStream 本身是 `0x800C0005`，是 MSXML 3 换的码）、6.0 报 `0xC00CE009`；外部实体与 notation
+的 SYSTEM/PUBLIC 是声明时的原样，`publicId`/`systemId`/`notationName` 缺的那个回 S_FALSE。altars-up `bad663f91a6`、
+`303abd68397`、`def826471c0`。

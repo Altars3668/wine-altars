@@ -11,6 +11,10 @@
  *   methods      what the less common interfaces answer: IMarshal, IProvideClassInfo, IOleCommandTarget,
  *                IServiceProvider, IPersistMoniker
  *   spaces       which spaces a document keeps without validating, by the content its DTD declares
+ *   entityrefs   more on references: the DTD's entity nodes, spaces, attributes, what may change, selection,
+ *                validation through a reference
+ *   valuespaces  what normalize joins, the DTD among node(), the spaces of values and of text, the
+ *                identifiers of external entities and notations
  *
  * Text is printed with everything outside printable ASCII as \uXXXX.  No files, no network; streams
  * are the probe's own objects, and no output pointer is passed that has not been seen to be safe.
@@ -1234,6 +1238,809 @@ static void section_methods( void )
     DeleteFileW( path );
 }
 
+/*** entityrefs ***/
+
+/* entities for the cases below: text, markup, a nested reference, empty, a space, a comment and a PI,
+ * a character reference, text with spaces around it */
+#define ER_DTD L"<!DOCTYPE r [<!ENTITY e \"x\"><!ENTITY m \"<b>y</b>\"><!ENTITY n \"a&e;b\"><!ENTITY s \"\">" \
+               L"<!ENTITY w \" \"><!ENTITY k \"<!--c-->x<?p d?>\"><!ENTITY c \"&#65;B\"><!ENTITY t \"  x  \">]>"
+
+static IXMLDOMDocument2 *er_load( unsigned int v, const char *name, const WCHAR *xml, BOOL preserve, BOOL validate )
+{
+    IXMLDOMDocument2 *doc = create_doc( versions[v].clsid );
+    VARIANT_BOOL ok = 0x55;
+    HRESULT hr;
+
+    if (!doc) return NULL;
+    IXMLDOMDocument2_put_validateOnParse( doc, validate ? VARIANT_TRUE : VARIANT_FALSE );
+    if (preserve) IXMLDOMDocument2_put_preserveWhiteSpace( doc, VARIANT_TRUE );
+    hr = IXMLDOMDocument2_loadXML( doc, (BSTR)xml, &ok );
+    printf( "%s %s: loadXML hr %#lx ok %d\n", versions[v].name, name, hr, ok );
+    if (hr == S_OK) return doc;
+    print_parse_error( doc );
+    IXMLDOMDocument2_Release( doc );
+    return NULL;
+}
+
+static IXMLDOMNode *er_root( IXMLDOMDocument2 *doc )
+{
+    IXMLDOMElement *root = NULL;
+    IXMLDOMDocument2_get_documentElement( doc, &root );
+    return (IXMLDOMNode *)root;
+}
+
+static IXMLDOMNode *er_child( IXMLDOMNode *node, LONG index )
+{
+    IXMLDOMNodeList *list = NULL;
+    IXMLDOMNode *child = NULL;
+
+    if (!node || FAILED(IXMLDOMNode_get_childNodes( node, &list )) || !list) return NULL;
+    IXMLDOMNodeList_get_item( list, index, &child );
+    IXMLDOMNodeList_Release( list );
+    return child;
+}
+
+static LONG er_count( IXMLDOMNode *node )
+{
+    IXMLDOMNodeList *list = NULL;
+    LONG length = -1;
+
+    if (!node || FAILED(IXMLDOMNode_get_childNodes( node, &list )) || !list) return -1;
+    IXMLDOMNodeList_get_length( list, &length );
+    IXMLDOMNodeList_Release( list );
+    return length;
+}
+
+static void er_release( IXMLDOMNode *node )
+{
+    if (node) IXMLDOMNode_Release( node );
+}
+
+static void er_select( const char *what, IXMLDOMNode *node, const WCHAR *query )
+{
+    IXMLDOMNodeList *list = NULL;
+    LONG length = -1;
+    HRESULT hr;
+
+    if (!node) return;
+    hr = IXMLDOMNode_selectNodes( node, (BSTR)query, &list );
+    printf( "    %s selectNodes(", what );
+    put_text( query, -1 );
+    printf( ") hr %#lx", hr );
+    if (list)
+    {
+        IXMLDOMNodeList_get_length( list, &length );
+        printf( " length %ld", length );
+        IXMLDOMNodeList_Release( list );
+    }
+    printf( "\n" );
+}
+
+static void er_select_single( const char *what, IXMLDOMNode *node, const WCHAR *query )
+{
+    IXMLDOMNode *found = NULL;
+    HRESULT hr;
+
+    if (!node) return;
+    hr = IXMLDOMNode_selectSingleNode( node, (BSTR)query, &found );
+    printf( "    %s selectSingleNode(", what );
+    put_text( query, -1 );
+    printf( ") hr %#lx", hr );
+    if (found)
+    {
+        DOMNodeType type = 0;
+        BSTR name = NULL;
+        IXMLDOMNode_get_nodeType( found, &type );
+        IXMLDOMNode_get_nodeName( found, &name );
+        printf( " %s ", type_name( type ) );
+        put_bstr( name );
+        SysFreeString( name );
+        IXMLDOMNode_Release( found );
+    }
+    printf( "\n" );
+}
+
+static void er_append( const char *what, IXMLDOMDocument2 *doc, IXMLDOMNode *parent )
+{
+    IXMLDOMText *text = NULL;
+    IXMLDOMNode *added = NULL;
+    HRESULT hr;
+
+    if (!parent) return;
+    IXMLDOMDocument2_createTextNode( doc, (BSTR)L"z", &text );
+    hr = IXMLDOMNode_appendChild( parent, (IXMLDOMNode *)text, &added );
+    printf( "    %s appendChild: hr %#lx\n", what, hr );
+    if (added) IXMLDOMNode_Release( added );
+    if (text) IXMLDOMText_Release( text );
+}
+
+static void er_put_value( const char *what, IXMLDOMNode *node )
+{
+    VARIANT value;
+    HRESULT hr;
+
+    if (!node) return;
+    V_VT( &value ) = VT_BSTR;
+    V_BSTR( &value ) = SysAllocString( L"changed" );
+    hr = IXMLDOMNode_put_nodeValue( node, value );
+    printf( "    %s put_nodeValue: hr %#lx\n", what, hr );
+    VariantClear( &value );
+}
+
+static void er_put_text( const char *what, IXMLDOMNode *node )
+{
+    HRESULT hr;
+
+    if (!node) return;
+    hr = IXMLDOMNode_put_text( node, (BSTR)L"z" );
+    printf( "    %s put_text: hr %#lx\n", what, hr );
+}
+
+static void er_dump( const char *what, IXMLDOMNode *node )
+{
+    if (!node) return;
+    dump_node( node, 0 );
+    print_xml_text( what, node );
+}
+
+/* the entity nodes of the DTD: their children, text and xml */
+static void entityrefs_doctype( unsigned int v )
+{
+    IXMLDOMDocument2 *doc = er_load( v, "doctype entities", ER_DTD L"<r/>", FALSE, FALSE );
+    IXMLDOMDocumentType *doctype = NULL;
+    IXMLDOMNode *child = NULL, *next, *grandchild, *after;
+
+    if (!doc) return;
+    if (SUCCEEDED(IXMLDOMDocument2_get_doctype( doc, &doctype )) && doctype)
+    {
+        IXMLDOMDocumentType_get_firstChild( doctype, &child );
+        while (child)
+        {
+            BSTR name = NULL, text = NULL, xml = NULL;
+            HRESULT hr_text, hr_xml;
+
+            IXMLDOMNode_get_nodeName( child, &name );
+            hr_text = IXMLDOMNode_get_text( child, &text );
+            hr_xml = IXMLDOMNode_get_xml( child, &xml );
+            printf( "    entity " );
+            put_bstr( name );
+            printf( " children %ld text hr %#lx ", er_count( child ), hr_text );
+            put_bstr( text );
+            printf( " xml hr %#lx ", hr_xml );
+            put_bstr( xml );
+            printf( "\n" );
+            SysFreeString( name );
+            SysFreeString( text );
+            SysFreeString( xml );
+            grandchild = NULL;
+            IXMLDOMNode_get_firstChild( child, &grandchild );
+            while (grandchild)
+            {
+                dump_node( grandchild, 2 );
+                after = NULL;
+                IXMLDOMNode_get_nextSibling( grandchild, &after );
+                IXMLDOMNode_Release( grandchild );
+                grandchild = after;
+            }
+            next = NULL;
+            IXMLDOMNode_get_nextSibling( child, &next );
+            IXMLDOMNode_Release( child );
+            child = next;
+        }
+        IXMLDOMDocumentType_Release( doctype );
+    }
+    IXMLDOMDocument2_Release( doc );
+}
+
+/* the nodes for references in various places, with spaces kept or not */
+static void entityrefs_structure( unsigned int v )
+{
+    static const struct { const char *name; const WCHAR *xml; BOOL preserve; } cases[] =
+    {
+        { "spaces around a reference", ER_DTD L"<r>\n  &e;\n  <b/>\n</r>" },
+        { "a space entity between letters", ER_DTD L"<r>a&w;b</r>" },
+        { "an entity with spaces around x", ER_DTD L"<r>&t;</r>" },
+        { "a comment and a PI in an entity", ER_DTD L"<r>&k;</r>" },
+        { "a character reference in an entity", ER_DTD L"<r>&c;</r>" },
+        { "references in attributes", ER_DTD L"<r a=\"&w;\" b=\"&t;\" c=\"&lt;&e;&gt;\" d=\"&c;&s;\"/>" },
+        { "spaces kept", ER_DTD L"<r>&w;<b/>&t;</r>", TRUE },
+        { "xml:space preserve", ER_DTD L"<r xml:space=\"preserve\">&w;<b/>&t;</r>" },
+        { "an entity declared after the one using it", L"<!DOCTYPE r [<!ENTITY n \"a&f;b\"><!ENTITY f \"x\">]><r>&n;</r>" },
+        { "markup in an entity in an attribute", ER_DTD L"<r a=\"&m;\"/>" },
+        { "an undeclared entity in an entity", L"<!DOCTYPE r [<!ENTITY u \"&zz;\">]><r>&u;</r>" },
+        { "an undeclared entity in an unused entity", L"<!DOCTYPE r [<!ENTITY u \"&zz;\">]><r/>" },
+        { "adjacent references", ER_DTD L"<r>x&e;&e;y</r>" },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAYSIZE(cases); i++)
+    {
+        IXMLDOMDocument2 *doc = er_load( v, cases[i].name, cases[i].xml, cases[i].preserve, FALSE );
+        IXMLDOMNode *root;
+        HRESULT hr;
+
+        if (!doc) continue;
+        root = er_root( doc );
+        er_dump( "root", root );
+        if (root && i == ARRAYSIZE(cases) - 1)
+        {
+            hr = IXMLDOMNode_QueryInterface( root, &IID_IXMLDOMElement, (void **)&root ) == S_OK
+                 ? IXMLDOMElement_normalize( (IXMLDOMElement *)root ) : E_NOINTERFACE;
+            printf( "    normalize: hr %#lx children %ld\n", hr, er_count( root ) );
+            dump_node( root, 0 );
+            er_release( root );
+        }
+        er_release( root );
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+/* what may change in and around a reference */
+static void entityrefs_changes( unsigned int v )
+{
+    IXMLDOMDocument2 *doc = er_load( v, "changes", ER_DTD L"<r a=\"1&e;2\">p&e;q&m;</r>", FALSE, FALSE );
+    IXMLDOMNode *root, *ref, *mref, *b, *child, *clone, *attr = NULL, *attr_ref, *holder = NULL;
+    IXMLDOMEntityReference *created = NULL;
+    IXMLDOMText *text = NULL;
+    IXMLDOMElement *element = NULL;
+    VARIANT value;
+    HRESULT hr;
+
+    if (!doc) return;
+    root = er_root( doc );
+    ref = er_child( root, 1 );
+    mref = er_child( root, 3 );
+    b = er_child( mref, 0 );
+
+    IXMLDOMDocument2_createTextNode( doc, (BSTR)L"z", &text );
+    child = er_child( ref, 0 );
+    if (ref && child)
+    {
+        IXMLDOMNode *out = NULL;
+        VARIANT before;
+
+        V_VT( &before ) = VT_UNKNOWN;
+        V_UNKNOWN( &before ) = (IUnknown *)child;
+        hr = IXMLDOMNode_insertBefore( ref, (IXMLDOMNode *)text, before, &out );
+        printf( "    reference insertBefore: hr %#lx\n", hr );
+        er_release( out );
+        out = NULL;
+        hr = IXMLDOMNode_replaceChild( ref, (IXMLDOMNode *)text, child, &out );
+        printf( "    reference replaceChild: hr %#lx\n", hr );
+        er_release( out );
+        out = NULL;
+        hr = IXMLDOMNode_removeChild( ref, child, &out );
+        printf( "    reference removeChild: hr %#lx\n", hr );
+        er_release( out );
+        er_put_text( "reference", ref );
+        er_put_text( "its text", child );
+        if (SUCCEEDED(IXMLDOMNode_QueryInterface( child, &IID_IXMLDOMText, (void **)&element )))
+        {
+            hr = IXMLDOMText_put_data( (IXMLDOMText *)element, (BSTR)L"z" );
+            printf( "    its text put_data: hr %#lx\n", hr );
+            hr = IXMLDOMText_appendData( (IXMLDOMText *)element, (BSTR)L"z" );
+            printf( "    its text appendData: hr %#lx\n", hr );
+            IXMLDOMText_Release( (IXMLDOMText *)element );
+            element = NULL;
+        }
+        print_xml_text( "reference after", ref );
+    }
+    er_release( child );
+
+    if (b && SUCCEEDED(IXMLDOMNode_QueryInterface( b, &IID_IXMLDOMElement, (void **)&element )))
+    {
+        V_VT( &value ) = VT_BSTR;
+        V_BSTR( &value ) = SysAllocString( L"1" );
+        hr = IXMLDOMElement_setAttribute( element, (BSTR)L"x", value );
+        printf( "    element in a reference setAttribute: hr %#lx\n", hr );
+        VariantClear( &value );
+        er_append( "element in a reference", doc, b );
+        child = er_child( b, 0 );
+        er_put_value( "text of the element in a reference", child );
+        if (child)
+        {
+            IXMLDOMNode *out = NULL;
+            hr = IXMLDOMNode_removeChild( b, child, &out );
+            printf( "    element in a reference removeChild: hr %#lx\n", hr );
+            er_release( out );
+        }
+        er_release( child );
+        IXMLDOMElement_Release( element );
+        element = NULL;
+    }
+
+    if (ref && SUCCEEDED(IXMLDOMNode_cloneNode( ref, VARIANT_TRUE, &clone )))
+    {
+        printf( "    deep clone of the reference: children %ld\n", er_count( clone ) );
+        er_append( "deep clone of the reference", doc, clone );
+        child = er_child( clone, 0 );
+        er_put_value( "text in the deep clone", child );
+        er_release( child );
+        er_release( clone );
+    }
+    if (ref && SUCCEEDED(IXMLDOMNode_cloneNode( ref, VARIANT_FALSE, &clone )))
+    {
+        printf( "    shallow clone of the reference: children %ld\n", er_count( clone ) );
+        er_append( "shallow clone of the reference", doc, clone );
+        er_release( clone );
+    }
+    if (root && SUCCEEDED(IXMLDOMNode_cloneNode( root, VARIANT_TRUE, &clone )))
+    {
+        IXMLDOMNode *clone_ref = er_child( clone, 1 );
+        er_append( "reference in a deep clone of the root", doc, clone_ref );
+        er_release( clone_ref );
+        er_release( clone );
+    }
+
+    if (root && SUCCEEDED(IXMLDOMNode_QueryInterface( root, &IID_IXMLDOMElement, (void **)&element )))
+    {
+        IXMLDOMElement_getAttributeNode( element, (BSTR)L"a", (IXMLDOMAttribute **)&attr );
+        IXMLDOMElement_Release( element );
+        element = NULL;
+    }
+    if (attr)
+    {
+        attr_ref = er_child( attr, 1 );
+        er_append( "reference in an attribute", doc, attr_ref );
+        child = er_child( attr_ref, 0 );
+        er_put_value( "text of the reference in an attribute", child );
+        er_release( child );
+        er_release( attr_ref );
+        V_VT( &value ) = VT_BSTR;
+        V_BSTR( &value ) = SysAllocString( L"new" );
+        hr = IXMLDOMNode_put_nodeValue( attr, value );
+        VariantClear( &value );
+        printf( "    attribute put_nodeValue: hr %#lx children %ld\n", hr, er_count( attr ) );
+        print_xml_text( "attribute", attr );
+        er_release( attr );
+    }
+
+    if (root && ref)
+    {
+        IXMLDOMNode *out = NULL;
+        hr = IXMLDOMNode_removeChild( root, ref, &out );
+        printf( "    root removeChild(reference): hr %#lx\n", hr );
+        er_release( out );
+        print_xml_text( "root after", root );
+        IXMLDOMDocument2_createElement( doc, (BSTR)L"h", (IXMLDOMElement **)&holder );
+        if (holder)
+        {
+            out = NULL;
+            hr = IXMLDOMNode_appendChild( holder, ref, &out );
+            printf( "    other element appendChild(reference): hr %#lx\n", hr );
+            er_release( out );
+            print_xml_text( "other element", holder );
+            er_append( "moved reference", doc, ref );
+            er_release( holder );
+        }
+    }
+
+    hr = IXMLDOMDocument2_createEntityReference( doc, (BSTR)L"e", &created );
+    printf( "    createEntityReference(e): hr %#lx\n", hr );
+    if (created)
+    {
+        er_append( "created reference", doc, (IXMLDOMNode *)created );
+        child = er_child( (IXMLDOMNode *)created, 0 );
+        er_put_value( "text of the created reference", child );
+        er_release( child );
+        IXMLDOMEntityReference_Release( created );
+    }
+    created = NULL;
+    hr = IXMLDOMDocument2_createEntityReference( doc, (BSTR)L"zz", &created );
+    printf( "    createEntityReference(zz): hr %#lx\n", hr );
+    if (created)
+    {
+        er_append( "created reference to an undeclared entity", doc, (IXMLDOMNode *)created );
+        IXMLDOMEntityReference_Release( created );
+    }
+
+    er_put_text( "root", root );
+    print_xml_text( "root at the end", root );
+
+    if (text) IXMLDOMText_Release( text );
+    er_release( b );
+    er_release( mref );
+    er_release( ref );
+    er_release( root );
+    IXMLDOMDocument2_Release( doc );
+}
+
+/* references to XPath, XSL patterns and getElementsByTagName */
+static void entityrefs_select( unsigned int v, BOOL xpath )
+{
+    IXMLDOMDocument2 *doc = er_load( v, xpath ? "selection, XPath" : "selection",
+                                     ER_DTD L"<r>p&e;q&m;s&n;&s;&#65;&amp;</r>", FALSE, FALSE );
+    static const WCHAR *queries[] = { L"text()", L"node()", L"b", L"*", L".//text()", L"//b", L"e", L"//node()" };
+    IXMLDOMNode *root, *ref, *mref, *b, *text;
+    IXMLDOMNodeList *list = NULL;
+    LONG length;
+    unsigned int i;
+
+    if (!doc) return;
+    if (xpath)
+    {
+        VARIANT lang;
+        V_VT( &lang ) = VT_BSTR;
+        V_BSTR( &lang ) = SysAllocString( L"XPath" );
+        IXMLDOMDocument2_setProperty( doc, (BSTR)L"SelectionLanguage", lang );
+        VariantClear( &lang );
+    }
+    root = er_root( doc );
+    for (i = 0; i < ARRAYSIZE(queries); i++) er_select( "root", root, queries[i] );
+    ref = er_child( root, 1 );
+    mref = er_child( root, 3 );
+    b = er_child( mref, 0 );
+    text = er_child( ref, 0 );
+    er_select( "reference", ref, L"text()" );
+    er_select( "reference", ref, L"node()" );
+    er_select_single( "reference", ref, L".." );
+    er_select_single( "text in a reference", text, L".." );
+    er_select_single( "element in a reference", b, L".." );
+    er_select_single( "element in a reference", b, L"ancestor::*" );
+    er_select( "element in a reference", b, L"preceding-sibling::node()" );
+    er_select( "element in a reference", b, L"following-sibling::node()" );
+    er_select( "text in a reference", text, L"ancestor::node()" );
+    er_select( "document", (IXMLDOMNode *)doc, L"//text()" );
+    er_select( "document", (IXMLDOMNode *)doc, L"/r/text()" );
+    er_select( "document", (IXMLDOMNode *)doc, L"/r/b" );
+    if (SUCCEEDED(IXMLDOMDocument2_getElementsByTagName( doc, (BSTR)L"b", &list )) && list)
+    {
+        length = -1;
+        IXMLDOMNodeList_get_length( list, &length );
+        printf( "    document getElementsByTagName(b) length %ld\n", length );
+        IXMLDOMNodeList_Release( list );
+    }
+    if (root)
+    {
+        IXMLDOMElement *element = NULL;
+        list = NULL;
+        IXMLDOMNode_QueryInterface( root, &IID_IXMLDOMElement, (void **)&element );
+        if (element && SUCCEEDED(IXMLDOMElement_getElementsByTagName( element, (BSTR)L"b", &list )) && list)
+        {
+            length = -1;
+            IXMLDOMNodeList_get_length( list, &length );
+            printf( "    root getElementsByTagName(b) length %ld\n", length );
+            IXMLDOMNodeList_Release( list );
+        }
+        if (element) IXMLDOMElement_Release( element );
+    }
+    er_release( text );
+    er_release( b );
+    er_release( mref );
+    er_release( ref );
+    er_release( root );
+    IXMLDOMDocument2_Release( doc );
+}
+
+/* validation sees what the references stand for */
+static void entityrefs_validation( unsigned int v )
+{
+    static const struct { const char *name; const WCHAR *xml; } cases[] =
+    {
+        { "valid through a reference",
+          L"<!DOCTYPE r [<!ELEMENT r (b)><!ELEMENT b (#PCDATA)><!ENTITY m \"<b>y</b>\">]><r>&m;</r>" },
+        { "invalid through a reference",
+          L"<!DOCTYPE r [<!ELEMENT r (c)><!ELEMENT b (#PCDATA)><!ELEMENT c EMPTY><!ENTITY m \"<b>y</b>\">]><r>&m;</r>" },
+        { "text in an EMPTY element through a reference",
+          L"<!DOCTYPE r [\n<!ELEMENT r (b)>\n<!ELEMENT b EMPTY>\n<!ENTITY m \"<b>y</b>\">\n]>\n<r>\n&m;</r>" },
+        { "a space in an EMPTY element through a reference",
+          L"<!DOCTYPE r [<!ELEMENT r EMPTY><!ENTITY w \" \">]><r>&w;</r>" },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAYSIZE(cases); i++)
+    {
+        IXMLDOMDocument2 *doc = er_load( v, cases[i].name, cases[i].xml, FALSE, TRUE );
+        IXMLDOMParseError *error = NULL;
+        HRESULT hr;
+
+        if (doc) IXMLDOMDocument2_Release( doc );
+        if (!(doc = er_load( v, cases[i].name, cases[i].xml, FALSE, FALSE ))) continue;
+        hr = IXMLDOMDocument2_validate( doc, &error );
+        printf( "    validate: hr %#lx\n", hr );
+        if (error)
+        {
+            LONG code = 0, line = 0, linepos = 0, filepos = 0;
+            IXMLDOMParseError_get_errorCode( error, &code );
+            IXMLDOMParseError_get_line( error, &line );
+            IXMLDOMParseError_get_linepos( error, &linepos );
+            IXMLDOMParseError_get_filepos( error, &filepos );
+            printf( "    validate error %#lx line %ld linepos %ld filepos %ld\n", code, line, linepos, filepos );
+            IXMLDOMParseError_Release( error );
+        }
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+static void section_entityrefs( void )
+{
+    unsigned int v;
+
+    printf( "== entityrefs\n" );
+    for (v = 0; v < ARRAYSIZE(versions); v++)
+    {
+        entityrefs_doctype( v );
+        entityrefs_structure( v );
+        entityrefs_changes( v );
+        entityrefs_select( v, FALSE );
+        if (!v) entityrefs_select( v, TRUE );
+        entityrefs_validation( v );
+    }
+}
+
+/*** valuespaces: what normalize joins, the DTD among node(), spaces in values ***/
+
+static void er_add_text( IXMLDOMDocument2 *doc, IXMLDOMElement *parent, const WCHAR *data, BOOL cdata )
+{
+    IXMLDOMNode *node = NULL, *added = NULL;
+
+    if (cdata)
+        IXMLDOMDocument2_createCDATASection( doc, (BSTR)data, (IXMLDOMCDATASection **)&node );
+    else
+        IXMLDOMDocument2_createTextNode( doc, (BSTR)data, (IXMLDOMText **)&node );
+    if (!node) return;
+    IXMLDOMElement_appendChild( parent, node, &added );
+    if (added) IXMLDOMNode_Release( added );
+    IXMLDOMNode_Release( node );
+}
+
+static void valuespaces_normalize( unsigned int v )
+{
+    IXMLDOMDocument2 *doc = create_doc( versions[v].clsid );
+    IXMLDOMElement *r = NULL, *x = NULL, *y = NULL;
+    IXMLDOMNode *added = NULL;
+    HRESULT hr;
+
+    if (!doc) return;
+    IXMLDOMDocument2_createElement( doc, (BSTR)L"r", &r );
+    IXMLDOMDocument2_createElement( doc, (BSTR)L"x", &x );
+    IXMLDOMDocument2_createElement( doc, (BSTR)L"y", &y );
+    if (r && x && y)
+    {
+        er_add_text( doc, r, L"a", FALSE );
+        er_add_text( doc, r, L"b", FALSE );
+        er_add_text( doc, r, L"", FALSE );
+        er_add_text( doc, r, L"c", TRUE );
+        er_add_text( doc, r, L"d", FALSE );
+        er_add_text( doc, x, L"e", FALSE );
+        er_add_text( doc, x, L"f", FALSE );
+        IXMLDOMElement_appendChild( r, (IXMLDOMNode *)x, &added );
+        if (added) IXMLDOMNode_Release( added );
+        added = NULL;
+        er_add_text( doc, y, L"", FALSE );
+        IXMLDOMElement_appendChild( r, (IXMLDOMNode *)y, &added );
+        if (added) IXMLDOMNode_Release( added );
+        er_add_text( doc, r, L"", FALSE );
+        er_add_text( doc, r, L" ", FALSE );
+        hr = IXMLDOMElement_normalize( r );
+        printf( "%s normalize: hr %#lx children %ld\n", versions[v].name, hr, er_count( (IXMLDOMNode *)r ) );
+        dump_node( (IXMLDOMNode *)r, 0 );
+    }
+    if (y) IXMLDOMElement_Release( y );
+    if (x) IXMLDOMElement_Release( x );
+    if (r) IXMLDOMElement_Release( r );
+    IXMLDOMDocument2_Release( doc );
+}
+
+static void valuespaces_doctype( unsigned int v )
+{
+    static const struct { const char *name; const WCHAR *xml; } cases[] =
+    {
+        { "a DTD", L"<!DOCTYPE r [<!ELEMENT r ANY>]><r><a/></r>" },
+        { "no DTD", L"<r><a/></r>" },
+        { "a DTD and a comment", L"<!--c--><!DOCTYPE r [<!ELEMENT r ANY>]><r><a/></r>" },
+    };
+    static const WCHAR *queries[] = { L"node()", L"//node()", L"/node()", L"//*", L"/*" };
+    unsigned int i, j, xpath;
+
+    for (xpath = 0; xpath < 2; xpath++)
+    for (i = 0; i < ARRAYSIZE(cases); i++)
+    {
+        IXMLDOMDocument2 *doc;
+        char name[64];
+
+        if (!xpath && v) continue;
+        sprintf( name, "%s%s", cases[i].name, xpath ? ", XPath" : "" );
+        if (!(doc = er_load( v, name, cases[i].xml, FALSE, FALSE ))) continue;
+        if (xpath)
+        {
+            VARIANT lang;
+            V_VT( &lang ) = VT_BSTR;
+            V_BSTR( &lang ) = SysAllocString( L"XPath" );
+            IXMLDOMDocument2_setProperty( doc, (BSTR)L"SelectionLanguage", lang );
+            VariantClear( &lang );
+        }
+        for (j = 0; j < ARRAYSIZE(queries); j++)
+            er_select( "document", (IXMLDOMNode *)doc, queries[j] );
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+static void valuespaces_values( unsigned int v )
+{
+    unsigned int preserve;
+
+    for (preserve = 0; preserve < 2; preserve++)
+    {
+        IXMLDOMDocument2 *doc = er_load( v, preserve ? "spaces in values, kept" : "spaces in values",
+                                         L"<r b=\"  x  \">  x  </r>", preserve, FALSE );
+        IXMLDOMNode *root, *attr = NULL, *text;
+        IXMLDOMElement *element = NULL;
+
+        if (!doc) continue;
+        root = er_root( doc );
+        dump_node( root, 0 );
+        if (root && SUCCEEDED(IXMLDOMNode_QueryInterface( root, &IID_IXMLDOMElement, (void **)&element )))
+        {
+            IXMLDOMElement_getAttributeNode( element, (BSTR)L"b", (IXMLDOMAttribute **)&attr );
+            IXMLDOMElement_Release( element );
+        }
+        if (attr)
+        {
+            print_xml_text( "attribute", attr );
+            IXMLDOMNode_Release( attr );
+        }
+        if ((text = er_child( root, 0 )))
+        {
+            print_xml_text( "text", text );
+            IXMLDOMNode_Release( text );
+        }
+        er_release( root );
+        IXMLDOMDocument2_Release( doc );
+    }
+}
+
+/* the identifiers of external entities and notations: as declared or resolved */
+static void valuespaces_ids( unsigned int v )
+{
+    IXMLDOMDocument2 *doc = er_load( v, "identifiers",
+            L"<!DOCTYPE r [<!NOTATION n PUBLIC \"pub-id\" \"sys-id\"><!NOTATION n2 SYSTEM \"sys-2\">"
+            L"<!NOTATION n3 PUBLIC \"pub-3\"><!ENTITY u SYSTEM \"sys-u\" NDATA n><!ENTITY x PUBLIC \"pub-x\" \"sys-x\">]><r/>",
+            FALSE, FALSE );
+    IXMLDOMDocumentType *doctype = NULL;
+    IXMLDOMNode *child = NULL, *next;
+
+    {
+        /* what resolveExternals is at first, and the same document without it */
+        IXMLDOMDocument2 *other = create_doc( versions[v].clsid );
+        VARIANT_BOOL resolving = 0x55, ok = 0x55;
+        HRESULT hr;
+
+        if (other)
+        {
+            hr = IXMLDOMDocument2_get_resolveExternals( other, &resolving );
+            printf( "%s resolveExternals: hr %#lx value %d\n", versions[v].name, hr, resolving );
+            IXMLDOMDocument2_put_resolveExternals( other, VARIANT_FALSE );
+            hr = IXMLDOMDocument2_loadXML( other, (BSTR)L"<!DOCTYPE r [<!ENTITY x SYSTEM \"sys-x\">]><r/>", &ok );
+            printf( "%s an external entity, not resolving: loadXML hr %#lx ok %d\n", versions[v].name, hr, ok );
+            if (hr != S_OK) print_parse_error( other );
+            IXMLDOMDocument2_put_resolveExternals( other, VARIANT_TRUE );
+            hr = IXMLDOMDocument2_loadXML( other, (BSTR)L"<!DOCTYPE r [<!ENTITY x SYSTEM \"sys-x\">]><r/>", &ok );
+            printf( "%s an external entity, resolving: loadXML hr %#lx ok %d\n", versions[v].name, hr, ok );
+            if (hr != S_OK) print_parse_error( other );
+            IXMLDOMDocument2_Release( other );
+        }
+    }
+
+    if (!doc) return;
+    if (SUCCEEDED(IXMLDOMDocument2_get_doctype( doc, &doctype )) && doctype)
+    {
+        IXMLDOMDocumentType_get_firstChild( doctype, &child );
+        while (child)
+        {
+            IXMLDOMNamedNodeMap *attrs = NULL;
+            IXMLDOMEntity *entity = NULL;
+            IXMLDOMNotation *notation = NULL;
+            DOMNodeType type = 0;
+            BSTR name = NULL, xml = NULL;
+            HRESULT hr;
+
+            IXMLDOMNode_get_nodeType( child, &type );
+            IXMLDOMNode_get_nodeName( child, &name );
+            hr = IXMLDOMNode_get_xml( child, &xml );
+            printf( "    %s ", type_name( type ) );
+            put_bstr( name );
+            printf( " xml hr %#lx ", hr );
+            put_bstr( xml );
+            printf( "\n" );
+            SysFreeString( name );
+            SysFreeString( xml );
+            if (SUCCEEDED(IXMLDOMNode_get_attributes( child, &attrs )) && attrs)
+            {
+                LONG count = 0, i;
+                IXMLDOMNamedNodeMap_get_length( attrs, &count );
+                for (i = 0; i < count; i++)
+                {
+                    IXMLDOMNode *attr = NULL;
+                    BSTR text = NULL;
+                    if (FAILED(IXMLDOMNamedNodeMap_get_item( attrs, i, &attr )) || !attr) continue;
+                    IXMLDOMNode_get_nodeName( attr, &name );
+                    IXMLDOMNode_get_text( attr, &text );
+                    printf( "      attribute " );
+                    put_bstr( name );
+                    printf( " " );
+                    put_bstr( text );
+                    printf( "\n" );
+                    SysFreeString( name );
+                    SysFreeString( text );
+                    IXMLDOMNode_Release( attr );
+                }
+                IXMLDOMNamedNodeMap_Release( attrs );
+            }
+            if (SUCCEEDED(IXMLDOMNode_QueryInterface( child, &IID_IXMLDOMEntity, (void **)&entity )))
+            {
+                VARIANT id;
+                BSTR str = NULL;
+                VariantInit( &id );
+                hr = IXMLDOMEntity_get_publicId( entity, &id );
+                printf( "      publicId hr %#lx vt %d ", hr, V_VT( &id ) );
+                if (V_VT( &id ) == VT_BSTR) put_bstr( V_BSTR( &id ) );
+                VariantClear( &id );
+                hr = IXMLDOMEntity_get_systemId( entity, &id );
+                printf( " systemId hr %#lx vt %d ", hr, V_VT( &id ) );
+                if (V_VT( &id ) == VT_BSTR) put_bstr( V_BSTR( &id ) );
+                VariantClear( &id );
+                hr = IXMLDOMEntity_get_notationName( entity, &str );
+                printf( " notationName hr %#lx ", hr );
+                put_bstr( str );
+                printf( "\n" );
+                SysFreeString( str );
+                IXMLDOMEntity_Release( entity );
+            }
+            if (SUCCEEDED(IXMLDOMNode_QueryInterface( child, &IID_IXMLDOMNotation, (void **)&notation )))
+            {
+                VARIANT id;
+                VariantInit( &id );
+                hr = IXMLDOMNotation_get_publicId( notation, &id );
+                printf( "      publicId hr %#lx vt %d ", hr, V_VT( &id ) );
+                if (V_VT( &id ) == VT_BSTR) put_bstr( V_BSTR( &id ) );
+                VariantClear( &id );
+                hr = IXMLDOMNotation_get_systemId( notation, &id );
+                printf( " systemId hr %#lx vt %d ", hr, V_VT( &id ) );
+                if (V_VT( &id ) == VT_BSTR) put_bstr( V_BSTR( &id ) );
+                printf( "\n" );
+                VariantClear( &id );
+                IXMLDOMNotation_Release( notation );
+            }
+            next = NULL;
+            IXMLDOMNode_get_nextSibling( child, &next );
+            IXMLDOMNode_Release( child );
+            child = next;
+        }
+        IXMLDOMDocumentType_Release( doctype );
+    }
+    IXMLDOMDocument2_Release( doc );
+}
+
+static void section_valuespaces( void )
+{
+    WCHAR path[MAX_PATH + 16], url[MAX_PATH + 32];
+    IStream *stream = NULL;
+    unsigned int v;
+    HRESULT hr;
+
+    printf( "== valuespaces\n" );
+    /* what a missing file gives from the download MSXML 3 reports */
+    GetTempPathW( MAX_PATH, path );
+    lstrcatW( path, L"msxmlmore-missing.xml" );
+    lstrcpyW( url, L"file:///" );
+    lstrcatW( url, path );
+    hr = URLOpenBlockingStreamW( NULL, url, &stream, 0, NULL );
+    printf( "URLOpenBlockingStream(missing file): hr %#lx\n", hr );
+    if (stream) IStream_Release( stream );
+    stream = NULL;
+    hr = URLOpenBlockingStreamW( NULL, path, &stream, 0, NULL );
+    printf( "URLOpenBlockingStream(missing path): hr %#lx\n", hr );
+    if (stream) IStream_Release( stream );
+    for (v = 0; v < ARRAYSIZE(versions); v++)
+    {
+        valuespaces_normalize( v );
+        valuespaces_doctype( v );
+        valuespaces_values( v );
+        valuespaces_ids( v );
+    }
+}
+
 int main( int argc, char **argv )
 {
     static const struct { const char *name; void (*func)(void); } sections[] =
@@ -1241,6 +2048,7 @@ int main( int argc, char **argv )
         { "interfaces", section_interfaces }, { "reasons", section_reasons }, { "pending", section_pending },
         { "blocks", section_blocks }, { "entities", section_entities }, { "epilog", section_epilog },
         { "validation", section_validation }, { "methods", section_methods }, { "spaces", section_spaces },
+        { "entityrefs", section_entityrefs }, { "valuespaces", section_valuespaces },
     };
     unsigned int i;
     int j;

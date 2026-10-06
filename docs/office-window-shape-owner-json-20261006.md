@@ -118,10 +118,26 @@ DWM 阴影：第 169 批在白、灰、黑三种背景上截了 64 px 边距的�
 用户的 Xwayland 上 mutter 持有合成选区，mutter 50 对带形状的无边框窗口不画它自己的阴影（读了它的源码），所以不会重复。
 细节见 [tools/dwmframeprobe/README.md](../tools/dwmframeprobe/README.md)。
 
-## 10. 还没做的
+## 10. msxml 的实体引用（第 169、170 批）
 
-- msxml 实体引用节点：结构已测清（见探针 README），Wine 仍把实体展开成文本；要让读取器把属性值里的原始引用交给 DOM 构建器。
+| 提交 | 内容 |
+|---|---|
+| `43c4077e5f7` | msxml3：表达式编译出错后不再往下编——XSL 模式里带轴的查询（如 `ancestor::node()`）原来会读第 −1 步而崩溃，Windows 回 `E_FAIL` |
+| `d8588136328` | msxml3：转成 libxml2 树时用 `xmlAddChild()` 的返回值——它把紧跟的文本并进前一个文本并释放新节点，原来随后写到已释放的节点上 |
+| `bad663f91a6` | msxml3：实现 `IXMLDOMElement::normalize`（相邻文本合并，CDATA 不并，空文本保留） |
+| `303abd68397` | msxml3：实体引用是节点，带着实体声明节点子节点的副本；DTD 结束时单独解析每个内部实体的文本；只读与克隆规则；声明的 xml 与标识；3.0 默认解析外部实体 |
+| `def826471c0` | msxml3：XPath 透过实体引用（6.0 全部、3.0 一层）；XSL 模式的 `node()` 含 DOCTYPE |
+
+模型：MSXML 在 DTD 读完时把每个内部实体的替换文本单独解析成实体声明节点的子节点（错误按替换文本里的位置报，没用到的实体
+也查），正文和属性里的每个引用是只读的 entityref 节点，挂着这些子节点的副本——所以引用处的 xml:space 不起作用、只含空白的实体
+引用后是空的。读取器为 DOM 做了两件新事：在 DTD 结束处单独读每个实体的文本（另开一个 locator，位置从 1:1 起），以及把属性值
+里的引用原样留给 DOM（引用编码成 U+FFFF 名字 U+FFFE，这两个字符文档里不可能出现）。探针 `tools/msxmlmoreprobe` 的 entities、
+entityrefs、valuespaces 三段现在除 reason 原文外与 Windows 完全一致（entities 原来差 268 行）。msxml3 全部测试 0 失败
+（domdoc 46410 项，新增约 570 项，全部取自 Windows 实测）。
+
+## 11. 还没做的
+
 - msxml 的 `IMarshal`（自由线程封送器）：有意不做，见上。
-- reason 原文：Windows 是带参数的中文，Wine 是英文、不带参数。
+- reason 原文：Windows 是带参数的中文，Wine 是英文、不带参数（msxml3 的消息表只有英文）。
 - 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
 - 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
