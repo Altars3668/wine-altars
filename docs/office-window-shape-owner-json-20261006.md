@@ -155,9 +155,13 @@ E_FAIL 等四条系统消息是 Wine 全局的中文译法（见探针 README）
 dwmframe 探针在 Xvfb + xcompmgr 上与 Windows 比：round-616161、round-red、layered-roundsmall-616161（Office 下拉面板的设置）
 连角上一圈的最大差由 55、53、39 降到 4、7、3。
 
+`359e8dbb15b`（winex11）：直角窗口的类带 `CS_DROPSHADOW`、且打开“窗口下显示阴影”时，照 Windows 11 在右侧和下方画柔和黑影
+（左上角内 7 px 到右下角外 2 px 的矩形、σ 1.2 px、透明度 0.5），与 Windows 最大差 2/255。Wine 默认关着这个设置
+（Windows 默认开），默认值没改。
+
 ## 13. 还没做的
 
 - msxml 的 `IMarshal`（自由线程封送器）：有意不做，见上。
 - 系统消息的中文措辞：E_FAIL、E_OUTOFMEMORY、E_INVALIDARG、E_ACCESSDENIED 等是 Wine 全局译法，与 Windows 不同，涉及所有程序，没有改。
-- `DWMWA_COLOR_NONE` 的圆角窗口角上几个抗锯齿像素：内容的颜色驱动不知道，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
+- `DWMWA_COLOR_NONE` 的圆角窗口角上几个抗锯齿像素：内容的颜色驱动不知道，Wine 的形状是二值的。
 - 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
