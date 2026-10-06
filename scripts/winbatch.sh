@@ -8,7 +8,9 @@
 # "%" stands for itself, as it did on the command line.
 # Each command's output follows a line "===== <command>" and ends with "WINRUN-EXIT <code>".  It runs
 # in the ssh service session; programs that need the signed-in user's desktop go through
-# scripts/winrun.sh --desktop instead.
+# scripts/win-deskrun.ps1, uploaded with the batch, so that they share its connection
+# ("powershell -NoProfile -ExecutionPolicy Bypass -File win-deskrun.ps1 -Exe probe.exe"), or through
+# scripts/winrun.sh --desktop on their own.
 #
 #   WIN_HOST=host WIN_USER=user WIN_PORT=22 scripts/winbatch.sh a.exe b_test.exe -- "a.exe" "b_test.exe domdoc"
 #
