@@ -99,14 +99,29 @@ user32 的 win、msg 测试与改动前对比：没有新增失败，新加的�
 
 `IMapView.Split` 两半按视图的哈希表顺序切开，Wine 已经如此；jsonprobe 与 Windows 逐行相同（含上次未初始化的那一行）。
 
-## 9. 还没做的
+## 9. 接着做的（第 169 批：msxml 接口与空白、DWM 阴影）
 
-- DWM 阴影与默认边框：第 167 批截图的边距不够、灰底分辨率只有 1/128；dwmframe 已改为 64 px 边距并加黑、白背景，
-  第 168 批时有人在用那台电脑，探针按设计拒绝运行，待下一批。拿到数据后按截图做九宫格阴影（四角取实测，四边沿窗口拉伸），
-  在 winex11 里给圆角弹出窗口配一个 ARGB 窗口垫在下面，只在合成管理器运行时启用。
+| 提交 | 内容 |
+|---|---|
+| `7d7e2f14ce6` | msxml3：不在开头的 XML 声明在正文、序言、根元素之后一律按 Windows 报错 |
+| `37bd26f7822` | msxml3：6.0 校验已加载的文档时仍找出 EMPTY 元素里被丢掉的空格 |
+| `42daa0e2cf3` | include：ownerDocument 的参数名按 SDK 改为 XMLDOMDocument，类型库里的 coclass 名随之对了 |
+| `460f1366ef0` | msxml3：文档的 IPersistMoniker、IProvideClassInfo、IOleCommandTarget、IServiceProvider；GetClassID 是创建时的类 |
+| `767ba961357` | msxml3：只剩被丢空白的元素写成 `<r>\r\n</r>`（Wine 自己的三个 todo_wine 随之通过） |
+| `49c42e13386` | win32u：没有边框色的圆角窗口保留圆角半径；默认边框时窗口形状向内收一圈，留给驱动画 |
+| `f073327c4cf` | winex11：圆角弹出窗口下方的 ARGB 阴影窗口，画 DWM 的阴影与默认边框 |
+
+DWM 阴影：第 169 批在白、灰、黑三种背景上截了 64 px 边距的图，阴影是纯黑带透明度，拟合成窗口矩形的模糊副本——ROUND 两层
+（α 0.1445、σ 7.1、下移 2；α 0.1487、σ 19.6、下移 34.5），ROUNDSMALL 一层（α 0.0977、σ 4.1、下移 9.2）；默认边框是 0.40 不透明度的
+0x767676，取代窗口最外一圈、叠在背景与阴影之上。winex11 按公式在运行时生成，跟着窗口移动、改大小、重排、显示与隐藏。
+在 Xvfb + xcompmgr 上，探针截图与 Windows 在窗口外的均方根差 0.3–0.7/255、最大 2–8；默认边框那一圈在灰底上最大差 2。
+用户的 Xwayland 上 mutter 持有合成选区，mutter 50 对带形状的无边框窗口不画它自己的阴影（读了它的源码），所以不会重复。
+细节见 [tools/dwmframeprobe/README.md](../tools/dwmframeprobe/README.md)。
+
+## 10. 还没做的
+
 - msxml 实体引用节点：结构已测清（见探针 README），Wine 仍把实体展开成文本；要让读取器把属性值里的原始引用交给 DOM 构建器。
-- msxml 的 `IPersistMoniker`、`IProvideClassInfo`、`IOleCommandTarget`、`IServiceProvider`、`IMarshal`：第 168 批只测到
-  一个类（探针自身的引用计数错误使它崩溃，已修），待下一批。
+- msxml 的 `IMarshal`（自由线程封送器）：有意不做，见上。
 - reason 原文：Windows 是带参数的中文，Wine 是英文、不带参数。
+- 圆角上几个抗锯齿像素：Windows 把窗口内容按覆盖比例与背后混合，Wine 的形状是二值的。`CS_DROPSHADOW` 的经典硬阴影也还没有。
 - 升级计划对话框“分离”：仍未复现，需要用户描述当时的操作。
-- 桌面上 Word/Excel/PowerPoint/Outlook 的图标原先仍指向退役的 `~/.wine-c2r-test`，已按用户要求改指 `~/.wine-c2r-up`。

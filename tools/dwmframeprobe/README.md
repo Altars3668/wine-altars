@@ -19,17 +19,28 @@ scripts/winbatch.sh tools/dwmframeprobe/dwmframe.exe scripts/win-deskrun.ps1 -- 
 | dropshadow-default / dropshadow-round | DEFAULT / ROUND | 不设 | 窗口类带 `CS_DROPSHADOW` |
 | toolwindow-round | ROUND | 不设 | `WS_EX_TOOLWINDOW` |
 
-## 结论（Windows 11 29671，浅色主题，results/windows-29671.txt 与 windows-29671-sheet.png）
+## 结论（Windows 11 29671，浅色主题，results/windows-29671.txt 与 windows-29671-sheet.png，第 169 批）
 
 - 只有请求了圆角（ROUND、ROUNDSMALL）的弹出窗口才有 DWM 的柔和阴影；DEFAULT、DONOTROUND 是直角、无阴影，设了边框色也不画。
-- ROUND 的阴影：左右约 26 px，紧贴窗口处约暗 12%；上方约 13 px、暗 6%；下方最深，紧贴处暗 22%，32 px 外仍未消失
-  （相当于向下偏移的模糊阴影）。`CS_DROPSHADOW`、`WS_EX_TOOLWINDOW` 不影响它。
-- ROUNDSMALL 的阴影小得多：左右约 10 px（暗约 5%），上方几乎没有，下方约 20 px（暗约 9%）。
-- 设了边框色就在窗口最外一圈像素画不透明的该色（0x616161 → 97,97,97；红）；`DWMWA_COLOR_NONE` 不画。
-- 不设边框色时最外一圈像素各边不同（左右 114、上 118、下 106），跟着阴影变，像是半透明的默认边框叠在阴影上；
-  颜色与透明度要在黑、白背景上再测才能定。
-- `CS_DROPSHADOW` 的直角窗口是经典的右下硬阴影，约 5 px（71、86、106、121、126）。
+  `CS_DROPSHADOW`、`WS_EX_TOOLWINDOW` 不影响它。
+- 阴影是纯黑、带透明度（黑底上窗外全为 0；白底与灰底算出的透明度一致）。`fit_shadow.py` 把它拟合成窗口矩形的
+  模糊副本（Φ 为正态分布函数，两层按透明度叠加）：
+  - ROUND：两层，(α 0.1445, σ 7.08 px, 下移 1.98 px) 与 (α 0.1487, σ 19.55 px, 下移 34.5 px)；均方根误差 0.72/255，
+    最大 4.3/255（96 dpi）。左右约 44 px、上方约 14 px、下方约 78 px 外才小于 1/512。
+  - ROUNDSMALL：一层，(α 0.0977, σ 4.05 px, 下移 9.17 px)；均方根误差 0.39/255；左右 9、上 1、下 18 px。
+- 设了边框色就在窗口最外一圈像素画不透明的该色；`DWMWA_COLOR_NONE` 不画。
+- 不设边框色时画默认边框：`fit_border.py` 从三种背景下的最外一圈像素拟合出 **0.40 不透明度、约 0x767676（预乘 47）的灰色，
+  叠在背景与阴影之上**——窗口自己的最外一圈像素被它取代，不是叠在窗口内容上（黑底上是 47，白底上随阴影是 181–189）。
+  ROUND 与 ROUNDSMALL 相同；均方根误差 0.7–1.2/255。
+- `CS_DROPSHADOW` 的直角窗口是经典的右下硬阴影，约 5 px（71、86、106、121、126）——Wine 尚未实现。
 
-Wine 现在只画圆角与给定颜色的边框（altars-up `13af402977c`、`dc64c3f9fb8`），阴影与默认边框都还没有。第 167 批的边距
-（32 px）不够：ROUND 的阴影到下方 32 px 处仍暗 8.6%，相邻格子也互相串影；第 168 批时有人在用那台电脑，探针拒绝运行，
-加大边距、加黑白背景的一批待下次。
+## Wine
+
+altars-up `49c42e13386`、`f073327c4cf` 照此实现：win32u 让没有边框色的圆角窗口保留圆角半径，默认边框时窗口形状向内收一圈；
+winex11 给 override-redirect 的圆角窗口在其正下方配一个 ARGB 的 override-redirect 窗口（点击穿透），按上面的公式画阴影，
+默认边框时在那一圈画 0.40 的灰色。需要合成管理器（mutter 在用户的 Xwayland 上持有 `_NET_WM_CM_S0`）；
+mutter 50 对带形状的无边框窗口不画它自己的阴影，所以不会重复。受管窗口、逐像素透明的窗口、虚拟桌面不画。
+
+`results/wine-f073327c4cf.txt` 与 `-sheet.png` 是在 Xvfb + xcompmgr 上的输出：窗口外与 Windows 的均方根差 0.3–0.7/255、
+最大 2–8；默认边框那一圈在灰底上最大差 2；只剩圆角上几个抗锯齿像素不同（Windows 把窗口内容按覆盖比例与背后混合，
+Wine 的形状是二值的）。在仿用户环境的隔离 GNOME Shell（mutter 50.1）里，阴影窗口按边距定位、紧贴在各自的弹出窗口之下。
