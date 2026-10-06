@@ -12181,3 +12181,5 @@ dist-up 换了 wine.inf 之后，第一次启动 Word 会先做前缀更新（`w
   `RoFreeParameterizedTypeExtra` 一并实现。新测试在 Windows 上 0 失败（第 126 批）。
 - 当时其余几条还未实现；同日后续原生测量、权限根因、三组修复和真实应用回归见
   [Office 前缀更新诊断：原生验证与修复](office-prefixupdate-20261003.md)，不要将此处历史状态当成当前待办。
+- 2026-10-04 继续处理 Word 启动日志里的其余诊断（FIPS 策略、AI_FQDN、证书 link、WsAbortServiceProxy 与 WinHTTP 同步取消），
+  原生测量、失败尝试和验证见 [Office 剩余功能修复：第一批](office-rest-fixes-20261004.md)。
