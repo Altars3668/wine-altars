@@ -8,12 +8,14 @@ Disk: about 10 GB free while installing, roughly 6 GB afterwards.
 
 What is verified and what is not, so you know what to trust:
 
-* `office-setup.sh prefix`, `webview2`, `signin`, `status` and the generated Office configuration
-  were run on a clean prefix with a wine-altars build (11.19 plus 540 of the 578 patches).
-* The Office installation (`setup.exe /configure`) and the sign-in are the procedure recorded in the
-  notes ([`office365-under-wine.md`](office365-under-wine.md)), done there by hand on the same Wine.
-  The scripted wrapper around them is newer than the notes. If it fails, the log paths below tell
-  you where, and the manual commands are in the script — it is short on purpose.
+* The whole sequence — `office-setup.sh all` (prefix, WebView2 runtime, Word from Microsoft's own
+  installer, sign-in switches) and starting Word — is run on a clean GitHub runner, with the released
+  Wine, by [`office-smoke.yml`](../.github/workflows/office-smoke.yml). It ends where it has to end: at
+  the sign-in prompt in the screenshot below. It cannot sign in, because that needs a person with a
+  subscription.
+* The sign-in and the licensing that follows are the procedure recorded in the notes
+  ([`office365-under-wine.md`](office365-under-wine.md)), done there by hand, with a personal Microsoft 365
+  Family/Personal subscription, on the same Wine.
 
 ## 0. What you need
 
@@ -123,8 +125,13 @@ name is silently ignored.
 scripts/office-setup.sh launch word
 ```
 
-A cold start takes tens of seconds. Word shows a dialog, *Sign in to set up Office* (or Microsoft's
-equivalent in your language). **Use the mouse.** Office's own buttons answer "done" to the
+A cold start takes tens of seconds. Word comes up with its Start screen and a dialog, *Sign in to get
+started with Word* (its window title is *Sign in to set up Office*), with a *Sign in or create account*
+button; there is also a *Sign in* link in the title bar. This is what the clean-runner test sees:
+
+![Word's first start: the Start screen with the "Sign in to get started with Word" dialog](img/word-first-start.png)
+
+**Use the mouse.** Office's own buttons answer "done" to the
 accessibility "press" request without doing anything — which makes scripted clicks look like
 Office is broken — but a real click works. The same door is *File → Account → Sign in*.
 

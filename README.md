@@ -35,6 +35,8 @@
 
 ## 开始使用
 
+**不想自己编译？** [Releases](https://github.com/Altars3668/wine-altars/releases) 页提供 Ubuntu 24.04 构建的预编译包 `wine-altars-linux-x86_64.tar.xz`（需要 glibc 2.39 或更新）和 `SHA256SUMS`：核对校验和，解压到 `/opt`（或任何目录），把其中的 `bin/` 加进 `PATH`，然后从下面设置 `WINEPREFIX` 的那一行继续。带 `v` 标签的是正式版；`nightly` 是随补丁系列滚动更新的预发布。
+
 需要 x86-64 Linux、X11 / Xwayland、正常 GL 驱动、Wine 构建依赖，以及自己的合法 Microsoft 365 订阅。优先按 [构建说明](docs/building.md) 准备依赖，在用户目录构建，避免默认替换系统 Wine：
 
 ```sh
@@ -78,6 +80,7 @@ scripts/office-setup.sh launch word
 - `release.yml` 定义 `v*` 标签发布，以及补丁 / 构建配方变更后的滚动 `nightly` 预发布。
 - 下载前先查看 [Releases](https://github.com/Altars3668/wine-altars/releases) 是否已有实际产物；目前不能假定 `latest/download` 一定存在，预发布也不一定出现在 `latest` 中。
 - Release 产物包含构建、补丁系列和 `SHA256SUMS`；选择准确 tag 并核对校验。Ubuntu 24.04 构建产物要求相应 glibc 兼容性。
+- `office-smoke.yml`（手动触发）在干净的 GitHub runner 上用 Release 里的 Wine 走完 `office-setup.sh all` 并启动 Word，把截图和日志存为产物。它停在 Office 自己的登录提示（[截图](docs/img/word-first-start.png)），不替用户登录；每次运行是否通过，以该工作流的运行记录为准。
 - README 中的命令会构建程序或修改 prefix；阅读文档本身不意味着已完成安装、订阅登录或应用验收。
 
 ## 公开与私有历史

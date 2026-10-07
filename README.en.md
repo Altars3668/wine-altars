@@ -35,6 +35,8 @@ Project notes record Word, Excel and PowerPoint startup, editing, saving, export
 
 ## Getting started
 
+**Rather not compile?** The [Releases](https://github.com/Altars3668/wine-altars/releases) page has a prebuilt Ubuntu 24.04 build, `wine-altars-linux-x86_64.tar.xz` (needs glibc 2.39 or newer), and `SHA256SUMS`. Check the checksum, unpack it under `/opt` (or anywhere), put its `bin/` on `PATH`, and continue from the `WINEPREFIX` line below. Tags starting with `v` are stable releases; `nightly` is the pre-release that tracks the patch series.
+
 You need x86-64 Linux, X11 / Xwayland, a working GL driver, Wine build dependencies and your own valid Microsoft 365 subscription. Follow [building.md](docs/building.md) for dependencies and build into a user directory rather than replacing system Wine by default:
 
 ```sh
@@ -78,6 +80,7 @@ Wine source is not vendored here. The builder fetches the baseline from `BASE` a
 - `release.yml` defines `v*` tag releases and rolling `nightly` prereleases for series / build-recipe changes.
 - Check [Releases](https://github.com/Altars3668/wine-altars/releases) for actual artifacts before downloading. Do not assume `latest/download` exists; prereleases may not appear under `latest`.
 - Release artifacts include the build, patch series and `SHA256SUMS`. Select an exact tag and verify checksums. Ubuntu 24.04 builds require compatible glibc.
+- `office-smoke.yml` (started by hand) runs `office-setup.sh all` on a clean GitHub runner with the Wine from a release, starts Word, and keeps a screenshot and logs as artifacts. It stops at Office's own sign-in prompt ([screenshot](docs/img/word-first-start.png)) and does not sign in for anyone; whether a given run passed is what that workflow's run history says.
 - Commands here build software or modify a prefix. Reading the instructions does not constitute installation, subscription sign-in or application qualification.
 
 ## Public and private histories

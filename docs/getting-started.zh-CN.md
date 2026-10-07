@@ -8,10 +8,11 @@
 
 先说清楚哪些验证过、哪些没有，免得你信错地方：
 
-* `office-setup.sh` 的 `prefix`、`webview2`、`signin`、`status` 以及生成的 Office 配置，已在一个干净前缀上、
-  用 wine-altars 构建（11.19 加 578 个补丁中的 540 个）跑过。
-* Office 本体的安装（`setup.exe /configure`）和登录，是笔记（[`office365-under-wine.md`](office365-under-wine.md)）里记录的流程，
-  当时在同一个 Wine 上手工完成。包住它们的脚本比笔记新。如果它失败了，下面写了日志位置；手工命令就在脚本里——它故意写得很短。
+* 整个流程——`office-setup.sh all`（前缀、WebView2 运行时、用微软自己的安装器装 Word、登录开关）加上启动 Word——由
+  [`office-smoke.yml`](../.github/workflows/office-smoke.yml) 在干净的 GitHub runner 上、用发布版 Wine 跑过。它停在该停的地方：
+  下面截图里的登录提示。它没法登录，因为那需要一个有订阅的真人。
+* 登录以及随后的授权，是笔记（[`office365-under-wine.md`](office365-under-wine.md)）里记录的流程，当时在同一个 Wine 上手工完成，
+  用的是个人版 Microsoft 365 Family/Personal 订阅。
 
 ## 0. 你需要什么
 
@@ -103,7 +104,12 @@ Microsoft.Office.Identity.TestGate.DisableBrokerForOneAuth    = true
 scripts/office-setup.sh launch word
 ```
 
-冷启动要几十秒。Word 会显示一个对话框，*登录以设置 Office*（英文界面是 *Sign in to set up Office*）。**用鼠标点。** Office 自己的按钮对无障碍接口的
+冷启动要几十秒。Word 带着开始页起来，并弹出一个对话框，标题 *Sign in to set up Office*，正文 *Sign in to get started with Word*，
+有一个 *Sign in or create account* 按钮；标题栏右上角还有一个 *Sign in* 链接（界面语言不同，文字不同）。干净 runner 上的测试看到的就是下面这样：
+
+![Word 首次启动：开始页上的“Sign in to get started with Word”对话框](img/word-first-start.png)
+
+**用鼠标点。** Office 自己的按钮对无障碍接口的
 “按下”请求回答“完成”，却什么也不做——这会让脚本化点击看起来像是 Office 坏了——但真实点击是有效的。同一个入口还有 *文件 → 账户 → 登录*。
 
 会打开一个标题为 *Sign in* 的窗口，约 450×520 像素。里面全是微软的页面：
