@@ -74,6 +74,13 @@ if [ -z "${WINESERVER:-}" ]; then
     fi
 fi
 ws() { "$WINESERVER" "$@"; }
+# wineserver -w waits until every process of the prefix has ended, and Office leaves its
+# Click-to-Run service running for ever: wait for the prefix to go quiet for a while, then stop it.
+settle() {
+    timeout "${1:-60}" "$WINESERVER" -w 2>/dev/null && return 0
+    "$WINESERVER" -k 2>/dev/null || true
+    "$WINESERVER" -w 2>/dev/null || true
+}
 
 webview2_dir() { find "$WEBVIEW2_GLOB" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | head -1 || true; }
 
@@ -96,11 +103,11 @@ cmd_prefix() {
     else
         # Mono and Gecko prompts have nothing to do with creating a prefix and would wait for a click
         WINEARCH=win64 WINEDLLOVERRIDES="$WINEDLLOVERRIDES;mscoree=d;mshtml=d" quiet_wine wineboot -u
-        ws -w
+        settle 120
     fi
     say "Windows 11 mode"
     quiet_wine winecfg -v win11
-    ws -w
+    settle 120
 
     # Without Gecko, anything that falls back to the built-in browser engine stops on Wine's own
     # "install Gecko?" prompt.  Install the two files here, from Wine's download site.
@@ -138,7 +145,7 @@ cmd_webview2() {
     pkill -f '[M]icrosoftEdgeUpdate.exe /c' 2>/dev/null || true
     # Wine bug 58921: the runtime's renderer process only starts if it is told to see Windows 7
     quiet_wine reg add 'HKCU\Software\Wine\AppDefaults\msedgewebview2.exe' /v Version /t REG_SZ /d win7 /f >/dev/null
-    ws -w
+    settle 120
     [ -n "$(webview2_dir)" ] || die "WebView2 runtime did not install (no $WEBVIEW2_GLOB/<version>)"
     note "installed: $(basename "$(webview2_dir)")"
 }
@@ -195,7 +202,7 @@ cmd_install() {
     rc=0
     quiet_wine "$CACHE/setup.exe" /configure "$(winpath "$CACHE/configuration.xml")" || rc=$?
     kill "$progress" 2>/dev/null || true; trap - EXIT
-    ws -w
+    settle 30    # the Click-to-Run service stays up after the install; this stops it and saves the registry
     if [ "$rc" != 0 ] || ! office_installed; then
         note "setup.exe exited $rc"
         note "its log is in $WINEPREFIX/drive_c/c2rlog/ -- the last 'Error' line there is the cause"
