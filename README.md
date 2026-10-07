@@ -1,138 +1,91 @@
 # wine-altars
 
-**Microsoft 365 on Linux, signed in for real.** A patch series on top of upstream Wine, plus the
-scripts and measurements around it, that runs Word, Excel and PowerPoint (Click-to-Run, 64-bit) and
-lets you sign in with your own Microsoft account and your own subscription — the same sign-in,
-the same licensing, as on Windows.
+**简体中文** | [English](README.en.md)
+
+面向 **Linux 上的 Microsoft 365 桌面应用与 Windows 客户端互操作**的 Wine 定制补丁集。当前公开构建线基于上游 **Wine 11.19**，维护重点是 Word、Excel、PowerPoint（64 位 Click-to-Run）的安装、渲染、编辑、打印，以及通过 Office 自身的 WebView2 窗口正常登录个人 Microsoft 365 订阅。
+
+> **不是破解或许可证绕过。** 用户必须使用自己的 Microsoft 账号和有效订阅。本仓库不提供密钥生成、KMS 模拟或许可证复制，不包含 Microsoft 软件，也不声称获得 Microsoft / WineHQ 的官方支持。
 
 [![CI](https://github.com/Altars3668/wine-altars/actions/workflows/ci.yml/badge.svg)](https://github.com/Altars3668/wine-altars/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Altars3668/wine-altars?include_prereleases)](https://github.com/Altars3668/wine-altars/releases)
-[![License: LGPL-2.1+](https://img.shields.io/badge/license-LGPL--2.1%2B-blue)](LICENSE)
 
-中文说明：[README.zh-CN.md](README.zh-CN.md)
+## 我的改造与特色
 
-> **What "activation" means here.** You sign in with your own Microsoft account, and Office
-> licenses itself against your subscription, exactly as it does on Windows. There is no crack,
-> no key generator, no KMS emulation and no licence copying in this repository. Without a
-> subscription Office does not license itself, here as on Windows. Microsoft does not support
-> Office on Wine; this is an independent project.
+| 改造方向 | 具体内容与证据入口 |
+| --- | --- |
+| **Click-to-Run / App-V 运行链路** | 围绕 Microsoft 365 安装、服务、COM / WinRT 和应用启动处理兼容缺口；不把“窗口打开了”当作完整可用。见 [实验笔记](docs/office365-under-wine.md)。 |
+| **Office 自身的正常登录** | 安装 WebView2 并选择有效的登录路径；Wine broker 无法提供账户票据时正确让位，避免空白或瞬间关闭的登录窗。见 [登录辅助脚本](scripts/enable-native-signin.sh)。 |
+| **界面、焦点与窗口行为** | 修正 Office 弹出面板立即关闭、下拉缓慢、窗口形状残留、跨进程 owner、圆角与 References 崩溃等问题。见 [弹出窗口记录](docs/office-popup-focus-latency-20261006.md) 和 [窗口行为记录](docs/office-window-shape-owner-json-20261006.md)。 |
+| **文档、OLE 与组件互操作** | 对照 Windows 处理嵌入 Excel、MSXML / 脚本 / JSON 等应用依赖的行为差异；源码补丁与对应探针一同保存。 |
+| **Linux 桌面集成** | CUPS 打印、输入法与应用集成；手动双面打印已按捕获输出验证，不把它描述成已用真实纸张验收。 |
+| **Windows / Wine 双边探针** | [tools/](tools/) 按问题保存探针、源码和两侧输出；目标是解释一个具体返回值、结构或可见行为，而不是凭猜测补 stub。 |
+| **可重建的上游补丁系列** | [patches/altars-up/](patches/altars-up/) 固定上游基点和应用顺序，保留补丁来源，配套导出、构建和 CI 脚本。 |
+| **分步安装与维护** | `office-setup.sh` 分离 prefix、WebView2、Office 安装和登录准备，并提供状态查询；避免把宿主环境及账户缓存打包给别人。 |
 
-## Where it stands
+这套系列也包含上游移植和继承的工作，**不能把所有补丁都算作本人原创**。当前可应用系列、发现过程中的补丁与旧 CrossOver 线的记录各有明确用途，来源见 [patches/README.md](patches/README.md)。
 
-Measured on Wine 11.19 + this series, against Windows 11 (build 29671) as the reference:
+## 已有证据与使用边界
 
-| | |
-|---|---|
-| **Works** | Word, Excel and PowerPoint start, edit, save and print; Microsoft sign-in in Office's own window (WebView2) and licensing against a personal Microsoft 365 Family/Personal subscription; Word's Start screen, ribbon, dialogs and pop-up panels; an Excel sheet embedded and edited in place inside Word; printing through CUPS (manual duplex for printers without a duplexer is implemented and verified on captured output, not yet on paper); Chinese input through XIM; saving to OneDrive |
-| **Checked** | Scripted feature sweeps: 34 Word, 72 Excel and 45 PowerPoint operations (save in many formats, export to PDF and XPS, charts, password-protected save, compare documents, …) pass, plus a save-and-reopen regression for each app. [`docs/`](docs) says how each was measured |
-| **Not covered** | Outlook, OneNote, Access, Publisher and Teams are not part of the tested set. Work or school (Entra ID) accounts were not tested — only a personal Microsoft account. Updating Office in place was not tested; the safe route is a fresh prefix |
-| **Known rough edges** | After an unclean exit Office offers Safe Mode on the next start (answer *No*). Under Xvfb (no GPU) WebView2 content renders black; that is the test display, not Office |
+项目文档记录了 Word、Excel、PowerPoint 的启动、编辑、保存、导出、打印、保存后重开、OLE 就地编辑，以及个人 Microsoft 365 Family / Personal 登录验证。它们是特定构建与环境的实测记录，**不代表本次 README 修改重新验收了这些应用，也不保证所有 Office 版本或机器都可用**。
 
-This is research-grade software. It gets a lot right and will still surprise you. The notes under
-[`docs/`](docs) record what was measured, what turned out to be wrong, and where it currently stops.
+- 未覆盖 Outlook、OneNote、Access、Publisher、Teams；未验证工作 / 学校的 Entra ID 账户。
+- Office 就地更新未作为可靠路径验证，升级优先采用新的 prefix 并保留数据备份。
+- WebView2 需要可用的图形驱动；无 GPU 的 Xvfb 可能显示黑色内容。
+- 非正常退出后，Office 下次可能询问安全模式；这不等于登录或订阅状态损坏。
+- 历史实验笔记保留了被后续测量推翻的结论；阅读时应看时间、后续修正和对应探针，不能把整份笔记当作当前操作步骤。
 
-## Quick start
+## 开始使用
 
-You need a Microsoft 365 subscription (the scripts install the *Family/Personal* product by
-default), an x86-64 Linux with X11 or Xwayland and a working GL driver, and about 10 GB of disk.
-The release build is made on Ubuntu 24.04, so it needs glibc 2.39 or newer.
+需要 x86-64 Linux、X11 / Xwayland、正常 GL 驱动、Wine 构建依赖，以及自己的合法 Microsoft 365 订阅。优先按 [构建说明](docs/building.md) 准备依赖，在用户目录构建，避免默认替换系统 Wine：
 
 ```sh
-# 1. Wine, from the latest release (or build it yourself: docs/building.md)
-curl -LO https://github.com/Altars3668/wine-altars/releases/latest/download/wine-altars-linux-x86_64.tar.xz
-sudo tar -C /opt -xf wine-altars-linux-x86_64.tar.xz
-export PATH=/opt/wine-altars/bin:$PATH
+git clone https://github.com/Altars3668/wine-altars.git
+cd wine-altars
+# 先按 docs/building.md 安装构建依赖；限制并行度，避免链接过程耗尽内存
+JOBS=2 PREFIX="$HOME/.local/opt/wine-altars" scripts/build-from-series.sh
+export PATH="$HOME/.local/opt/wine-altars/bin:$PATH"
 
-# 2. These scripts
-git clone https://github.com/Altars3668/wine-altars.git && cd wine-altars
-
-# 3. Prefix, WebView2 runtime, Office, sign-in switches.  Mostly waiting for Microsoft's CDN.
-export WINEPREFIX=$HOME/.wine-office
+# 使用独立 prefix；不要让两种 Wine 构建同时打开同一 prefix
+export WINEPREFIX="$HOME/.wine-office-altars"
 scripts/office-setup.sh all
-
-# 4. Start Word, and sign in with your own Microsoft account when it asks
+scripts/office-setup.sh status
 scripts/office-setup.sh launch word
 ```
 
-Step 3 is four commands you can also run one at a time (`prefix`, `webview2`, `install`,
-`signin`); `scripts/office-setup.sh status` tells you which are done. By running `install` you accept
-Microsoft's licence terms — it passes `AcceptEULA` to Microsoft's own installer.
+`all` 可以拆成 `prefix`、`webview2`、`install`、`signin`。运行 `install` 会将 `AcceptEULA` 交给 Microsoft 官方安装器，意味着接受相应许可条款；脚本不代替用户登录。打开 Word 后，在 **文件 → 账户 → 登录**中完成真实账号登录及二次验证。
 
-**Signing in.** On the first start Word shows *Sign in to set up Office*; the same door is
-*File → Account → Sign in*. Click it with the mouse — Office's buttons ignore the accessibility
-"press" request, a real click works. A window titled *Sign in* opens (a WebView2 browser), you
-enter your account, password and second factor as usual, and Word comes up licensed. *File →
-Account* then shows the subscription as activated, as on Windows. The result is stored in the
-prefix and survives restarts.
+不要复制其他机器的身份或许可证缓存：它们受该机器 DPAPI 密钥保护，不是这里的登录方案。prefix、诊断日志和身份缓存含敏感信息，不能上传到公开仓库。
 
-The step-by-step guide, with what each step does and what to do when it does not work, is
-[`docs/getting-started.md`](docs/getting-started.md).
+完整中文操作与排错：[docs/getting-started.zh-CN.md](docs/getting-started.zh-CN.md)；英文：[docs/getting-started.md](docs/getting-started.md)。
 
-### Why the sign-in needs help
+## 源码与文件导航
 
-Three things stand between a stock Wine and Office's own sign-in window. All three are handled by
-the steps above and none of them touches licensing:
+| 路径 | 用途 |
+| --- | --- |
+| [patches/altars-up/BASE](patches/altars-up/BASE) | 当前上游版本、提交和源码镜像。 |
+| [patches/altars-up/SERIES.tsv](patches/altars-up/SERIES.tsv) | 开发树 commit ID 与公开补丁文件的对应关系。 |
+| [scripts/build-from-series.sh](scripts/build-from-series.sh) | 获取上游、应用系列、配置、编译与安装。 |
+| [scripts/office-setup.sh](scripts/office-setup.sh) | prefix、运行时、Office 与启动管理。 |
+| [docs/building.md](docs/building.md) | 构建依赖、变量、32 / 64 位组件及 prefix DLL 同步。 |
+| [docs/README.md](docs/README.md) / [docs/method.md](docs/method.md) | 实验索引与 Windows 对照方法。 |
+| [tools/](tools/) | 小型行为探针与已脱敏的参考结果。 |
+| [.github/workflows/](.github/workflows/) | 校验与发布配方。 |
 
-1. Office decides *which* of its two sign-in implementations to use with feature gates, and both
-   gates default the wrong way here. With the default, Office falls back to the built-in browser
-   engine, the Microsoft sign-in page (a script-built single-page app) renders as an empty
-   `<div>`, and the window is blank or closes at once. `signin` flips the two gates in the prefix
-   (`scripts/enable-native-signin.sh`): the WebView2 gate on, and the "go through the account
-   broker" gate off.
-2. The WebView2 runtime has to be in the prefix (`webview2`). Microsoft's installer is a 32-bit
-   program, which is why this Wine is built with its 32-bit half.
-3. Wine's account broker (`windows.security.authentication.onlineid`) used to *claim* it could
-   serve a Microsoft account and then fail to produce a ticket, so Office reported every later
-   failure as a broker error instead of opening its own window. It now declines accounts it cannot
-   serve ([`0024-onlineid-stand-aside-…`](patches/altars-up/0024-onlineid-stand-aside-when-this-broker-holds-no-token.patch)), and Office falls back
-   to its own sign-in.
+完整 Wine 源码并未 vendoring 进此仓库；构建器按 `BASE` 获取上游并应用补丁。旧笔记中的 `wine-src` / `altars-up` SHA 不是这个文档仓库的 commit，公开系列可通过 `SERIES.tsv` 定位。
 
-Identity caches copied from another machine make things worse, not better: they are sealed with
-that machine's DPAPI keys, nothing here can open them, and Office answers "your account can't be
-accessed" without offering a sign-in form. Start from an empty profile.
+## 发布与验证
 
-## Repository layout
+- `ci.yml` 定义脚本语法、静态检查、单元测试及补丁系列应用检查；**配置了检查不等于每次运行都已通过**。
+- `release.yml` 定义 `v*` 标签发布，以及补丁 / 构建配方变更后的滚动 `nightly` 预发布。
+- 下载前先查看 [Releases](https://github.com/Altars3668/wine-altars/releases) 是否已有实际产物；目前不能假定 `latest/download` 一定存在，预发布也不一定出现在 `latest` 中。
+- Release 产物包含构建、补丁系列和 `SHA256SUMS`；选择准确 tag 并核对校验。Ubuntu 24.04 构建产物要求相应 glibc 兼容性。
+- README 中的命令会构建程序或修改 prefix；阅读文档本身不意味着已完成安装、订阅登录或应用验收。
 
-| path | what is in it |
-|---|---|
-| [`patches/altars-up/`](patches/altars-up) | **The code**: 578 patches on top of upstream Wine `wine-11.19`, in order, `git am`-able; `BASE` names the upstream commit |
-| [`scripts/`](scripts) | `office-setup.sh` (the quick start), `build-from-series.sh` (fetch, patch, build), prefix and measurement helpers, PE/PDB/WinRT inspection scripts |
-| [`tools/`](tools) | About 190 small probes. Each one asks Windows and Wine the same question and keeps both answers side by side (`*.win.txt`, `*.wine.txt`); the Wine patches cite them |
-| [`docs/`](docs) | The lab notebook and the notes behind individual fixes — [index](docs/README.md) |
-| [`patches/office`](patches/office), [`patches/mstsc`](patches/mstsc), [`patches/mesa`](patches/mesa), [`patches/ported`](patches/ported) | Discovery-order patches with their reasoning, the inherited RDP-client series, a Mesa fix, work ported from other trees — see [`patches/README.md`](patches/README.md) |
-| [`.github/workflows/`](.github/workflows) | CI, and the release build |
+## 公开与私有历史
 
-The method is the point of the project: every claim in the notes is a register read, a memory read
-or bytes on the wire, measured on Windows and on Wine, and the probe that measured it is in the
-repository. [`docs/method.md`](docs/method.md) lists the instruments and the traps already hit.
+GitHub 使用已经匿名化的公开历史，Gitea 保留完整开发历史。两端 README 保持同样的说明，但 commit SHA 和部分实验记录 / 补丁元数据可能不同；**不把私有分支直接强推到公开仓库，也不为追求 SHA 一致撤销脱敏**。
 
-## Releases and CI
+## 许可证与问题反馈
 
-* **Tag `v*`** (for example `v11.19-altars.1`): GitHub Actions builds Wine from upstream and the
-  series with [`scripts/build-from-series.sh`](scripts/build-from-series.sh), smoke-tests it
-  (`wineboot`, a 64-bit and a 32-bit `cmd`), and publishes a release with the build, the patch
-  series and checksums.
-* **Push to `main`** that changes the series or the build recipe: the rolling **`nightly`**
-  pre-release is rebuilt.
-* **Every push and pull request**: shell and Python scripts parse, `shellcheck` finds no errors, the
-  unit tests pass, and the series still applies to the pinned upstream commit.
+本仓库采用 [GNU LGPL 2.1 或更新版本](LICENSE)，保留 Wine、移植补丁和其他组件的来源 / 授权声明。Office、WebView2 与订阅遵循 Microsoft 的独立条款；本仓库只提供从官方来源安装的辅助脚本。
 
-A local build is the same recipe: [`docs/building.md`](docs/building.md).
-
-## Reporting a problem
-
-Wine logs and Office's own diagnostic files (`%LOCALAPPDATA%\Temp\Diagnostics`) contain account
-identifiers, tenant ids, device ids and, in some modes, request URLs. **Read and redact before you
-attach anything to an issue**, and never paste a token, a cookie or a licence file. The most useful
-report is the output of `scripts/office-setup.sh status`, the Wine version, what you did, and the
-first error line.
-
-## Licence and trademarks
-
-Everything here is under the GNU LGPL 2.1 or later, the licence of Wine ([`LICENSE`](LICENSE)).
-This repository contains no Microsoft software: Office and the WebView2 runtime are downloaded from
-Microsoft by Microsoft's own installers, onto your machine, for use under your own licence.
-
-Microsoft, Windows, Office, Word, Excel, PowerPoint, Microsoft 365, OneDrive and Edge are
-trademarks of the Microsoft group of companies. Wine is a trademark of its respective owners. This
-project is not affiliated with, endorsed by, or supported by Microsoft or the WineHQ project.
+反馈请附 Wine / 系列版本、复现步骤和已脱敏的首个错误。日志可能含账户、租户、设备标识和请求 URL；先阅读再提交，不上传 token、cookie、身份缓存或许可证文件。
