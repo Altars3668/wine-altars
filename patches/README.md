@@ -1,41 +1,44 @@
-# 补丁集
+# Patches
 
-这里有两类东西，用途不同。
+Four kinds of patch live here. They differ in what they are for.
 
-## `wine/altars-cx-series.patch` —— 截至 `9443b55` 的可重放快照
+## `altars-up/` — the code
 
-从 CrossOver 26.3.0 的源码（`wine-src` 的 `crossover-26.3` 分支）到
-`altars-cx` 的 `9443b55` 为止，`git format-patch` 导出的 197 个提交，451 个文件。
-后续 ETW 提交还没有进入这个文件；它目前**不能**重建最新的 `altars-cx`。
+578 patches on top of upstream Wine `wine-11.19`, in order. This is what gets built.
+[`altars-up/README.md`](altars-up/README.md) explains the layout; `scripts/build-from-series.sh`
+fetches upstream, applies them and builds; `scripts/export-series.sh` regenerates them from the
+Wine tree they are developed in.
 
-要重建这棵树，用这个：
+## `office/NNNN-*.patch` — the discovery record
 
-```sh
-cd wine-src
-git checkout -b my-altars crossover-26.3
-git am ../patches/wine/altars-cx-series.patch
-```
+Numbered in the order the problems were found, each with its reasoning: what was observed, what was
+ruled out, why this change and not another. **Their value is the explanation**, not the diff.
 
-验证过它能干净应用到 `crossover-26.3`，应用后整棵树与 `9443b55` 逐字节一致；
-ETW 补丁未纳入前，不应再用当前 `altars-cx` 作这一比较。
+They do not form a clean sequence you can `git am`, because they honestly record the exploration:
+the same file is changed again by later patches (`dlls/d3d11/shared.c` appears in 0009, 0015,
+0016, 0018, 0019 and 0020), so an early patch's context no longer matches the final state. Read
+them for *why*; to rebuild the code use `altars-up/`.
 
-## `office/NNNN-*.patch` —— 发现过程
+Several are marked "diagnostic" (0007, 0009, 0013, 0016, 0017, 0019): temporary code added to see a
+phenomenon, not part of the final state. They are kept because they record how the phenomenon was
+measured, so the next one of its kind does not need that instrument invented again.
 
-按问题被找到的顺序编号，每一个带着当时的推理：观察到什么、排除了什么、
-为什么这样改而不是那样改。**它们的价值在说明文字**，不在 diff 本身。
+## `mstsc/` — the inherited RDP-client series
 
-这些补丁不构成一条可以顺序 `git am` 的干净序列，原因是它们诚实地记录了
-探索过程：同一个文件常被后续补丁继续修改（`dlls/d3d11/shared.c` 先后出现在
-0009、0015、0016、0018、0019、0020 里），早期补丁的上下文因此与最终状态不符。
+The 13 patches this project started from, written for running Microsoft's RDP client engine
+(`mstscax.dll`) against `gnome-remote-desktop`: CredSSP, MUI resource redirection, ETW
+TraceLogging decoding, `srpapi`, and others. [`mstsc/README.md`](mstsc/README.md) describes them;
+[`mstsc/upstream/`](mstsc/upstream) is the same work reshaped as upstream-style submissions.
+They are part of `altars-up/` now.
 
-要看**为什么**这么改，读这里；要**重建代码**，用上面那个。
+## `mesa/` and `ported/`
 
-其中几个标着 "diagnostic" 的（0007、0009、0013、0016、0017、0019）是当时为了
-看清现象加的临时代码，不在最终状态里——它们留下来是因为记录了如何测量那些
-现象，下次遇到同类问题不必重新发明。
+`mesa/` is a fix that does not belong to Wine: Office hung now and then because a new GL context
+entered Mesa's shared-context list before it had its state tracker, and another thread walking the
+list with the lock held crashed. Wine swallows that fault and the lock is never released. Patch,
+evidence and a workaround are in [`mesa/README.md`](mesa/README.md); it has not been submitted
+to Mesa.
 
-## `mesa/` —— 不属于 Wine 的修复
-
-Office 在上游 Wine 下偶发卡死，根因在 Mesa：新 GL 上下文还没有 `st` 就进了共享链表，
-另一线程持锁遍历时空指针崩溃，Wine 吞掉这个故障后锁永远不放。补丁、证据和规避办法见
-`mesa/README.md`；尚未提交上游。
+`ported/` holds work taken from other trees (here, one Valve patch), each with its source named.
+[`../docs/upstream-evaluation.md`](../docs/upstream-evaluation.md) is the survey of what else was
+looked at and rejected, and why; that list is the useful half.
