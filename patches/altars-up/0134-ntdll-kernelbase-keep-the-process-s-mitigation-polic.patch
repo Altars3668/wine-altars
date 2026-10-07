@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 13:16:30 -0400
+Subject: [PATCH] ntdll, kernelbase: keep the process's mitigation policies and
+ power throttling state, and answer them.
+
+Word asks for its mitigation policies and those of processes it starts,
+sets two of them, and sets its power throttling state; the query
+returned TRUE without writing anything, the setters succeeded at
+nothing, and GetProcessInformation did not know the class.
+tools/procpolicyprobe measured Windows 11:
+
+- A 64-bit process starts with ASLR bottom up and of high entropy, and
+  with shadow stack APIs kept out of process; the other policies start
+  off.  ASLR cannot be changed while the process runs (access denied),
+  and the others can be added to and not taken back (access denied).
+- A policy of one DWORD is asked and set in one; DEP's structure is its
+  own size, and a 64-bit process says it does not support setting it.
+- The power throttling state is asked for by version, of this process
+  only (invalid parameter for another), and is what was set last.
+
+ProcessMitigationPolicy and ProcessPowerThrottlingState now keep and
+answer these for the process itself; another process answers as it
+started.  Policies are kept, not enforced, and the mask of mitigation
+options is not known.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 73903f177228f910182aefc4bd76038da0a21786)
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index 25b3f4fffb9..ec44c2ce23f 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -933,8 +933,53 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetProcessId( HANDLE process )
+ BOOL WINAPI /* DECLSPEC_HOTPATCH */ GetProcessMitigationPolicy( HANDLE process, PROCESS_MITIGATION_POLICY policy,
+                                                           void *buffer, SIZE_T length )
+ {
+-    FIXME( "(%p, %u, %p, %Iu): stub\n", process, policy, buffer, length );
+-    return TRUE;
++    PROCESS_MITIGATION_POLICY_INFORMATION info;
++
++    TRACE( "(%p, %u, %p, %Iu)\n", process, policy, buffer, length );
++
++    switch (policy)
++    {
++    case ProcessDEPPolicy:
++    {
++        PROCESS_MITIGATION_DEP_POLICY *dep = buffer;
++        ULONG flags;
++
++        if (length != sizeof(*dep))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        if (!set_ntstatus( NtQueryInformationProcess( process, ProcessExecuteFlags, &flags, sizeof(flags), NULL )))
++            return FALSE;
++        dep->Flags = 0;
++        dep->Enable = !!(flags & MEM_EXECUTE_OPTION_DISABLE);
++        dep->DisableAtlThunkEmulation = !!(flags & MEM_EXECUTE_OPTION_DISABLE_THUNK_EMULATION);
++        dep->Permanent = !!(flags & MEM_EXECUTE_OPTION_PERMANENT);
++        return TRUE;
++    }
++
++    case ProcessMitigationOptionsMask:
++        if (length != sizeof(ULONG64) && length != 2 * sizeof(ULONG64))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        FIXME( "the mask of mitigation options is not known\n" );
++        memset( buffer, 0, length );
++        return TRUE;
++
++    default:
++        if (policy >= MaxProcessMitigationPolicy || length != sizeof(DWORD))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        info.Policy = policy;
++        if (!set_ntstatus( NtQueryInformationProcess( process, ProcessMitigationPolicy, &info, sizeof(info), NULL )))
++            return FALSE;
++        *(DWORD *)buffer = info.ASLRPolicy.Flags;
++        return TRUE;
++    }
+ }
+ 
+ 
+@@ -1078,6 +1123,9 @@ BOOL WINAPI GetProcessInformation( HANDLE process, PROCESS_INFORMATION_CLASS inf
+ {
+     switch (info_class)
+     {
++        case ProcessPowerThrottling:
++            return set_ntstatus( NtQueryInformationProcess( process, ProcessPowerThrottlingState, data, size, NULL ));
++
+         case ProcessMachineTypeInfo:
+         {
+             PROCESS_MACHINE_INFORMATION *mi = data;
+@@ -1277,8 +1325,52 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetProcessGroupAffinity( HANDLE process, const GRO
+ BOOL WINAPI /* DECLSPEC_HOTPATCH */ SetProcessMitigationPolicy( PROCESS_MITIGATION_POLICY policy,
+                                                           void *buffer, SIZE_T length )
+ {
+-    FIXME( "(%d, %p, %Iu): stub\n", policy, buffer, length );
+-    return TRUE;
++    PROCESS_MITIGATION_POLICY_INFORMATION info;
++
++    TRACE( "(%d, %p, %Iu)\n", policy, buffer, length );
++
++    switch (policy)
++    {
++    case ProcessDEPPolicy:
++    {
++        const PROCESS_MITIGATION_DEP_POLICY *dep = buffer;
++
++        if (length != sizeof(*dep))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++#ifdef _WIN64
++        /* a 64-bit process has it always and for good, and says it does not support changing it */
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++#else
++        {
++            ULONG flags = 0;
++
++            if (dep->Enable) flags |= MEM_EXECUTE_OPTION_DISABLE | MEM_EXECUTE_OPTION_PERMANENT;
++            if (dep->DisableAtlThunkEmulation) flags |= MEM_EXECUTE_OPTION_DISABLE_THUNK_EMULATION;
++            return set_ntstatus( NtSetInformationProcess( GetCurrentProcess(), ProcessExecuteFlags,
++                                                          &flags, sizeof(flags) ));
++        }
++#endif
++    }
++
++    case ProcessMitigationOptionsMask:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++
++    default:
++        if (policy >= MaxProcessMitigationPolicy || length != sizeof(DWORD))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        info.Policy = policy;
++        info.ASLRPolicy.Flags = *(DWORD *)buffer;
++        return set_ntstatus( NtSetInformationProcess( GetCurrentProcess(), ProcessMitigationPolicy,
++                                                      &info, sizeof(info) ));
++    }
+ }
+ 
+ 
+diff --git a/dlls/kernelbase/tests/process.c b/dlls/kernelbase/tests/process.c
+index 65a04eed9c0..396da250e1f 100644
+--- a/dlls/kernelbase/tests/process.c
++++ b/dlls/kernelbase/tests/process.c
+@@ -687,6 +687,98 @@ static void test_QueryThreadCycleTime(void)
+     ok( GetLastError() == ERROR_INVALID_HANDLE, "got error %lu.\n", GetLastError() );
+ }
+ 
++static void test_mitigation_policies(void)
++{
++    PROCESS_MITIGATION_IMAGE_LOAD_POLICY image;
++    PROCESS_MITIGATION_ASLR_POLICY aslr;
++    PROCESS_MITIGATION_DEP_POLICY dep;
++    PROCESS_POWER_THROTTLING_STATE state;
++    DWORD flags;
++    BOOL ret;
++
++    /* a policy of one DWORD, asked for in one */
++    memset(&aslr, 0xcc, sizeof(aslr));
++    ret = GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr));
++    ok(ret, "got error %lu\n", GetLastError());
++    ok(aslr.EnableBottomUpRandomization, "got %#lx\n", aslr.Flags);
++    SetLastError(0xdeadbeef);
++    ret = GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr) + 1);
++    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, GetLastError());
++    SetLastError(0xdeadbeef);
++    ret = GetProcessMitigationPolicy(GetCurrentProcess(), ProcessDEPPolicy, &flags, sizeof(flags));
++    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, GetLastError());
++    ret = GetProcessMitigationPolicy(GetCurrentProcess(), ProcessDEPPolicy, &dep, sizeof(dep));
++    ok(ret, "got error %lu\n", GetLastError());
++    ok(dep.Enable || sizeof(void *) == 4, "DEP is off\n");
++    SetLastError(0xdeadbeef);
++    ret = GetProcessMitigationPolicy(GetCurrentProcess(), MaxProcessMitigationPolicy + 5, &flags, sizeof(flags));
++    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, GetLastError());
++
++    /* ASLR is not to be changed while the process runs */
++    aslr.Flags = 0;
++    aslr.EnableForceRelocateImages = 1;
++    SetLastError(0xdeadbeef);
++    ret = SetProcessMitigationPolicy(ProcessASLRPolicy, &aslr, sizeof(aslr));
++    ok(!ret && GetLastError() == ERROR_ACCESS_DENIED, "got %d, error %lu\n", ret, GetLastError());
++#ifdef _WIN64
++    dep.Flags = 0;
++    dep.Enable = 1;
++    SetLastError(0xdeadbeef);
++    ret = SetProcessMitigationPolicy(ProcessDEPPolicy, &dep, sizeof(dep));
++    ok(!ret && GetLastError() == ERROR_NOT_SUPPORTED, "got %d, error %lu\n", ret, GetLastError());
++#endif
++
++    /* the others are added to, and not taken back */
++    image.Flags = 0;
++    image.NoRemoteImages = 1;
++    image.PreferSystem32Images = 1;
++    SetLastError(0xdeadbeef);
++    ret = SetProcessMitigationPolicy(ProcessImageLoadPolicy, &image, 3);
++    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, GetLastError());
++    ret = SetProcessMitigationPolicy(ProcessImageLoadPolicy, &image, sizeof(image));
++    ok(ret, "got error %lu\n", GetLastError());
++    memset(&image, 0xcc, sizeof(image));
++    ret = GetProcessMitigationPolicy(GetCurrentProcess(), ProcessImageLoadPolicy, &image, sizeof(image));
++    ok(ret, "got error %lu\n", GetLastError());
++    ok(image.Flags == 5, "got %#lx\n", image.Flags);
++    image.NoRemoteImages = 0;
++    SetLastError(0xdeadbeef);
++    ret = SetProcessMitigationPolicy(ProcessImageLoadPolicy, &image, sizeof(image));
++    ok(!ret && GetLastError() == ERROR_ACCESS_DENIED, "got %d, error %lu\n", ret, GetLastError());
++
++    /* the power throttling state of this process only, asked for by version */
++    memset(&state, 0xcc, sizeof(state));
++    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
++    ret = GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
++    ok(ret, "got error %lu\n", GetLastError());
++    ok(!state.ControlMask && !state.StateMask, "got %#lx %#lx\n", state.ControlMask, state.StateMask);
++    state.ControlMask = state.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
++    ret = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
++    ok(ret, "got error %lu\n", GetLastError());
++    memset(&state, 0xcc, sizeof(state));
++    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
++    ret = GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
++    ok(ret, "got error %lu\n", GetLastError());
++    ok(state.ControlMask == PROCESS_POWER_THROTTLING_EXECUTION_SPEED &&
++       state.StateMask == PROCESS_POWER_THROTTLING_EXECUTION_SPEED, "got %#lx %#lx\n", state.ControlMask, state.StateMask);
++    state.Version = 5;
++    SetLastError(0xdeadbeef);
++    ret = GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
++    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, GetLastError());
++}
++
++static void run_child(const char *test)
++{
++    STARTUPINFOA si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    char **argv, cmdline[MAX_PATH + 64];
++
++    winetest_get_mainargs(&argv);
++    sprintf(cmdline, "\"%s\" process %s", argv[0], test);
++    ok(CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi), "CreateProcess failed\n");
++    wait_child_process(&pi);
++}
++
+ static void init_funcs(void)
+ {
+     HMODULE hmod = GetModuleHandleA("kernelbase.dll");
+@@ -713,8 +805,18 @@ static void init_funcs(void)
+ 
+ START_TEST(process)
+ {
++    char **argv;
++    int argc = winetest_get_mainargs(&argv);
++
+     init_funcs();
+ 
++    /* a process of its own: policies are not taken back, and change how DLLs are found */
++    if (argc > 2 && !strcmp(argv[2], "mitigation"))
++    {
++        test_mitigation_policies();
++        return;
++    }
++
+     test_CompareObjectHandles();
+     test_MapViewOfFile3();
+     test_VirtualAlloc2();
+@@ -727,4 +829,5 @@ START_TEST(process)
+     test_QueryProcessCycleTime();
+     test_GetMachineTypeAttributes();
+     test_QueryThreadCycleTime();
++    run_child("mitigation");
+ }
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index fcb09323c65..fbc52500483 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1145,6 +1145,88 @@ static NTSTATUS get_process_cpu_time( HANDLE handle, ULONGLONG *ns )
+     return STATUS_SUCCESS;
+ }
+ 
++/* The mitigation policies of this process, as Windows starts a process with them: ASLR for everything and of
++ * high entropy for a 64-bit process, and shadow stack APIs kept out of process.  Policies can be added to while
++ * the process runs, not taken back; ASLR cannot be changed at all. */
++static DWORD mitigation_flags[MaxProcessMitigationPolicy];
++static BOOL mitigation_init;
++static PROCESS_POWER_THROTTLING_STATE power_throttling = { PROCESS_POWER_THROTTLING_CURRENT_VERSION };
++
++static DWORD default_mitigation_flags( PROCESS_MITIGATION_POLICY policy, BOOL win64 )
++{
++    switch (policy)
++    {
++    case ProcessASLRPolicy:
++        return 0x1 /* EnableBottomUpRandomization */ | (win64 ? 0x4 /* EnableHighEntropy */ : 0);
++    case ProcessUserShadowStackPolicy:
++        return 0x100; /* CetDynamicApisOutOfProcOnly */
++    default:
++        return 0;
++    }
++}
++
++/* whether a handle names this process; the others are only asked of, and answer as they started */
++static BOOL is_this_process( HANDLE handle )
++{
++    PROCESS_BASIC_INFORMATION pbi;
++
++    if (handle == NtCurrentProcess()) return TRUE;
++    if (NtQueryInformationProcess( handle, ProcessBasicInformation, &pbi, sizeof(pbi), NULL )) return FALSE;
++    return pbi.UniqueProcessId == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
++}
++
++static NTSTATUS get_mitigation_policy( HANDLE handle, PROCESS_MITIGATION_POLICY_INFORMATION *info )
++{
++    BOOL win64 = is_win64 && !is_wow64();
++
++    if (info->Policy >= MaxProcessMitigationPolicy || info->Policy == ProcessDEPPolicy ||
++        info->Policy == ProcessMitigationOptionsMask)
++        return STATUS_INVALID_PARAMETER;
++    if (!is_this_process( handle ))
++    {
++        USHORT machine = 0;
++        NTSTATUS status;
++
++        SERVER_START_REQ( get_process_info )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            if (!(status = wine_server_call( req ))) machine = reply->machine;
++        }
++        SERVER_END_REQ;
++        if (status) return status;
++        info->ASLRPolicy.Flags = default_mitigation_flags( info->Policy,
++                machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64 );
++        return STATUS_SUCCESS;
++    }
++    if (!mitigation_init)
++    {
++        unsigned int i;
++
++        for (i = 0; i < MaxProcessMitigationPolicy; i++) mitigation_flags[i] = default_mitigation_flags( i, win64 );
++        mitigation_init = TRUE;
++    }
++    info->ASLRPolicy.Flags = mitigation_flags[info->Policy];
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS set_mitigation_policy( HANDLE handle, const PROCESS_MITIGATION_POLICY_INFORMATION *info )
++{
++    PROCESS_MITIGATION_POLICY_INFORMATION current = { .Policy = info->Policy };
++    NTSTATUS status;
++
++    if (!is_this_process( handle )) return STATUS_ACCESS_DENIED;
++    if ((status = get_mitigation_policy( handle, &current ))) return status;
++    if (info->Policy == ProcessASLRPolicy) return STATUS_ACCESS_DENIED;
++    if (current.ASLRPolicy.Flags & ~info->ASLRPolicy.Flags) return STATUS_ACCESS_DENIED;
++    if (info->ASLRPolicy.Flags & ~current.ASLRPolicy.Flags)
++    {
++        static unsigned int once;
++        if (!once++) FIXME( "mitigation policy %u %#x is kept, not enforced\n", info->Policy, (int)info->ASLRPolicy.Flags );
++    }
++    mitigation_flags[info->Policy] = info->ASLRPolicy.Flags;
++    return STATUS_SUCCESS;
++}
++
+ /**********************************************************************
+  *           NtQueryInformationProcess  (NTDLL.@)
+  */
+@@ -1564,6 +1646,27 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+         break;
+ 
++    case ProcessMitigationPolicy:
++        len = sizeof(PROCESS_MITIGATION_POLICY_INFORMATION);
++        if (size != len) ret = STATUS_INFO_LENGTH_MISMATCH;
++        else if (!info) ret = STATUS_ACCESS_VIOLATION;
++        else ret = get_mitigation_policy( handle, info );
++        break;
++
++    case ProcessPowerThrottlingState:
++    {
++        PROCESS_POWER_THROTTLING_STATE *state = info;
++
++        /* only this process's own, which the caller asks for by version */
++        len = sizeof(*state);
++        if (size != len) ret = STATUS_INFO_LENGTH_MISMATCH;
++        else if (!info) ret = STATUS_ACCESS_VIOLATION;
++        else if (state->Version != PROCESS_POWER_THROTTLING_CURRENT_VERSION || !is_this_process( handle ))
++            ret = STATUS_INVALID_PARAMETER;
++        else *state = power_throttling;
++        break;
++    }
++
+     case ProcessCookie:
+         if (handle == NtCurrentProcess())
+         {
+@@ -1921,8 +2024,24 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class,
+         break;
+ 
+     case ProcessPowerThrottlingState:
+-        FIXME( "ProcessPowerThrottlingState - stub\n" );
+-        return STATUS_SUCCESS;
++    {
++        const PROCESS_POWER_THROTTLING_STATE *state = info;
++
++        if (size != sizeof(*state)) return STATUS_INFO_LENGTH_MISMATCH;
++        if (state->Version != PROCESS_POWER_THROTTLING_CURRENT_VERSION ||
++            (state->ControlMask & ~PROCESS_POWER_THROTTLING_VALID_FLAGS) ||
++            (state->StateMask & ~state->ControlMask))
++            return STATUS_INVALID_PARAMETER;
++        if (!is_this_process( handle )) return STATUS_ACCESS_DENIED;
++        /* kept and answered; the scheduler here has no efficiency mode to put the process in */
++        power_throttling = *state;
++        break;
++    }
++
++    case ProcessMitigationPolicy:
++        if (size != sizeof(PROCESS_MITIGATION_POLICY_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
++        ret = set_mitigation_policy( handle, info );
++        break;
+ 
+     default:
+         FIXME( "(%p,0x%08x,%p,0x%08x) stub\n", handle, class, info, size );

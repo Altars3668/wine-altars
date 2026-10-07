@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:00:27 -0400
+Subject: [PATCH] ntdll: tell whether a thread has I/O pending.
+
+ThreadIsIoPending always answered FALSE, with a FIXME Office's thread
+pool printed 22 times as Word started.  A pool asks it before it retires
+a thread: Windows keeps the I/O a thread issued on the thread, and
+cancelling a thread's I/O is what its exit does.
+
+The server now says in get_thread_info whether any of a thread's asyncs
+is still to complete, which is what Windows answers: TRUE for a thread
+with an overlapped read pending, bound to a completion port or not, and
+for one blocked in a synchronous read, FALSE once the read completes or
+is cancelled.  As there, the question needs THREAD_QUERY_INFORMATION,
+and a NULL buffer is STATUS_ACCESS_VIOLATION.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 20cdaee88a6389c9b38797ca7bd73dc3b633f1c9)
+
+diff --git a/dlls/ntdll/tests/info.c b/dlls/ntdll/tests/info.c
+index 8cf6f5b212c..8cdb3c19247 100644
+--- a/dlls/ntdll/tests/info.c
++++ b/dlls/ntdll/tests/info.c
+@@ -4518,6 +4518,106 @@ static void test_process_id(void)
+     }
+ }
+ 
++struct io_pending_job
++{
++    HANDLE pipe;
++    BOOL overlapped;
++    HANDLE issued, done;
++};
++
++static DWORD WINAPI io_pending_thread( void *arg )
++{
++    struct io_pending_job *job = arg;
++    OVERLAPPED ov = {0};
++    char buf[16];
++    DWORD read;
++    BOOL ret;
++
++    if (job->overlapped)
++    {
++        ov.hEvent = CreateEventA( NULL, TRUE, FALSE, NULL );
++        ret = ReadFile( job->pipe, buf, sizeof(buf), &read, &ov );
++        ok( !ret && GetLastError() == ERROR_IO_PENDING, "got %d, error %lu\n", ret, GetLastError() );
++        SetEvent( job->issued );
++        WaitForSingleObject( job->done, INFINITE );
++        CloseHandle( ov.hEvent );
++    }
++    else
++    {
++        SetEvent( job->issued );
++        ret = ReadFile( job->pipe, buf, sizeof(buf), &read, NULL );
++        ok( ret, "ReadFile failed, error %lu\n", GetLastError() );
++        WaitForSingleObject( job->done, INFINITE );
++    }
++    return 0;
++}
++
++static void test_ThreadIsIoPending(void)
++{
++    static const char name[] = "\\\\.\\pipe\\wine_ntdll_io_pending";
++    struct io_pending_job job;
++    HANDLE server, thread, limited;
++    NTSTATUS status;
++    ULONG value, len;
++    DWORD written;
++    int overlapped;
++
++    value = len = 0xdead;
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadIsIoPending, &value, sizeof(value), &len );
++    ok( !status, "got %#lx\n", status );
++    ok( !value, "got %lu\n", value );
++    ok( len == sizeof(value), "got %lu\n", len );
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadIsIoPending, &value, sizeof(value) + 1, &len );
++    ok( status == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", status );
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadIsIoPending, NULL, sizeof(value), &len );
++    ok( status == STATUS_ACCESS_VIOLATION, "got %#lx\n", status );
++    status = pNtQueryInformationThread( (HANDLE)0xdeadbeef, ThreadIsIoPending, &value, sizeof(value), &len );
++    ok( status == STATUS_INVALID_HANDLE, "got %#lx\n", status );
++
++    /* the I/O a thread started, whether it waits for it or not, until it completes */
++    for (overlapped = 1; overlapped >= 0; overlapped--)
++    {
++        winetest_push_context( overlapped ? "overlapped" : "synchronous" );
++        server = CreateNamedPipeA( name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE, 1, 64, 64, 0, NULL );
++        ok( server != INVALID_HANDLE_VALUE, "CreateNamedPipe failed, error %lu\n", GetLastError() );
++        job.pipe = CreateFileA( name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
++                                overlapped ? FILE_FLAG_OVERLAPPED : 0, NULL );
++        ok( job.pipe != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
++        job.overlapped = overlapped;
++        job.issued = CreateEventA( NULL, TRUE, FALSE, NULL );
++        job.done = CreateEventA( NULL, TRUE, FALSE, NULL );
++        thread = CreateThread( NULL, 0, io_pending_thread, &job, 0, NULL );
++        WaitForSingleObject( job.issued, INFINITE );
++        Sleep( 100 );
++
++        value = 0xdead;
++        status = pNtQueryInformationThread( thread, ThreadIsIoPending, &value, sizeof(value), NULL );
++        ok( !status, "got %#lx\n", status );
++        ok( value == 1, "got %lu\n", value );
++        DuplicateHandle( GetCurrentProcess(), thread, GetCurrentProcess(), &limited,
++                         THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0 );
++        status = pNtQueryInformationThread( limited, ThreadIsIoPending, &value, sizeof(value), NULL );
++        ok( status == STATUS_ACCESS_DENIED, "got %#lx\n", status );
++        CloseHandle( limited );
++
++        WriteFile( server, "x", 1, &written, NULL );
++        Sleep( 100 );
++        value = 0xdead;
++        status = pNtQueryInformationThread( thread, ThreadIsIoPending, &value, sizeof(value), NULL );
++        ok( !status, "got %#lx\n", status );
++        ok( !value, "got %lu\n", value );
++
++        SetEvent( job.done );
++        WaitForSingleObject( thread, INFINITE );
++        CloseHandle( thread );
++        CloseHandle( job.issued );
++        CloseHandle( job.done );
++        CloseHandle( job.pipe );
++        CloseHandle( server );
++        winetest_pop_context();
++    }
++}
++
+ static volatile LONG cycle_spin_stop;
+ 
+ static DWORD WINAPI cycle_spin_thread( void *arg )
+@@ -4850,4 +4950,5 @@ START_TEST(info)
+     test_processor_idle_cycle_time();
+     test_process_parameters_flags(argc, argv);
+     test_cycle_time(argv);
++    test_ThreadIsIoPending();
+ }
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index d2cdb127ada..63f60f66164 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -2390,12 +2390,18 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+     }
+ 
+     case ThreadIsIoPending:
+-        FIXME( "ThreadIsIoPending info class not supported yet\n" );
+         if (length != sizeof(BOOL)) return STATUS_INFO_LENGTH_MISMATCH;
+-        if (!data) return STATUS_ACCESS_DENIED;
+-        *(BOOL*)data = FALSE;
+-        if (ret_len) *ret_len = sizeof(BOOL);
+-        return STATUS_SUCCESS;
++        if (!data) return STATUS_ACCESS_VIOLATION;
++        SERVER_START_REQ( get_thread_info )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            req->access = THREAD_QUERY_INFORMATION;
++            if (!(status = wine_server_call( req )))
++                *(BOOL *)data = !!(reply->flags & GET_THREAD_INFO_FLAG_IO_PENDING);
++        }
++        SERVER_END_REQ;
++        if (!status && ret_len) *ret_len = sizeof(BOOL);
++        return status;
+ 
+     case ThreadCycleTime:
+     {
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 055970b322b..36953ec66cb 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1426,6 +1426,7 @@ struct get_thread_info_reply
+ #define GET_THREAD_INFO_FLAG_TERMINATED    0x02
+ #define GET_THREAD_INFO_FLAG_LAST          0x04
+ #define GET_THREAD_INFO_FLAG_DISABLE_BOOST 0x08
++#define GET_THREAD_INFO_FLAG_IO_PENDING    0x10
+ 
+ 
+ 
+@@ -7205,6 +7206,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 964
++#define SERVER_PROTOCOL_VERSION 965
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/async.c b/server/async.c
+index ae51b2f72b0..074e952b7c8 100644
+--- a/server/async.c
++++ b/server/async.c
+@@ -774,6 +774,17 @@ restart:
+     }
+ }
+ 
++/* whether a thread has I/O pending that it started, as ThreadIsIoPending asks: whatever it waits on, or has
++ * bound to a completion port, until it completes or is cancelled */
++int thread_has_pending_io( struct thread *thread )
++{
++    struct async *async;
++
++    LIST_FOR_EACH_ENTRY( async, &thread->process->asyncs, struct async, process_entry )
++        if (async->thread == thread && !async->terminated && !async->is_system) return 1;
++    return 0;
++}
++
+ /* wake up async operations on the queue */
+ void async_wake_up( struct async_queue *queue, unsigned int status )
+ {
+diff --git a/server/file.h b/server/file.h
+index 61f570f7290..59ca04383c9 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -271,6 +271,7 @@ extern struct thread *async_get_thread( struct async *async );
+ extern struct async *find_pending_async( struct async_queue *queue );
+ extern void cancel_terminating_process_asyncs( struct process *process );
+ extern void cancel_terminating_thread_asyncs( struct thread *thread );
++extern int thread_has_pending_io( struct thread *thread );
+ extern int async_close_obj_handle( struct object *obj, struct process *process, obj_handle_t handle );
+ 
+ static inline void init_async_queue( struct async_queue *queue )
+diff --git a/server/protocol.def b/server/protocol.def
+index 6acebc7d3ca..8799f06f275 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1343,6 +1343,7 @@ typedef volatile struct
+ #define GET_THREAD_INFO_FLAG_TERMINATED    0x02
+ #define GET_THREAD_INFO_FLAG_LAST          0x04
+ #define GET_THREAD_INFO_FLAG_DISABLE_BOOST 0x08
++#define GET_THREAD_INFO_FLAG_IO_PENDING    0x10
+ 
+ 
+ /* Retrieve information about thread times */
+diff --git a/server/thread.c b/server/thread.c
+index bdf48c4bf8f..8286937ff8a 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1831,6 +1831,8 @@ DECL_HANDLER(get_thread_info)
+             reply->flags |= GET_THREAD_INFO_FLAG_LAST;
+         if (thread->disable_boost)
+             reply->flags |= GET_THREAD_INFO_FLAG_DISABLE_BOOST;
++        if (thread_has_pending_io( thread ))
++            reply->flags |= GET_THREAD_INFO_FLAG_IO_PENDING;
+ 
+         if (thread->desc && get_reply_max_size())
+         {

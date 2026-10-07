@@ -1,0 +1,2404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 22:23:58 -0400
+Subject: [PATCH] advapi32: Keep the classic event logs, in files shared by
+ every process.
+
+ReportEvent wrote nothing (Word reports one event as it starts), and
+ReadEventLog, the counts, backups and clearing were stubs.  Each log is
+now a file in the classic format in system32\winevt\Logs, a named mutex
+around every access to it and a named event pulsed for
+NotifyChangeEventLog.  A source writes to the log of that name, to the
+log whose key names it, or to Application.  Records have the layout
+Windows 11 gives them -- the user SID at the next 8-byte boundary after
+the computer name, strings and data right after, the whole padded to
+8 bytes with its length last -- and reads move as on Windows: a
+sequential read goes on from the last record the previous read gave,
+in either direction, a seek read starts at the record asked for, and a
+read gives as many whole records as fit (tools/startupgapsprobe
+evtread).  Numbering goes on after a log is cleared; a log about to
+outgrow its MaxSize drops its oldest records.  The event log service
+writes the version (6009) and that it started (6005) to the System log
+when it starts, and that it stopped (6006), as Windows does.  The
+upstream tests pass without their todos; the reads that seek to the
+tenth record of the System log are skipped while it has fewer.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/advapi32/Makefile.in b/dlls/advapi32/Makefile.in
+index a2ec5adba8b..8b0bc7acb47 100644
+--- a/dlls/advapi32/Makefile.in
++++ b/dlls/advapi32/Makefile.in
+@@ -11,6 +11,7 @@ SOURCES = \
+ 	advapi32.rc \
+ 	cred.c \
+ 	crypt.c \
++	classiclog.c \
+ 	eventlog.c \
+ 	lsa.c \
+ 	registry.c \
+diff --git a/dlls/advapi32/classiclog.c b/dlls/advapi32/classiclog.c
+new file mode 100644
+index 00000000000..f6b35f3aced
+--- /dev/null
++++ b/dlls/advapi32/classiclog.c
+@@ -0,0 +1,1262 @@
++/*
++ * The classic event logs: OpenEventLog, RegisterEventSource, ReportEvent, ReadEventLog and the rest
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Each log is a file in the classic format -- ELF_LOGFILE_HEADER, the records, ELF_EOF_RECORD -- named after it in
++ * %SystemRoot%\system32\winevt\Logs, and shared by every process: a named mutex serializes all access to it, and
++ * a named event is pulsed when a record is written, for NotifyChangeEventLog.  The file never wraps; one that
++ * would grow past the log's MaxSize drops its oldest records instead.  A record has the layout Windows 11 gives
++ * ReadEventLogW: the source and computer names after the fixed part, the user SID at the next 8-byte boundary,
++ * the strings and the data right after it, and the whole padded to 8 bytes with its length in the last four.
++ * Record numbers go on from where they were when a log is cleared, as on Windows.  A source is in the log whose
++ * registry key under Services\EventLog names it, or is the log; others are in the Application log.
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "winreg.h"
++#include "winternl.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++#include "advapi32_misc.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(eventlog);
++
++typedef struct
++{
++    ULONG HeaderSize;
++    ULONG Signature;
++    ULONG MajorVersion;
++    ULONG MinorVersion;
++    ULONG StartOffset;
++    ULONG EndOffset;
++    ULONG CurrentRecordNumber;
++    ULONG OldestRecordNumber;
++    ULONG MaxSize;
++    ULONG Flags;
++    ULONG Retention;
++    ULONG EndHeaderSize;
++} ELF_LOGFILE_HEADER;
++
++typedef struct
++{
++    ULONG RecordSizeBeginning;
++    ULONG One;
++    ULONG Two;
++    ULONG Three;
++    ULONG Four;
++    ULONG BeginRecord;
++    ULONG EndRecord;
++    ULONG CurrentRecordNumber;
++    ULONG OldestRecordNumber;
++    ULONG RecordSizeEnd;
++} ELF_EOF_RECORD;
++
++#define LOG_SIGNATURE     0x654c664c /* LfLe */
++#define LOG_DEFAULT_SIZE  20971520
++#define LOG_MIN_SIZE      0x10000
++
++static const WCHAR eventlog_key[] = L"SYSTEM\\CurrentControlSet\\Services\\EventLog";
++
++/* A handle to an event log, by OpenEventLog(), OpenBackupEventLog() or RegisterEventSource(): the one kind, which
++ * the functions take alike; a handle closed is not one any more. */
++struct eventlog
++{
++    struct list entry;
++    CRITICAL_SECTION cs;
++    WCHAR *log;             /* the log, as the registry names it */
++    WCHAR *source;          /* what ReportEvent writes as the source */
++    BOOL backup;            /* a backup file, read only */
++    HANDLE file;
++    HANDLE mutex;           /* the log's, held around every access to its file; none for a backup */
++    HANDLE changed;         /* the log's, pulsed by every write */
++    DWORD max_size;
++    DWORD cursor;           /* the record a forward sequential read starts at, 0 before any read */
++    /* where the records are, oldest first: kept up as the log grows, rebuilt once it was cleared or cut */
++    DWORD oldest;
++    DWORD next;
++    DWORD end;
++    DWORD *offsets;
++    DWORD offsets_size;
++    HANDLE notify_thread;
++    HANDLE notify_stop;
++    HANDLE notify_event;
++};
++
++static struct list eventlogs = LIST_INIT( eventlogs );
++static CRITICAL_SECTION eventlog_cs;
++static CRITICAL_SECTION_DEBUG eventlog_cs_debug =
++{
++    0, 0, &eventlog_cs,
++    { &eventlog_cs_debug.ProcessLocksList, &eventlog_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": eventlog_cs") }
++};
++static CRITICAL_SECTION eventlog_cs = { &eventlog_cs_debug, -1, 0, 0, 0, 0 };
++
++static inline DWORD align8( DWORD size )
++{
++    return (size + 7) & ~7;
++}
++
++/* Whether a server is this computer: none, its names, its DNS names, or the loopback ones.  Another the event log
++ * service is not reached on. */
++static BOOL is_local_server( const WCHAR *server )
++{
++    static const COMPUTER_NAME_FORMAT formats[] =
++    {
++        ComputerNameNetBIOS, ComputerNameDnsHostname, ComputerNameDnsFullyQualified
++    };
++    WCHAR name[MAX_COMPUTERNAME_LENGTH * 8 + 1];
++    DWORD size;
++    unsigned int i;
++
++    if (!server || !server[0]) return TRUE;
++    if (server[0] == '\\' && server[1] == '\\') server += 2;
++    if (!wcsicmp( server, L"localhost" ) || !wcscmp( server, L"." ) || !wcscmp( server, L"127.0.0.1" ) ||
++        !wcscmp( server, L"::1" ))
++        return TRUE;
++    for (i = 0; i < ARRAY_SIZE(formats); i++)
++    {
++        size = ARRAY_SIZE(name);
++        if (GetComputerNameExW( formats[i], name, &size ) && !wcsicmp( server, name )) return TRUE;
++    }
++    return FALSE;
++}
++
++static BOOL read_at( HANDLE file, DWORD offset, void *buffer, DWORD size )
++{
++    OVERLAPPED ovl = {0};
++    DWORD done;
++
++    ovl.Offset = offset;
++    return ReadFile( file, buffer, size, &done, &ovl ) && done == size;
++}
++
++static BOOL write_at( HANDLE file, DWORD offset, const void *buffer, DWORD size )
++{
++    OVERLAPPED ovl = {0};
++    DWORD done;
++
++    ovl.Offset = offset;
++    return WriteFile( file, buffer, size, &done, &ovl ) && done == size;
++}
++
++static void init_header( ELF_LOGFILE_HEADER *header, DWORD max_size )
++{
++    memset( header, 0, sizeof(*header) );
++    header->HeaderSize = header->EndHeaderSize = sizeof(*header);
++    header->Signature = LOG_SIGNATURE;
++    header->MajorVersion = header->MinorVersion = 1;
++    header->StartOffset = header->EndOffset = sizeof(*header);
++    header->CurrentRecordNumber = header->OldestRecordNumber = 1;
++    header->MaxSize = max_size;
++}
++
++static BOOL valid_header( const ELF_LOGFILE_HEADER *header, DWORD file_size )
++{
++    return header->HeaderSize == sizeof(*header) && header->EndHeaderSize == sizeof(*header) &&
++           header->Signature == LOG_SIGNATURE && header->MajorVersion == 1 &&
++           header->StartOffset >= sizeof(*header) && header->StartOffset <= header->EndOffset &&
++           header->EndOffset <= file_size && header->OldestRecordNumber <= header->CurrentRecordNumber;
++}
++
++/* the end of a log file: an EOF record after the records, and the header saying where they are */
++static BOOL write_end( HANDLE file, const ELF_LOGFILE_HEADER *header )
++{
++    ELF_EOF_RECORD eof;
++
++    eof.RecordSizeBeginning = eof.RecordSizeEnd = sizeof(eof);
++    eof.One = 0x11111111;
++    eof.Two = 0x22222222;
++    eof.Three = 0x33333333;
++    eof.Four = 0x44444444;
++    eof.BeginRecord = header->StartOffset;
++    eof.EndRecord = header->EndOffset;
++    eof.CurrentRecordNumber = header->CurrentRecordNumber;
++    eof.OldestRecordNumber = header->OldestRecordNumber;
++    return write_at( file, header->EndOffset, &eof, sizeof(eof) ) && write_at( file, 0, header, sizeof(*header) );
++}
++
++static void lock_log( struct eventlog *log )
++{
++    if (log->mutex) WaitForSingleObject( log->mutex, INFINITE );
++}
++
++static void unlock_log( struct eventlog *log )
++{
++    if (log->mutex) ReleaseMutex( log->mutex );
++}
++
++/* the header of the log, with the index of its records brought up to date; the log is locked */
++static BOOL refresh_log( struct eventlog *log, ELF_LOGFILE_HEADER *header )
++{
++    LARGE_INTEGER size;
++    DWORD pos, length;
++
++    if (!GetFileSizeEx( log->file, &size ) || !read_at( log->file, 0, header, sizeof(*header) ) ||
++        !valid_header( header, size.u.LowPart ))
++    {
++        SetLastError( ERROR_EVENTLOG_FILE_CORRUPT );
++        return FALSE;
++    }
++    if (header->OldestRecordNumber != log->oldest || header->EndOffset < log->end || log->next < log->oldest)
++    {
++        log->oldest = log->next = header->OldestRecordNumber;
++        log->end = header->StartOffset;
++    }
++    for (pos = log->end; pos < header->EndOffset; pos += length)
++    {
++        if (!read_at( log->file, pos, &length, sizeof(length) ) || length < sizeof(EVENTLOGRECORD) ||
++            length > header->EndOffset - pos)
++        {
++            WARN( "corrupt record at %#lx in log %s\n", pos, debugstr_w(log->log) );
++            break;
++        }
++        if (log->next - log->oldest >= log->offsets_size)
++        {
++            DWORD new_size = max( 64, log->offsets_size * 2 ), *offsets;
++
++            if (!(offsets = realloc( log->offsets, new_size * sizeof(*offsets) )))
++            {
++                SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++                return FALSE;
++            }
++            log->offsets = offsets;
++            log->offsets_size = new_size;
++        }
++        log->offsets[log->next++ - log->oldest] = pos;
++        log->end = pos + length;
++    }
++    return TRUE;
++}
++
++/* the name of the log a source writes to: the log of that name, the log with the source in its key, or Application */
++static WCHAR *log_name( const WCHAR *source )
++{
++    WCHAR name[256];
++    HKEY key, log_key, source_key;
++    DWORD i, len;
++    WCHAR *ret = NULL;
++
++    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, eventlog_key, 0, KEY_READ, &key ))
++    {
++        for (i = 0; !ret && (len = ARRAY_SIZE(name), !RegEnumKeyExW( key, i, name, &len, NULL, NULL, NULL, NULL )); i++)
++            if (!wcsicmp( name, source )) ret = wcsdup( name );
++        for (i = 0; !ret && (len = ARRAY_SIZE(name), !RegEnumKeyExW( key, i, name, &len, NULL, NULL, NULL, NULL )); i++)
++        {
++            if (RegOpenKeyExW( key, name, 0, KEY_READ, &log_key )) continue;
++            if (!RegOpenKeyExW( log_key, source, 0, KEY_READ, &source_key ))
++            {
++                RegCloseKey( source_key );
++                ret = wcsdup( name );
++            }
++            RegCloseKey( log_key );
++        }
++        RegCloseKey( key );
++    }
++    return ret ? ret : wcsdup( L"Application" );
++}
++
++static DWORD log_max_size( const WCHAR *log )
++{
++    DWORD size = LOG_DEFAULT_SIZE, len = sizeof(size), type;
++    WCHAR path[ARRAY_SIZE(eventlog_key) + 260];
++    HKEY key;
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", eventlog_key, log );
++    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key ))
++    {
++        if (RegQueryValueExW( key, L"MaxSize", NULL, &type, (BYTE *)&size, &len ) || type != REG_DWORD)
++            size = LOG_DEFAULT_SIZE;
++        RegCloseKey( key );
++    }
++    return max( size, LOG_MIN_SIZE );
++}
++
++/* a named object of the log, the same for every case of its name */
++static HANDLE log_object( const WCHAR *log, BOOL mutex )
++{
++    WCHAR name[300];
++    HANDLE ret;
++
++    swprintf( name, ARRAY_SIZE(name), L"__wine_eventlog_%s_%s", mutex ? L"lock" : L"changed", log );
++    wcsupr( name );
++    ret = mutex ? CreateMutexW( NULL, FALSE, name ) : CreateEventW( NULL, TRUE, FALSE, name );
++    return ret;
++}
++
++static void free_eventlog( struct eventlog *log )
++{
++    if (log->notify_thread)
++    {
++        SetEvent( log->notify_stop );
++        WaitForSingleObject( log->notify_thread, INFINITE );
++        CloseHandle( log->notify_thread );
++        CloseHandle( log->notify_stop );
++        CloseHandle( log->notify_event );
++    }
++    if (log->file && log->file != INVALID_HANDLE_VALUE) CloseHandle( log->file );
++    if (log->mutex) CloseHandle( log->mutex );
++    if (log->changed) CloseHandle( log->changed );
++    free( log->offsets );
++    free( log->log );
++    free( log->source );
++    log->cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection( &log->cs );
++    free( log );
++}
++
++static HANDLE add_eventlog( struct eventlog *log )
++{
++    EnterCriticalSection( &eventlog_cs );
++    list_add_tail( &eventlogs, &log->entry );
++    LeaveCriticalSection( &eventlog_cs );
++    return log;
++}
++
++static struct eventlog *alloc_eventlog(void)
++{
++    struct eventlog *log;
++
++    if (!(log = calloc( 1, sizeof(*log) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return NULL;
++    }
++    InitializeCriticalSectionEx( &log->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    log->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": eventlog.cs");
++    return log;
++}
++
++/* opens the log a source writes to, its file created if it is not there */
++static HANDLE open_log( const WCHAR *source )
++{
++    WCHAR path[MAX_PATH + 300];
++    ELF_LOGFILE_HEADER header;
++    struct eventlog *log;
++    LARGE_INTEGER size;
++    DWORD len;
++
++    if (!(log = alloc_eventlog())) return NULL;
++    if (!(log->log = log_name( source )) || !(log->source = wcsdup( source ))) goto oom;
++    log->max_size = log_max_size( log->log );
++    if (!(log->mutex = log_object( log->log, TRUE )) || !(log->changed = log_object( log->log, FALSE )))
++        goto error;
++
++    len = GetSystemDirectoryW( path, MAX_PATH );
++    wcscpy( path + len, L"\\winevt" );
++    CreateDirectoryW( path, NULL );
++    wcscat( path, L"\\Logs" );
++    CreateDirectoryW( path, NULL );
++    wcscat( path, L"\\" );
++    wcscat( path, log->log );
++    wcscat( path, L".evt" );
++    log->file = CreateFileW( path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
++    if (log->file == INVALID_HANDLE_VALUE) goto error;
++
++    lock_log( log );
++    if (GetFileSizeEx( log->file, &size ) && size.QuadPart < sizeof(header) + sizeof(ELF_EOF_RECORD))
++    {
++        TRACE( "creating %s\n", debugstr_w(path) );
++        init_header( &header, log->max_size );
++        write_end( log->file, &header );
++    }
++    unlock_log( log );
++    TRACE( "source %s writes to log %s\n", debugstr_w(source), debugstr_w(log->log) );
++    return add_eventlog( log );
++
++oom:
++    SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++error:
++    len = GetLastError();
++    free_eventlog( log );
++    SetLastError( len );
++    return NULL;
++}
++
++/* the handle's log, locked against other threads of the process using the same handle */
++static struct eventlog *grab_eventlog( HANDLE handle )
++{
++    struct eventlog *log;
++
++    EnterCriticalSection( &eventlog_cs );
++    LIST_FOR_EACH_ENTRY( log, &eventlogs, struct eventlog, entry )
++    {
++        if (log != handle) continue;
++        EnterCriticalSection( &log->cs );
++        LeaveCriticalSection( &eventlog_cs );
++        return log;
++    }
++    LeaveCriticalSection( &eventlog_cs );
++    SetLastError( ERROR_INVALID_HANDLE );
++    return NULL;
++}
++
++static void release_eventlog( struct eventlog *log )
++{
++    LeaveCriticalSection( &log->cs );
++}
++
++static BOOL close_eventlog( HANDLE handle )
++{
++    struct eventlog *log;
++
++    EnterCriticalSection( &eventlog_cs );
++    LIST_FOR_EACH_ENTRY( log, &eventlogs, struct eventlog, entry )
++    {
++        if (log != handle) continue;
++        list_remove( &log->entry );
++        LeaveCriticalSection( &eventlog_cs );
++        EnterCriticalSection( &log->cs );
++        LeaveCriticalSection( &log->cs );
++        free_eventlog( log );
++        return TRUE;
++    }
++    LeaveCriticalSection( &eventlog_cs );
++    SetLastError( ERROR_INVALID_HANDLE );
++    return FALSE;
++}
++
++/* makes room for a record of that size: the oldest records go until the log is down to three quarters of its size */
++static BOOL make_room( struct eventlog *log, ELF_LOGFILE_HEADER *header, DWORD size )
++{
++    DWORD keep = log->max_size / 4 * 3, first, bytes;
++    BYTE *buffer;
++    BOOL ret;
++
++    if (header->EndOffset + size + sizeof(ELF_EOF_RECORD) <= log->max_size) return TRUE;
++    keep = size < keep ? keep - size : 0;
++    for (first = log->oldest; first < log->next; first++)
++        if (log->end - log->offsets[first - log->oldest] <= keep) break;
++    bytes = first < log->next ? log->end - log->offsets[first - log->oldest] : 0;
++    TRACE( "log %s: dropping records %lu to %lu\n", debugstr_w(log->log), log->oldest, first - 1 );
++
++    if (!(buffer = malloc( max( bytes, 1 ) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    ret = (!bytes || read_at( log->file, log->offsets[first - log->oldest], buffer, bytes )) &&
++          (!bytes || write_at( log->file, header->StartOffset, buffer, bytes ));
++    free( buffer );
++    if (!ret) return FALSE;
++    header->OldestRecordNumber = first;
++    header->EndOffset = header->StartOffset + bytes;
++    if (!write_end( log->file, header )) return FALSE;
++    SetFilePointer( log->file, header->EndOffset + sizeof(ELF_EOF_RECORD), NULL, FILE_BEGIN );
++    SetEndOfFile( log->file );
++    return refresh_log( log, header );
++}
++
++static void pulse_changed( struct eventlog *log )
++{
++    PulseEvent( log->changed );
++}
++
++/* appends a record built for this log; it gets its number here */
++static BOOL append_record( struct eventlog *log, EVENTLOGRECORD *record )
++{
++    ELF_LOGFILE_HEADER header;
++    BOOL ret = FALSE;
++
++    lock_log( log );
++    if (refresh_log( log, &header ) && make_room( log, &header, record->Length ))
++    {
++        record->RecordNumber = header.CurrentRecordNumber;
++        if (write_at( log->file, header.EndOffset, record, record->Length ))
++        {
++            header.EndOffset += record->Length;
++            header.CurrentRecordNumber++;
++            ret = write_end( log->file, &header );
++        }
++    }
++    unlock_log( log );
++    if (ret) pulse_changed( log );
++    return ret;
++}
++
++/* the computer name a record carries: the DNS one, as Windows since Vista writes */
++static void get_computer_name( WCHAR *name, DWORD size )
++{
++    if (!GetComputerNameExW( ComputerNameDnsFullyQualified, name, &size ) || !name[0])
++    {
++        size = MAX_COMPUTERNAME_LENGTH + 1;
++        GetComputerNameW( name, &size );
++    }
++}
++
++static DWORD write_string( WCHAR *dst, const WCHAR *src )
++{
++    DWORD len = src ? wcslen( src ) + 1 : 1;
++
++    if (dst)
++    {
++        if (src) memcpy( dst, src, len * sizeof(WCHAR) );
++        else dst[0] = 0;
++    }
++    return len * sizeof(WCHAR);
++}
++
++static EVENTLOGRECORD *build_record( const WCHAR *source, WORD type, WORD category, DWORD id, PSID sid,
++                                     WORD count, DWORD data_size, const WCHAR **strings, const void *data )
++{
++    WCHAR computer[MAX_COMPUTERNAME_LENGTH * 8 + 1];
++    DWORD size, sid_size = sid ? GetLengthSid( sid ) : 0, pos, i;
++    LARGE_INTEGER now;
++    EVENTLOGRECORD *record;
++    BYTE *ptr;
++
++    get_computer_name( computer, ARRAY_SIZE(computer) );
++    pos = sizeof(EVENTLOGRECORD) + write_string( NULL, source ) + write_string( NULL, computer );
++    size = align8( pos ) + sid_size;
++    for (i = 0; i < count; i++) size += write_string( NULL, strings ? strings[i] : NULL );
++    size = align8( size + data_size + sizeof(DWORD) );
++
++    if (!(record = calloc( 1, size )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return NULL;
++    }
++    ptr = (BYTE *)record;
++    record->Length = size;
++    record->Reserved = LOG_SIGNATURE;
++    NtQuerySystemTime( &now );
++    RtlTimeToSecondsSince1970( &now, &record->TimeGenerated );
++    record->TimeWritten = record->TimeGenerated;
++    record->EventID = id;
++    /* what is not one of the types is written as EVENTLOG_SUCCESS, as since Vista */
++    switch (type)
++    {
++    case EVENTLOG_SUCCESS:
++    case EVENTLOG_ERROR_TYPE:
++    case EVENTLOG_WARNING_TYPE:
++    case EVENTLOG_INFORMATION_TYPE:
++    case EVENTLOG_AUDIT_SUCCESS:
++    case EVENTLOG_AUDIT_FAILURE:
++        record->EventType = type;
++        break;
++    default:
++        record->EventType = EVENTLOG_SUCCESS;
++        break;
++    }
++    record->NumStrings = count;
++    record->EventCategory = category;
++
++    pos = sizeof(EVENTLOGRECORD);
++    pos += write_string( (WCHAR *)(ptr + pos), source );
++    pos += write_string( (WCHAR *)(ptr + pos), computer );
++    pos = align8( pos );
++    record->UserSidOffset = pos;
++    record->UserSidLength = sid_size;
++    if (sid_size) CopySid( sid_size, ptr + pos, sid );
++    pos += sid_size;
++    record->StringOffset = pos;
++    for (i = 0; i < count; i++) pos += write_string( (WCHAR *)(ptr + pos), strings ? strings[i] : NULL );
++    record->DataOffset = pos;
++    record->DataLength = data_size;
++    if (data_size) memcpy( ptr + pos, data, data_size );
++    *(DWORD *)(ptr + size - sizeof(DWORD)) = size;
++    return record;
++}
++
++/* the size a record has for ReadEventLogA, and it converted when there is somewhere to put it */
++static DWORD record_to_ansi( const EVENTLOGRECORD *record, EVENTLOGRECORD *out )
++{
++    const WCHAR *source = (const WCHAR *)(record + 1), *computer = source + wcslen( source ) + 1;
++    const WCHAR *str = (const WCHAR *)((const BYTE *)record + record->StringOffset);
++    BYTE *ptr = (BYTE *)out;
++    DWORD pos = sizeof(EVENTLOGRECORD), size, i;
++    int len;
++
++    len = WideCharToMultiByte( CP_ACP, 0, source, -1, out ? (char *)ptr + pos : NULL, out ? 0x7fffffff : 0, NULL, NULL );
++    pos += len;
++    len = WideCharToMultiByte( CP_ACP, 0, computer, -1, out ? (char *)ptr + pos : NULL, out ? 0x7fffffff : 0, NULL, NULL );
++    pos += len;
++    pos = align8( pos );
++    if (out)
++    {
++        *out = *record;
++        out->UserSidOffset = pos;
++        if (record->UserSidLength)
++            memcpy( ptr + pos, (const BYTE *)record + record->UserSidOffset, record->UserSidLength );
++    }
++    pos += record->UserSidLength;
++    if (out) out->StringOffset = pos;
++    for (i = 0; i < record->NumStrings; i++)
++    {
++        len = WideCharToMultiByte( CP_ACP, 0, str, -1, out ? (char *)ptr + pos : NULL, out ? 0x7fffffff : 0, NULL, NULL );
++        pos += len;
++        str += wcslen( str ) + 1;
++    }
++    if (out)
++    {
++        out->DataOffset = pos;
++        if (record->DataLength)
++            memcpy( ptr + pos, (const BYTE *)record + record->DataOffset, record->DataLength );
++    }
++    pos += record->DataLength;
++    size = align8( pos + sizeof(DWORD) );
++    if (out)
++    {
++        memset( ptr + pos, 0, size - pos );
++        out->Length = size;
++        *(DWORD *)(ptr + size - sizeof(DWORD)) = size;
++    }
++    return size;
++}
++
++/* what a read needs: somewhere to put the records and the sizes, the handle, and one way to read in one
++ * direction */
++static BOOL check_read( void *buffer, DWORD *read, DWORD *needed )
++{
++    if (!buffer || !read || !needed)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static BOOL check_flags( DWORD flags )
++{
++    DWORD how = flags & (EVENTLOG_SEQUENTIAL_READ | EVENTLOG_SEEK_READ);
++    DWORD direction = flags & (EVENTLOG_FORWARDS_READ | EVENTLOG_BACKWARDS_READ);
++
++    if (!how || how == (EVENTLOG_SEQUENTIAL_READ | EVENTLOG_SEEK_READ) ||
++        !direction || direction == (EVENTLOG_FORWARDS_READ | EVENTLOG_BACKWARDS_READ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* Reads as many whole records as the buffer holds.  A sequential read starts where the last read left off --
++ * forwards at the record after the last one read, backwards at the one before it -- a seek read at the record
++ * asked for; either way the next sequential read goes on from the last record this one gave. */
++static BOOL read_records( HANDLE handle, DWORD flags, DWORD offset, void *buffer, DWORD size, DWORD *read,
++                          DWORD *needed, BOOL ansi )
++{
++    BOOL forward = !!(flags & EVENTLOG_FORWARDS_READ);
++    ELF_LOGFILE_HEADER header;
++    struct eventlog *log;
++    EVENTLOGRECORD *record = NULL;
++    DWORD number, used = 0, last = 0, length, rec_size = 0;
++    BOOL ret = FALSE;
++
++    if (!check_read( buffer, read, needed )) return FALSE;
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    if (!check_flags( flags )) goto done;
++
++    lock_log( log );
++    if (!refresh_log( log, &header )) goto unlock;
++
++    if (flags & EVENTLOG_SEEK_READ)
++    {
++        if (offset < log->oldest || offset >= log->next)
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            goto unlock;
++        }
++        number = offset;
++    }
++    else if (!log->cursor) number = forward ? log->oldest : log->next - 1;
++    else if (forward) number = max( log->cursor, log->oldest );
++    else number = min( log->cursor - 1, log->next - 1 );
++
++    for (;;)
++    {
++        if (log->next == log->oldest || number < log->oldest || number >= log->next) break;
++        if (!read_at( log->file, log->offsets[number - log->oldest], &length, sizeof(length) )) break;
++        if (length > rec_size)
++        {
++            free( record );
++            if (!(record = malloc( rec_size = length )))
++            {
++                SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++                goto unlock;
++            }
++        }
++        if (!read_at( log->file, log->offsets[number - log->oldest], record, length )) break;
++        length = ansi ? record_to_ansi( record, NULL ) : record->Length;
++        if (used + length > size)
++        {
++            if (!used)
++            {
++                *needed = length;
++                *read = 0;
++                SetLastError( ERROR_INSUFFICIENT_BUFFER );
++                goto unlock;
++            }
++            break;
++        }
++        if (ansi) record_to_ansi( record, (EVENTLOGRECORD *)((BYTE *)buffer + used ));
++        else memcpy( (BYTE *)buffer + used, record, length );
++        used += length;
++        last = number;
++        if (forward) number++;
++        else number--;
++    }
++
++    if (!used)
++    {
++        SetLastError( ERROR_HANDLE_EOF );
++        goto unlock;
++    }
++    log->cursor = forward ? last + 1 : last;
++    *read = used;
++    *needed = 0;
++    ret = TRUE;
++
++unlock:
++    unlock_log( log );
++done:
++    free( record );
++    release_eventlog( log );
++    return ret;
++}
++
++/* writes the records of a log or backup to a new backup file */
++static BOOL backup_log( struct eventlog *log, const WCHAR *file_name )
++{
++    ELF_LOGFILE_HEADER header;
++    HANDLE file;
++    BYTE *buffer = NULL;
++    DWORD bytes;
++    BOOL ret = FALSE;
++
++    if (GetFileAttributesW( file_name ) != INVALID_FILE_ATTRIBUTES)
++    {
++        SetLastError( ERROR_ALREADY_EXISTS );
++        return FALSE;
++    }
++    lock_log( log );
++    if (!refresh_log( log, &header )) goto done;
++    bytes = log->end - header.StartOffset;
++    if (!(buffer = malloc( max( bytes, 1 ) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        goto done;
++    }
++    if (bytes && !read_at( log->file, header.StartOffset, buffer, bytes )) goto done;
++
++    file = CreateFileW( file_name, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL );
++    if (file == INVALID_HANDLE_VALUE) goto done;
++    header.OldestRecordNumber = log->oldest;
++    header.CurrentRecordNumber = log->next;
++    header.StartOffset = sizeof(header);
++    header.EndOffset = sizeof(header) + bytes;
++    header.Flags = 0;
++    ret = (!bytes || write_at( file, sizeof(header), buffer, bytes )) && write_end( file, &header );
++    CloseHandle( file );
++    if (!ret) DeleteFileW( file_name );
++
++done:
++    unlock_log( log );
++    free( buffer );
++    return ret;
++}
++
++static DWORD CALLBACK notify_thread( void *arg )
++{
++    struct eventlog *log = arg;
++    HANDLE handles[2] = { log->notify_stop, log->changed };
++
++    while (WaitForMultipleObjects( 2, handles, FALSE, INFINITE ) == WAIT_OBJECT_0 + 1)
++        SetEvent( log->notify_event );
++    return 0;
++}
++
++/******************************************************************************
++ * BackupEventLogA [ADVAPI32.@]
++ */
++BOOL WINAPI BackupEventLogA( HANDLE handle, const char *file_name )
++{
++    WCHAR *file_nameW;
++    BOOL ret;
++
++    file_nameW = strdupAW( file_name );
++    ret = BackupEventLogW( handle, file_nameW );
++    free( file_nameW );
++    return ret;
++}
++
++/******************************************************************************
++ * BackupEventLogW [ADVAPI32.@]
++ */
++BOOL WINAPI BackupEventLogW( HANDLE handle, const WCHAR *file_name )
++{
++    struct eventlog *log;
++    BOOL ret;
++
++    TRACE( "%p, %s\n", handle, debugstr_w(file_name) );
++
++    if (!file_name)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    ret = backup_log( log, file_name );
++    release_eventlog( log );
++    return ret;
++}
++
++/******************************************************************************
++ * ClearEventLogA [ADVAPI32.@]
++ */
++BOOL WINAPI ClearEventLogA( HANDLE handle, const char *file_name )
++{
++    WCHAR *file_nameW;
++    BOOL ret;
++
++    file_nameW = strdupAW( file_name );
++    ret = ClearEventLogW( handle, file_nameW );
++    free( file_nameW );
++    return ret;
++}
++
++/******************************************************************************
++ * ClearEventLogW [ADVAPI32.@]
++ *
++ * Saves the records to the backup file first, when there is one; a backup cannot be cleared.
++ */
++BOOL WINAPI ClearEventLogW( HANDLE handle, const WCHAR *file_name )
++{
++    ELF_LOGFILE_HEADER header;
++    struct eventlog *log;
++    BOOL ret = FALSE;
++
++    TRACE( "%p, %s\n", handle, debugstr_w(file_name) );
++
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    if (log->backup)
++    {
++        SetLastError( ERROR_INVALID_HANDLE );
++        goto done;
++    }
++    if (file_name && !backup_log( log, file_name )) goto done;
++
++    lock_log( log );
++    if (refresh_log( log, &header ))
++    {
++        header.OldestRecordNumber = header.CurrentRecordNumber;
++        header.EndOffset = header.StartOffset;
++        if ((ret = write_end( log->file, &header )))
++        {
++            SetFilePointer( log->file, header.EndOffset + sizeof(ELF_EOF_RECORD), NULL, FILE_BEGIN );
++            SetEndOfFile( log->file );
++            refresh_log( log, &header );
++        }
++    }
++    unlock_log( log );
++
++done:
++    release_eventlog( log );
++    return ret;
++}
++
++/******************************************************************************
++ * CloseEventLog [ADVAPI32.@]
++ */
++BOOL WINAPI CloseEventLog( HANDLE handle )
++{
++    TRACE( "%p\n", handle );
++
++    return close_eventlog( handle );
++}
++
++/******************************************************************************
++ * DeregisterEventSource [ADVAPI32.@]
++ */
++BOOL WINAPI DeregisterEventSource( HANDLE handle )
++{
++    TRACE( "%p\n", handle );
++
++    /* no handle is no call, and leaves the last error as it is */
++    if (!handle) return FALSE;
++    return close_eventlog( handle );
++}
++
++/******************************************************************************
++ * GetEventLogInformation [ADVAPI32.@]
++ *
++ * A log is never full: it drops its oldest records instead.
++ */
++BOOL WINAPI GetEventLogInformation( HANDLE handle, DWORD level, void *buffer, DWORD size, DWORD *needed )
++{
++    EVENTLOG_FULL_INFORMATION *efi = buffer;
++    struct eventlog *log;
++
++    TRACE( "%p, %lu, %p, %lu, %p\n", handle, level, buffer, size, needed );
++
++    if (level != EVENTLOG_FULL_INFO)
++    {
++        SetLastError( ERROR_INVALID_LEVEL );
++        return FALSE;
++    }
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    release_eventlog( log );
++
++    if (!buffer || !needed)
++    {
++        SetLastError( RPC_X_NULL_REF_POINTER );
++        return FALSE;
++    }
++    *needed = sizeof(EVENTLOG_FULL_INFORMATION);
++    if (size < sizeof(EVENTLOG_FULL_INFORMATION))
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    efi->dwFull = 0;
++    return TRUE;
++}
++
++/******************************************************************************
++ * GetNumberOfEventLogRecords [ADVAPI32.@]
++ */
++BOOL WINAPI GetNumberOfEventLogRecords( HANDLE handle, DWORD *count )
++{
++    ELF_LOGFILE_HEADER header;
++    struct eventlog *log;
++    BOOL ret;
++
++    TRACE( "%p, %p\n", handle, count );
++
++    if (!count)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    lock_log( log );
++    if ((ret = refresh_log( log, &header ))) *count = log->next - log->oldest;
++    unlock_log( log );
++    release_eventlog( log );
++    return ret;
++}
++
++/******************************************************************************
++ * GetOldestEventLogRecord [ADVAPI32.@]
++ *
++ * An empty log has none, record 0.
++ */
++BOOL WINAPI GetOldestEventLogRecord( HANDLE handle, DWORD *oldest )
++{
++    ELF_LOGFILE_HEADER header;
++    struct eventlog *log;
++    BOOL ret;
++
++    TRACE( "%p, %p\n", handle, oldest );
++
++    if (!oldest)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    lock_log( log );
++    if ((ret = refresh_log( log, &header ))) *oldest = log->next > log->oldest ? log->oldest : 0;
++    unlock_log( log );
++    release_eventlog( log );
++    return ret;
++}
++
++/******************************************************************************
++ * NotifyChangeEventLog [ADVAPI32.@]
++ *
++ * Sets the event whenever a record is written to the log, from now on; a later call takes another event.
++ */
++BOOL WINAPI NotifyChangeEventLog( HANDLE handle, HANDLE event )
++{
++    struct eventlog *log;
++    BOOL ret = FALSE;
++    HANDLE dup;
++
++    TRACE( "%p, %p\n", handle, event );
++
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    if (log->backup)
++    {
++        SetLastError( ERROR_INVALID_HANDLE );
++        goto done;
++    }
++    if (!DuplicateHandle( GetCurrentProcess(), event, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS ))
++        goto done;
++    if (log->notify_thread)
++    {
++        SetEvent( log->notify_stop );
++        WaitForSingleObject( log->notify_thread, INFINITE );
++        CloseHandle( log->notify_thread );
++        CloseHandle( log->notify_event );
++        ResetEvent( log->notify_stop );
++    }
++    else if (!(log->notify_stop = CreateEventW( NULL, TRUE, FALSE, NULL )))
++    {
++        CloseHandle( dup );
++        goto done;
++    }
++    log->notify_event = dup;
++    if (!(log->notify_thread = CreateThread( NULL, 0, notify_thread, log, 0, NULL )))
++    {
++        CloseHandle( dup );
++        log->notify_event = NULL;
++        goto done;
++    }
++    ret = TRUE;
++
++done:
++    release_eventlog( log );
++    return ret;
++}
++
++/******************************************************************************
++ * OpenBackupEventLogA [ADVAPI32.@]
++ */
++HANDLE WINAPI OpenBackupEventLogA( const char *server, const char *file_name )
++{
++    WCHAR *serverW, *file_nameW;
++    HANDLE handle;
++
++    serverW = strdupAW( server );
++    file_nameW = strdupAW( file_name );
++    handle = OpenBackupEventLogW( serverW, file_nameW );
++    free( serverW );
++    free( file_nameW );
++    return handle;
++}
++
++/******************************************************************************
++ * OpenBackupEventLogW [ADVAPI32.@]
++ *
++ * A backup is read as it is when it is opened.
++ */
++HANDLE WINAPI OpenBackupEventLogW( const WCHAR *server, const WCHAR *file_name )
++{
++    ELF_LOGFILE_HEADER header;
++    struct eventlog *log;
++
++    TRACE( "%s, %s\n", debugstr_w(server), debugstr_w(file_name) );
++
++    if (!file_name)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!is_local_server( server ))
++    {
++        FIXME( "Remote server not supported\n" );
++        SetLastError( RPC_S_SERVER_UNAVAILABLE );
++        return NULL;
++    }
++
++    if (!(log = alloc_eventlog())) return NULL;
++    log->backup = TRUE;
++    log->file = CreateFileW( file_name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
++    if (log->file == INVALID_HANDLE_VALUE || !(log->log = wcsdup( file_name )) || !refresh_log( log, &header ))
++    {
++        DWORD error = GetLastError();
++
++        if (log->file != INVALID_HANDLE_VALUE && error != ERROR_NOT_ENOUGH_MEMORY) error = ERROR_EVENTLOG_FILE_CORRUPT;
++        free_eventlog( log );
++        SetLastError( error );
++        return NULL;
++    }
++    return add_eventlog( log );
++}
++
++/******************************************************************************
++ * OpenEventLogA [ADVAPI32.@]
++ */
++HANDLE WINAPI OpenEventLogA( const char *server, const char *source )
++{
++    WCHAR *serverW, *sourceW;
++    HANDLE handle;
++
++    serverW = strdupAW( server );
++    sourceW = strdupAW( source );
++    handle = OpenEventLogW( serverW, sourceW );
++    free( serverW );
++    free( sourceW );
++    return handle;
++}
++
++/******************************************************************************
++ * OpenEventLogW [ADVAPI32.@]
++ *
++ * Opens the log of that name, or the one the source of that name writes to.
++ */
++HANDLE WINAPI OpenEventLogW( const WCHAR *server, const WCHAR *source )
++{
++    TRACE( "%s, %s\n", debugstr_w(server), debugstr_w(source) );
++
++    if (!source)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!is_local_server( server ))
++    {
++        FIXME( "Remote server not supported\n" );
++        SetLastError( RPC_S_SERVER_UNAVAILABLE );
++        return NULL;
++    }
++    return open_log( source );
++}
++
++/******************************************************************************
++ * ReadEventLogA [ADVAPI32.@]
++ */
++BOOL WINAPI ReadEventLogA( HANDLE handle, DWORD flags, DWORD offset, void *buffer, DWORD size, DWORD *read,
++                           DWORD *needed )
++{
++    TRACE( "%p, %#lx, %lu, %p, %lu, %p, %p\n", handle, flags, offset, buffer, size, read, needed );
++
++    return read_records( handle, flags, offset, buffer, size, read, needed, TRUE );
++}
++
++/******************************************************************************
++ * ReadEventLogW [ADVAPI32.@]
++ */
++BOOL WINAPI ReadEventLogW( HANDLE handle, DWORD flags, DWORD offset, void *buffer, DWORD size, DWORD *read,
++                           DWORD *needed )
++{
++    TRACE( "%p, %#lx, %lu, %p, %lu, %p, %p\n", handle, flags, offset, buffer, size, read, needed );
++
++    return read_records( handle, flags, offset, buffer, size, read, needed, FALSE );
++}
++
++/******************************************************************************
++ * RegisterEventSourceA [ADVAPI32.@]
++ */
++HANDLE WINAPI RegisterEventSourceA( const char *server, const char *source )
++{
++    WCHAR *serverW, *sourceW;
++    HANDLE handle;
++
++    TRACE( "%s, %s\n", debugstr_a(server), debugstr_a(source) );
++
++    serverW = strdupAW( server );
++    sourceW = strdupAW( source );
++    handle = RegisterEventSourceW( serverW, sourceW );
++    free( serverW );
++    free( sourceW );
++    return handle;
++}
++
++/******************************************************************************
++ * RegisterEventSourceW [ADVAPI32.@]
++ */
++HANDLE WINAPI RegisterEventSourceW( const WCHAR *server, const WCHAR *source )
++{
++    TRACE( "%s, %s\n", debugstr_w(server), debugstr_w(source) );
++
++    if (!source || !source[0])
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!is_local_server( server ))
++    {
++        FIXME( "Remote server not supported\n" );
++        SetLastError( RPC_S_SERVER_UNAVAILABLE );
++        return NULL;
++    }
++    /* only the system writes the security log */
++    if (!wcsicmp( source, L"Security" ))
++    {
++        SetLastError( ERROR_ACCESS_DENIED );
++        return NULL;
++    }
++    return open_log( source );
++}
++
++/******************************************************************************
++ * ReportEventA [ADVAPI32.@]
++ */
++BOOL WINAPI ReportEventA( HANDLE handle, WORD type, WORD category, DWORD id, PSID sid, WORD count,
++                          DWORD data_size, const char **strings, void *data )
++{
++    WCHAR **stringsW = NULL;
++    unsigned int i;
++    BOOL ret;
++
++    TRACE( "%p, %#x, %#x, %#lx, %p, %u, %lu, %p, %p\n", handle, type, category, id, sid, count, data_size,
++           strings, data );
++
++    if (count && strings)
++    {
++        if (!(stringsW = calloc( count, sizeof(*stringsW) )))
++        {
++            SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++            return FALSE;
++        }
++        for (i = 0; i < count; i++) stringsW[i] = strdupAW( strings[i] );
++    }
++    ret = ReportEventW( handle, type, category, id, sid, count, data_size, (const WCHAR **)stringsW, data );
++    if (stringsW)
++    {
++        for (i = 0; i < count; i++) free( stringsW[i] );
++        free( stringsW );
++    }
++    return ret;
++}
++
++/******************************************************************************
++ * ReportEventW [ADVAPI32.@]
++ */
++BOOL WINAPI ReportEventW( HANDLE handle, WORD type, WORD category, DWORD id, PSID sid, WORD count,
++                          DWORD data_size, const WCHAR **strings, void *data )
++{
++    EVENTLOGRECORD *record;
++    struct eventlog *log;
++    BOOL ret = FALSE;
++
++    TRACE( "%p, %#x, %#x, %#lx, %p, %u, %lu, %p, %p\n", handle, type, category, id, sid, count, data_size,
++           strings, data );
++
++    if (!(log = grab_eventlog( handle ))) return FALSE;
++    if (log->backup)
++    {
++        SetLastError( ERROR_INVALID_HANDLE );
++        goto done;
++    }
++    if (sid && !IsValidSid( sid ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        goto done;
++    }
++    if (!data) data_size = 0;
++    if (!(record = build_record( log->source, type, category, id, sid, count, data_size, strings, data ))) goto done;
++    ret = append_record( log, record );
++    free( record );
++
++done:
++    release_eventlog( log );
++    return ret;
++}
+diff --git a/dlls/advapi32/eventlog.c b/dlls/advapi32/eventlog.c
+index bac83596ad1..ac65a541e71 100644
+--- a/dlls/advapi32/eventlog.c
++++ b/dlls/advapi32/eventlog.c
+@@ -39,206 +39,6 @@
+ #include "advapi32_misc.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(advapi);
+-WINE_DECLARE_DEBUG_CHANNEL(eventlog);
+-
+-/* A handle to an event log, by OpenEventLog(), OpenBackupEventLog() or RegisterEventSource(): the one kind, which
+- * the functions take alike; a handle closed is not one any more. */
+-struct eventlog
+-{
+-    struct list entry;
+-};
+-
+-static struct list eventlogs = LIST_INIT( eventlogs );
+-static CRITICAL_SECTION eventlog_cs;
+-static CRITICAL_SECTION_DEBUG eventlog_cs_debug =
+-{
+-    0, 0, &eventlog_cs,
+-    { &eventlog_cs_debug.ProcessLocksList, &eventlog_cs_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": eventlog_cs") }
+-};
+-static CRITICAL_SECTION eventlog_cs = { &eventlog_cs_debug, -1, 0, 0, 0, 0 };
+-
+-static HANDLE new_eventlog(void)
+-{
+-    struct eventlog *log;
+-
+-    if (!(log = malloc( sizeof(*log) )))
+-    {
+-        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+-        return NULL;
+-    }
+-    EnterCriticalSection( &eventlog_cs );
+-    list_add_tail( &eventlogs, &log->entry );
+-    LeaveCriticalSection( &eventlog_cs );
+-    return log;
+-}
+-
+-static BOOL is_eventlog( HANDLE handle )
+-{
+-    struct eventlog *log;
+-    BOOL ret = FALSE;
+-
+-    EnterCriticalSection( &eventlog_cs );
+-    LIST_FOR_EACH_ENTRY( log, &eventlogs, struct eventlog, entry )
+-        if (log == handle) ret = TRUE;
+-    LeaveCriticalSection( &eventlog_cs );
+-    if (!ret) SetLastError( ERROR_INVALID_HANDLE );
+-    return ret;
+-}
+-
+-static BOOL close_eventlog( HANDLE handle )
+-{
+-    struct eventlog *log;
+-    BOOL ret = FALSE;
+-
+-    EnterCriticalSection( &eventlog_cs );
+-    LIST_FOR_EACH_ENTRY( log, &eventlogs, struct eventlog, entry )
+-    {
+-        if (log != handle) continue;
+-        list_remove( &log->entry );
+-        free( log );
+-        ret = TRUE;
+-        break;
+-    }
+-    LeaveCriticalSection( &eventlog_cs );
+-    if (!ret) SetLastError( ERROR_INVALID_HANDLE );
+-    return ret;
+-}
+-
+-/* Whether a server is this computer: none, its names, its DNS names, or the loopback ones.  Another the event log
+- * service is not reached on. */
+-static BOOL is_local_server( const WCHAR *server )
+-{
+-    static const COMPUTER_NAME_FORMAT formats[] =
+-    {
+-        ComputerNameNetBIOS, ComputerNameDnsHostname, ComputerNameDnsFullyQualified
+-    };
+-    WCHAR name[MAX_COMPUTERNAME_LENGTH * 8 + 1];
+-    DWORD size;
+-    unsigned int i;
+-
+-    if (!server || !server[0]) return TRUE;
+-    if (server[0] == '\\' && server[1] == '\\') server += 2;
+-    if (!wcsicmp( server, L"localhost" ) || !wcscmp( server, L"." ) || !wcscmp( server, L"127.0.0.1" ) ||
+-        !wcscmp( server, L"::1" ))
+-        return TRUE;
+-    for (i = 0; i < ARRAY_SIZE(formats); i++)
+-    {
+-        size = ARRAY_SIZE(name);
+-        if (GetComputerNameExW( formats[i], name, &size ) && !wcsicmp( server, name )) return TRUE;
+-    }
+-    return FALSE;
+-}
+-
+-/******************************************************************************
+- * BackupEventLogA [ADVAPI32.@]
+- *
+- * Saves the event log to a backup file.
+- *
+- * PARAMS
+- *  hEventLog        [I] Handle to event log to backup.
+- *  lpBackupFileName [I] Name of the backup file.
+- *
+- * RETURNS
+- *  Success: nonzero. File lpBackupFileName will contain the contents of
+- *           hEvenLog.
+- *  Failure: zero.
+- */
+-BOOL WINAPI BackupEventLogA( HANDLE hEventLog, LPCSTR lpBackupFileName )
+-{
+-    LPWSTR backupW;
+-    BOOL ret;
+-
+-    backupW = strdupAW(lpBackupFileName);
+-    ret = BackupEventLogW(hEventLog, backupW);
+-    free(backupW);
+-
+-    return ret;
+-}
+-
+-/******************************************************************************
+- * BackupEventLogW [ADVAPI32.@]
+- *
+- * See BackupEventLogA.
+- */
+-BOOL WINAPI BackupEventLogW( HANDLE hEventLog, LPCWSTR lpBackupFileName )
+-{
+-    FIXME("(%p,%s) stub\n", hEventLog, debugstr_w(lpBackupFileName));
+-
+-    if (!lpBackupFileName)
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-    }
+-
+-    if (!is_eventlog( hEventLog )) return FALSE;
+-
+-    if (GetFileAttributesW(lpBackupFileName) != INVALID_FILE_ATTRIBUTES)
+-    {
+-        SetLastError(ERROR_ALREADY_EXISTS);
+-        return FALSE;
+-    }
+-
+-    return TRUE;
+-}
+-
+-/******************************************************************************
+- * ClearEventLogA [ADVAPI32.@]
+- *
+- * Clears the event log and optionally saves the log to a backup file.
+- *
+- * PARAMS
+- *  hEvenLog         [I] Handle to event log to clear.
+- *  lpBackupFileName [I] Name of the backup file.
+- *
+- * RETURNS
+- *  Success: nonzero. if lpBackupFileName != NULL, lpBackupFileName will 
+- *           contain the contents of hEvenLog and the log will be cleared.
+- *  Failure: zero. Fails if the event log is empty or if lpBackupFileName
+- *           exists.
+- */
+-BOOL WINAPI ClearEventLogA( HANDLE hEventLog, LPCSTR lpBackupFileName )
+-{
+-    LPWSTR backupW;
+-    BOOL ret;
+-
+-    backupW = strdupAW(lpBackupFileName);
+-    ret = ClearEventLogW(hEventLog, backupW);
+-    free(backupW);
+-
+-    return ret;
+-}
+-
+-/******************************************************************************
+- * ClearEventLogW [ADVAPI32.@]
+- *
+- * See ClearEventLogA.
+- */
+-BOOL WINAPI ClearEventLogW( HANDLE hEventLog, LPCWSTR lpBackupFileName )
+-{
+-    FIXME("(%p,%s) stub\n", hEventLog, debugstr_w(lpBackupFileName));
+-
+-    return is_eventlog( hEventLog );
+-}
+-
+-/******************************************************************************
+- * CloseEventLog [ADVAPI32.@]
+- *
+- * Closes a read handle to the event log.
+- *
+- * PARAMS
+- *  hEventLog [I/O] Handle of the event log to close.
+- *
+- * RETURNS
+- *  Success: nonzero
+- *  Failure: zero
+- */
+-BOOL WINAPI CloseEventLog( HANDLE hEventLog )
+-{
+-    TRACE("(%p)\n", hEventLog);
+-
+-    return close_eventlog( hEventLog );
+-}
+ 
+ /******************************************************************************
+  * FlushTraceA [ADVAPI32.@]
+@@ -257,27 +57,6 @@ ULONG WINAPI FlushTraceW ( TRACEHANDLE hSession, LPCWSTR SessionName, PEVENT_TRA
+ }
+ 
+ 
+-/******************************************************************************
+- * DeregisterEventSource [ADVAPI32.@]
+- * 
+- * Closes a write handle to an event log
+- *
+- * PARAMS
+- *  hEventLog [I/O] Handle of the event log.
+- *
+- * RETURNS
+- *  Success: nonzero
+- *  Failure: zero
+- */
+-BOOL WINAPI DeregisterEventSource( HANDLE hEventLog )
+-{
+-    TRACE("(%p)\n", hEventLog);
+-
+-    /* no handle is no call, and leaves the last error as it is */
+-    if (!hEventLog) return FALSE;
+-    return close_eventlog( hEventLog );
+-}
+-
+ /******************************************************************************
+  * EnableTraceEx [ADVAPI32.@]
+  */
+@@ -312,492 +91,6 @@ ULONG WINAPI EnableTrace( ULONG enable, ULONG flag, ULONG level, LPCGUID guid, T
+                            EVENT_CONTROL_CODE_DISABLE_PROVIDER, level, flag, 0, 0, NULL );
+ }
+ 
+-/******************************************************************************
+- * GetEventLogInformation [ADVAPI32.@]
+- *
+- * Retrieve some information about an event log.
+- *
+- * PARAMS
+- *  hEventLog      [I]   Handle to an open event log.
+- *  dwInfoLevel    [I]   Level of information (only EVENTLOG_FULL_INFO)
+- *  lpBuffer       [I/O] The buffer for the returned information
+- *  cbBufSize      [I]   The size of the buffer
+- *  pcbBytesNeeded [O]   The needed bytes to hold the information
+- *
+- * RETURNS
+- *  Success: TRUE. lpBuffer will hold the information and pcbBytesNeeded shows
+- *           the needed buffer size.
+- *  Failure: FALSE.
+- */
+-BOOL WINAPI GetEventLogInformation( HANDLE hEventLog, DWORD dwInfoLevel, LPVOID lpBuffer, DWORD cbBufSize, LPDWORD pcbBytesNeeded)
+-{
+-    EVENTLOG_FULL_INFORMATION *efi;
+-
+-    FIXME("(%p, %ld, %p, %ld, %p) stub\n", hEventLog, dwInfoLevel, lpBuffer, cbBufSize, pcbBytesNeeded);
+-
+-    if (dwInfoLevel != EVENTLOG_FULL_INFO)
+-    {
+-        SetLastError(ERROR_INVALID_LEVEL);
+-        return FALSE;
+-    }
+-
+-    if (!is_eventlog( hEventLog )) return FALSE;
+-
+-    if (!lpBuffer || !pcbBytesNeeded)
+-    {
+-        /* FIXME: This will be handled properly when eventlog is moved
+-         * to a higher level
+-         */
+-        SetLastError(RPC_X_NULL_REF_POINTER);
+-        return FALSE;
+-    }
+-
+-    *pcbBytesNeeded = sizeof(EVENTLOG_FULL_INFORMATION);
+-    if (cbBufSize < sizeof(EVENTLOG_FULL_INFORMATION))
+-    {
+-        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+-        return FALSE;
+-    }
+-
+-    /* Pretend the log is not full */
+-    efi = (EVENTLOG_FULL_INFORMATION *)lpBuffer;
+-    efi->dwFull = 0;
+-
+-    return TRUE;
+-}
+-
+-/******************************************************************************
+- * GetNumberOfEventLogRecords [ADVAPI32.@]
+- *
+- * Retrieves the number of records in an event log.
+- *
+- * PARAMS
+- *  hEventLog       [I] Handle to an open event log.
+- *  NumberOfRecords [O] Number of records in the log.
+- *
+- * RETURNS
+- *  Success: nonzero. NumberOfRecords will contain the number of records in
+- *           the log.
+- *  Failure: zero
+- */
+-BOOL WINAPI GetNumberOfEventLogRecords( HANDLE hEventLog, PDWORD NumberOfRecords )
+-{
+-    FIXME("(%p,%p) stub\n", hEventLog, NumberOfRecords);
+-
+-    if (!NumberOfRecords)
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-    }
+-
+-    if (!is_eventlog( hEventLog )) return FALSE;
+-
+-    *NumberOfRecords = 0;
+-
+-    return TRUE;
+-}
+-
+-/******************************************************************************
+- * GetOldestEventLogRecord [ADVAPI32.@]
+- *
+- * Retrieves the absolute record number of the oldest record in an even log.
+- *
+- * PARAMS
+- *  hEventLog    [I] Handle to an open event log.
+- *  OldestRecord [O] Absolute record number of the oldest record.
+- *
+- * RETURNS
+- *  Success: nonzero. OldestRecord contains the record number of the oldest
+- *           record in the log.
+- *  Failure: zero 
+- */
+-BOOL WINAPI GetOldestEventLogRecord( HANDLE hEventLog, PDWORD OldestRecord )
+-{
+-    FIXME("(%p,%p) stub\n", hEventLog, OldestRecord);
+-
+-    if (!OldestRecord)
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-    }
+-
+-    if (!is_eventlog( hEventLog )) return FALSE;
+-
+-    *OldestRecord = 0;
+-
+-    return TRUE;
+-}
+-
+-/******************************************************************************
+- * NotifyChangeEventLog [ADVAPI32.@]
+- *
+- * Enables an application to receive notification when an event is written
+- * to an event log.
+- *
+- * PARAMS
+- *  hEventLog [I] Handle to an event log.
+- *  hEvent    [I] Handle to a manual-reset event object.
+- *
+- * RETURNS
+- *  Success: nonzero
+- *  Failure: zero
+- */
+-BOOL WINAPI NotifyChangeEventLog( HANDLE hEventLog, HANDLE hEvent )
+-{
+-    FIXME("(%p,%p) stub\n", hEventLog, hEvent);
+-    return is_eventlog( hEventLog );
+-}
+-
+-/******************************************************************************
+- * OpenBackupEventLogA [ADVAPI32.@]
+- *
+- * Opens a handle to a backup event log.
+- *
+- * PARAMS
+- *  lpUNCServerName [I] Universal Naming Convention name of the server on which
+- *                      this will be performed.
+- *  lpFileName      [I] Specifies the name of the backup file.
+- *
+- * RETURNS
+- *  Success: Handle to the backup event log.
+- *  Failure: NULL
+- */
+-HANDLE WINAPI OpenBackupEventLogA( LPCSTR lpUNCServerName, LPCSTR lpFileName )
+-{
+-    LPWSTR uncnameW, filenameW;
+-    HANDLE handle;
+-
+-    uncnameW = strdupAW(lpUNCServerName);
+-    filenameW = strdupAW(lpFileName);
+-    handle = OpenBackupEventLogW(uncnameW, filenameW);
+-    free(uncnameW);
+-    free(filenameW);
+-
+-    return handle;
+-}
+-
+-/******************************************************************************
+- * OpenBackupEventLogW [ADVAPI32.@]
+- *
+- * See OpenBackupEventLogA.
+- */
+-HANDLE WINAPI OpenBackupEventLogW( LPCWSTR lpUNCServerName, LPCWSTR lpFileName )
+-{
+-    FIXME("(%s,%s) stub\n", debugstr_w(lpUNCServerName), debugstr_w(lpFileName));
+-
+-    if (!lpFileName)
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return NULL;
+-    }
+-
+-    if (!is_local_server( lpUNCServerName ))
+-    {
+-        FIXME("Remote server not supported\n");
+-        SetLastError(RPC_S_SERVER_UNAVAILABLE);
+-        return NULL;
+-    }
+-
+-    if (GetFileAttributesW(lpFileName) == INVALID_FILE_ATTRIBUTES)
+-    {
+-        SetLastError(ERROR_FILE_NOT_FOUND);
+-        return NULL;
+-    }
+-
+-    return new_eventlog();
+-}
+-
+-/******************************************************************************
+- * OpenEventLogA [ADVAPI32.@]
+- *
+- * Opens a handle to the specified event log.
+- *
+- * PARAMS
+- *  lpUNCServerName [I] UNC name of the server on which the event log is
+- *                      opened.
+- *  lpSourceName    [I] Name of the log.
+- *
+- * RETURNS
+- *  Success: Handle to an event log.
+- *  Failure: NULL
+- */
+-HANDLE WINAPI OpenEventLogA( LPCSTR uncname, LPCSTR source )
+-{
+-    LPWSTR uncnameW, sourceW;
+-    HANDLE handle;
+-
+-    uncnameW = strdupAW(uncname);
+-    sourceW = strdupAW(source);
+-    handle = OpenEventLogW(uncnameW, sourceW);
+-    free(uncnameW);
+-    free(sourceW);
+-
+-    return handle;
+-}
+-
+-/******************************************************************************
+- * OpenEventLogW [ADVAPI32.@]
+- *
+- * See OpenEventLogA.
+- */
+-HANDLE WINAPI OpenEventLogW( LPCWSTR uncname, LPCWSTR source )
+-{
+-    FIXME("(%s,%s) stub\n", debugstr_w(uncname), debugstr_w(source));
+-
+-    if (!source)
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return NULL;
+-    }
+-
+-    if (!is_local_server( uncname ))
+-    {
+-        FIXME("Remote server not supported\n");
+-        SetLastError(RPC_S_SERVER_UNAVAILABLE);
+-        return NULL;
+-    }
+-
+-    return new_eventlog();
+-}
+-
+-/* what a read needs: somewhere to put the records and the sizes, the handle, and one way to read in one
+- * direction */
+-static BOOL check_read( HANDLE log, DWORD flags, void *buffer, DWORD *read, DWORD *needed )
+-{
+-    DWORD how = flags & (EVENTLOG_SEQUENTIAL_READ | EVENTLOG_SEEK_READ);
+-    DWORD direction = flags & (EVENTLOG_FORWARDS_READ | EVENTLOG_BACKWARDS_READ);
+-
+-    if (!buffer || !read || !needed)
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-    }
+-    if (!is_eventlog( log )) return FALSE;
+-    if (!how || how == (EVENTLOG_SEQUENTIAL_READ | EVENTLOG_SEEK_READ) ||
+-        !direction || direction == (EVENTLOG_FORWARDS_READ | EVENTLOG_BACKWARDS_READ))
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-    }
+-    return TRUE;
+-}
+-
+-/******************************************************************************
+- * ReadEventLogA [ADVAPI32.@]
+- *
+- * Reads a whole number of entries from an event log.
+- *
+- * PARAMS
+- *  hEventLog                [I] Handle of the event log to read.
+- *  dwReadFlags              [I] see MSDN doc.
+- *  dwRecordOffset           [I] Log-entry record number to start at.
+- *  lpBuffer                 [O] Buffer for the data read.
+- *  nNumberOfBytesToRead     [I] Size of lpBuffer.
+- *  pnBytesRead              [O] Receives number of bytes read.
+- *  pnMinNumberOfBytesNeeded [O] Receives number of bytes required for the
+- *                               next log entry.
+- *
+- * RETURNS
+- *  Success: nonzero
+- *  Failure: zero
+- */
+-BOOL WINAPI ReadEventLogA( HANDLE hEventLog, DWORD dwReadFlags, DWORD dwRecordOffset,
+-    LPVOID lpBuffer, DWORD nNumberOfBytesToRead, DWORD *pnBytesRead, DWORD *pnMinNumberOfBytesNeeded )
+-{
+-    FIXME("(%p,0x%08lx,0x%08lx,%p,0x%08lx,%p,%p) stub\n", hEventLog, dwReadFlags,
+-          dwRecordOffset, lpBuffer, nNumberOfBytesToRead, pnBytesRead, pnMinNumberOfBytesNeeded);
+-
+-    if (!check_read( hEventLog, dwReadFlags, lpBuffer, pnBytesRead, pnMinNumberOfBytesNeeded )) return FALSE;
+-    SetLastError(ERROR_HANDLE_EOF);
+-    return FALSE;
+-}
+-
+-/******************************************************************************
+- * ReadEventLogW [ADVAPI32.@]
+- *
+- * See ReadEventLogA.
+- */
+-BOOL WINAPI ReadEventLogW( HANDLE hEventLog, DWORD dwReadFlags, DWORD dwRecordOffset,
+-    LPVOID lpBuffer, DWORD nNumberOfBytesToRead, DWORD *pnBytesRead, DWORD *pnMinNumberOfBytesNeeded )
+-{
+-    FIXME("(%p,0x%08lx,0x%08lx,%p,0x%08lx,%p,%p) stub\n", hEventLog, dwReadFlags,
+-          dwRecordOffset, lpBuffer, nNumberOfBytesToRead, pnBytesRead, pnMinNumberOfBytesNeeded);
+-
+-    if (!check_read( hEventLog, dwReadFlags, lpBuffer, pnBytesRead, pnMinNumberOfBytesNeeded )) return FALSE;
+-    SetLastError(ERROR_HANDLE_EOF);
+-    return FALSE;
+-}
+-
+-/******************************************************************************
+- * RegisterEventSourceA [ADVAPI32.@]
+- *
+- * Returns a registered handle to an event log.
+- *
+- * PARAMS
+- *  lpUNCServerName [I] UNC name of the source server.
+- *  lpSourceName    [I] Specifies the name of the event source to retrieve.
+- *
+- * RETURNS
+- *  Success: Handle to the event log.
+- *  Failure: NULL. Returns ERROR_ACCESS_DENIED if lpSourceName specifies the
+- *           Security event log.
+- */
+-HANDLE WINAPI RegisterEventSourceA( LPCSTR lpUNCServerName, LPCSTR lpSourceName )
+-{
+-    UNICODE_STRING lpUNCServerNameW;
+-    UNICODE_STRING lpSourceNameW;
+-    HANDLE ret;
+-
+-    TRACE("(%s,%s)\n", debugstr_a(lpUNCServerName), debugstr_a(lpSourceName));
+-
+-    RtlCreateUnicodeStringFromAsciiz(&lpUNCServerNameW, lpUNCServerName);
+-    RtlCreateUnicodeStringFromAsciiz(&lpSourceNameW, lpSourceName);
+-    ret = RegisterEventSourceW(lpUNCServerNameW.Buffer,lpSourceNameW.Buffer);
+-    RtlFreeUnicodeString (&lpUNCServerNameW);
+-    RtlFreeUnicodeString (&lpSourceNameW);
+-    return ret;
+-}
+-
+-/******************************************************************************
+- * RegisterEventSourceW [ADVAPI32.@]
+- *
+- * See RegisterEventSourceA.
+- */
+-HANDLE WINAPI RegisterEventSourceW( LPCWSTR lpUNCServerName, LPCWSTR lpSourceName )
+-{
+-    TRACE("(%s,%s)\n", debugstr_w(lpUNCServerName), debugstr_w(lpSourceName));
+-
+-    if (!lpSourceName || !lpSourceName[0])
+-    {
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return NULL;
+-    }
+-    if (!is_local_server( lpUNCServerName ))
+-    {
+-        FIXME("Remote server not supported\n");
+-        SetLastError(RPC_S_SERVER_UNAVAILABLE);
+-        return NULL;
+-    }
+-    /* only the system writes the security log */
+-    if (!wcsicmp( lpSourceName, L"Security" ))
+-    {
+-        SetLastError(ERROR_ACCESS_DENIED);
+-        return NULL;
+-    }
+-    return new_eventlog();
+-}
+-
+-/******************************************************************************
+- * ReportEventA [ADVAPI32.@]
+- *
+- * Writes an entry at the end of an event log.
+- *
+- * PARAMS
+- *  hEventLog   [I] Handle of an event log.
+- *  wType       [I] See MSDN doc.
+- *  wCategory   [I] Event category.
+- *  dwEventID   [I] Event identifier.
+- *  lpUserSid   [I] Current user's security identifier.
+- *  wNumStrings [I] Number of insert strings in lpStrings.
+- *  dwDataSize  [I] Size of event-specific raw data to write.
+- *  lpStrings   [I] Buffer containing an array of string to be merged.
+- *  lpRawData   [I] Buffer containing the binary data.
+- *
+- * RETURNS
+- *  Success: nonzero. Entry was written to the log.
+- *  Failure: zero.
+- *
+- * NOTES
+- *  The ReportEvent function adds the time, the entry's length, and the
+- *  offsets before storing the entry in the log. If lpUserSid != NULL, the
+- *  username is also logged.
+- */
+-BOOL WINAPI ReportEventA ( HANDLE hEventLog, WORD wType, WORD wCategory, DWORD dwEventID,
+-    PSID lpUserSid, WORD wNumStrings, DWORD dwDataSize, LPCSTR *lpStrings, LPVOID lpRawData)
+-{
+-    LPWSTR *wideStrArray;
+-    UNICODE_STRING str;
+-    UINT i;
+-    BOOL ret;
+-
+-    FIXME("(%p,0x%04x,0x%04x,0x%08lx,%p,0x%04x,0x%08lx,%p,%p): stub\n", hEventLog,
+-          wType, wCategory, dwEventID, lpUserSid, wNumStrings, dwDataSize, lpStrings, lpRawData);
+-
+-    if (!is_eventlog( hEventLog )) return FALSE;
+-    if (wNumStrings == 0) return TRUE;
+-    if (!lpStrings) return TRUE;
+-
+-    wideStrArray = malloc(sizeof(WCHAR *) * wNumStrings);
+-    for (i = 0; i < wNumStrings; i++)
+-    {
+-        RtlCreateUnicodeStringFromAsciiz(&str, lpStrings[i]);
+-        wideStrArray[i] = str.Buffer;
+-    }
+-    ret = ReportEventW(hEventLog, wType, wCategory, dwEventID, lpUserSid,
+-                       wNumStrings, dwDataSize, (LPCWSTR *)wideStrArray, lpRawData);
+-    for (i = 0; i < wNumStrings; i++)
+-    {
+-        str.Buffer = wideStrArray[i];
+-        RtlFreeUnicodeString(&str);
+-    }
+-    free(wideStrArray);
+-    return ret;
+-}
+-
+-/******************************************************************************
+- * ReportEventW [ADVAPI32.@]
+- *
+- * See ReportEventA.
+- */
+-BOOL WINAPI ReportEventW( HANDLE hEventLog, WORD wType, WORD wCategory, DWORD dwEventID,
+-    PSID lpUserSid, WORD wNumStrings, DWORD dwDataSize, LPCWSTR *lpStrings, LPVOID lpRawData )
+-{
+-    UINT i;
+-
+-    FIXME("(%p,0x%04x,0x%04x,0x%08lx,%p,0x%04x,0x%08lx,%p,%p): stub\n", hEventLog,
+-          wType, wCategory, dwEventID, lpUserSid, wNumStrings, dwDataSize, lpStrings, lpRawData);
+-
+-    /* partial stub: what is reported goes to the debug channel */
+-    if (!is_eventlog( hEventLog )) return FALSE;
+-
+-    if (wNumStrings == 0) return TRUE;
+-    if (!lpStrings) return TRUE;
+-
+-    for (i = 0; i < wNumStrings; i++)
+-    {
+-        const WCHAR *line = lpStrings[i];
+-
+-        while (*line)
+-        {
+-            const WCHAR *next = wcschr( line, '\n' );
+-
+-            if (next)
+-                ++next;
+-            else
+-                next = line + wcslen( line );
+-
+-            switch (wType)
+-            {
+-            case EVENTLOG_SUCCESS:
+-                TRACE_(eventlog)("%s\n", debugstr_wn(line, next - line));
+-                break;
+-            case EVENTLOG_ERROR_TYPE:
+-                ERR_(eventlog)("%s\n", debugstr_wn(line, next - line));
+-                break;
+-            case EVENTLOG_WARNING_TYPE:
+-                WARN_(eventlog)("%s\n", debugstr_wn(line, next - line));
+-                break;
+-            default:
+-                TRACE_(eventlog)("%s\n", debugstr_wn(line, next - line));
+-                break;
+-            }
+-
+-            line = next;
+-        }
+-    }
+-    return TRUE;
+-}
+-
+ /******************************************************************************
+  * StopTraceA [ADVAPI32.@]
+  *
+diff --git a/dlls/advapi32/tests/eventlog.c b/dlls/advapi32/tests/eventlog.c
+index 9fc2f3bef70..2f3a8b986a5 100644
+--- a/dlls/advapi32/tests/eventlog.c
++++ b/dlls/advapi32/tests/eventlog.c
+@@ -85,7 +85,6 @@ static BOOL create_backup(const char *filename)
+     CloseEventLog(handle);
+ 
+     attribs = GetFileAttributesA(filename);
+-    todo_wine
+     ok(attribs != INVALID_FILE_ATTRIBUTES, "Expected a backup file attribs=%#lx le=%lu\n", attribs, GetLastError());
+     return TRUE;
+ }
+@@ -240,17 +239,13 @@ static void test_count(void)
+     if (create_backup(backup))
+     {
+         handle = OpenBackupEventLogA(NULL, backup);
+-        todo_wine
+         ok(handle != NULL, "Expected a handle, le=%ld\n", GetLastError());
+ 
+         /* Does GetNumberOfEventLogRecords work with backup eventlogs? */
+         count = 0xdeadbeef;
+         ret = GetNumberOfEventLogRecords(handle, &count);
+-        todo_wine
+-        {
+         ok(ret, "Expected success : %ld\n", GetLastError());
+         ok(count != 0xdeadbeef, "Expected the number of records\n");
+-        }
+ 
+         CloseEventLog(handle);
+         DeleteFileA(backup);
+@@ -300,17 +295,13 @@ static void test_oldest(void)
+     if (create_backup(backup))
+     {
+         handle = OpenBackupEventLogA(NULL, backup);
+-        todo_wine
+         ok(handle != NULL, "Expected a handle\n");
+ 
+         /* Does GetOldestEventLogRecord work with backup eventlogs? */
+         oldest = 0xdeadbeef;
+         ret = GetOldestEventLogRecord(handle, &oldest);
+-        todo_wine
+-        {
+         ok(ret, "Expected success : %ld\n", GetLastError());
+         ok(oldest != 0xdeadbeef, "Expected the number of the oldest record\n");
+-        }
+ 
+         CloseEventLog(handle);
+         DeleteFileA(backup);
+@@ -355,31 +346,23 @@ static void test_backup(void)
+         return;
+     }
+     ok(ret, "Expected success : %ld\n", GetLastError());
+-    todo_wine
+     ok(GetFileAttributesA(backup) != INVALID_FILE_ATTRIBUTES, "Expected a backup file\n");
+ 
+     /* Try to overwrite */
+     SetLastError(0xdeadbeef);
+     ret = BackupEventLogA(handle, backup);
+-    todo_wine
+-    {
+     ok(!ret, "Expected failure\n");
+     ok(GetLastError() == ERROR_ALREADY_EXISTS, "Expected ERROR_ALREADY_EXISTS, got %ld\n", GetLastError());
+-    }
+ 
+     CloseEventLog(handle);
+ 
+     /* Can we make a backup of a backup? */
+     handle = OpenBackupEventLogA(NULL, backup);
+-    todo_wine
+     ok(handle != NULL, "Expected a handle\n");
+ 
+     ret = BackupEventLogA(handle, backup2);
+-    todo_wine
+-    {
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(GetFileAttributesA(backup2) != INVALID_FILE_ATTRIBUTES, "Expected a backup file\n");
+-    }
+ 
+     CloseEventLog(handle);
+     DeleteFileA(backup);
+@@ -643,7 +626,6 @@ static void test_clear(void)
+     ok(GetLastError() == ERROR_INVALID_HANDLE, "Expected ERROR_INVALID_HANDLE, got %ld\n", GetLastError());
+ 
+     handle = OpenBackupEventLogA(NULL, backup);
+-    todo_wine
+     ok(handle != NULL, "Expected a handle\n");
+ 
+     /* A real eventlog would fail with ERROR_ALREADY_EXISTS */
+@@ -670,7 +652,6 @@ static void test_clear(void)
+     ok(GetLastError() == ERROR_INVALID_HANDLE, "Expected ERROR_INVALID_HANDLE, got %ld\n", GetLastError());
+ 
+     CloseEventLog(handle);
+-    todo_wine
+     ok(DeleteFileA(backup), "Could not delete the backup file\n");
+ }
+ 
+@@ -885,13 +866,11 @@ static void test_readwrite(void)
+         SetLastError(0xdeadbeef);
+         ret = GetNumberOfEventLogRecords(handle, &count);
+         ok(ret, "Expected GetNumberOfEventLogRecords success : %ld\n", GetLastError());
+-        todo_wine
+         ok(count == (i + 1), "Expected %ld records, got %ld\n", i + 1, count);
+ 
+         oldest = 0xdeadbeef;
+         ret = GetOldestEventLogRecord(handle, &oldest);
+         ok(ret, "Expected GetOldestEventLogRecord success : %ld\n", GetLastError());
+-        todo_wine
+         ok(oldest == 1 ||
+            (oldest > 1 && oldest != 0xdeadbeef), /* Vista SP1+, W2K8 and Win7 */
+            "Expected oldest to be 1 or higher, got %ld\n", oldest);
+@@ -912,7 +891,6 @@ static void test_readwrite(void)
+     count = 0xdeadbeef;
+     ret = GetNumberOfEventLogRecords(handle, &count);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+-    todo_wine
+     ok(count == i, "Expected %ld records, got %ld\n", i, count);
+     CloseEventLog(handle);
+ 
+@@ -1558,7 +1536,7 @@ static void test_eventlog_start(void)
+         }
+         free(record);
+     }
+-    todo_wine ok(found, "EventlogStarted event not found\n");
++    ok(found, "EventlogStarted event not found\n");
+     CloseEventLog(handle);
+     free(localcomputer);
+ 
+@@ -1622,15 +1600,25 @@ static void test_eventlog_start(void)
+         }
+         free(record);
+     }
+-    todo_wine ok(found, "EventlogStarted event not found\n");
++    ok(found, "EventlogStarted event not found\n");
+     CloseEventLog(handle);
+     free(localcomputerA);
+ 
++    /* the reads below want ten records in the log, which a new Wine prefix has not written yet */
++    handle = OpenEventLogW(0, L"System");
++    count = 0;
++    GetNumberOfEventLogRecords(handle, &count);
++    CloseEventLog(handle);
++    if (count < 10)
++    {
++        skip("only %lu records in the System log\n", count);
++        return;
++    }
++
+     /* SEQUENTIAL | FORWARDS - dwRecordOffset is ignored */
+     handle = OpenEventLogW(0, L"System");
+     size = sizeof(EVENTLOGRECORD) + 128;
+     record = malloc(size);
+-    todo_wine {
+     ret = read_record(handle, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_FORWARDS_READ, 100, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 1, "Expected 1, got %lu\n", record->RecordNumber);
+@@ -1645,13 +1633,11 @@ static void test_eventlog_start(void)
+     ret = read_record(handle, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_BACKWARDS_READ, 400, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 1, "Expected 1, got %lu\n", record->RecordNumber);
+-    }
+ 
+     /* changing how is an error */
+     SetLastError(0xdeadbeef);
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_BACKWARDS_READ, 0, &record, &size);
+     ok(!ret, "Expected failure\n");
+-    todo_wine
+     ok(GetLastError() == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
+     CloseEventLog(handle);
+ 
+@@ -1660,18 +1646,14 @@ static void test_eventlog_start(void)
+     count = 0xdeadbeef;
+     ret = GetNumberOfEventLogRecords(handle, &count);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+-    todo_wine
+     ok(count, "Zero records in log\n");
+ 
+     ret = read_record(handle, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_BACKWARDS_READ, 100, &record, &size);
+-    todo_wine
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == count, "Expected %lu, got %lu\n", count, record->RecordNumber);
+     ret = read_record(handle, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_BACKWARDS_READ, 100, &record, &size);
+-    todo_wine {
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == count - 1, "Expected %lu, got %lu\n", count - 1, record->RecordNumber);
+-    }
+     CloseEventLog(handle);
+ 
+     handle = OpenEventLogW(0, L"System");
+@@ -1679,7 +1661,6 @@ static void test_eventlog_start(void)
+     /* bogus offset */
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_FORWARDS_READ, 0, &record, &size);
+     ok(!ret, "Expected failure\n");
+-    todo_wine
+     ok(GetLastError() == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
+ 
+     count = 0xdeadbeef;
+@@ -1687,10 +1668,8 @@ static void test_eventlog_start(void)
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_FORWARDS_READ, count + 1, &record, &size);
+     ok(!ret, "Expected failure\n");
+-    todo_wine
+     ok(GetLastError() == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
+ 
+-    todo_wine {
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_FORWARDS_READ, 2, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 2, "Expected 2, got %lu\n", record->RecordNumber);
+@@ -1711,7 +1690,6 @@ static void test_eventlog_start(void)
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_BACKWARDS_READ, 10, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 10, "Expected 10, got %lu\n", record->RecordNumber);
+-    }
+     CloseEventLog(handle);
+ 
+     /* SEEK | BACKWARDS */
+@@ -1719,10 +1697,8 @@ static void test_eventlog_start(void)
+     /* bogus offset */
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_BACKWARDS_READ, 0, &record, &size);
+     ok(!ret, "Expected failure\n");
+-    todo_wine
+     ok(GetLastError() == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
+ 
+-    todo_wine {
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_BACKWARDS_READ, 5, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 5, "Expected 5, got %lu\n", record->RecordNumber);
+@@ -1743,20 +1719,17 @@ static void test_eventlog_start(void)
+     ret = read_record(handle, EVENTLOG_SEEK_READ | EVENTLOG_FORWARDS_READ, 10, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 10, "Expected 10, got %lu\n", record->RecordNumber);
+-    }
+     CloseEventLog(handle);
+ 
+     /* reading same log with different handles */
+     handle = OpenEventLogW(0, L"System");
+     handle2 = OpenEventLogW(0, L"SYSTEM");
+-    todo_wine {
+     ret = read_record(handle, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_FORWARDS_READ, 0, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 1, "Expected 1, got %lu\n", record->RecordNumber);
+     ret = read_record(handle2, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_FORWARDS_READ, 0, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ok(record->RecordNumber == 1, "Expected 1, got %lu\n", record->RecordNumber);
+-    }
+     CloseEventLog(handle2);
+     CloseEventLog(handle);
+ 
+@@ -1765,12 +1738,10 @@ static void test_eventlog_start(void)
+     record2 = malloc(size2);
+     handle = OpenEventLogW(0, L"System");
+     handle2 = OpenEventLogW(0, L"EventLog");
+-    todo_wine {
+     ret = read_record(handle, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_FORWARDS_READ, 0, &record, &size);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+     ret = read_record(handle2, EVENTLOG_SEQUENTIAL_READ | EVENTLOG_FORWARDS_READ, 0, &record2, &size2);
+     ok(ret, "Expected success : %ld\n", GetLastError());
+-    }
+     ok(size == size2, "Expected %lu, got %lu\n", size, size2);
+     ok(!memcmp(record, record2, min(size, size2)), "Records miscompare\n");
+     count = 0xdeadbeef;
+diff --git a/dlls/wevtsvc/wevtsvc.c b/dlls/wevtsvc/wevtsvc.c
+index 78c68bac69b..7fb297c8b40 100644
+--- a/dlls/wevtsvc/wevtsvc.c
++++ b/dlls/wevtsvc/wevtsvc.c
+@@ -22,7 +22,9 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winternl.h"
+ #include "winsvc.h"
++#include "netevent.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(eventlog);
+@@ -30,6 +32,56 @@ WINE_DEFAULT_DEBUG_CHANNEL(eventlog);
+ static SERVICE_STATUS_HANDLE svc_handle;
+ static HANDLE done_event;
+ 
++#ifndef EVENT_EventlogStopped
++#define EVENT_EventlogStopped 0x80001776
++#endif
++#ifndef EVENT_EventLogProductInfo
++#define EVENT_EventLogProductInfo 0x80001779
++#endif
++
++/* What the service writes to the System log when it starts, as Windows 11 does: the version (6009), then that it
++ * started (6005) with the time it did; and when it stops, that it did (6006). */
++static void report_started(void)
++{
++    WCHAR version[16], build[16], *csd, *processors;
++    const WCHAR *strings[5];
++    RTL_OSVERSIONINFOEXW info = { sizeof(info) };
++    SYSTEM_INFO system;
++    BYTE data[24] = { 0 };
++    HANDLE source;
++
++    if (!(source = RegisterEventSourceW( NULL, L"EventLog" )))
++    {
++        ERR("RegisterEventSource error %lu\n", GetLastError());
++        return;
++    }
++    RtlGetVersion( &info );
++    GetSystemInfo( &system );
++    swprintf( version, ARRAY_SIZE(version), L"%lu.%02lu.", info.dwMajorVersion, info.dwMinorVersion );
++    swprintf( build, ARRAY_SIZE(build), L"%lu", info.dwBuildNumber );
++    csd = info.szCSDVersion;
++    processors = system.dwNumberOfProcessors > 1 ? (WCHAR *)L"Multiprocessor Free" : (WCHAR *)L"Uniprocessor Free";
++    strings[0] = version;
++    strings[1] = build;
++    strings[2] = csd;
++    strings[3] = processors;
++    strings[4] = L"0";
++    ReportEventW( source, EVENTLOG_INFORMATION_TYPE, 0, EVENT_EventLogProductInfo, NULL, 5, 0, strings, NULL );
++    GetSystemTime( (SYSTEMTIME *)data );
++    ReportEventW( source, EVENTLOG_INFORMATION_TYPE, 0, EVENT_EventlogStarted, NULL, 0, sizeof(data), NULL, data );
++    DeregisterEventSource( source );
++}
++
++static void report_stopped(void)
++{
++    DWORD data[2] = { 1, 0 };
++    HANDLE source;
++
++    if (!(source = RegisterEventSourceW( NULL, L"EventLog" ))) return;
++    ReportEventW( source, EVENTLOG_INFORMATION_TYPE, 0, EVENT_EventlogStopped, NULL, 0, sizeof(data), NULL, data );
++    DeregisterEventSource( source );
++}
++
+ static void eventlog_update_status(DWORD state)
+ {
+     SERVICE_STATUS status;
+@@ -74,12 +126,14 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR *argv)
+         return;
+     }
+ 
++    done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
++    report_started();
+     eventlog_update_status(SERVICE_RUNNING);
+ 
+-    done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+     WaitForSingleObject(done_event, INFINITE);
+     CloseHandle(done_event);
+ 
++    report_stopped();
+     eventlog_update_status(SERVICE_STOPPED);
+ 
+     TRACE("exiting Event Log Service\n");
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 2cfd1658208..501cd4c06e2 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -1130,8 +1130,12 @@ ErrorControl=1
+ [Services]
+ HKLM,%CurrentVersion%\RunServices,"winemenubuilder",2,"%11%\winemenubuilder.exe -a -r"
+ HKLM,"System\CurrentControlSet\Services\Dnscache\Parameters",,16
+-HKLM,"System\CurrentControlSet\Services\Eventlog\Application",,16
++HKLM,"System\CurrentControlSet\Services\Eventlog\Application","MaxSize",0x10001,20971520
++HKLM,"System\CurrentControlSet\Services\Eventlog\Application","Retention",0x10001,0
+ HKLM,"System\CurrentControlSet\Services\Eventlog\System","Sources",0x10000,""
++HKLM,"System\CurrentControlSet\Services\Eventlog\System","MaxSize",0x10001,20971520
++HKLM,"System\CurrentControlSet\Services\Eventlog\System","Retention",0x10001,0
++HKLM,"System\CurrentControlSet\Services\Eventlog\System\EventLog",,16
+ HKLM,"System\CurrentControlSet\Services\Tcpip\Parameters","DataBasePath",,"%12%\etc"
+ HKLM,"System\CurrentControlSet\Services\Tcpip6\Parameters",,16
+ HKLM,"System\CurrentControlSet\Services\VxD\MSTCP",,16

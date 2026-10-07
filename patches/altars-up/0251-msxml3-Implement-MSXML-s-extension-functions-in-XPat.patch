@@ -1,0 +1,1221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 07:08:10 -0400
+Subject: [PATCH] msxml3: Implement MSXML's extension functions in XPath and
+ XSLT.
+
+MSXML 4.0 and later have ms:utc, ms:number, ms:local-name,
+ms:namespace-uri, ms:format-date, ms:format-time, ms:type-local-name,
+ms:type-namespace-uri and ms:schema-info-available next to
+ms:string-compare, in selectNodes() and in XSLT alike.  Wine had only
+ms:string-compare, in XPath.  msxsl.c answers them as Windows 11 does,
+and both the XPath engine and libxslt (registered per transformation
+when the source is MSXML 4.0 or later) call it:
+
+- ms:utc() reads an XML Schema date, time, dateTime or g* value, moves
+  it to UTC and writes it without the zone, with dashes for the parts it
+  lacks (----------T10:00:00) and milliseconds rounded to three digits;
+- ms:number() reads an XML Schema double (1e3, INF, NaN);
+- ms:format-date() and ms:format-time() format through GetDateFormat()
+  and GetTimeFormat(), in UTC, with the language's own format by default;
+- ms:namespace-uri() resolves the prefix on the node, not on the
+  stylesheet or SelectionNamespaces.
+
+A language argument is taken only when Rfc1766ToLcidW() answers S_OK
+for it, so de and en-us are languages and de-DE is not.  A
+transformation that such an argument stops now fails with E_FAIL
+instead of returning an empty string.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/Makefile.in b/dlls/msxml3/Makefile.in
+index b769ad65c9c..bbdc609f04d 100644
+--- a/dlls/msxml3/Makefile.in
++++ b/dlls/msxml3/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = msxml3.dll
+ IMPORTS   = $(XSLT_PE_LIBS) $(XML2_PE_LIBS) uuid urlmon shlwapi oleaut32 ole32 user32 advapi32
++DELAYIMPORTS = mlang
+ EXTRAINCL = $(XSLT_PE_CFLAGS) $(XML2_PE_CFLAGS)
+ 
+ VER_FILEDESCRIPTION_STR = "Wine MSXML 3.0"
+@@ -25,6 +26,7 @@ SOURCES = \
+ 	msxml.mc \
+ 	msxml3_v1.idl \
+ 	mxnamespace.c \
++	msxsl.c \
+ 	mxwriter.c \
+ 	node.c \
+ 	nodelist.c \
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index d07e304dbb0..d7823dc3e71 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -350,6 +350,20 @@ extern void wineXmlCallbackError(char const* caller, const xmlError* err);
+ extern bool node_query_interface(struct domnode*,REFIID,void**);
+ extern struct domnode *get_node_obj(void *iface);
+ extern bool parser_is_valid_qualified_name(const WCHAR *name);
++
++/* MSXML's extension functions, urn:schemas-microsoft-com:xslt */
++struct _xsltTransformContext;
++extern HRESULT msxsl_language(const WCHAR *language, LCID *lcid);
++extern HRESULT msxsl_string_compare(const WCHAR *x, const WCHAR *y, const WCHAR *language, const WCHAR *options,
++        int *result);
++extern WCHAR *msxsl_utc(const WCHAR *value);
++extern double msxsl_number(const WCHAR *value);
++extern WCHAR *msxsl_local_name(const WCHAR *qname);
++extern WCHAR *msxsl_qname_prefix(const WCHAR *qname);
++extern const WCHAR *msxsl_reserved_namespace(const WCHAR *prefix);
++extern HRESULT msxsl_format_date(const WCHAR *value, const WCHAR *format, const WCHAR *language, BOOL time,
++        WCHAR **out);
++extern void msxsl_register_xslt_functions(struct _xsltTransformContext *ctxt);
+ extern HRESULT parse_xml_decl_body(const WCHAR *text, BSTR *version, BSTR *encoding, BSTR *standalone);
+ 
+ extern struct dtd * parser_dtd_addref(struct dtd *dtd);
+diff --git a/dlls/msxml3/msxsl.c b/dlls/msxml3/msxsl.c
+new file mode 100644
+index 00000000000..8b1bfae596c
+--- /dev/null
++++ b/dlls/msxml3/msxsl.c
+@@ -0,0 +1,640 @@
++/*
++ * MSXML's extension functions, in the urn:schemas-microsoft-com:xslt namespace
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* What the functions answer is what MSXML 6 answers on Windows 11 (tools/msxslfuncprobe in the
++ * wine-altars tree records it).  The XPath engine (xpath.c) and the XSLT processor (libxslt,
++ * registered below) share it. */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include <math.h>
++
++#include <libxml/xpathInternals.h>
++#include <libxslt/extensions.h>
++#include <libxslt/transform.h>
++#include <libxslt/xsltInternals.h>
++#include <libxslt/xsltutils.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "ole2.h"
++#include "mlang.h"
++#include "msxml6.h"
++
++#include "msxml_private.h"
++
++
++/* A language is the user's own when none is given, or a name MLang knows as it is: de and
++ * en-us are taken, de-de (which MLang only takes for de) is not. */
++HRESULT msxsl_language(const WCHAR *language, LCID *lcid)
++{
++    if (!language || !*language)
++    {
++        *lcid = LOCALE_USER_DEFAULT;
++        return S_OK;
++    }
++    return Rfc1766ToLcidW(lcid, language) == S_OK ? S_OK : E_FAIL;
++}
++
++/* ms:string-compare(x, y[, language[, options]]): -1, 0 or 1 as x sorts before, with or after y
++ * in the language, case sensitive with lowercase first; the options "i" ignore case, "u" put
++ * uppercase first. */
++HRESULT msxsl_string_compare(const WCHAR *x, const WCHAR *y, const WCHAR *language, const WCHAR *options,
++        int *result)
++{
++    WCHAR locale[LOCALE_NAME_MAX_LENGTH];
++    BOOL upper_first = FALSE;
++    DWORD flags = 0;
++    LCID lcid;
++    int ret;
++
++    if (options && *options)
++    {
++        if (!wcscmp(options, L"i")) flags = NORM_IGNORECASE;
++        else if (!wcscmp(options, L"u")) upper_first = TRUE;
++        else return E_FAIL;
++    }
++    if (FAILED(msxsl_language(language, &lcid)) || !LCIDToLocaleName(lcid, locale, ARRAY_SIZE(locale), 0))
++        return E_FAIL;
++
++    ret = CompareStringEx(locale, upper_first ? NORM_IGNORECASE : flags, x, -1, y, -1, NULL, NULL, 0);
++    /* uppercase first reverses what case alone decides */
++    if (ret == CSTR_EQUAL && upper_first)
++        ret = 2 * CSTR_EQUAL - CompareStringEx(locale, 0, x, -1, y, -1, NULL, NULL, 0);
++    if (!ret) return E_FAIL;
++    *result = ret - CSTR_EQUAL;
++    return S_OK;
++}
++
++#define XSD_YEAR   0x1
++#define XSD_MONTH  0x2
++#define XSD_DAY    0x4
++#define XSD_TIME   0x8
++
++/* an XML Schema date, time, dateTime, gYearMonth, gYear, gMonthDay, gDay or gMonth; the parts
++ * it lacks are those of 2000-01-01T00:00:00 */
++struct xsd_date
++{
++    int year, month, day, hour, minute, second, msec;
++    unsigned int parts;
++    BOOL fraction;
++    BOOL zone;
++    int zone_minutes;
++};
++
++static BOOL is_xml_space(WCHAR c)
++{
++    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++static BOOL parse_digits(const WCHAR **p, int count, int *value)
++{
++    int i, v = 0;
++
++    for (i = 0; i < count; i++)
++    {
++        if ((*p)[i] < '0' || (*p)[i] > '9') return FALSE;
++        v = v * 10 + (*p)[i] - '0';
++    }
++    *p += count;
++    *value = v;
++    return TRUE;
++}
++
++static BOOL is_digit(WCHAR c)
++{
++    return c >= '0' && c <= '9';
++}
++
++static BOOL is_leap_year(int year)
++{
++    return !(year % 4) && (year % 100 || !(year % 400));
++}
++
++static int days_in_month(int year, int month)
++{
++    static const int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
++    return month == 2 && is_leap_year(year) ? 29 : days[month - 1];
++}
++
++/* days from 0001-01-01 in the proleptic Gregorian calendar */
++static LONGLONG days_from_date(int year, int month, int day)
++{
++    LONGLONG y = year - 1;
++    LONGLONG days = y * 365 + y / 4 - y / 100 + y / 400;
++    int m;
++
++    for (m = 1; m < month; m++) days += days_in_month(year, m);
++    return days + day - 1;
++}
++
++static void date_from_days(LONGLONG days, int *year, int *month, int *day)
++{
++    LONGLONG y400, y100, y4, y1;
++    int y, m;
++
++    y400 = days / 146097; days %= 146097;
++    y100 = days / 36524; if (y100 == 4) y100 = 3; days -= y100 * 36524;
++    y4 = days / 1461; days %= 1461;
++    y1 = days / 365; if (y1 == 4) y1 = 3; days -= y1 * 365;
++    y = 400 * y400 + 100 * y100 + 4 * y4 + y1 + 1;
++    for (m = 1; days >= days_in_month(y, m); m++) days -= days_in_month(y, m);
++    *year = y;
++    *month = m;
++    *day = days + 1;
++}
++
++static BOOL parse_time(const WCHAR **p, struct xsd_date *date)
++{
++    int digits = 0, value = 0;
++
++    if (!parse_digits(p, 2, &date->hour) || **p != ':') return FALSE;
++    ++*p;
++    if (!parse_digits(p, 2, &date->minute) || **p != ':') return FALSE;
++    ++*p;
++    if (!parse_digits(p, 2, &date->second)) return FALSE;
++    if (**p == '.')
++    {
++        ++*p;
++        if (!is_digit(**p)) return FALSE;
++        /* rounded to the millisecond: .9999 is a whole second more */
++        for (; is_digit(**p); ++*p)
++            if (digits < 4) value = value * 10 + **p - '0', digits++;
++        for (; digits < 4; digits++) value *= 10;
++        date->msec = (value + 5) / 10;
++        date->fraction = TRUE;
++    }
++    date->parts |= XSD_TIME;
++    return TRUE;
++}
++
++static BOOL parse_zone(const WCHAR **p, struct xsd_date *date)
++{
++    int hours, minutes, sign;
++
++    if (**p == 'Z')
++    {
++        ++*p;
++        date->zone = TRUE;
++        return TRUE;
++    }
++    if (**p != '+' && **p != '-') return TRUE;
++    sign = **p == '-' ? -1 : 1;
++    ++*p;
++    if (!parse_digits(p, 2, &hours) || **p != ':') return FALSE;
++    ++*p;
++    if (!parse_digits(p, 2, &minutes) || minutes > 59 || hours * 60 + minutes > 14 * 60) return FALSE;
++    date->zone = TRUE;
++    date->zone_minutes = sign * (hours * 60 + minutes);
++    return TRUE;
++}
++
++static BOOL parse_xsd_date(const WCHAR *str, struct xsd_date *date)
++{
++    const WCHAR *p = str, *end;
++    int year;
++
++    memset(date, 0, sizeof(*date));
++    date->year = 2000;
++    date->month = 1;
++    date->day = 1;
++
++    while (is_xml_space(*p)) p++;
++    end = p + wcslen(p);
++    while (end > p && is_xml_space(end[-1])) end--;
++
++    if (p[0] == '-' && p[1] == '-')
++    {
++        p += 2;
++        if (*p == '-')
++        {
++            p++;
++            if (!parse_digits(&p, 2, &date->day)) return FALSE;
++            date->parts = XSD_DAY;
++        }
++        else
++        {
++            if (!parse_digits(&p, 2, &date->month)) return FALSE;
++            date->parts = XSD_MONTH;
++            if (*p == '-' && is_digit(p[1]))
++            {
++                p++;
++                if (!parse_digits(&p, 2, &date->day)) return FALSE;
++                date->parts |= XSD_DAY;
++            }
++        }
++    }
++    else if (is_digit(p[0]) && is_digit(p[1]) && p[2] == ':')
++    {
++        if (!parse_time(&p, date)) return FALSE;
++    }
++    else
++    {
++        /* four digits, no more and no sign: 0001 to 9999 */
++        if (!parse_digits(&p, 4, &year) || is_digit(*p) || !year) return FALSE;
++        date->year = year;
++        date->parts = XSD_YEAR;
++        if (*p == '-' && is_digit(p[1]))
++        {
++            p++;
++            if (!parse_digits(&p, 2, &date->month)) return FALSE;
++            date->parts |= XSD_MONTH;
++            if (*p == '-' && is_digit(p[1]))
++            {
++                p++;
++                if (!parse_digits(&p, 2, &date->day)) return FALSE;
++                date->parts |= XSD_DAY;
++                if (*p == 'T')
++                {
++                    p++;
++                    if (!parse_time(&p, date)) return FALSE;
++                }
++            }
++        }
++    }
++    if (!parse_zone(&p, date) || p != end) return FALSE;
++
++    if (date->month < 1 || date->month > 12) return FALSE;
++    if (date->day < 1 || date->day > days_in_month(date->year, date->month)) return FALSE;
++    if (date->minute > 59 || date->second > 59) return FALSE;
++    if (date->hour > 24 || (date->hour == 24 && (date->minute || date->second || date->msec))) return FALSE;
++    return TRUE;
++}
++
++/* Carries 24:00:00 and a rounded-up millisecond, and moves the date to UTC when it has a time
++ * zone; a date without a time is midnight.  Fails when the year leaves 0001-9999. */
++static BOOL xsd_date_normalize(struct xsd_date *date)
++{
++    LONGLONG seconds;
++
++    seconds = days_from_date(date->year, date->month, date->day) * 86400
++            + date->hour * 3600 + date->minute * 60 + date->second - date->zone_minutes * 60;
++    if (date->msec == 1000)
++    {
++        seconds++;
++        date->msec = 0;
++    }
++    if (seconds < 0) return FALSE;
++    date->hour = seconds % 86400 / 3600;
++    date->minute = seconds % 3600 / 60;
++    date->second = seconds % 60;
++    date_from_days(seconds / 86400, &date->year, &date->month, &date->day);
++    date->zone_minutes = 0;
++    return date->year <= 9999;
++}
++
++/* ms:utc(value): the value in UTC, written without its time zone; the parts it lacks are dashes
++ * (----------T10:00:00 for a time), a fraction of a second is three digits, anything else is "". */
++WCHAR *msxsl_utc(const WCHAR *value)
++{
++    struct xsd_date date;
++    WCHAR buffer[64], *p = buffer;
++
++    if (!parse_xsd_date(value, &date) || !xsd_date_normalize(&date))
++        return wcsdup(L"");
++
++    if (date.parts & XSD_YEAR) p += swprintf(p, 5, L"%04d", date.year);
++    else if (date.parts & (XSD_MONTH | XSD_DAY | XSD_TIME)) p += swprintf(p, 5, L"----");
++    if (date.parts & XSD_MONTH) p += swprintf(p, 4, L"-%02d", date.month);
++    else if (date.parts & (XSD_DAY | XSD_TIME)) p += swprintf(p, 4, L"---");
++    if (date.parts & XSD_DAY) p += swprintf(p, 4, L"-%02d", date.day);
++    else if (date.parts & XSD_TIME) p += swprintf(p, 4, L"---");
++    if (date.parts & XSD_TIME)
++    {
++        p += swprintf(p, 10, L"T%02d:%02d:%02d", date.hour, date.minute, date.second);
++        if (date.fraction) swprintf(p, 5, L".%03d", date.msec);
++    }
++    return wcsdup(buffer);
++}
++
++/* ms:number(value): an XML Schema double; NaN when the string is not one */
++double msxsl_number(const WCHAR *value)
++{
++    const WCHAR *p = value, *start, *end;
++    WCHAR buffer[400];
++    size_t len;
++    BOOL digits = FALSE;
++
++    while (is_xml_space(*p)) p++;
++    end = p + wcslen(p);
++    while (end > p && is_xml_space(end[-1])) end--;
++    len = end - p;
++
++    if (len == 3 && !wcsncmp(p, L"INF", 3)) return INFINITY;
++    if (len == 4 && !wcsncmp(p, L"-INF", 4)) return -INFINITY;
++    if (len == 3 && !wcsncmp(p, L"NaN", 3)) return NAN;
++
++    start = p;
++    if (*p == '+' || *p == '-') p++;
++    while (is_digit(*p)) p++, digits = TRUE;
++    if (*p == '.')
++        for (p++; is_digit(*p); p++) digits = TRUE;
++    if (!digits) return NAN;
++    if (*p == 'e' || *p == 'E')
++    {
++        p++;
++        if (*p == '+' || *p == '-') p++;
++        if (!is_digit(*p)) return NAN;
++        while (is_digit(*p)) p++;
++    }
++    if (p != end || len >= ARRAY_SIZE(buffer)) return NAN;
++
++    memcpy(buffer, start, len * sizeof(WCHAR));
++    buffer[len] = 0;
++    return wcstod(buffer, NULL);
++}
++
++/* ms:local-name(qname): the local part of a qualified name, "" for anything else */
++WCHAR *msxsl_local_name(const WCHAR *qname)
++{
++    const WCHAR *colon;
++
++    if (!parser_is_valid_qualified_name(qname)) return wcsdup(L"");
++    colon = wcschr(qname, ':');
++    return wcsdup(colon ? colon + 1 : qname);
++}
++
++/* the prefix of a qualified name, NULL when it has none or is not one */
++WCHAR *msxsl_qname_prefix(const WCHAR *qname)
++{
++    const WCHAR *colon;
++    WCHAR *prefix;
++
++    if (!parser_is_valid_qualified_name(qname) || !(colon = wcschr(qname, ':'))) return NULL;
++    if (!(prefix = malloc((colon - qname + 1) * sizeof(WCHAR)))) return NULL;
++    memcpy(prefix, qname, (colon - qname) * sizeof(WCHAR));
++    prefix[colon - qname] = 0;
++    return prefix;
++}
++
++/* the namespaces ms:namespace-uri() knows whatever the node declares */
++const WCHAR *msxsl_reserved_namespace(const WCHAR *prefix)
++{
++    if (!wcscmp(prefix, L"xml")) return L"http://www.w3.org/XML/1998/namespace";
++    if (!wcscmp(prefix, L"xmlns")) return L"http://www.w3.org/2000/xmlns/";
++    return NULL;
++}
++
++/* ms:format-date(value[, format[, language]]) and ms:format-time(): the date or the time of an
++ * XML Schema value, in UTC, through GetDateFormat or GetTimeFormat; the language's own format
++ * when none is given.  A date the value lacks is 2000-01-01, a time midnight.  E_FAIL for a
++ * language MSXML refuses; *out is "" for a value it cannot read or before 1601. */
++HRESULT msxsl_format_date(const WCHAR *value, const WCHAR *format, const WCHAR *language, BOOL time,
++        WCHAR **out)
++{
++    struct xsd_date date;
++    SYSTEMTIME st = { 0 };
++    FILETIME ft;
++    WCHAR *buffer;
++    LCID lcid;
++    int len;
++
++    if (FAILED(msxsl_language(language, &lcid))) return E_FAIL;
++
++    *out = NULL;
++    if (!parse_xsd_date(value, &date) || !xsd_date_normalize(&date)
++            || (time ? !(date.parts & (XSD_TIME | XSD_DAY)) : date.year < 1601))
++        return (*out = wcsdup(L"")) ? S_OK : E_OUTOFMEMORY;
++
++    if (date.year < 1601) date.year = 2000, date.month = date.day = 1;
++    st.wYear = date.year;
++    st.wMonth = date.month;
++    st.wDay = date.day;
++    st.wHour = date.hour;
++    st.wMinute = date.minute;
++    st.wSecond = date.second;
++    /* the day of the week */
++    SystemTimeToFileTime(&st, &ft);
++    FileTimeToSystemTime(&ft, &st);
++
++    if (format && !*format) format = NULL;
++    if (time) len = GetTimeFormatW(lcid, 0, &st, format, NULL, 0);
++    else len = GetDateFormatW(lcid, format ? 0 : DATE_SHORTDATE, &st, format, NULL, 0);
++    if (!len || !(buffer = malloc(len * sizeof(WCHAR)))) return (*out = wcsdup(L"")) ? S_OK : E_OUTOFMEMORY;
++    if (time) GetTimeFormatW(lcid, 0, &st, format, buffer, len);
++    else GetDateFormatW(lcid, format ? 0 : DATE_SHORTDATE, &st, format, buffer, len);
++    *out = buffer;
++    return S_OK;
++}
++
++/* the XSLT side: libxslt calls these with the parser context of its XPath engine */
++
++static WCHAR *pop_string(xmlXPathParserContextPtr ctxt)
++{
++    xmlChar *str = xmlXPathPopString(ctxt);
++    WCHAR *ret = str ? (WCHAR *)bstr_from_xmlChar(str) : NULL;
++
++    xmlFree(str);
++    return ret;
++}
++
++/* takes a string from malloc() */
++static void push_string(xmlXPathParserContextPtr ctxt, WCHAR *str)
++{
++    xmlChar *utf8 = str ? xmlchar_from_wchar(str) : NULL;
++
++    free(str);
++    if (!utf8)
++    {
++        xmlXPathSetError(ctxt, XPATH_MEMORY_ERROR);
++        return;
++    }
++    valuePush(ctxt, xmlXPathNewString(utf8));
++    free(utf8);
++}
++
++/* a language or an option the function does not take stops the transformation */
++static void msxsl_error(xmlXPathParserContextPtr ctxt, const char *function)
++{
++    xsltTransformError(xsltXPathGetTransformContext(ctxt), NULL, NULL, "ms:%s: invalid argument\n", function);
++    xmlXPathSetError(ctxt, XPATH_INVALID_OPERAND);
++}
++
++static void xslt_string_compare(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    BSTR x, y, language = NULL, options = NULL;
++    int result;
++
++    if (nargs < 2 || nargs > 4)
++    {
++        xmlXPathSetArityError(ctxt);
++        return;
++    }
++    if (nargs == 4) options = pop_string(ctxt);
++    if (nargs >= 3) language = pop_string(ctxt);
++    y = pop_string(ctxt);
++    x = pop_string(ctxt);
++    if (x && y && SUCCEEDED(msxsl_string_compare(x, y, language, options, &result)))
++        valuePush(ctxt, xmlXPathNewFloat(result));
++    else
++        msxsl_error(ctxt, "string-compare");
++    SysFreeString(x);
++    SysFreeString(y);
++    SysFreeString(language);
++    SysFreeString(options);
++}
++
++static void xslt_utc(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    BSTR value;
++
++    CHECK_ARITY(1);
++    value = pop_string(ctxt);
++    push_string(ctxt, msxsl_utc(value ? value : L""));
++    SysFreeString(value);
++}
++
++static void xslt_number(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    BSTR value;
++
++    CHECK_ARITY(1);
++    value = pop_string(ctxt);
++    valuePush(ctxt, xmlXPathNewFloat(msxsl_number(value ? value : L"")));
++    SysFreeString(value);
++}
++
++static void xslt_local_name(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    BSTR value;
++
++    CHECK_ARITY(1);
++    value = pop_string(ctxt);
++    push_string(ctxt, msxsl_local_name(value ? value : L""));
++    SysFreeString(value);
++}
++
++static void xslt_namespace_uri(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    const WCHAR *reserved;
++    xmlNodePtr node;
++    WCHAR *prefix;
++    xmlNsPtr ns;
++    BSTR value;
++
++    CHECK_ARITY(1);
++    value = pop_string(ctxt);
++    prefix = value ? msxsl_qname_prefix(value) : NULL;
++    SysFreeString(value);
++    if (!prefix)
++    {
++        valuePush(ctxt, xmlXPathNewCString(""));
++        return;
++    }
++    if ((reserved = msxsl_reserved_namespace(prefix)))
++    {
++        push_string(ctxt, wcsdup(reserved));
++        free(prefix);
++        return;
++    }
++    /* the prefixes in scope on the node being looked at, not those of the stylesheet */
++    node = ctxt->context->node;
++    if (node && node->type == XML_ATTRIBUTE_NODE) node = node->parent;
++    if (node && node->type == XML_ELEMENT_NODE)
++    {
++        xmlChar *prefix_utf8 = xmlchar_from_wchar(prefix);
++        ns = xmlSearchNs(node->doc, node, prefix_utf8);
++        free(prefix_utf8);
++        valuePush(ctxt, xmlXPathNewString(ns ? ns->href : BAD_CAST ""));
++    }
++    else
++        valuePush(ctxt, xmlXPathNewCString(""));
++    free(prefix);
++}
++
++static void xslt_format(xmlXPathParserContextPtr ctxt, int nargs, BOOL time)
++{
++    BSTR value, format = NULL, language = NULL;
++    WCHAR *out;
++
++    if (nargs < 1 || nargs > 3)
++    {
++        xmlXPathSetArityError(ctxt);
++        return;
++    }
++    if (nargs == 3) language = pop_string(ctxt);
++    if (nargs >= 2) format = pop_string(ctxt);
++    value = pop_string(ctxt);
++    if (SUCCEEDED(msxsl_format_date(value ? value : L"", format, language, time, &out)))
++        push_string(ctxt, out);
++    else
++        msxsl_error(ctxt, time ? "format-time" : "format-date");
++    SysFreeString(value);
++    SysFreeString(format);
++    SysFreeString(language);
++}
++
++static void xslt_format_date(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    xslt_format(ctxt, nargs, FALSE);
++}
++
++static void xslt_format_time(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    xslt_format(ctxt, nargs, TRUE);
++}
++
++/* without a schema no node has a type */
++static void xslt_type_name(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    if (nargs > 1)
++    {
++        xmlXPathSetArityError(ctxt);
++        return;
++    }
++    if (nargs) xmlXPathFreeObject(valuePop(ctxt));
++    valuePush(ctxt, xmlXPathNewCString(""));
++}
++
++static void xslt_schema_info_available(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    CHECK_ARITY(0);
++    valuePush(ctxt, xmlXPathNewBoolean(0));
++}
++
++/* MSXML 4.0 brought the functions; ms:type-is() needs a schema and stays unknown */
++void msxsl_register_xslt_functions(xsltTransformContextPtr ctxt)
++{
++    static const struct
++    {
++        const char *name;
++        xmlXPathFunction func;
++    }
++    functions[] =
++    {
++        { "string-compare", xslt_string_compare },
++        { "utc", xslt_utc },
++        { "number", xslt_number },
++        { "local-name", xslt_local_name },
++        { "namespace-uri", xslt_namespace_uri },
++        { "format-date", xslt_format_date },
++        { "format-time", xslt_format_time },
++        { "type-local-name", xslt_type_name },
++        { "type-namespace-uri", xslt_type_name },
++        { "schema-info-available", xslt_schema_info_available },
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        xsltRegisterExtFunction(ctxt, BAD_CAST functions[i].name, BAD_CAST "urn:schemas-microsoft-com:xslt",
++                functions[i].func);
++}
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index 8b19f8dff1d..afe771ab909 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -3224,6 +3224,8 @@ HRESULT node_transform_node_params(struct domnode *node, IXMLDOMNode *stylesheet
+ 
+         node_transform_bind_scripts(ctxt, owner_doc, sheet_doc, &scripts);
+         ctxt->userData = &scripts;
++        if (domdoc_version(node_get_doc(node)) >= MSXML4)
++            msxsl_register_xslt_functions(ctxt);
+ 
+         if (xslparams)
+         {
+@@ -3258,6 +3260,11 @@ HRESULT node_transform_node_params(struct domnode *node, IXMLDOMNode *stylesheet
+                 hr = node_transform_write_to_bstr(xsltSS, result, p);
+             xmlFreeDoc(result);
+         }
++        else
++        {
++            /* an error while transforming, such as an extension function refusing its argument */
++            hr = E_FAIL;
++        }
+ 
+         xsltFreeStylesheet(xsltSS);
+     }
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index 0532081d032..bc3c1c15f41 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -5476,6 +5476,213 @@ static void test_XPath_number_predicate(void)
+     free_bstrs();
+ }
+ 
++static BSTR xslt_value_of(IXMLDOMDocument2 *doc, const WCHAR *expr, HRESULT *hr)
++{
++    static const WCHAR fmt[] =
++        L"<xsl:stylesheet version='1.0' xmlns:xsl='http://www.w3.org/1999/XSL/Transform'"
++        L" xmlns:ms='urn:schemas-microsoft-com:xslt' xmlns:a='urn:style-a'>"
++        L"<xsl:output method='text'/>"
++        L"<xsl:template match='/'><xsl:for-each select='r'><xsl:value-of select=\"%s\"/></xsl:for-each></xsl:template>"
++        L"</xsl:stylesheet>";
++    IXMLDOMDocument2 *style;
++    WCHAR xsl[1024];
++    VARIANT_BOOL b;
++    BSTR str, out = NULL;
++
++    swprintf(xsl, ARRAY_SIZE(xsl), fmt, expr);
++    style = create_document_version(60, &IID_IXMLDOMDocument2);
++    str = SysAllocString(xsl);
++    *hr = IXMLDOMDocument2_loadXML(style, str, &b);
++    SysFreeString(str);
++    ok(*hr == S_OK && b == VARIANT_TRUE, "Unexpected hr %#lx.\n", *hr);
++    *hr = IXMLDOMDocument2_transformNode(doc, (IXMLDOMNode *)style, &out);
++    IXMLDOMDocument2_Release(style);
++    return out;
++}
++
++static void test_ms_extension_values(void)
++{
++    static const struct
++    {
++        const WCHAR *expr;
++        const WCHAR *value; /* NULL: the transformation fails */
++        BOOL string;        /* compare as a string in selectNodes() as well */
++    }
++    tests[] =
++    {
++        /* in UTC, without the time zone; what the value lacks are dashes */
++        { L"ms:utc('2026-09-29T10:00:00')", L"2026-09-29T10:00:00", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00Z')", L"2026-09-29T10:00:00", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00+08:00')", L"2026-09-29T02:00:00", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00.5-05:30')", L"2026-09-29T15:30:00.500", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00.1234567')", L"2026-09-29T10:00:00.123", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00.9999')", L"2026-09-29T10:00:01.000", TRUE },
++        { L"ms:utc('2026-09-29')", L"2026-09-29", TRUE },
++        { L"ms:utc('2026-09-29+08:00')", L"2026-09-28", TRUE },
++        { L"ms:utc('10:00:00')", L"----------T10:00:00", TRUE },
++        { L"ms:utc('02:00:00+08:00')", L"----------T18:00:00", TRUE },
++        { L"ms:utc('2026-09')", L"2026-09", TRUE },
++        { L"ms:utc('2026-09+08:00')", L"2026-08", TRUE },
++        { L"ms:utc('2026')", L"2026", TRUE },
++        { L"ms:utc('--09-29')", L"-----09-29", TRUE },
++        { L"ms:utc('---29')", L"--------29", TRUE },
++        { L"ms:utc('--09')", L"-----09", TRUE },
++        { L"ms:utc('2026-09-29T24:00:00')", L"2026-09-30T00:00:00", TRUE },
++        { L"ms:utc('2026-12-31T23:59:59-01:00')", L"2027-01-01T00:59:59", TRUE },
++        { L"ms:utc(' 2026-09-29T10:00:00 ')", L"2026-09-29T10:00:00", TRUE },
++        { L"ms:utc('2024-02-29')", L"2024-02-29", TRUE },
++        { L"ms:utc('2023-02-29')", L"", TRUE },
++        { L"ms:utc('0000-01-01')", L"", TRUE },
++        { L"ms:utc('0001-01-01T00:00:00+01:00')", L"", TRUE },
++        { L"ms:utc('12026-09-29T10:00:00')", L"", TRUE },
++        { L"ms:utc('2026-9-29')", L"", TRUE },
++        { L"ms:utc('2026-09-29T10:00')", L"", TRUE },
++        { L"ms:utc('2026-09-29t10:00:00')", L"", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00+14:01')", L"", TRUE },
++        { L"ms:utc('2026-09-29T10:00:00+0800')", L"", TRUE },
++        { L"ms:utc('abc')", L"", TRUE },
++        { L"ms:utc()", NULL },
++        /* of a qualified name, "" for anything else */
++        { L"ms:local-name('a:b')", L"b", TRUE },
++        { L"ms:local-name('b')", L"b", TRUE },
++        { L"ms:local-name('_a:_b')", L"_b", TRUE },
++        { L"ms:local-name('a:b:c')", L"", TRUE },
++        { L"ms:local-name('1a:b')", L"", TRUE },
++        { L"ms:local-name(' a:b ')", L"", TRUE },
++        { L"ms:local-name()", NULL },
++        /* the prefixes of the node, not those of the stylesheet or of SelectionNamespaces */
++        { L"ms:namespace-uri('s:b')", L"urn:source-s", TRUE },
++        { L"ms:namespace-uri('a:b')", L"", TRUE },
++        { L"ms:namespace-uri('S:b')", L"", TRUE },
++        { L"ms:namespace-uri('b')", L"", TRUE },
++        { L"ms:namespace-uri('xml:lang')", L"http://www.w3.org/XML/1998/namespace", TRUE },
++        { L"ms:namespace-uri('xmlns:b')", L"http://www.w3.org/2000/xmlns/", TRUE },
++        /* an XML Schema double */
++        { L"ms:number('1.5')", L"1.5" },
++        { L"ms:number(' 1.5 ')", L"1.5" },
++        { L"ms:number('1e3')", L"1000" },
++        { L"ms:number('1E-2')", L"0.01" },
++        { L"ms:number('INF')", L"Infinity" },
++        { L"ms:number('-INF')", L"-Infinity" },
++        { L"ms:number('inf')", L"NaN" },
++        { L"ms:number('+INF')", L"NaN" },
++        { L"ms:number('.5')", L"0.5" },
++        { L"ms:number('5.')", L"5" },
++        { L"ms:number('-0')", L"0" },
++        { L"ms:number('1,5')", L"NaN" },
++        { L"ms:number('1e')", L"NaN" },
++        { L"ms:number('1e400')", L"Infinity" },
++        { L"ms:number()", NULL },
++        /* GetDateFormat() and GetTimeFormat() pictures, in UTC */
++        { L"ms:format-date('2026-09-29T10:05:03', 'yyyy-MM-dd')", L"2026-09-29", TRUE },
++        { L"ms:format-date('2026-09-29T10:05:03', 'dddd, MMMM d, yyyy', 'en-US')", L"Tuesday, September 29, 2026", TRUE },
++        { L"ms:format-date('2026-09-29', 'ddd, MMM d', 'en')", L"Tue, Sep 29", TRUE },
++        { L"ms:format-date('2026-09-29T02:00:00+08:00', 'yyyy-MM-dd')", L"2026-09-28", TRUE },
++        { L"ms:format-date('10:00:00', 'yyyy-MM-dd')", L"2000-01-01", TRUE },
++        { L"ms:format-date('2026-09', 'yyyy-MM')", L"2026-09", TRUE },
++        { L"ms:format-date('1601-01-01', 'yyyy-MM-dd')", L"1601-01-01", TRUE },
++        { L"ms:format-date('1600-01-01', 'yyyy-MM-dd')", L"", TRUE },
++        { L"ms:format-date('2026-09-29', 'HH:mm')", L"HH:mm", TRUE },
++        { L"ms:format-date('bad', 'yyyy')", L"", TRUE },
++        { L"ms:format-date('2026-09-29', 'yyyy', 'de-DE')", NULL },
++        { L"ms:format-date('2026-09-29', 'yyyy', 'xx-XX')", NULL },
++        { L"ms:format-time('2026-09-29T13:05:03', 'HH:mm', 'en-US')", L"13:05", TRUE },
++        { L"ms:format-time('2026-09-29T13:05:03', 'hh:mm tt', 'en-us')", L"01:05 PM", TRUE },
++        { L"ms:format-time('2026-09-29', 'HH:mm:ss')", L"00:00:00", TRUE },
++        { L"ms:format-time('2026-09-29T13:05:03+08:00', 'HH:mm')", L"05:05", TRUE },
++        { L"ms:format-time('24:00:00', 'HH:mm')", L"00:00", TRUE },
++        { L"ms:format-time('2026-09-29T13:05:03', 'yyyy HH')", L"yyyy 13", TRUE },
++        { L"ms:format-time('13:05', 'HH:mm')", L"", TRUE },
++        { L"ms:format-time('2026-09-29T13:05:03', 'HH', 'de-DE')", NULL },
++        { L"ms:string-compare('a', 'b')", L"-1" },
++        { L"ms:string-compare('a', 'b', 'de')", L"-1" },
++        { L"ms:string-compare('a', 'b', 'de-DE')", NULL },
++        /* nothing has a type without a schema */
++        { L"ms:type-local-name()", L"", TRUE },
++        { L"ms:type-namespace-uri()", L"", TRUE },
++        { L"ms:schema-info-available()", L"false" },
++        { L"ms:type-is('string')", NULL },
++    };
++    IXMLDOMDocument2 *doc;
++    IXMLDOMNodeList *list;
++    WCHAR query[512];
++    VARIANT_BOOL b;
++    unsigned int i;
++    HRESULT hr;
++    LONG len;
++    BSTR out;
++
++    if (!is_clsid_supported(&CLSID_DOMDocument60, &IID_IXMLDOMDocument2))
++        return;
++
++    doc = create_document_version(60, &IID_IXMLDOMDocument2);
++    hr = IXMLDOMDocument2_loadXML(doc, _bstr_("<r xmlns:s='urn:source-s' x='b'><e>b</e></r>"), &b);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXMLDOMDocument2_setProperty(doc, _bstr_("SelectionNamespaces"),
++            _variantbstr_("xmlns:ms='urn:schemas-microsoft-com:xslt' xmlns:a='urn:selection-a'"));
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context("%s", wine_dbgstr_w(tests[i].expr));
++
++        out = xslt_value_of(doc, tests[i].expr, &hr);
++        if (tests[i].value)
++        {
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ok(out && !wcscmp(out, tests[i].value), "Got %s.\n", wine_dbgstr_w(out));
++        }
++        else
++            ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        SysFreeString(out);
++
++        if (!tests[i].value)
++            swprintf(query, ARRAY_SIZE(query), L"/r[%s]", tests[i].expr);
++        else
++            swprintf(query, ARRAY_SIZE(query), L"/r[%s = '%s']", tests[i].expr, tests[i].value);
++        if (!tests[i].value || tests[i].string)
++        {
++            list = NULL;
++            out = SysAllocString(query);
++            hr = IXMLDOMDocument2_selectNodes(doc, out, &list);
++            SysFreeString(out);
++            if (!tests[i].value)
++                ok(hr == E_FAIL, "selectNodes: unexpected hr %#lx.\n", hr);
++            else
++            {
++                ok(hr == S_OK, "selectNodes: unexpected hr %#lx.\n", hr);
++                len = 0;
++                if (list) IXMLDOMNodeList_get_length(list, &len);
++                ok(len == 1, "selectNodes: got %ld nodes.\n", len);
++            }
++            if (list) IXMLDOMNodeList_Release(list);
++        }
++        winetest_pop_context();
++    }
++
++    /* a position only when it is one */
++    {
++        static const struct { const char *query; LONG count; } positions[] =
++        {
++            { "/r[ms:number('+1')]", 1 }, { "/r[ms:number('1.5')]", 0 },
++        };
++
++        for (i = 0; i < ARRAY_SIZE(positions); i++)
++        {
++            list = NULL;
++            hr = IXMLDOMDocument2_selectNodes(doc, _bstr_(positions[i].query), &list);
++            ok(hr == S_OK, "%s: unexpected hr %#lx.\n", positions[i].query, hr);
++            len = -1;
++            if (list) IXMLDOMNodeList_get_length(list, &len);
++            ok(len == positions[i].count, "%s: got %ld nodes.\n", positions[i].query, len);
++            if (list) IXMLDOMNodeList_Release(list);
++        }
++    }
++
++    IXMLDOMDocument2_Release(doc);
++    free_bstrs();
++}
++
+ static void test_XPath_ms_functions(void)
+ {
+     static const struct
+@@ -5519,6 +5726,12 @@ static void test_XPath_ms_functions(void)
+         { L"ms:string-compare('a', 'A', 'en-US', 'u')", 1 },
+         { L"ms:string-compare('a', 'b', 'en_US')", 2 },
+         { L"ms:string-compare('a', 'b', 'xx-XX')", 2 },
++        /* only as MLang names it: de-DE is only de to MLang */
++        { L"ms:string-compare('a', 'b', 'de')", -1 },
++        { L"ms:string-compare('a', 'b', 'pt-br')", -1 },
++        { L"ms:string-compare('a', 'b', 'de-DE')", 2 },
++        { L"ms:string-compare('a', 'b', 'ja-JP')", 2 },
++        { L"ms:string-compare('a', 'b', 'zh-Hans')", 2 },
+         /* two to four arguments */
+         { L"ms:string-compare('a')", 2 },
+         { L"ms:string-compare('a', 'b', '', 'i', 'x')", 2 },
+@@ -19066,6 +19279,7 @@ START_TEST(domdoc)
+     test_XPath();
+     test_XPath_number_predicate();
+     test_XPath_ms_functions();
++    test_ms_extension_values();
+     test_XSLPattern();
+     test_cloneNode();
+     test_xmlTypes();
+diff --git a/dlls/msxml3/xpath.c b/dlls/msxml3/xpath.c
+index 86b575a6ae0..93cab507daa 100644
+--- a/dlls/msxml3/xpath.c
++++ b/dlls/msxml3/xpath.c
+@@ -7706,15 +7706,12 @@ static void xpath_register_xpath_functions(struct xpath_context *ctxt)
+     xpath_register_func(ctxt, L"translate", xpath_builtin_translate);
+ }
+ 
+-/* ms:string-compare(x, y[, language[, options]]): -1, 0 or 1 as x sorts before, with or after y in the
+- * language, case sensitive with lowercase first; the options "i" ignore case, "u" put uppercase first. */
++/* MSXML's extension functions (msxsl.c has what they answer) */
++
+ static void xpath_ms_string_compare(struct xpath_parser_context *ctxt, int nargs)
+ {
+     WCHAR *x, *y, *language = NULL, *options = NULL;
+-    const WCHAR *locale = LOCALE_NAME_USER_DEFAULT;
+-    bool upper_first = false;
+-    DWORD flags = 0;
+-    int ret;
++    int result;
+ 
+     if (nargs < 2 || nargs > 4)
+         return xpath_parser_context_set_error(ctxt, XPATH_INVALID_ARITY);
+@@ -7726,38 +7723,181 @@ static void xpath_ms_string_compare(struct xpath_parser_context *ctxt, int nargs
+     y = xpath_pop_string(ctxt);
+     x = xpath_pop_string(ctxt);
+ 
+-    if (options && *options)
++    if (x && y && SUCCEEDED(msxsl_string_compare(x, y, language, options, &result)))
++        xpath_push_value(ctxt, xpath_new_number(ctxt, result));
++    else
++        xpath_parser_context_set_error(ctxt, XPATH_INVALID_OPERAND);
++
++    free(x);
++    free(y);
++    free(language);
++    free(options);
++}
++
++/* takes a string from malloc() */
++static void xpath_ms_push_string(struct xpath_parser_context *ctxt, WCHAR *str)
++{
++    if (str)
++        xpath_push_value(ctxt, xpath_new_string(ctxt, str));
++    else
++        xpath_parser_context_set_error(ctxt, XPATH_MEMORY_ERROR);
++    free(str);
++}
++
++static void xpath_ms_utc(struct xpath_parser_context *ctxt, int nargs)
++{
++    WCHAR *value;
++
++    if (!xpath_builtin_check_stack(ctxt, nargs, 1))
++        return;
++    value = xpath_pop_string(ctxt);
++    xpath_ms_push_string(ctxt, msxsl_utc(value ? value : L""));
++    free(value);
++}
++
++static void xpath_ms_number(struct xpath_parser_context *ctxt, int nargs)
++{
++    WCHAR *value;
++
++    if (!xpath_builtin_check_stack(ctxt, nargs, 1))
++        return;
++    value = xpath_pop_string(ctxt);
++    xpath_push_value(ctxt, xpath_new_number(ctxt, msxsl_number(value ? value : L"")));
++    free(value);
++}
++
++static void xpath_ms_local_name(struct xpath_parser_context *ctxt, int nargs)
++{
++    WCHAR *value;
++
++    if (!xpath_builtin_check_stack(ctxt, nargs, 1))
++        return;
++    value = xpath_pop_string(ctxt);
++    xpath_ms_push_string(ctxt, msxsl_local_name(value ? value : L""));
++    free(value);
++}
++
++/* the namespace a prefix has on a node: used by the element or declared there or above it */
++static BSTR xpath_ms_lookup_prefix(struct domnode *node, const WCHAR *prefix)
++{
++    struct domnode *attr;
++    BSTR uri;
++
++    if (node->type == NODE_ATTRIBUTE) node = xpath_get_parent(node);
++    for (; node; node = xpath_get_parent(node))
+     {
+-        if (!wcscmp(options, L"i")) flags = NORM_IGNORECASE;
+-        else if (!wcscmp(options, L"u")) upper_first = true;
+-        else xpath_parser_context_set_error(ctxt, XPATH_INVALID_OPERAND);
++        if (node->type != NODE_ELEMENT) continue;
++        LIST_FOR_EACH_ENTRY(attr, &node->attributes, struct domnode, entry)
++        {
++            if (attr->prefix && !wcscmp(attr->prefix, L"xmlns") && !wcscmp(attr->name, prefix)
++                    && SUCCEEDED(node_get_text(attr, &uri)))
++                return uri;
++        }
++        if (node->prefix && !wcscmp(node->prefix, prefix) && node->uri)
++            return SysAllocString(node->uri);
+     }
+-    if (language && *language)
++    return NULL;
++}
++
++static void xpath_ms_namespace_uri(struct xpath_parser_context *ctxt, int nargs)
++{
++    const WCHAR *reserved;
++    WCHAR *value, *prefix;
++    BSTR uri = NULL;
++
++    if (!xpath_builtin_check_stack(ctxt, nargs, 1))
++        return;
++    value = xpath_pop_string(ctxt);
++    prefix = value ? msxsl_qname_prefix(value) : NULL;
++    free(value);
++
++    if (prefix && (reserved = msxsl_reserved_namespace(prefix)))
++        xpath_push_value(ctxt, xpath_new_string(ctxt, reserved));
++    else
+     {
+-        /* a language is named as Windows names it, with a hyphen */
+-        if (!wcschr(language, '_') && LocaleNameToLCID(language, 0)) locale = language;
+-        else xpath_parser_context_set_error(ctxt, XPATH_INVALID_OPERAND);
++        if (prefix) uri = xpath_ms_lookup_prefix(ctxt->context->node, prefix);
++        xpath_push_value(ctxt, xpath_new_string(ctxt, uri ? uri : L""));
++        SysFreeString(uri);
+     }
++    free(prefix);
++}
++
++static void xpath_ms_format(struct xpath_parser_context *ctxt, int nargs, BOOL time)
++{
++    WCHAR *value, *format = NULL, *language = NULL, *out;
++
++    if (nargs < 1 || nargs > 3)
++        return xpath_parser_context_set_error(ctxt, XPATH_INVALID_ARITY);
++    if (ctxt->stack.count < nargs)
++        return xpath_parser_context_set_error(ctxt, XPATH_STACK_ERROR);
++
++    if (nargs == 3) language = xpath_pop_string(ctxt);
++    if (nargs >= 2) format = xpath_pop_string(ctxt);
++    value = xpath_pop_string(ctxt);
+ 
+-    if (!x || !y)
++    if (SUCCEEDED(msxsl_format_date(value ? value : L"", format, language, time, &out)))
++        xpath_ms_push_string(ctxt, out);
++    else
+         xpath_parser_context_set_error(ctxt, XPATH_INVALID_OPERAND);
+ 
+-    if (ctxt->error == XPATH_EXPRESSION_OK)
++    free(value);
++    free(format);
++    free(language);
++}
++
++static void xpath_ms_format_date(struct xpath_parser_context *ctxt, int nargs)
++{
++    xpath_ms_format(ctxt, nargs, FALSE);
++}
++
++static void xpath_ms_format_time(struct xpath_parser_context *ctxt, int nargs)
++{
++    xpath_ms_format(ctxt, nargs, TRUE);
++}
++
++/* without a schema no node has a type */
++static void xpath_ms_type_name(struct xpath_parser_context *ctxt, int nargs)
++{
++    if (nargs > 1)
++        return xpath_parser_context_set_error(ctxt, XPATH_INVALID_ARITY);
++    if (ctxt->stack.count < nargs)
++        return xpath_parser_context_set_error(ctxt, XPATH_STACK_ERROR);
++    if (nargs) xpath_free_object(xpath_pop_value(ctxt));
++    xpath_push_value(ctxt, xpath_new_string(ctxt, L""));
++}
++
++static void xpath_ms_schema_info_available(struct xpath_parser_context *ctxt, int nargs)
++{
++    if (nargs)
++        return xpath_parser_context_set_error(ctxt, XPATH_INVALID_ARITY);
++    xpath_push_value(ctxt, xpath_new_boolean(ctxt, 0));
++}
++
++/* MSXML 4.0 brought them; ms:type-is() needs a schema and stays unknown */
++static void xpath_register_ms_functions(struct xpath_context *ctxt)
++{
++    static const struct
+     {
+-        ret = CompareStringEx(locale, upper_first ? NORM_IGNORECASE : flags, x, -1, y, -1, NULL, NULL, 0);
+-        /* uppercase first reverses what case alone decides */
+-        if (ret == CSTR_EQUAL && upper_first)
+-            ret = 2 * CSTR_EQUAL - CompareStringEx(locale, 0, x, -1, y, -1, NULL, NULL, 0);
+-        if (ret)
+-            xpath_push_value(ctxt, xpath_new_number(ctxt, ret - CSTR_EQUAL));
+-        else
+-            xpath_parser_context_set_error(ctxt, XPATH_INVALID_OPERAND);
+-    }
++        const WCHAR *name;
++        xpath_function func;
++    }
++    functions[] =
++    {
++        { L"string-compare", xpath_ms_string_compare },
++        { L"utc", xpath_ms_utc },
++        { L"number", xpath_ms_number },
++        { L"local-name", xpath_ms_local_name },
++        { L"namespace-uri", xpath_ms_namespace_uri },
++        { L"format-date", xpath_ms_format_date },
++        { L"format-time", xpath_ms_format_time },
++        { L"type-local-name", xpath_ms_type_name },
++        { L"type-namespace-uri", xpath_ms_type_name },
++        { L"schema-info-available", xpath_ms_schema_info_available },
++    };
++    unsigned int i;
+ 
+-    free(x);
+-    free(y);
+-    free(language);
+-    free(options);
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        xpath_register_func_uri(ctxt, functions[i].name, L"urn:schemas-microsoft-com:xslt", functions[i].func);
+ }
+ 
+ static void xpath_register_xslpattern_functions(struct xpath_context *ctxt)
+@@ -7791,7 +7931,7 @@ struct xpath_context * xpath_create_context(bool xpath, struct domnode *node)
+         xpath_register_xpath_functions(ret);
+         /* the extension functions came with MSXML 4.0 */
+         if (ret->properties->version >= MSXML4)
+-            xpath_register_func_uri(ret, L"string-compare", L"urn:schemas-microsoft-com:xslt", xpath_ms_string_compare);
++            xpath_register_ms_functions(ret);
+     }
+     else
+         xpath_register_xslpattern_functions(ret);

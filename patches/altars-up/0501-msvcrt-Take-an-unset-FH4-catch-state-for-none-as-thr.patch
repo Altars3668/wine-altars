@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 21:29:00 -0400
+Subject: [PATCH] msvcrt: Take an unset FH4 catch state for none, as threads
+ have at process exit.
+
+__CxxFrameHandler4 hands the state a nested handler starts from over in
+fiber local storage, -2 meaning none, so that the state comes from the
+IP; it was set to -2 for each thread at DLL_THREAD_ATTACH.  Process
+exit cleans up every thread's fiber local storage before the
+DLL_PROCESS_DETACH that runs the static destructors, and a thread that
+was running before vcruntime140_1 was loaded never had it set: both
+read NULL, state 0, and looked for catch blocks in the wrong place.
+Word's exit died on that: one of MSO's static destructors destroys a
+roaming setting after the roaming manager is gone, which throws, and
+the destructor's catch (...) was not found in a noexcept function, so
+terminate() and exit code 3.  The state is now kept offset by 2, NULL
+meaning none; Windows 11 with its own vcruntime140_1 catches in a
+thread older than the module as in any other (the new ucrtbase test).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msvcrt/handler4.c b/dlls/msvcrt/handler4.c
+index 06bd02d9258..666157c0ac5 100644
+--- a/dlls/msvcrt/handler4.c
++++ b/dlls/msvcrt/handler4.c
+@@ -374,6 +374,21 @@ static void cxx_local_unwind4(ULONG64 frame, DISPATCHER_CONTEXT *dispatch,
+     }
+ }
+ 
++/* The state the next frame handler starts from instead of the one of its IP, handed over per thread while a catch
++ * block runs.  A slot never set reads as NULL, so the state is kept offset by 2, for NULL to mean -2 -- "find it
++ * from the IP": that is what a thread has that was running before this module was loaded, and every thread once
++ * its fiber local storage was cleaned up, which process exit does before DLL_PROCESS_DETACH, where static
++ * destructors catch exceptions too. */
++static int get_catch_state(void)
++{
++    return (DWORD_PTR)FlsGetValue(fls_index) - 2;
++}
++
++static void set_catch_state(int state)
++{
++    FlsSetValue(fls_index, (void *)(DWORD_PTR)(state + 2));
++}
++
+ static LONG CALLBACK cxx_rethrow_filter(PEXCEPTION_POINTERS eptrs, void *c)
+ {
+     EXCEPTION_RECORD *rec = eptrs->ExceptionRecord;
+@@ -382,7 +397,7 @@ static LONG CALLBACK cxx_rethrow_filter(PEXCEPTION_POINTERS eptrs, void *c)
+     if (rec->ExceptionCode == CXX_EXCEPTION && !rec->ExceptionInformation[1] && !rec->ExceptionInformation[2])
+         return EXCEPTION_EXECUTE_HANDLER;
+ 
+-    FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx->search_state);
++    set_catch_state(ctx->search_state);
+     if (rec->ExceptionCode != CXX_EXCEPTION)
+         return EXCEPTION_CONTINUE_SEARCH;
+     if (rec->ExceptionInformation[1] == ctx->prev_rec->ExceptionInformation[1])
+@@ -395,7 +410,7 @@ static void CALLBACK cxx_catch_cleanup(BOOL normal, void *c)
+     cxx_catch_ctx *ctx = c;
+     __CxxUnregisterExceptionObject(&ctx->frame_info, ctx->rethrow);
+ 
+-    FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx->unwind_state);
++    set_catch_state(ctx->unwind_state);
+ }
+ 
+ static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
+@@ -423,7 +438,7 @@ static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
+         {
+             TRACE("detect rethrow: exception code: %lx\n", prev_rec->ExceptionCode);
+             ctx.rethrow = TRUE;
+-            FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx.search_state);
++            set_catch_state(ctx.search_state);
+ 
+             if (untrans_rec)
+             {
+@@ -441,7 +456,7 @@ static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
+     }
+     __FINALLY_CTX(cxx_catch_cleanup, &ctx)
+ 
+-    FlsSetValue(fls_index, (void*)-2);
++    set_catch_state(-2);
+     TRACE("handler returned %p, ret_addr[0] %#Ix, ret_addr[1] %#Ix.\n",
+           ret_addr, rec->ExceptionInformation[8], rec->ExceptionInformation[9]);
+ 
+@@ -680,8 +695,8 @@ EXCEPTION_DISPOSITION __cdecl __CxxFrameHandler4(EXCEPTION_RECORD *rec,
+ 
+     TRACE("%p %Ix %p %p\n", rec, frame, context, dispatch);
+ 
+-    trylevel = (DWORD_PTR)FlsGetValue(fls_index);
+-    FlsSetValue(fls_index, (void*)-2);
++    trylevel = get_catch_state();
++    set_catch_state(-2);
+ 
+     memset(&descr, 0, sizeof(descr));
+     p = cxx_rva(*(UINT*)dispatch->HandlerData, dispatch->ImageBase);
+@@ -750,15 +765,7 @@ EXCEPTION_DISPOSITION __cdecl __CxxFrameHandler4(EXCEPTION_RECORD *rec,
+ BOOL msvcrt_init_handler4(void)
+ {
+     fls_index = FlsAlloc(NULL);
+-    if (fls_index == FLS_OUT_OF_INDEXES)
+-        return FALSE;
+-    msvcrt_attach_handler4();
+-    return TRUE;
+-}
+-
+-void msvcrt_attach_handler4(void)
+-{
+-    FlsSetValue(fls_index, (void*)-2);
++    return fls_index != FLS_OUT_OF_INDEXES;
+ }
+ 
+ void msvcrt_free_handler4(void)
+diff --git a/dlls/msvcrt/main.c b/dlls/msvcrt/main.c
+index 39c20b20241..7a44ae5dde1 100644
+--- a/dlls/msvcrt/main.c
++++ b/dlls/msvcrt/main.c
+@@ -137,9 +137,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+     TRACE("finished process init\n");
+     break;
+   case DLL_THREAD_ATTACH:
+-#if defined(__x86_64__) && _MSVCR_VER>=140
+-    msvcrt_attach_handler4();
+-#endif
+     break;
+   case DLL_PROCESS_DETACH:
+     _flushall();
+diff --git a/dlls/msvcrt/msvcrt.h b/dlls/msvcrt/msvcrt.h
+index 47cf70f1cc9..f88de2fe8c2 100644
+--- a/dlls/msvcrt/msvcrt.h
++++ b/dlls/msvcrt/msvcrt.h
+@@ -154,7 +154,6 @@ int* __cdecl __processing_throw(void);
+ 
+ #if defined(__x86_64__) && _MSVCR_VER>=140
+ BOOL msvcrt_init_handler4(void);
+-void msvcrt_attach_handler4(void);
+ void msvcrt_free_handler4(void);
+ #endif
+ 
+diff --git a/dlls/ucrtbase/tests/cpp.c b/dlls/ucrtbase/tests/cpp.c
+index e5b52872cd6..21b142dc5d7 100644
+--- a/dlls/ucrtbase/tests/cpp.c
++++ b/dlls/ucrtbase/tests/cpp.c
+@@ -401,6 +401,152 @@ static void test___C_specific_handler(void)
+     __C_specific_handler(&rec, (void*)0x1234, &context, &dispatch);
+     ok(0, "should not be reached\n");
+ }
++
++/* Two functions built at run time.  The inner one has a __CxxFrameHandler4 handler and calls RaiseException in
++ * state 1 of a try block whose catch(...) covers only that state; it returns 1 when the catch ran.  The outer one
++ * calls it in a scope of __C_specific_handler that takes every exception and returns the code of one the inner
++ * function let through. */
++static BYTE *fh4_code;
++static HANDLE fh4_started, fh4_go;
++
++static void build_fh4_code(void *cxx_frame_handler4)
++{
++    static const BYTE code[] =
++    {
++        /* 0x20: jmp *0x08 */
++        [0x20] = 0xff, 0x25, 0xe2, 0xff, 0xff, 0xff,
++        /* 0x28: jmp *0x10 */
++        [0x28] = 0xff, 0x25, 0xe2, 0xff, 0xff, 0xff,
++        /* 0x30: the inner function */
++        [0x30] = 0x48, 0x83, 0xec, 0x28,         /* sub $0x28,%rsp */
++        0xb9, 0x01, 0x00, 0x00, 0xe0,            /* mov $0xe0000001,%ecx */
++        0x31, 0xd2,                              /* xor %edx,%edx */
++        0x45, 0x31, 0xc0,                        /* xor %r8d,%r8d */
++        0x45, 0x31, 0xc9,                        /* xor %r9d,%r9d */
++        0xff, 0x15, 0xb9, 0xff, 0xff, 0xff,      /* 0x41: call *0x00 (RaiseException) */
++        0x90,                                    /* nop */
++        0x31, 0xc0,                              /* 0x48: xor %eax,%eax */
++        0x48, 0x83, 0xc4, 0x28,                  /* add $0x28,%rsp */
++        0xc3,                                    /* ret */
++        0xb8, 0x01, 0x00, 0x00, 0x00,            /* 0x4f: mov $1,%eax -- where the catch continues */
++        0x48, 0x83, 0xc4, 0x28,                  /* add $0x28,%rsp */
++        0xc3,                                    /* ret */
++        /* 0x60: the catch funclet */
++        [0x60] = 0x31, 0xc0, 0xc3,               /* xor %eax,%eax; ret */
++        /* 0x70: the outer function */
++        [0x70] = 0x48, 0x83, 0xec, 0x28,         /* sub $0x28,%rsp */
++        0xe8, 0xb7, 0xff, 0xff, 0xff,            /* 0x74: call 0x30 */
++        0x90,                                    /* nop */
++        0x48, 0x83, 0xc4, 0x28,                  /* 0x7a: add $0x28,%rsp */
++        0xc3,                                    /* ret */
++        0x48, 0x83, 0xc4, 0x28,                  /* 0x7f: add $0x28,%rsp -- the scope's target, %eax the code */
++        0xc3,                                    /* ret */
++        /* 0x100: the unwind information of the inner function: sub $0x28,%rsp, handler at 0x20, FuncInfo4 at
++         * 0x140 */
++        [0x100] = 0x19, 0x04, 0x01, 0x00, 0x04, 0x42, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00,
++        /* 0x120: the outer function's, handler at 0x28, one scope from 0x74 to 0x7a, filter EXCEPTION_EXECUTE_HANDLER,
++         * target 0x7f */
++        [0x120] = 0x19, 0x04, 0x01, 0x00, 0x04, 0x42, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00,
++        0x01, 0x00, 0x00, 0x00, 0x74, 0x00, 0x00, 0x00, 0x7a, 0x00, 0x00, 0x00,
++        0x01, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x00,
++        /* 0x140: FuncInfo4: an unwind map at 0x160, a try block map at 0x170, the IP to state map at 0x180 */
++        [0x140] = 0x18, 0x60, 0x01, 0x00, 0x00, 0x70, 0x01, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00,
++        /* 0x160: three states with nothing to unwind, 1 and 2 going back to 0 */
++        [0x160] = 0x06, 0x08, 0x08, 0x10,
++        /* 0x170: one try block, states 1 to 1, catch state 2, its catch blocks at 0x178 */
++        [0x170] = 0x02, 0x02, 0x02, 0x04, 0x78, 0x01, 0x00, 0x00,
++        /* 0x178: one catch(...), the funclet at 0x60, continuing at 0x1f into the function */
++        [0x178] = 0x02, 0x10, 0x60, 0x00, 0x00, 0x00, 0x3e,
++        /* 0x180: state -1 from 0x30, 1 from 0x41 (the call), -1 again from 0x48 */
++        [0x180] = 0x06, 0x00, 0x00, 0x22, 0x04, 0x0e, 0x00,
++    };
++    RUNTIME_FUNCTION *functions;
++
++    fh4_code = VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
++    memcpy(fh4_code, code, sizeof(code));
++    *(void **)fh4_code = RaiseException;
++    *(void **)(fh4_code + 0x08) = cxx_frame_handler4;
++    *(void **)(fh4_code + 0x10) = __C_specific_handler;
++    functions = (RUNTIME_FUNCTION *)(fh4_code + 0x200);
++    functions[0].BeginAddress = 0x30;
++    functions[0].EndAddress = 0x59;
++    functions[0].UnwindData = 0x100;
++    functions[1].BeginAddress = 0x70;
++    functions[1].EndAddress = 0x84;
++    functions[1].UnwindData = 0x120;
++    RtlAddFunctionTable(functions, 2, (ULONG_PTR)fh4_code);
++}
++
++static DWORD call_fh4_code(void)
++{
++    return ((DWORD (WINAPI *)(void))(fh4_code + 0x70))();
++}
++
++static DWORD WINAPI fh4_thread(void *arg)
++{
++    if (arg)
++    {
++        SetEvent(fh4_started);
++        WaitForSingleObject(fh4_go, INFINITE);
++    }
++    return call_fh4_code();
++}
++
++static void test___CxxFrameHandler4(void)
++{
++    HANDLE early = NULL, late;
++    HMODULE module;
++    void *handler;
++    DWORD ret;
++
++    /* a thread running before vcruntime140_1 is loaded, which gets no DLL_THREAD_ATTACH from it */
++    if (!GetModuleHandleA("vcruntime140_1.dll"))
++    {
++        fh4_started = CreateEventW(NULL, FALSE, FALSE, NULL);
++        fh4_go = CreateEventW(NULL, FALSE, FALSE, NULL);
++        early = CreateThread(NULL, 0, fh4_thread, (void *)1, 0, NULL);
++        WaitForSingleObject(fh4_started, INFINITE);
++    }
++
++    module = LoadLibraryA("vcruntime140_1.dll");
++    if (!module || !(handler = GetProcAddress(module, "__CxxFrameHandler4")))
++    {
++        win_skip("vcruntime140_1.dll not installed\n");
++        if (early)
++        {
++            TerminateThread(early, 0);
++            CloseHandle(early);
++        }
++        if (module) FreeLibrary(module);
++        return;
++    }
++    build_fh4_code(handler);
++
++    ret = call_fh4_code();
++    ok(ret == 1, "got %#lx\n", ret);
++
++    late = CreateThread(NULL, 0, fh4_thread, NULL, 0, NULL);
++    WaitForSingleObject(late, INFINITE);
++    GetExitCodeThread(late, &ret);
++    ok(ret == 1, "a thread started later: got %#lx\n", ret);
++    CloseHandle(late);
++
++    if (early)
++    {
++        SetEvent(fh4_go);
++        WaitForSingleObject(early, INFINITE);
++        GetExitCodeThread(early, &ret);
++        ok(ret == 1, "a thread started before: got %#lx\n", ret);
++        CloseHandle(early);
++        CloseHandle(fh4_started);
++        CloseHandle(fh4_go);
++    }
++    else skip("vcruntime140_1.dll was already loaded\n");
++
++    RtlDeleteFunctionTable((RUNTIME_FUNCTION *)(fh4_code + 0x200));
++    VirtualFree(fh4_code, 0, MEM_RELEASE);
++    FreeLibrary(module);
++}
+ #endif
+ 
+ START_TEST(cpp)
+@@ -412,5 +558,6 @@ START_TEST(cpp)
+     test___DestructExceptionObject();
+ #ifdef __x86_64__
+     test___C_specific_handler();
++    test___CxxFrameHandler4();
+ #endif
+ }
+diff --git a/dlls/vcruntime140_1/main.c b/dlls/vcruntime140_1/main.c
+index a8a4903c82b..ffa64e7ea29 100644
+--- a/dlls/vcruntime140_1/main.c
++++ b/dlls/vcruntime140_1/main.c
+@@ -28,9 +28,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, VOID *reserved)
+   {
+   case DLL_PROCESS_ATTACH:
+       return msvcrt_init_handler4();
+-  case DLL_THREAD_ATTACH:
+-      msvcrt_attach_handler4();
+-      break;
+   case DLL_PROCESS_DETACH:
+       if (reserved) break;
+       msvcrt_free_handler4();

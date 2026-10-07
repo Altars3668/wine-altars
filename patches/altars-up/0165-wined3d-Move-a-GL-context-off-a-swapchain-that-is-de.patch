@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 17:03:44 -0400
+Subject: [PATCH] wined3d: Move a GL context off a swapchain that is destroyed.
+
+A device has one GL context per thread, shared by its swapchains, and
+the context follows the swapchain it last drew to.  Nothing moved it off
+that swapchain when the swapchain was destroyed, so the context went on
+taking its window and DC from freed memory each time it was made current.
+Under PowerPoint the DC it tried was 0034006B00300064, which is the text
+"d0k4": the freed swapchain's memory held a string by then.  What followed
+depended on what the memory held; in some runs the context fell back to
+the backup window 173 times.  One earlier run, logged without warnings,
+gave "Fallback to backup window failed too" 1926 times, drawing nothing
+each time; that has not come back since, though no run showed it with
+this cause in view.
+
+Now the contexts of a swapchain being destroyed move to the device's
+implicit swapchain, on the command stream thread.  The d3d11 test creates
+a device on a thread that then exits, so the window DXGI made for it goes,
+and draws on through a swapchain released in between; it passes with and
+without the change, which shows through +d3d traces instead.  d3d9
+(d3d9ex, device, visual) and d3d11 give the same failures on GL with and
+without it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ba6fad028e8267ffe51e66a07cb76b46fe54409d)
+
+diff --git a/dlls/d3d11/tests/d3d11.c b/dlls/d3d11/tests/d3d11.c
+index 898c807fe2f..ba7b4414ead 100644
+--- a/dlls/d3d11/tests/d3d11.c
++++ b/dlls/d3d11/tests/d3d11.c
+@@ -6871,6 +6871,80 @@ static void test_device_removed_reason(void)
+     ok(!refcount, "Device has %lu references left.\n", refcount);
+ }
+ 
++static DWORD WINAPI create_device_thread(void *param)
++{
++    ID3D11Device **device = param;
++
++    *device = create_device(NULL);
++    return 0;
++}
++
++/* The window DXGI keeps for a device belongs to the thread that created the device; when that thread
++ * exits, the window goes with it, and the device has to go on drawing without it. */
++static void test_device_created_on_exited_thread(void)
++{
++    static const float red[] = {1.0f, 0.0f, 0.0f, 1.0f}, green[] = {0.0f, 1.0f, 0.0f, 1.0f};
++    D3D11_TEXTURE2D_DESC texture_desc;
++    ID3D11DeviceContext *context;
++    ID3D11RenderTargetView *rtv;
++    IDXGISwapChain *swapchain;
++    ID3D11Texture2D *texture;
++    ID3D11Device *device;
++    HANDLE thread;
++    ULONG refcount;
++    HWND window;
++    HRESULT hr;
++
++    device = NULL;
++    thread = CreateThread(NULL, 0, create_device_thread, &device, 0, NULL);
++    ok(!!thread, "Failed to create a thread, error %lu.\n", GetLastError());
++    WaitForSingleObject(thread, INFINITE);
++    CloseHandle(thread);
++    if (!device)
++    {
++        skip("Failed to create device.\n");
++        return;
++    }
++    ID3D11Device_GetImmediateContext(device, &context);
++
++    texture_desc.Width = 4;
++    texture_desc.Height = 4;
++    texture_desc.MipLevels = 1;
++    texture_desc.ArraySize = 1;
++    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    texture_desc.SampleDesc.Count = 1;
++    texture_desc.SampleDesc.Quality = 0;
++    texture_desc.Usage = D3D11_USAGE_DEFAULT;
++    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
++    texture_desc.CPUAccessFlags = 0;
++    texture_desc.MiscFlags = 0;
++    hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL, &texture);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)texture, NULL, &rtv);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    ID3D11DeviceContext_ClearRenderTargetView(context, rtv, red);
++    check_texture_color(texture, 0xff0000ff, 0);
++
++    /* Drawing somewhere else in between leaves the device's first context to be made current again. */
++    window = CreateWindowA("static", "d3d11_test", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
++            0, 0, 640, 480, NULL, NULL, NULL, NULL);
++    swapchain = create_swapchain(device, window, NULL);
++    hr = IDXGISwapChain_Present(swapchain, 0, 0);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    IDXGISwapChain_Release(swapchain);
++    DestroyWindow(window);
++
++    ID3D11DeviceContext_ClearRenderTargetView(context, rtv, green);
++    check_texture_color(texture, 0xff00ff00, 0);
++
++    ID3D11RenderTargetView_Release(rtv);
++    ID3D11Texture2D_Release(texture);
++    ID3D11DeviceContext_Release(context);
++    refcount = ID3D11Device_Release(device);
++    ok(!refcount, "Device has %lu references left.\n", refcount);
++}
++
+ static void test_private_data(void)
+ {
+     ULONG refcount, expected_refcount;
+@@ -37873,6 +37947,11 @@ START_TEST(d3d11)
+         test_create_device_child();
+         return;
+     }
++    if (argc == 3 && !strcmp(argv[2], "--device-thread"))
++    {
++        test_device_created_on_exited_thread();
++        return;
++    }
+     if (argc == 3 && !strcmp(argv[2], "--map-do-not-wait"))
+     {
+         use_warp_adapter = TRUE;
+@@ -37911,6 +37990,7 @@ START_TEST(d3d11)
+     print_adapter_info();
+ 
+     queue_test(test_create_device);
++    queue_test(test_device_created_on_exited_thread);
+     queue_for_each_feature_level(test_device_interfaces);
+     queue_test(test_immediate_context);
+     queue_test(test_create_deferred_context);
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 78455b0b29b..691ba7e9c7d 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -101,8 +101,38 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
+     }
+ }
+ 
++static void wined3d_swapchain_gl_destroy_object(void *object)
++{
++    struct wined3d_swapchain_gl *swapchain_gl = object;
++    struct wined3d_device *device = swapchain_gl->s.device;
++    struct wined3d_swapchain *implicit;
++    unsigned int i;
++
++    /* A device's contexts are shared by its swapchains, and a context follows
++     * the swapchain it last drew to. One that is left pointing at a swapchain
++     * that is gone takes its window and DC from freed memory. */
++    implicit = device->swapchain_count ? device->swapchains[0] : NULL;
++    if (implicit == &swapchain_gl->s)
++        implicit = NULL;
++    for (i = 0; i < device->context_count; ++i)
++    {
++        struct wined3d_context *context = device->contexts[i];
++
++        if (context->swapchain == &swapchain_gl->s)
++        {
++            TRACE("Moving context %p from swapchain %p to swapchain %p.\n", context, swapchain_gl, implicit);
++            context->swapchain = implicit;
++        }
++    }
++}
++
+ void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
+ {
++    struct wined3d_cs *cs = swapchain_gl->s.device->cs;
++
++    wined3d_cs_destroy_object(cs, wined3d_swapchain_gl_destroy_object, swapchain_gl);
++    wined3d_cs_finish(cs, WINED3D_CS_QUEUE_DEFAULT);
++
+     wined3d_swapchain_cleanup(&swapchain_gl->s);
+ }
+ 

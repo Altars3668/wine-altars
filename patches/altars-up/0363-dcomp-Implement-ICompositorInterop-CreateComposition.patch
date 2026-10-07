@@ -1,0 +1,753 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 06:05:58 -0400
+Subject: [PATCH] dcomp: Implement
+ ICompositorInterop::CreateCompositionSurfaceForSwapChain().
+
+A surface of a swapchain made for composition shows what the swapchain
+presented last: the texture dxgi keeps of it, drawn as a bitmap on the
+target's Direct2D context, or brought over to the target's device
+first when that is another one, the way the tiles of drawing surfaces
+already were (that copy is now shared by both).  Surface brushes and
+nine-grids draw either kind of surface.
+
+As on Windows, what a swapchain presents is shown without a commit: on
+each present the targets are drawn again, as they stand, on the
+compositor's thread.  The present only queues that, since the
+presenting thread may not take the compositor's lock.
+
+Only a swapchain made for composition can be shown; anything else is
+E_INVALIDARG.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/dcomp/Makefile.in b/dlls/dcomp/Makefile.in
+index cfe563e8df1..ace1b8f09f9 100644
+--- a/dlls/dcomp/Makefile.in
++++ b/dlls/dcomp/Makefile.in
+@@ -22,5 +22,6 @@ SOURCES = \
+ 	render.c \
+ 	shadow.c \
+ 	surface.c \
++	swapchain.c \
+ 	target.c \
+ 	visual.c
+diff --git a/dlls/dcomp/compositor.c b/dlls/dcomp/compositor.c
+index 9f208fa285b..b88d9c79bcb 100644
+--- a/dlls/dcomp/compositor.c
++++ b/dlls/dcomp/compositor.c
+@@ -54,6 +54,7 @@ struct compositor
+     ICompositorController *controller;
+     BOOL changed;               /* since the last commit */
+     BOOL work_queued;           /* on the dispatcher queue, to commit or to say one is needed */
++    LONG frame_queued;          /* on the dispatcher queue, to draw what a swapchain presented */
+     struct graphics_device **locked;    /* the devices the frame being drawn holds */
+     unsigned int locked_count;
+     struct list commit_needed;
+@@ -368,6 +369,7 @@ struct work
+     IDispatcherQueueHandler IDispatcherQueueHandler_iface;
+     LONG ref;
+     struct compositor *compositor;
++    BOOL frame;                 /* only to draw the targets again */
+ };
+ 
+ static inline struct work *impl_from_IDispatcherQueueHandler( IDispatcherQueueHandler *iface )
+@@ -415,7 +417,20 @@ static HRESULT WINAPI work_Invoke( IDispatcherQueueHandler *iface )
+     struct commit_needed_handler *entry;
+     unsigned int count = 0, i;
+ 
+-    TRACE( "compositor %p.\n", compositor );
++    TRACE( "compositor %p, frame %d.\n", compositor, work->frame );
++
++    if (work->frame)
++    {
++        BOOL closed;
++
++        /* a present from now on queues another */
++        InterlockedExchange( &compositor->frame_queued, 0 );
++        compositor_lock( compositor );
++        closed = compositor->closed;
++        compositor_unlock( compositor );
++        if (!closed) compositor_render( compositor, FALSE );
++        return S_OK;
++    }
+ 
+     compositor_lock( compositor );
+     compositor->work_queued = FALSE;
+@@ -476,6 +491,37 @@ static void compositor_queue_work( struct compositor *compositor )
+     IDispatcherQueueHandler_Release( &work->IDispatcherQueueHandler_iface );
+ }
+ 
++/*
++ * A swapchain a surface of the compositor shows has presented: the targets
++ * are drawn again, as they stand, on the compositor's thread, as Windows shows
++ * what a swapchain presents without a commit.  Called on the thread that
++ * presented, without the compositor's lock, which that thread may not take.
++ */
++void compositor_presented( struct compositor *compositor )
++{
++    boolean queued = FALSE;
++    struct work *work;
++
++    if (InterlockedCompareExchange( &compositor->frame_queued, 1, 0 )) return;
++    if (!compositor->queue || !(work = calloc( 1, sizeof(*work) )))
++    {
++        InterlockedExchange( &compositor->frame_queued, 0 );
++        return;
++    }
++    work->IDispatcherQueueHandler_iface.lpVtbl = &work_vtbl;
++    work->ref = 1;
++    work->compositor = compositor;
++    work->frame = TRUE;
++    compositor_add_ref( compositor );
++    if (FAILED(IDispatcherQueue_TryEnqueue( compositor->queue, &work->IDispatcherQueueHandler_iface, &queued )) ||
++        !queued)
++    {
++        WARN( "could not queue a frame on the dispatcher queue.\n" );
++        InterlockedExchange( &compositor->frame_queued, 0 );
++    }
++    IDispatcherQueueHandler_Release( &work->IDispatcherQueueHandler_iface );
++}
++
+ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid, void **out )
+ {
+     struct compositor *compositor = impl_from_ICompositor( iface );
+@@ -1503,8 +1549,11 @@ static HRESULT WINAPI compositor_interop_CreateCompositionSurfaceForHandle( ICom
+ static HRESULT WINAPI compositor_interop_CreateCompositionSurfaceForSwapChain( ICompositorInterop *iface, IUnknown *swapchain,
+                                                                                ICompositionSurface **result )
+ {
+-    FIXME( "iface %p, swapchain %p, result %p stub!\n", iface, swapchain, result );
+-    return E_NOTIMPL;
++    struct compositor *compositor = impl_from_ICompositorInterop( iface );
++
++    TRACE( "iface %p, swapchain %p, result %p.\n", iface, swapchain, result );
++
++    return swapchain_surface_create( compositor, swapchain, result );
+ }
+ 
+ /* a device for drawing surfaces on: the application's Direct2D or Direct3D device */
+diff --git a/dlls/dcomp/private.h b/dlls/dcomp/private.h
+index d4979bddf5b..d4fd6993a0c 100644
+--- a/dlls/dcomp/private.h
++++ b/dlls/dcomp/private.h
+@@ -296,6 +296,7 @@ extern struct list *compositor_running( struct compositor *compositor );
+ extern struct list *compositor_batches( struct compositor *compositor );
+ extern struct list *compositor_trackers( struct compositor *compositor );
+ extern void compositor_changed( struct compositor *compositor );
++extern void compositor_presented( struct compositor *compositor );
+ extern void compositor_set_controller( struct compositor *compositor, ICompositorController *controller );
+ extern HRESULT compositor_add_commit_needed( struct compositor *compositor,
+                                              ITypedEventHandler_CompositorController_IInspectable *handler,
+@@ -481,6 +482,18 @@ extern HRESULT graphics_device_create( struct compositor *compositor, IUnknown *
+ extern void graphics_device_lock( struct graphics_device *device );
+ extern void graphics_device_unlock( struct graphics_device *device );
+ 
++/* a texture's pixels on another device than its own, as of a version of them */
++struct mirror
++{
++    ID3D11Texture2D *texture;
++    ID3D11Device *device;
++    UINT version;
++};
++
++extern HRESULT mirror_texture( struct mirror *mirror, ID3D11Texture2D *source, UINT version, ID3D11Device *device,
++                               ID3D11Texture2D **out );
++extern void mirror_release( struct mirror *mirror );
++
+ /*
+  * A surface keeps its pixels in textures on its graphics device's Direct3D
+  * device: one of the surface's own size, or, for a virtual surface, tiles of
+@@ -492,10 +505,7 @@ struct tile
+     RECT rect;                      /* the part of the surface it holds */
+     ID3D11Texture2D *texture;
+     UINT version;                   /* counts the changes to its pixels */
+-    /* its pixels on the device a target draws with, when that is another device, as of a version */
+-    ID3D11Texture2D *mirror;
+-    ID3D11Device *mirror_device;
+-    UINT mirror_version;
++    struct mirror mirror;           /* on the device a target draws with, when that is another */
+ };
+ 
+ struct drawing_surface
+@@ -527,6 +537,12 @@ extern HRESULT drawing_surface_create( struct graphics_device *device, SIZE size
+                                        DirectXAlphaMode alpha_mode, BOOL is_virtual, struct drawing_surface **out );
+ extern struct drawing_surface *unsafe_impl_from_ICompositionSurface( ICompositionSurface *iface );
+ 
++/* surfaces of swapchains for composition */
++extern HRESULT swapchain_surface_create( struct compositor *compositor, IUnknown *swapchain, ICompositionSurface **out );
++extern HRESULT swapchain_surface_texture( ICompositionSurface *iface, ID3D11Device *device, ID3D11Texture2D **out,
++                                          D2D1_ALPHA_MODE *alpha_mode );
++extern BOOL is_swapchain_surface( ICompositionSurface *iface );
++
+ /* window targets */
+ struct target
+ {
+diff --git a/dlls/dcomp/render.c b/dlls/dcomp/render.c
+index a7dcdb00376..5cdaa387284 100644
+--- a/dlls/dcomp/render.c
++++ b/dlls/dcomp/render.c
+@@ -430,31 +430,81 @@ static D2D1_MATRIX_3X2_F surface_brush_transform( const struct brush_state *brus
+     return matrix_2d_multiply( &m, &t );
+ }
+ 
+-/* a surface's own, if it is one of ours with pixels to show */
+-static struct drawing_surface *render_surface( struct render *render, ICompositionSurface *iface )
++/* what a surface brush draws: a drawing surface's tiles, or what a swapchain presented last */
++struct source
++{
++    SIZE size;
++    struct drawing_surface *drawing;
++    ID2D1Bitmap1 *bitmap;
++};
++
++/* a surface's pixels, if it is one of ours with pixels to show; released with source_release */
++static BOOL render_source( struct render *render, ICompositionSurface *iface, struct source *source )
+ {
+     struct drawing_surface *surface = unsafe_impl_from_ICompositionSurface( iface );
++    D2D1_BITMAP_PROPERTIES1 props = {{0}};
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Texture2D *texture;
++    IDXGISurface *dxgi;
++    HRESULT hr;
+ 
+-    if (!surface)
++    memset( source, 0, sizeof(*source) );
++    if (surface)
+     {
+-        if (iface) FIXME( "surface %p is not a drawing surface.\n", iface );
+-        return NULL;
++        if (!surface->size.cx || !surface->size.cy) return FALSE;
++        source->size = surface->size;
++        source->drawing = surface;
++        return TRUE;
++    }
++    if (!is_swapchain_surface( iface ))
++    {
++        if (iface) FIXME( "surface %p is not one of ours.\n", iface );
++        return FALSE;
++    }
++
++    if (swapchain_surface_texture( iface, render->target->device, &texture, &props.pixelFormat.alphaMode ) != S_OK)
++        return FALSE;
++    ID3D11Texture2D_GetDesc( texture, &desc );
++    props.pixelFormat.format = desc.Format;
++    props.dpiX = props.dpiY = 96.0f;
++    hr = ID3D11Texture2D_QueryInterface( texture, &IID_IDXGISurface, (void **)&dxgi );
++    ID3D11Texture2D_Release( texture );
++    if (FAILED(hr)) return FALSE;
++    hr = ID2D1DeviceContext_CreateBitmapFromDxgiSurface( render->context, dxgi, &props, &source->bitmap );
++    IDXGISurface_Release( dxgi );
++    if (FAILED(hr))
++    {
++        WARN( "failed to draw what swapchain surface %p shows, format %#x, hr %#lx.\n", iface, desc.Format, hr );
++        return FALSE;
+     }
+-    if (!surface->size.cx || !surface->size.cy) return NULL;
+-    return surface;
++    source->size.cx = desc.Width;
++    source->size.cy = desc.Height;
++    return TRUE;
++}
++
++static void source_release( struct source *source )
++{
++    if (source->bitmap) ID2D1Bitmap1_Release( source->bitmap );
+ }
+ 
+ /*
+  * Draws the part src of a surface onto dst, in the space the context's
+- * transform is for, stretched to fit; the surface's pixels are in tiles.
++ * transform is for, stretched to fit; a drawing surface's pixels are in tiles.
+  */
+-static void draw_surface_part( struct render *render, struct drawing_surface *surface, const D2D1_RECT_F *src,
++static void draw_surface_part( struct render *render, const struct source *source, const D2D1_RECT_F *src,
+                                const D2D1_RECT_F *dst, float opacity, D2D1_INTERPOLATION_MODE interpolation )
+ {
++    struct drawing_surface *surface = source->drawing;
+     float sx, sy;
+     struct tile *tile;
+ 
+     if (src->right <= src->left || src->bottom <= src->top || dst->right <= dst->left || dst->bottom <= dst->top) return;
++    if (source->bitmap)
++    {
++        ID2D1DeviceContext_DrawBitmap( render->context, (ID2D1Bitmap *)source->bitmap, dst, opacity, interpolation,
++                                       src, NULL );
++        return;
++    }
+     sx = (dst->right - dst->left) / (src->right - src->left);
+     sy = (dst->bottom - dst->top) / (src->bottom - src->top);
+ 
+@@ -520,30 +570,30 @@ static D2D1_INTERPOLATION_MODE brush_interpolation( const struct brush *brush )
+ static void draw_surface( struct render *render, const struct brush *brush, const struct brush_state *state,
+                           Vector2 size, float opacity, const D2D1_MATRIX_3X2_F *world )
+ {
+-    struct drawing_surface *surface = render_surface( render, brush->surface );
+     D2D1_MATRIX_3X2_F transform, placement;
+     D2D1_RECT_F bounds = {0.0f, 0.0f, size.X, size.Y}, whole;
+     float sx = 1.0f, sy = 1.0f, x, y;
++    struct source surface;
+     Vector2 content;
+ 
+-    if (!surface) return;
++    if (!render_source( render, brush->surface, &surface )) return;
+ 
+     switch (brush->stretch)
+     {
+     case CompositionStretch_None: break;
+     case CompositionStretch_Fill:
+-        sx = size.X / surface->size.cx;
+-        sy = size.Y / surface->size.cy;
++        sx = size.X / surface.size.cx;
++        sy = size.Y / surface.size.cy;
+         break;
+     case CompositionStretch_Uniform:
+-        sx = sy = min( size.X / surface->size.cx, size.Y / surface->size.cy );
++        sx = sy = min( size.X / surface.size.cx, size.Y / surface.size.cy );
+         break;
+     case CompositionStretch_UniformToFill:
+-        sx = sy = max( size.X / surface->size.cx, size.Y / surface->size.cy );
++        sx = sy = max( size.X / surface.size.cx, size.Y / surface.size.cy );
+         break;
+     }
+-    content.X = surface->size.cx * sx;
+-    content.Y = surface->size.cy * sy;
++    content.X = surface.size.cx * sx;
++    content.Y = surface.size.cy * sy;
+     x = (size.X - content.X) * state->horizontal_alignment_ratio;
+     y = (size.Y - content.Y) * state->vertical_alignment_ratio;
+ 
+@@ -557,11 +607,12 @@ static void draw_surface( struct render *render, const struct brush *brush, cons
+     ID2D1DeviceContext_PushAxisAlignedClip( render->context, &bounds, D2D1_ANTIALIAS_MODE_ALIASED );
+     ID2D1DeviceContext_SetTransform( render->context, &transform );
+     whole.left = whole.top = 0.0f;
+-    whole.right = surface->size.cx;
+-    whole.bottom = surface->size.cy;
+-    draw_surface_part( render, surface, &whole, &whole, opacity, brush_interpolation( brush ) );
++    whole.right = surface.size.cx;
++    whole.bottom = surface.size.cy;
++    draw_surface_part( render, &surface, &whole, &whole, opacity, brush_interpolation( brush ) );
+     ID2D1DeviceContext_SetTransform( render->context, world );
+     ID2D1DeviceContext_PopAxisAlignedClip( render->context );
++    source_release( &surface );
+ }
+ 
+ /*
+@@ -618,17 +669,17 @@ static void draw_nine_grid( struct render *render, const struct brush *brush, co
+     }
+     if (source->kind == BRUSH_SURFACE)
+     {
+-        struct drawing_surface *surface = render_surface( render, source->surface );
++        struct source surface;
+         float sxs[4], sys[4];
+ 
+-        if (!surface) return;
++        if (!render_source( render, source->surface, &surface )) return;
+         sxs[0] = sys[0] = 0.0f;
+         sxs[1] = state->insets[0];
+         sys[1] = state->insets[1];
+-        sxs[2] = surface->size.cx - state->insets[2];
+-        sys[2] = surface->size.cy - state->insets[3];
+-        sxs[3] = surface->size.cx;
+-        sys[3] = surface->size.cy;
++        sxs[2] = surface.size.cx - state->insets[2];
++        sys[2] = surface.size.cy - state->insets[3];
++        sxs[3] = surface.size.cx;
++        sys[3] = surface.size.cy;
+         for (j = 0; j < 3; j++)
+             for (i = 0; i < 3; i++)
+             {
+@@ -636,8 +687,9 @@ static void draw_nine_grid( struct render *render, const struct brush *brush, co
+                 D2D1_RECT_F to = {xs[i], ys[j], xs[i + 1], ys[j + 1]};
+ 
+                 if (i == 1 && j == 1 && brush->hollow) continue;
+-                draw_surface_part( render, surface, &from, &to, opacity, brush_interpolation( source ) );
++                draw_surface_part( render, &surface, &from, &to, opacity, brush_interpolation( source ) );
+             }
++        source_release( &surface );
+         return;
+     }
+     FIXME( "nine-grid of a brush of kind %u not drawn.\n", source->kind );
+diff --git a/dlls/dcomp/surface.c b/dlls/dcomp/surface.c
+index 4bc89629346..2715e0c63d3 100644
+--- a/dlls/dcomp/surface.c
++++ b/dlls/dcomp/surface.c
+@@ -101,77 +101,104 @@ static void texture_clear( ID3D11Device *device, ID3D11Texture2D *texture )
+ 
+ /*** tiles ***/
+ 
+-static void tile_destroy( struct tile *tile )
++void mirror_release( struct mirror *mirror )
+ {
+-    list_remove( &tile->entry );
+-    ID3D11Texture2D_Release( tile->texture );
+-    if (tile->mirror) ID3D11Texture2D_Release( tile->mirror );
+-    if (tile->mirror_device) ID3D11Device_Release( tile->mirror_device );
+-    free( tile );
++    if (mirror->texture) ID3D11Texture2D_Release( mirror->texture );
++    if (mirror->device) ID3D11Device_Release( mirror->device );
++    mirror->texture = NULL;
++    mirror->device = NULL;
+ }
+ 
+ /*
+- * A tile's pixels as a texture of the device a target draws with.  On another
+- * device than its own, they are read back from its own and handed to the
+- * other, whenever they have changed since: as on Windows, what any device drew
+- * is composed together.  Both devices are locked by the frame that asks.
++ * A texture's pixels as a texture of another device, the one a target draws
++ * with: they are read back from the texture's own device and handed to the
++ * other, whenever their version has changed since.  As on Windows, what any
++ * device drew is composed together.
+  */
+-HRESULT tile_texture( struct drawing_surface *surface, struct tile *tile, ID3D11Device *device, ID3D11Texture2D **out )
++HRESULT mirror_texture( struct mirror *mirror, ID3D11Texture2D *source, UINT version, ID3D11Device *device,
++                        ID3D11Texture2D **out )
+ {
+-    ID3D11DeviceContext *source, *destination;
++    ID3D11DeviceContext *own_context, *context;
+     D3D11_MAPPED_SUBRESOURCE map;
+-    D3D11_TEXTURE2D_DESC desc;
++    D3D11_TEXTURE2D_DESC desc, mirror_desc;
+     ID3D11Texture2D *staging;
++    ID3D11Device *own;
+     HRESULT hr;
+ 
+-    if (surface->device->d3d_device == device)
++    ID3D11Texture2D_GetDesc( source, &desc );
++    if (mirror->texture)
+     {
+-        *out = tile->texture;
+-        return S_OK;
+-    }
+-    if (tile->mirror && tile->mirror_device != device)
+-    {
+-        ID3D11Texture2D_Release( tile->mirror );
+-        ID3D11Device_Release( tile->mirror_device );
+-        tile->mirror = NULL;
+-        tile->mirror_device = NULL;
++        ID3D11Texture2D_GetDesc( mirror->texture, &mirror_desc );
++        if (mirror->device != device || mirror_desc.Width != desc.Width || mirror_desc.Height != desc.Height ||
++            mirror_desc.Format != desc.Format)
++            mirror_release( mirror );
+     }
+-    ID3D11Texture2D_GetDesc( tile->texture, &desc );
+-    if (!tile->mirror)
++    if (!mirror->texture)
+     {
+-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+-        desc.MiscFlags = 0;
+-        if (FAILED(hr = ID3D11Device_CreateTexture2D( device, &desc, NULL, &tile->mirror ))) return hr;
+-        ID3D11Device_AddRef( (tile->mirror_device = device) );
+-        tile->mirror_version = tile->version - 1;
++        mirror_desc = desc;
++        mirror_desc.Usage = D3D11_USAGE_DEFAULT;
++        mirror_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        mirror_desc.CPUAccessFlags = 0;
++        mirror_desc.MiscFlags = 0;
++        if (FAILED(hr = ID3D11Device_CreateTexture2D( device, &mirror_desc, NULL, &mirror->texture ))) return hr;
++        ID3D11Device_AddRef( (mirror->device = device) );
++        mirror->version = version - 1;
+     }
+-    if (tile->mirror_version != tile->version)
++    if (mirror->version != version)
+     {
+-        TRACE( "copying tile %s of surface %p to device %p.\n", wine_dbgstr_rect( &tile->rect ), surface, device );
++        TRACE( "copying texture %p to device %p.\n", source, device );
+         desc.Usage = D3D11_USAGE_STAGING;
+         desc.BindFlags = 0;
+         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         desc.MiscFlags = 0;
+-        if (FAILED(hr = ID3D11Device_CreateTexture2D( surface->device->d3d_device, &desc, NULL, &staging ))) return hr;
+-        ID3D11Device_GetImmediateContext( surface->device->d3d_device, &source );
+-        ID3D11DeviceContext_CopyResource( source, (ID3D11Resource *)staging, (ID3D11Resource *)tile->texture );
+-        if (SUCCEEDED(hr = ID3D11DeviceContext_Map( source, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map )))
++        ID3D11Texture2D_GetDevice( source, &own );
++        hr = ID3D11Device_CreateTexture2D( own, &desc, NULL, &staging );
++        if (SUCCEEDED(hr))
+         {
+-            ID3D11Device_GetImmediateContext( device, &destination );
+-            ID3D11DeviceContext_UpdateSubresource( destination, (ID3D11Resource *)tile->mirror, 0, NULL, map.pData,
+-                                                   map.RowPitch, 0 );
+-            ID3D11DeviceContext_Release( destination );
+-            ID3D11DeviceContext_Unmap( source, (ID3D11Resource *)staging, 0 );
+-            tile->mirror_version = tile->version;
++            ID3D11Device_GetImmediateContext( own, &own_context );
++            ID3D11DeviceContext_CopyResource( own_context, (ID3D11Resource *)staging, (ID3D11Resource *)source );
++            if (SUCCEEDED(hr = ID3D11DeviceContext_Map( own_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map )))
++            {
++                ID3D11Device_GetImmediateContext( device, &context );
++                ID3D11DeviceContext_UpdateSubresource( context, (ID3D11Resource *)mirror->texture, 0, NULL, map.pData,
++                                                       map.RowPitch, 0 );
++                ID3D11DeviceContext_Release( context );
++                ID3D11DeviceContext_Unmap( own_context, (ID3D11Resource *)staging, 0 );
++                mirror->version = version;
++            }
++            ID3D11DeviceContext_Release( own_context );
++            ID3D11Texture2D_Release( staging );
+         }
+-        ID3D11DeviceContext_Release( source );
+-        ID3D11Texture2D_Release( staging );
++        ID3D11Device_Release( own );
+         if (FAILED(hr)) return hr;
+     }
+-    *out = tile->mirror;
++    *out = mirror->texture;
+     return S_OK;
+ }
+ 
++static void tile_destroy( struct tile *tile )
++{
++    list_remove( &tile->entry );
++    ID3D11Texture2D_Release( tile->texture );
++    mirror_release( &tile->mirror );
++    free( tile );
++}
++
++/*
++ * A tile's pixels as a texture of the device a target draws with, brought
++ * over from its own when that is another.  Both devices are locked by the
++ * frame that asks.
++ */
++HRESULT tile_texture( struct drawing_surface *surface, struct tile *tile, ID3D11Device *device, ID3D11Texture2D **out )
++{
++    if (surface->device->d3d_device == device)
++    {
++        *out = tile->texture;
++        return S_OK;
++    }
++    return mirror_texture( &tile->mirror, tile->texture, tile->version, device, out );
++}
++
+ static void surface_drop_tiles( struct drawing_surface *surface )
+ {
+     struct tile *tile, *next;
+@@ -358,8 +385,7 @@ static HRESULT surface_resize( struct drawing_surface *surface, SIZE size )
+     if (old)
+     {
+         ID3D11Texture2D_Release( old->texture );
+-        if (old->mirror) ID3D11Texture2D_Release( old->mirror );
+-        if (old->mirror_device) ID3D11Device_Release( old->mirror_device );
++        mirror_release( &old->mirror );
+         free( old );
+     }
+     return hr;
+diff --git a/dlls/dcomp/swapchain.c b/dlls/dcomp/swapchain.c
+new file mode 100644
+index 00000000000..b8bdedf02e1
+--- /dev/null
++++ b/dlls/dcomp/swapchain.c
+@@ -0,0 +1,214 @@
++/*
++ * Windows.UI.Composition surfaces of swapchains for composition
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "dxgi1_6.h"
++/* what the other interfaces of dxgi's own speak of, which is not for here */
++struct wined3d_device_parent;
++struct wined3d_resource;
++struct wined3d_texture;
++#include "initguid.h"
++#include "wine/winedxgi.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
++
++/*
++ * A surface of a swapchain made for composition shows what the swapchain
++ * presented last.  The swapchain keeps that in a texture of its device, and
++ * calls in on each present; as on Windows, what a swapchain presents is shown
++ * without a commit, so the targets are drawn again then.
++ */
++struct swapchain_surface
++{
++    struct object base;
++    ICompositionSurface ICompositionSurface_iface;
++    IDXGISwapChain1 *swapchain;
++    IWineDXGICompositionSwapChain *composition;
++    struct mirror mirror;           /* on the device a target draws with, when that is another */
++};
++
++static inline struct swapchain_surface *impl_from_swapchain_object( struct object *object )
++{
++    return CONTAINING_RECORD( object, struct swapchain_surface, base );
++}
++
++static HRESULT swapchain_query_interface( struct object *object, REFIID iid, void **out )
++{
++    struct swapchain_surface *surface = impl_from_swapchain_object( object );
++
++    if (IsEqualGUID( iid, &IID_ICompositionSurface )) *out = &surface->ICompositionSurface_iface;
++    else return object_query_interface( object, iid, out );
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static void WINAPI swapchain_presented( void *context )
++{
++    struct swapchain_surface *surface = context;
++    compositor_presented( surface->base.compositor );
++}
++
++/* called with the compositor locked */
++static void swapchain_close( struct object *object )
++{
++    struct swapchain_surface *surface = impl_from_swapchain_object( object );
++
++    IWineDXGICompositionSwapChain_remove_present_callback( surface->composition, swapchain_presented, surface );
++    mirror_release( &surface->mirror );
++}
++
++static void swapchain_destroy( struct object *object )
++{
++    struct swapchain_surface *surface = impl_from_swapchain_object( object );
++
++    IWineDXGICompositionSwapChain_Release( surface->composition );
++    IDXGISwapChain1_Release( surface->swapchain );
++    free( surface );
++}
++
++static const struct object_ops swapchain_ops =
++{
++    L"Windows.UI.Composition.CompositionSurface",
++    swapchain_query_interface,
++    swapchain_destroy,
++    swapchain_close,
++};
++
++DEFINE_IINSPECTABLE( swapchain, ICompositionSurface, struct swapchain_surface, base.ICompositionObject_iface )
++
++static const struct ICompositionSurfaceVtbl swapchain_vtbl =
++{
++    swapchain_QueryInterface,
++    swapchain_AddRef,
++    swapchain_Release,
++    /* IInspectable methods */
++    swapchain_GetIids,
++    swapchain_GetRuntimeClassName,
++    swapchain_GetTrustLevel,
++    /* ICompositionSurface methods */
++};
++
++static struct swapchain_surface *unsafe_impl_from_swapchain_surface( ICompositionSurface *iface )
++{
++    if (!iface || iface->lpVtbl != &swapchain_vtbl) return NULL;
++    return impl_from_ICompositionSurface( iface );
++}
++
++HRESULT swapchain_surface_create( struct compositor *compositor, IUnknown *swapchain, ICompositionSurface **out )
++{
++    IWineDXGICompositionSwapChain *composition;
++    struct swapchain_surface *surface;
++    IDXGISwapChain1 *swapchain1;
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!swapchain) return E_INVALIDARG;
++    if (FAILED(IUnknown_QueryInterface( swapchain, &IID_IDXGISwapChain1, (void **)&swapchain1 )))
++    {
++        WARN( "%p is not a swapchain.\n", swapchain );
++        return E_INVALIDARG;
++    }
++    /* only one made for composition can be shown */
++    if (FAILED(IDXGISwapChain1_QueryInterface( swapchain1, &IID_IWineDXGICompositionSwapChain, (void **)&composition )))
++    {
++        WARN( "swapchain %p is not one for composition.\n", swapchain );
++        IDXGISwapChain1_Release( swapchain1 );
++        return E_INVALIDARG;
++    }
++
++    if (!(surface = calloc( 1, sizeof(*surface) )))
++    {
++        IWineDXGICompositionSwapChain_Release( composition );
++        IDXGISwapChain1_Release( swapchain1 );
++        return E_OUTOFMEMORY;
++    }
++    object_init( &surface->base, &swapchain_ops, compositor );
++    surface->ICompositionSurface_iface.lpVtbl = &swapchain_vtbl;
++    surface->swapchain = swapchain1;
++    surface->composition = composition;
++    if (FAILED(hr = IWineDXGICompositionSwapChain_add_present_callback( composition, swapchain_presented, surface )))
++    {
++        /* closing takes away a callback it never had, which is nothing */
++        ICompositionSurface_Release( &surface->ICompositionSurface_iface );
++        return hr;
++    }
++
++    TRACE( "swapchain %p, surface %p.\n", swapchain, surface );
++    *out = &surface->ICompositionSurface_iface;
++    return S_OK;
++}
++
++/*
++ * What a swapchain surface shows, as a texture of the device a target draws
++ * with: on another device than the swapchain's, its pixels are brought over
++ * whenever it has presented since.  S_FALSE, and no texture, until the first
++ * present.  Called with the compositor locked.
++ */
++HRESULT swapchain_surface_texture( ICompositionSurface *iface, ID3D11Device *device, ID3D11Texture2D **out,
++                                   D2D1_ALPHA_MODE *alpha_mode )
++{
++    struct swapchain_surface *surface = unsafe_impl_from_swapchain_surface( iface );
++    ID3D11Texture2D *texture, *mirror;
++    DXGI_SWAP_CHAIN_DESC1 desc;
++    ID3D11Device *own;
++    IDXGISurface *presented;
++    UINT version;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!surface || surface->base.closed) return S_FALSE;
++    if (IWineDXGICompositionSwapChain_get_presented( surface->composition, &presented, &version ) != S_OK)
++        return S_FALSE;
++    hr = IDXGISurface_QueryInterface( presented, &IID_ID3D11Texture2D, (void **)&texture );
++    IDXGISurface_Release( presented );
++    if (FAILED(hr)) return hr;
++
++    /* composition shows what is presented with alpha premultiplied, or as opaque */
++    *alpha_mode = D2D1_ALPHA_MODE_IGNORE;
++    if (SUCCEEDED(IDXGISwapChain1_GetDesc1( surface->swapchain, &desc )))
++    {
++        if (desc.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED) *alpha_mode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++        else if (desc.AlphaMode == DXGI_ALPHA_MODE_STRAIGHT)
++        {
++            FIXME( "straight alpha drawn as premultiplied.\n" );
++            *alpha_mode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++        }
++    }
++
++    ID3D11Texture2D_GetDevice( texture, &own );
++    ID3D11Device_Release( own );
++    if (own == device)
++    {
++        *out = texture;
++        return S_OK;
++    }
++    hr = mirror_texture( &surface->mirror, texture, version, device, &mirror );
++    ID3D11Texture2D_Release( texture );
++    if (FAILED(hr)) return hr;
++    ID3D11Texture2D_AddRef( (*out = mirror) );
++    return S_OK;
++}
++
++BOOL is_swapchain_surface( ICompositionSurface *iface )
++{
++    return !!unsafe_impl_from_swapchain_surface( iface );
++}

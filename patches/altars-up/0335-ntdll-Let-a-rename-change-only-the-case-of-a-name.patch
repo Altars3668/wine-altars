@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 02:25:59 -0400
+Subject: [PATCH] ntdll: Let a rename change only the case of a name.
+
+The lookup of the new name is case-insensitive, so a name differing
+from the old one only in case found the file itself, and the server,
+seeing the same file, did nothing; on Windows the file then carries the
+case asked for ([MS-FSA] 2.1.5.15.12 returns early only on an exact
+match), for files and directories alike, as the MoveFile tests expect.
+The new name now keeps the case asked for when the file it was found as
+is the one being renamed, and when it is a file that the rename
+replaces, the result is renamed to it once in place.  A name matched
+through its short name is left alone.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/file.c b/dlls/kernel32/tests/file.c
+index 17e9b34170a..67d33b8b8e5 100644
+--- a/dlls/kernel32/tests/file.c
++++ b/dlls/kernel32/tests/file.c
+@@ -2086,7 +2086,7 @@ static void test_MoveFileA(void)
+     ok(hfile != INVALID_HANDLE_VALUE, "FindFirstFileA: failed, error %ld\n", GetLastError());
+     if (hfile != INVALID_HANDLE_VALUE)
+     {
+-        todo_wine ok(!lstrcmpA(strrchr(tempdir, '\\') + 1, find_data.cFileName),
++        ok(!lstrcmpA(strrchr(tempdir, '\\') + 1, find_data.cFileName),
+            "MoveFile failed to change casing on same file: got %s\n", find_data.cFileName);
+     }
+     CloseHandle(hfile);
+@@ -2131,7 +2131,7 @@ static void test_MoveFileA(void)
+     ok(hfile != INVALID_HANDLE_VALUE, "FindFirstFileA: failed, error %ld\n", GetLastError());
+     if (hfile != INVALID_HANDLE_VALUE)
+     {
+-        todo_wine ok(!lstrcmpA(strrchr(tempdir, '\\') + 1, find_data.cFileName),
++        ok(!lstrcmpA(strrchr(tempdir, '\\') + 1, find_data.cFileName),
+            "MoveFile failed to change casing on same directory: got %s\n", find_data.cFileName);
+     }
+     CloseHandle(hfile);
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 94da5e3d802..a004b3d362a 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5410,6 +5410,70 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+ }
+ 
+ 
++/* the unix name with its last element spelled as the NT name asks, when the two differ only in case */
++static char *unix_name_in_asked_case( const UNICODE_STRING *name, const char *unix_name )
++{
++    const WCHAR *end = name->Buffer + name->Length / sizeof(WCHAR), *last = end;
++    const char *disk = strrchr( unix_name, '/' );
++    WCHAR disk_name[MAX_DIR_ENTRY_LEN + 1];
++    int len, disk_len;
++    size_t dir_len;
++    char *ret;
++
++    while (last > name->Buffer && last[-1] != '\\' && last[-1] != '/') last--;
++    if (last == end || !disk) return NULL;
++    disk++;
++    /* the same letters in another case only, not a short name */
++    disk_len = ntdll_umbstowcs( disk, strlen( disk ), disk_name, ARRAY_SIZE(disk_name) );
++    if (disk_len != end - last || !wcsncmp( disk_name, last, disk_len ) || wcsnicmp( disk_name, last, disk_len ))
++        return NULL;
++
++    dir_len = disk - unix_name;
++    if (!(ret = malloc( dir_len + (end - last) * 3 + 1 ))) return NULL;
++    memcpy( ret, unix_name, dir_len );
++    if ((len = ntdll_wcstoumbs( last, end - last, ret + dir_len, (end - last) * 3, TRUE )) <= 0)
++    {
++        free( ret );
++        return NULL;
++    }
++    ret[dir_len + len] = 0;
++    return ret;
++}
++
++/* whether a unix name names the file that a handle is open on */
++static BOOL is_handle_file( HANDLE handle, const char *unix_name )
++{
++    struct stat st1, st2;
++    int fd, needs_close;
++    BOOL ret;
++
++    if (server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )) return FALSE;
++    ret = !fstat( fd, &st1 ) && !stat( unix_name, &st2 ) && st1.st_dev == st2.st_dev && st1.st_ino == st2.st_ino;
++    if (needs_close) close( fd );
++    return ret;
++}
++
++static unsigned int set_fd_name( HANDLE handle, OBJECT_ATTRIBUTES *attr, const char *unix_name, BOOL link,
++                                 unsigned int flags )
++{
++    unsigned int status;
++
++    SERVER_START_REQ( set_fd_name_info )
++    {
++        req->handle   = wine_server_obj_handle( handle );
++        req->rootdir  = wine_server_obj_handle( attr->RootDirectory );
++        req->namelen  = attr->ObjectName->Length;
++        req->link     = link;
++        req->flags    = flags;
++        wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
++        wine_server_add_data( req, unix_name, strlen(unix_name) );
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    return status;
++}
++
++
+ /******************************************************************************
+  *              NtSetInformationFile   (NTDLL.@)
+  */
+@@ -5712,19 +5776,19 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
+             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+             {
+-                SERVER_START_REQ( set_fd_name_info )
++                /* a name found in another case takes the case asked for, whether it is the file itself
++                 * that is renamed or one that the rename replaces */
++                char *asked = status ? NULL : unix_name_in_asked_case( &name_str, unix_name );
++
++                if (asked && is_handle_file( handle, unix_name ))
+                 {
+-                    req->handle   = wine_server_obj_handle( handle );
+-                    req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
+-                    req->namelen  = attr.ObjectName->Length;
+-                    req->link     = FALSE;
+-                    req->flags    = flags;
+-                    wine_server_add_data( req, attr.ObjectName->Buffer, attr.ObjectName->Length );
+-                    wine_server_add_data( req, unix_name, strlen(unix_name) );
+-                    status = wine_server_call( req );
++                    free( unix_name );
++                    unix_name = asked;
++                    asked = NULL;
+                 }
+-                SERVER_END_REQ;
+-
++                status = set_fd_name( handle, &attr, unix_name, FALSE, flags );
++                if (!status && asked) status = set_fd_name( handle, &attr, asked, FALSE, flags );
++                free( asked );
+             }
+             free( unix_name );
+             free( nt_name.Buffer );
+@@ -5762,21 +5826,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             InitializeObjectAttributes( &attr, &name_str, OBJ_CASE_INSENSITIVE, info->RootDirectory, NULL );
+             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
+             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+-            {
+-                SERVER_START_REQ( set_fd_name_info )
+-                {
+-                    req->handle   = wine_server_obj_handle( handle );
+-                    req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
+-                    req->namelen  = attr.ObjectName->Length;
+-                    req->link     = TRUE;
+-                    req->flags    = flags;
+-                    wine_server_add_data( req, attr.ObjectName->Buffer, attr.ObjectName->Length );
+-                    wine_server_add_data( req, unix_name, strlen(unix_name) );
+-                    status  = wine_server_call( req );
+-                }
+-                SERVER_END_REQ;
+-
+-            }
++                status = set_fd_name( handle, &attr, unix_name, TRUE, flags );
+             free( unix_name );
+             free( nt_name.Buffer );
+         }

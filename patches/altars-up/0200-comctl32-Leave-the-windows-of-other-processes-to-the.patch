@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:11:26 -0400
+Subject: [PATCH] comctl32: Leave the windows of other processes to them in the
+ subclassing helpers.
+
+The subclass stack a window property points to belongs to the process
+that made it, and another process read it as its own: Excel, in place
+in a Word document, asked GetWindowSubclass about Word's window and
+crashed in the middle of IOleObject::DoVerb.  As on Windows, another
+process now sees no subclass of the window and changes nothing; another
+thread of the owner's sees them and may remove one, but not add one;
+DefSubclassProc outside a subclass procedure calls nothing; and version
+6 keeps its stack under the name it uses there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8741ba915f8fb81b935beeba3a2723cfffda72e6)
+
+diff --git a/dlls/comctl32/commctrl.c b/dlls/comctl32/commctrl.c
+index 3ddc3452fec..aff98b66bbd 100644
+--- a/dlls/comctl32/commctrl.c
++++ b/dlls/comctl32/commctrl.c
+@@ -89,7 +89,12 @@ static const WORD wPattern55AA[] =
+     0x5555, 0xaaaa, 0x5555, 0xaaaa
+ };
+ 
++/* the window property the subclassing helpers keep their stack in, which version 6 names differently */
++#if __WINE_COMCTL32_VERSION == 6
++static const WCHAR strCC32SubclassInfo[] = L"UxSubclassInfo";
++#else
+ static const WCHAR strCC32SubclassInfo[] = L"CC32SubclassInfo";
++#endif
+ 
+ static const struct
+ {
+@@ -1010,6 +1015,15 @@ VOID WINAPI InitMUILanguage (LANGID uiLang)
+ }
+ 
+ 
++/* The subclassing helpers leave alone the windows of other processes: the stack a window property points to
++ * belongs to the process that made it. */
++static BOOL is_process_window(HWND hwnd)
++{
++    DWORD pid;
++
++    return GetWindowThreadProcessId(hwnd, &pid) && pid == GetCurrentProcessId();
++}
++
+ /***********************************************************************
+  * SetWindowSubclass [COMCTL32.410]
+  *
+@@ -1042,6 +1056,10 @@ BOOL WINAPI SetWindowSubclass (HWND hWnd, SUBCLASSPROC pfnSubclass,
+    if (!hWnd || !pfnSubclass)
+        return FALSE;
+ 
++   /* only the thread that owns the window subclasses it */
++   if (GetWindowThreadProcessId(hWnd, NULL) != GetCurrentThreadId())
++       return FALSE;
++
+    /* Since the window procedure that we set here has two additional arguments,
+     * we can't simply set it as the new window procedure of the window. So we
+     * set our own window procedure and then calculate the other two arguments
+@@ -1123,6 +1141,9 @@ BOOL WINAPI GetWindowSubclass (HWND hWnd, SUBCLASSPROC pfnSubclass,
+ 
+    TRACE("%p, %p, %Ix, %p\n", hWnd, pfnSubclass, uID, pdwRef);
+ 
++   if (!is_process_window(hWnd))
++      goto done;
++
+    /* See if we have been called for this window */
+    stack = GetPropW (hWnd, COMCTL32_wSubclass);
+    if (!stack)
+@@ -1170,6 +1191,9 @@ BOOL WINAPI RemoveWindowSubclass(HWND hWnd, SUBCLASSPROC pfnSubclass, UINT_PTR u
+ 
+    TRACE("%p, %p, %Ix.\n", hWnd, pfnSubclass, uID);
+ 
++   if (!is_process_window(hWnd))
++      return FALSE;
++
+    /* Find the Subclass to remove */
+    stack = GetPropW (hWnd, COMCTL32_wSubclass);
+    if (!stack)
+@@ -1276,6 +1300,9 @@ LRESULT WINAPI DefSubclassProc (HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
+ 
+    TRACE("%p, %#x, %#Ix, %#Ix\n", hWnd, uMsg, wParam, lParam);
+ 
++   if (!is_process_window(hWnd))
++      return 0;
++
+    /* retrieve our little stack from the Properties */
+    stack = GetPropW (hWnd, COMCTL32_wSubclass);
+    if (!stack) {
+@@ -1283,6 +1310,12 @@ LRESULT WINAPI DefSubclassProc (HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
+       return 0;
+    }
+ 
++   /* outside a subclass procedure there is no next procedure to call */
++   if (!stack->running) {
++      WARN("called outside a subclass procedure for %p\n", hWnd);
++      return 0;
++   }
++
+    /* If we are at the end of stack then we have to call the original
+     * window procedure */
+    if (!stack->stackpos) {
+diff --git a/dlls/comctl32/tests/subclass.c b/dlls/comctl32/tests/subclass.c
+index 73e7288e8a2..e6d18c5a96c 100644
+--- a/dlls/comctl32/tests/subclass.c
++++ b/dlls/comctl32/tests/subclass.c
+@@ -448,12 +448,119 @@ static void test_GetWindowSubclass(void)
+     DestroyWindow(hwnd);
+ }
+ 
++static HWND other_thread_window;
++
++static DWORD WINAPI other_thread_proc(void *arg)
++{
++    DWORD_PTR data = 0xdeadbeef;
++    BOOL ret;
++
++    /* another thread sees the subclasses of the window and may remove them, but not add one */
++    ret = pGetWindowSubclass(other_thread_window, wnd_proc_sub, 2, &data);
++    ok(ret, "GetWindowSubclass failed.\n");
++    ok(data == 7, "Got unexpected data %#Ix.\n", data);
++    ret = pSetWindowSubclass(other_thread_window, wnd_proc_sub, 3, 8);
++    ok(!ret, "SetWindowSubclass succeeded.\n");
++    ret = pGetWindowSubclass(other_thread_window, wnd_proc_sub, 3, NULL);
++    ok(!ret, "GetWindowSubclass succeeded.\n");
++    ret = pDefSubclassProc(other_thread_window, WM_GETTEXTLENGTH, 0, 0);
++    ok(!ret, "DefSubclassProc returned %d.\n", ret);
++    ret = pRemoveWindowSubclass(other_thread_window, wnd_proc_sub, 2);
++    ok(ret, "RemoveWindowSubclass failed.\n");
++    return 0;
++}
++
++/* another process sees no subclass of the window, and changes nothing */
++static void other_process(HWND hwnd, SUBCLASSPROC proc)
++{
++    DWORD_PTR data = 0xdeadbeef;
++    BOOL ret;
++
++    ret = pGetWindowSubclass(hwnd, proc, 2, &data);
++    ok(!ret, "GetWindowSubclass succeeded.\n");
++    ok(!data, "Got unexpected data %#Ix.\n", data);
++    ret = pSetWindowSubclass(hwnd, wnd_proc_sub, 4, 9);
++    ok(!ret, "SetWindowSubclass succeeded.\n");
++    ret = pDefSubclassProc(hwnd, WM_GETTEXTLENGTH, 0, 0);
++    ok(!ret, "DefSubclassProc returned %d.\n", ret);
++    ret = pRemoveWindowSubclass(hwnd, proc, 2);
++    ok(!ret, "RemoveWindowSubclass succeeded.\n");
++}
++
++static void test_other_thread_and_process(char **argv)
++{
++    STARTUPINFOA si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    char cmdline[MAX_PATH + 64];
++    DWORD_PTR data;
++    HANDLE thread;
++    HWND hwnd;
++    BOOL ret;
++
++    hwnd = CreateWindowA("TestSubclass", "Test subclass", WS_OVERLAPPEDWINDOW, 100, 100, 200, 200,
++                         0, 0, 0, NULL);
++    ok(hwnd != NULL, "CreateWindowA failed, error %ld.\n", GetLastError());
++    ret = pSetWindowSubclass(hwnd, wnd_proc_sub, 2, 7);
++    ok(ret, "SetWindowSubclass failed.\n");
++
++    /* outside a subclass procedure there is no next procedure to call */
++    ret = pDefSubclassProc(hwnd, WM_GETTEXTLENGTH, 0, 0);
++    ok(!ret, "DefSubclassProc returned %d.\n", ret);
++
++    other_thread_window = hwnd;
++    thread = CreateThread(NULL, 0, other_thread_proc, NULL, 0, NULL);
++    ok(!WaitForSingleObject(thread, 5000), "wait failed\n");
++    CloseHandle(thread);
++    ret = pGetWindowSubclass(hwnd, wnd_proc_sub, 2, NULL);
++    ok(!ret, "GetWindowSubclass succeeded.\n");
++    ret = pGetWindowSubclass(hwnd, wnd_proc_sub, 3, NULL);
++    ok(!ret, "GetWindowSubclass succeeded.\n");
++
++    ret = pSetWindowSubclass(hwnd, wnd_proc_sub, 2, 7);
++    ok(ret, "SetWindowSubclass failed.\n");
++    sprintf(cmdline, "\"%s\" subclass %p %p", argv[0], hwnd, wnd_proc_sub);
++    ret = CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
++    ok(ret, "CreateProcess failed, error %lu.\n", GetLastError());
++    if (ret)
++    {
++        wait_child_process(&pi);
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++    }
++    data = 0xdeadbeef;
++    ret = pGetWindowSubclass(hwnd, wnd_proc_sub, 2, &data);
++    ok(ret, "GetWindowSubclass failed.\n");
++    ok(data == 7, "Got unexpected data %#Ix.\n", data);
++    ret = pGetWindowSubclass(hwnd, wnd_proc_sub, 4, NULL);
++    ok(!ret, "GetWindowSubclass succeeded.\n");
++
++    pRemoveWindowSubclass(hwnd, wnd_proc_sub, 2);
++    DestroyWindow(hwnd);
++    flush_sequence();
++}
++
+ START_TEST(subclass)
+ {
++    char **argv;
++    int argc;
++
+     if(!init_function_pointers()) return;
+ 
++    argc = winetest_get_mainargs(&argv);
++    if (argc >= 4)
++    {
++        HWND hwnd;
++        SUBCLASSPROC proc;
++
++        sscanf(argv[2], "%p", &hwnd);
++        sscanf(argv[3], "%p", &proc);
++        other_process(hwnd, proc);
++        return;
++    }
++
+     if(!register_window_classes()) return;
+ 
+     test_subclass();
+     test_GetWindowSubclass();
++    test_other_thread_and_process(argv);
+ }

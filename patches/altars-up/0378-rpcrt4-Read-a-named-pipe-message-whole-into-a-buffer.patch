@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 14:07:51 -0400
+Subject: [PATCH] rpcrt4: Read a named pipe message whole into a buffer.
+
+Receiving a packet took three reads of the message-mode pipe: an empty
+one waiting for data, then the common header, then the rest.  Each is a
+wineserver round trip or more.  Now the connection reads the whole
+message, up to RPC_MAX_PACKET_SIZE, into a buffer when it waits for
+data or needs more, and serves the header and the body from there,
+still stopping at the end of a message as the single reads did.
+
+An ncalrpc call between two processes (48 bytes each way) went from 22
+wineserver requests to 14, and from 274 to 191 us.  Click-to-Run's
+registry hooks make about ten thousand such calls while Office starts.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/rpcrt4/rpc_transport.c b/dlls/rpcrt4/rpc_transport.c
+index ad59637e9fc..aa034b907ee 100644
+--- a/dlls/rpcrt4/rpc_transport.c
++++ b/dlls/rpcrt4/rpc_transport.c
+@@ -67,6 +67,12 @@ typedef struct _RpcConnection_np
+     IO_STATUS_BLOCK io_status;
+     HANDLE event_cache;
+     BOOL read_closed;
++    /* a message is read whole into this buffer and handed out from there, so reading a packet's header
++     * and body is one read of the pipe instead of three */
++    char *read_buffer;
++    unsigned int read_pos;
++    unsigned int read_len;
++    BOOL read_more;     /* the message in the buffer goes on in the pipe */
+ } RpcConnection_np;
+ 
+ static RpcConnection *rpcrt4_conn_np_alloc(void)
+@@ -301,6 +307,15 @@ static void rpcrt4_conn_np_handoff(RpcConnection_np *old_npc, RpcConnection_np *
+     new_npc->pipe = old_npc->pipe;
+     old_npc->pipe = 0;
+     assert(!old_npc->listen_event);
++
++    /* and what was read from it */
++    new_npc->read_buffer = old_npc->read_buffer;
++    new_npc->read_pos = old_npc->read_pos;
++    new_npc->read_len = old_npc->read_len;
++    new_npc->read_more = old_npc->read_more;
++    old_npc->read_buffer = NULL;
++    old_npc->read_pos = old_npc->read_len = 0;
++    old_npc->read_more = FALSE;
+ }
+ 
+ static RPC_STATUS rpcrt4_ncacn_np_handoff(RpcConnection *old_conn, RpcConnection *new_conn)
+@@ -371,12 +386,15 @@ static RPC_STATUS rpcrt4_ncalrpc_handoff(RpcConnection *old_conn, RpcConnection
+   return status;
+ }
+ 
+-static int rpcrt4_conn_np_read(RpcConnection *conn, void *buffer, unsigned int count)
++/* reads the next message, or the next part of one, into the connection's buffer */
++static int rpcrt4_conn_np_fill(RpcConnection_np *connection)
+ {
+-    RpcConnection_np *connection = (RpcConnection_np *) conn;
+     HANDLE event;
+     NTSTATUS status;
+ 
++    if (!connection->read_buffer && !(connection->read_buffer = malloc(RPC_MAX_PACKET_SIZE)))
++        return -1;
++
+     event = get_np_event(connection);
+     if (!event)
+         return -1;
+@@ -384,7 +402,8 @@ static int rpcrt4_conn_np_read(RpcConnection *conn, void *buffer, unsigned int c
+     if (connection->read_closed)
+         status = STATUS_CANCELLED;
+     else
+-        status = NtReadFile(connection->pipe, event, NULL, NULL, &connection->io_status, buffer, count, NULL, NULL);
++        status = NtReadFile(connection->pipe, event, NULL, NULL, &connection->io_status,
++                            connection->read_buffer, RPC_MAX_PACKET_SIZE, NULL, NULL);
+     if (status == STATUS_PENDING)
+     {
+         /* check read_closed again before waiting to avoid a race */
+@@ -397,7 +416,49 @@ static int rpcrt4_conn_np_read(RpcConnection *conn, void *buffer, unsigned int c
+         status = connection->io_status.Status;
+     }
+     release_np_event(connection, event);
+-    return status && status != STATUS_BUFFER_OVERFLOW ? -1 : connection->io_status.Information;
++    if (status && status != STATUS_BUFFER_OVERFLOW)
++        return -1;
++
++    connection->read_pos = 0;
++    connection->read_len = connection->io_status.Information;
++    connection->read_more = status == STATUS_BUFFER_OVERFLOW;
++    return 0;
++}
++
++/* like a read of the message-mode pipe: stops at the end of a message */
++static int rpcrt4_conn_np_read(RpcConnection *conn, void *buffer, unsigned int count)
++{
++    RpcConnection_np *connection = (RpcConnection_np *) conn;
++    unsigned int done = 0, len;
++
++    if (connection->read_closed)
++        return -1;
++
++    /* waiting for incoming data: the next message is read into the buffer */
++    if (!count)
++    {
++        if (connection->read_pos < connection->read_len)
++            return 0;
++        return rpcrt4_conn_np_fill(connection);
++    }
++
++    while (done < count)
++    {
++        if (connection->read_pos == connection->read_len)
++        {
++            if (done && !connection->read_more)
++                break;
++            if (rpcrt4_conn_np_fill(connection) < 0)
++                return -1;
++            if (!connection->read_len)
++                break;
++        }
++        len = min(count - done, connection->read_len - connection->read_pos);
++        memcpy((char *)buffer + done, connection->read_buffer + connection->read_pos, len);
++        connection->read_pos += len;
++        done += len;
++    }
++    return done;
+ }
+ 
+ static int rpcrt4_conn_np_write(RpcConnection *conn, const void *buffer, unsigned int count)
+@@ -444,6 +505,10 @@ static int rpcrt4_conn_np_close(RpcConnection *conn)
+         CloseHandle(connection->event_cache);
+         connection->event_cache = 0;
+     }
++    free(connection->read_buffer);
++    connection->read_buffer = NULL;
++    connection->read_pos = connection->read_len = 0;
++    connection->read_more = FALSE;
+     return 0;
+ }
+ 

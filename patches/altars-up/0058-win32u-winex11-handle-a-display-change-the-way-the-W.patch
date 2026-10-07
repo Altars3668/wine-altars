@@ -1,0 +1,576 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 05:11:31 -0400
+Subject: [PATCH] win32u, winex11: handle a display change the way the Windows
+ kernel does.
+
+Turning a phone running a remote desktop client from portrait to landscape
+left Word in a frame the size of the old screen.  Three things were
+different from Windows:
+
+The desktop's process now owns the display configuration, as the kernel
+does: it enumerates, commits and tells everybody.  A process that notices
+the host has moved on asks the desktop to look again instead of publishing
+what it saw itself -- several processes rewriting the configuration at once
+is how one of them came to read a screen half written, and a process on
+another X server published that server's screen for the whole session.
+
+A configuration is committed in one step.  The enumeration is recorded and
+replayed into the registry only once it has a monitor, so the moment a
+remote session spends with no output while it swaps screens leaves the
+stored configuration where it was, instead of every process falling back to
+a stand-in monitor.  A host with a single mode keeps an emulated mode only
+while the host stays in the mode it was set on.
+
+After a real change -- and only then -- every top-level window is told with
+WM_DISPLAYCHANGE, whoever changed the display, and each maximized window is
+maximized again in its own thread, through WM_GETMINMAXINFO and with
+SWP_FRAMECHANGED.  The window manager resizes the X window first, while the
+configuration is still the old one, and Office works its client area out
+from the monitor it has at that moment; nothing made it look again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit a8bf29779482613edbf59ac19f48feeb115d4d47)
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 8c9a2aaef7c..b5395bfdfb3 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2263,8 +2263,13 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+         return 0;
+     }
+     case WM_WINE_UPDATEWINDOWSTATE:
++        if (wparam) fit_window_to_display( hwnd );
+         update_window_state( hwnd );
+         return 0;
++    case WM_WINE_DISPLAYMODECHANGED:
++        /* a display change another process noticed, for the desktop to take up */
++        if (hwnd == get_desktop_window()) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
++        return 0;
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index b6d7e040d48..4640bf47f55 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2235,7 +2235,21 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+     }
+     else
+     {
+-        if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ))
++        DEVMODEW stored_physical;
++
++        /* A host with a single mode has the modes programs ask for emulated on
++         * top of it, and the one in use is kept in the registry.  That stands
++         * for as long as the host stays in the mode it was set on.  Once the
++         * host changes the mode itself -- a remote session resized by its
++         * client, a phone turned from portrait to landscape -- the display is
++         * the new mode, as it would be on Windows, where there is no emulated
++         * mode to outlive it.  Keeping the stored one kept the monitor, and
++         * every window sized from it, at the size of a screen that was gone. */
++        if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ) ||
++            !read_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &stored_physical ) ||
++            stored_physical.dmPelsWidth != physical.dmPelsWidth ||
++            stored_physical.dmPelsHeight != physical.dmPelsHeight ||
++            stored_physical.dmDisplayOrientation != physical.dmDisplayOrientation)
+             virtual = physical;
+ 
+         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
+@@ -2845,16 +2859,205 @@ static BOOL add_virtual_source( struct device_manager_ctx *ctx )
+     return STATUS_SUCCESS;
+ }
+ 
++/* What the driver reported in one enumeration, kept until it is known to
++ * describe a screen.
++ *
++ * The device manager writes the registry as the driver calls it: the first
++ * GPU empties the stored configuration, and every source and monitor after it
++ * is written as it arrives.  A host part way through a mode switch -- a remote
++ * desktop client turned from portrait to landscape takes the old output down
++ * before it puts the new one up -- enumerates as sources with no monitors, and
++ * by the time that shows, the configuration every process reads has already
++ * been replaced by it.  They then fall back to a stand-in monitor, and size
++ * their windows from that.
++ *
++ * On Windows the configuration belongs to the kernel and changes in one step:
++ * no program ever reads a screen that is half torn down.  Recording the
++ * enumeration and replaying it into the device manager only once it has a
++ * monitor gives the same guarantee -- the stored configuration goes straight
++ * from the old screen to the new one, and a moment with nothing attached
++ * leaves it where it was. */
++enum device_call
++{
++    DEVICE_CALL_GPU,
++    DEVICE_CALL_SOURCE,
++    DEVICE_CALL_MONITOR,
++    DEVICE_CALL_MODES,
++};
++
++struct device_record
++{
++    struct list entry;
++    enum device_call call;
++    char *name;
++    union
++    {
++        struct
++        {
++            struct pci_id pci_id;
++            GUID vulkan_uuid;
++            BOOL has_vulkan_uuid;
++        } gpu;
++        struct
++        {
++            UINT state_flags;
++            UINT dpi;
++        } source;
++        struct gdi_monitor monitor;
++        struct
++        {
++            DEVMODEW current;
++            UINT count;
++            DEVMODEW *modes;
++        } modes;
++    };
++};
++
++struct device_recording
++{
++    struct list records;
++    UINT monitor_count;
++    BOOL failed;
++};
++
++static struct device_record *record_device_call( struct device_recording *recording, enum device_call call,
++                                                 const char *name )
++{
++    struct device_record *record;
++
++    if (recording->failed) return NULL;
++    if (!(record = calloc( 1, sizeof(*record) )) || (name && !(record->name = strdup( name ))))
++    {
++        free( record );
++        recording->failed = TRUE;
++        return NULL;
++    }
++
++    record->call = call;
++    list_add_tail( &recording->records, &record->entry );
++    return record;
++}
++
++static void record_gpu( const char *name, const struct pci_id *pci_id, const GUID *vulkan_uuid, void *param )
++{
++    struct device_record *record;
++
++    if (!(record = record_device_call( param, DEVICE_CALL_GPU, name ))) return;
++    record->gpu.pci_id = *pci_id;
++    if ((record->gpu.has_vulkan_uuid = vulkan_uuid != NULL)) record->gpu.vulkan_uuid = *vulkan_uuid;
++}
++
++static void record_source( const char *name, UINT state_flags, UINT dpi, void *param )
++{
++    struct device_record *record;
++
++    if (!(record = record_device_call( param, DEVICE_CALL_SOURCE, name ))) return;
++    record->source.state_flags = state_flags;
++    record->source.dpi = dpi;
++}
++
++static void record_monitor( const struct gdi_monitor *monitor, void *param )
++{
++    struct device_recording *recording = param;
++    struct device_record *record;
++
++    if (!(record = record_device_call( recording, DEVICE_CALL_MONITOR, NULL ))) return;
++    record->monitor = *monitor;
++    record->monitor.edid = NULL;
++    if (monitor->edid && monitor->edid_len)
++    {
++        if (!(record->monitor.edid = malloc( monitor->edid_len )))
++        {
++            recording->failed = TRUE;
++            return;
++        }
++        memcpy( record->monitor.edid, monitor->edid, monitor->edid_len );
++    }
++    recording->monitor_count++;
++}
++
++static void record_modes( const DEVMODEW *current, UINT count, const DEVMODEW *modes, void *param )
++{
++    struct device_recording *recording = param;
++    struct device_record *record;
++
++    if (!(record = record_device_call( recording, DEVICE_CALL_MODES, NULL ))) return;
++    record->modes.current = *current;
++    if (!(record->modes.count = count)) return;
++
++    /* add_modes() takes modes without driver data, one DEVMODEW after another */
++    if (!(record->modes.modes = malloc( count * sizeof(*modes) )))
++    {
++        recording->failed = TRUE;
++        return;
++    }
++    memcpy( record->modes.modes, modes, count * sizeof(*modes) );
++}
++
++static const struct gdi_device_manager device_recorder =
++{
++    record_gpu,
++    record_source,
++    record_monitor,
++    record_modes,
++};
++
++static void replay_device_calls( const struct device_recording *recording, struct device_manager_ctx *ctx )
++{
++    const struct device_record *record;
++
++    LIST_FOR_EACH_ENTRY( record, &recording->records, const struct device_record, entry )
++    {
++        switch (record->call)
++        {
++        case DEVICE_CALL_GPU:
++            device_manager.add_gpu( record->name, &record->gpu.pci_id,
++                                    record->gpu.has_vulkan_uuid ? &record->gpu.vulkan_uuid : NULL, ctx );
++            break;
++        case DEVICE_CALL_SOURCE:
++            device_manager.add_source( record->name, record->source.state_flags, record->source.dpi, ctx );
++            break;
++        case DEVICE_CALL_MONITOR:
++            device_manager.add_monitor( &record->monitor, ctx );
++            break;
++        case DEVICE_CALL_MODES:
++            device_manager.add_modes( &record->modes.current, record->modes.count, record->modes.modes, ctx );
++            break;
++        }
++    }
++}
++
++static void free_device_recording( struct device_recording *recording )
++{
++    struct device_record *record, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( record, next, &recording->records, struct device_record, entry )
++    {
++        list_remove( &record->entry );
++        if (record->call == DEVICE_CALL_MONITOR) free( record->monitor.edid );
++        if (record->call == DEVICE_CALL_MODES) free( record->modes.modes );
++        free( record->name );
++        free( record );
++    }
++}
++
+ static UINT update_display_devices( struct device_manager_ctx *ctx )
+ {
++    struct device_recording recording = {.records = LIST_INIT( recording.records )};
+     UINT status;
+ 
+-    if (!(status = user_driver->pUpdateDisplayDevices( &device_manager, ctx )))
++    if (!(status = user_driver->pUpdateDisplayDevices( &device_recorder, &recording )))
+     {
+-        if (ctx->source_count && is_virtual_desktop()) return add_virtual_source( ctx );
++        if (recording.failed) status = STATUS_NO_MEMORY;
++        else if (recording.monitor_count || is_virtual_desktop()) replay_device_calls( &recording, ctx );
++        else TRACE( "host reports no monitors, keeping the stored configuration.\n" );
++        free_device_recording( &recording );
++
++        if (!status && ctx->source_count && is_virtual_desktop()) return add_virtual_source( ctx );
+         return status;
+     }
+ 
++    free_device_recording( &recording );
+     if (status == STATUS_NOT_IMPLEMENTED) return default_update_display_devices( ctx );
+     return status;
+ }
+@@ -2946,10 +3149,48 @@ static BOOL host_display_changed(void)
+     if (!user_driver->pGetHostDisplayKey( &key )) return FALSE;
+     if (key == published) return FALSE;
+ 
+-    TRACE( "host display key %#I64x no longer matches the published %#I64x.\n", key, published );
++    TRACE( "host display key %s no longer matches the published %s.\n",
++           wine_dbgstr_longlong( key ), wine_dbgstr_longlong( published ) );
+     return TRUE;
+ }
+ 
++/* The session's desktop window if it has one yet.  Unlike get_desktop_window()
++ * this never starts explorer to make one: it is asked from inside the display
++ * code, which the desktop's own creation goes through. */
++static HWND get_existing_desktop_window(void)
++{
++    struct user_thread_info *thread_info = get_user_thread_info();
++    HWND desktop = 0;
++
++    if (thread_info->top_window) return thread_info->top_window;
++
++    SERVER_START_REQ( get_desktop_window )
++    {
++        req->force = 0;
++        if (!wine_server_call( req )) desktop = UlongToHandle( reply->top_window );
++    }
++    SERVER_END_REQ;
++    return desktop;
++}
++
++/* On Windows the display configuration is the kernel's: it alone reads the
++ * hardware, applies a change in one step and then tells everybody.  Here the
++ * desktop's process plays that part.  Another process that notices the host
++ * has moved on asks it to look again rather than enumerating and publishing
++ * on its own: several processes rewriting the configuration at once is how
++ * one of them comes to read a screen half written, and a process attached to
++ * another X server than the session's would publish that server's screen for
++ * everybody.  A session with no desktop yet has nobody to ask, so whoever is
++ * first derives the configuration, as before. */
++static BOOL request_display_update(void)
++{
++    HWND desktop = get_existing_desktop_window();
++
++    if (!desktop) return FALSE;
++    TRACE( "asking the desktop %p to take up a display change.\n", desktop );
++    return NtUserPostMessage( desktop, WM_WINE_DISPLAYMODECHANGED, 0, 0 );
++}
++
+ static BOOL lock_display_devices( BOOL force )
+ {
+     static const WCHAR wine_service_station_name[] =
+@@ -2997,7 +3238,11 @@ static BOOL lock_display_devices( BOOL force )
+      * yet.  Keying it on the process would put a full enumeration, vulkan GPUs
+      * and all, in front of every program's first window. */
+     if (serial <= 1) force = TRUE;
+-    if (!force && host_display_changed()) force = TRUE;
++    /* The host has moved on: the desktop re-derives the configuration and
++     * publishes it, and until it has, the published one stands -- a change
++     * applied here would be one nobody else is told about.  Only a session
++     * without a desktop to ask does it in place. */
++    if (!force && host_display_changed() && !request_display_update()) force = TRUE;
+     if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
+     if (force)
+     {
+@@ -4579,15 +4824,58 @@ static BOOL get_primary_source_mode( DEVMODEW *mode )
+  * Windows recomputes it with the screen and tells applications so. */
+ static void invalidate_work_area(void);
+ 
++/* What a display change is judged by: the monitors' areas and work areas, in
++ * the host's own coordinates. */
++struct display_snapshot
++{
++    UINT count;
++    RECT monitor[16];
++    RECT work[16];
++};
++
++static void get_display_snapshot( struct display_snapshot *snapshot )
++{
++    struct monitor *monitor;
++
++    memset( snapshot, 0, sizeof(*snapshot) );
++    if (!lock_display_devices( FALSE )) return;
++
++    LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
++    {
++        if (!is_monitor_active( monitor ) || monitor->is_clone) continue;
++        if (snapshot->count == ARRAY_SIZE(snapshot->monitor)) break;
++        snapshot->monitor[snapshot->count] = monitor_get_rect( monitor, 0, MDT_RAW_DPI );
++        snapshot->work[snapshot->count] = monitor->rc_work;
++        snapshot->count++;
++    }
++
++    unlock_display_devices();
++}
++
+ static void display_mode_changed( BOOL broadcast )
+ {
+     DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
++    struct display_snapshot before, after;
+ 
++    get_display_snapshot( &before );
+     if (!update_display_cache( TRUE ))
+     {
+         ERR( "Failed to update display cache after mode change.\n" );
+         return;
+     }
++    get_display_snapshot( &after );
++
++    /* A host that reports every property it changes, a change noticed twice,
++     * a moment with nothing attached that was not committed: none of them is a
++     * new screen, and Windows says nothing about them.  Telling programs the
++     * display changed when it has not makes them tear down and rebuild what
++     * they draw with, for nothing. */
++    if (!broadcast && !memcmp( &before, &after, sizeof(before) ))
++    {
++        TRACE( "display configuration unchanged.\n" );
++        return;
++    }
++
+     if (!get_primary_source_mode( &current_mode ))
+     {
+         ERR( "Failed to get primary source current display settings.\n" );
+@@ -4617,6 +4905,14 @@ static void display_mode_changed( BOOL broadcast )
+         else
+             send_notify_message( desktop, WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
+                                  MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ), FALSE );
++
++        /* Windows sends WM_DISPLAYCHANGE to every top-level window, whoever
++         * changed the display: a screen the host resized -- a remote session's
++         * client turned on its side -- is as much a new screen as one a program
++         * asked for.  Posted without waiting, so a program that is slow to
++         * answer cannot hold up the desktop. */
++        send_notify_message( HWND_BROADCAST, WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
++                             MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ), FALSE );
+     }
+     else
+     {
+@@ -4630,6 +4926,8 @@ static void display_mode_changed( BOOL broadcast )
+         /* post clip_fullscreen_window request to the foreground window */
+         NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_CLIPCURSOR, SET_CURSOR_FSCLIP, 0 );
+     }
++
++    fit_windows_to_display();
+ }
+ 
+ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmode,
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 2c92515a01c..00d4596cf4a 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -324,6 +324,8 @@ extern void set_window_normal_placement( HWND hwnd, RECT rect );
+ extern BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y );
+ extern UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits );
+ extern void update_window_state( HWND hwnd );
++extern void fit_window_to_display( HWND hwnd );
++extern void fit_windows_to_display(void);
+ extern HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest );
+ extern HWND get_shell_window(void);
+ extern HWND get_progman_window(void);
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index e2bde691d21..7acce6952a1 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4963,6 +4963,60 @@ void update_window_state( HWND hwnd )
+     set_thread_dpi_awareness_context( context );
+ }
+ 
++/* Once the display has changed, Windows puts each maximized top-level window
++ * right before telling anyone about it: the window is maximized again, taking
++ * the size the monitor it is on has now.  Nothing did that here.  The window
++ * manager resizes the X window, but the size a program ends up with is
++ * whatever it worked out from the configuration it had at that moment -- the
++ * old one, during a change -- and a maximized window is then held at the size
++ * of a screen that is gone.  A program that lays itself out from its window,
++ * as Office does, stays in that frame until it is restored and maximized by
++ * hand.  Asking it again for its maximized size, through WM_GETMINMAXINFO as
++ * maximizing does, gets the answer the new screen gives. */
++void fit_window_to_display( HWND hwnd )
++{
++    DWORD style = get_window_long( hwnd, GWL_STYLE );
++    MINMAXINFO minmax;
++    UINT context;
++
++    if ((style & (WS_CHILD | WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE)) != (WS_VISIBLE | WS_MAXIMIZE)) return;
++
++    context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
++    minmax = get_min_max_info( hwnd );
++    TRACE( "%p maximized again at (%d,%d) %dx%d\n", hwnd, minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
++           minmax.ptMaxSize.x, minmax.ptMaxSize.y );
++    /* The window manager may well have resized the window already, so its
++     * size need not change -- but the frame has: a program that works its
++     * client area out from the monitor, as Office's own frame does, did so
++     * against the old one, and only a new WM_NCCALCSIZE makes it look again. */
++    NtUserSetWindowPos( hwnd, 0, minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
++                        minmax.ptMaxSize.x, minmax.ptMaxSize.y,
++                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED );
++    set_thread_dpi_awareness_context( context );
++}
++
++/* Each window is put right in its own thread, which is where its window
++ * procedure answers WM_GETMINMAXINFO. */
++void fit_windows_to_display(void)
++{
++    DWORD style;
++    HWND *list;
++    int i;
++
++    if (!(list = list_window_children( get_desktop_window() ))) return;
++
++    for (i = 0; list[i]; i++)
++    {
++        style = get_window_long( list[i], GWL_STYLE );
++        if ((style & (WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE)) != (WS_VISIBLE | WS_MAXIMIZE)) continue;
++
++        if (is_current_thread_window( list[i] )) fit_window_to_display( list[i] );
++        else NtUserPostMessage( list[i], WM_WINE_UPDATEWINDOWSTATE, TRUE, 0 );
++    }
++
++    free( list );
++}
++
+ /***********************************************************************
+  *              show_window
+  *
+diff --git a/dlls/winex11.drv/xrandr.c b/dlls/winex11.drv/xrandr.c
+index 3b88388fee0..d403ec03965 100644
+--- a/dlls/winex11.drv/xrandr.c
++++ b/dlls/winex11.drv/xrandr.c
+@@ -1228,20 +1228,15 @@ static BOOL xrandr14_device_change_handler( HWND hwnd, XEvent *event )
+ 
+     xrandr14_invalidate_current_mode_cache();
+ 
+-    /* Publishing the new configuration is the desktop thread's job, and doing
+-     * it from one thread is what keeps every process in the session from
+-     * enumerating at once.  But the event reaches every process that selected
+-     * for it, and the desktop thread is not always among them: when it is not,
+-     * this used to return having done nothing at all, and nothing went back to
+-     * check afterwards.  The configuration in the registry then went on
+-     * describing a screen that was gone -- every process sized its windows
+-     * from it, and none of them could be resized past it, which does not look
+-     * like a display problem from the outside.
+-     *
+-     * So publish from the desktop thread as before, and from any other thread
+-     * only once what win32u reports has actually stopped matching the host.
+-     * The first process through rewrites the shared configuration and moves
+-     * the window station's serial; the rest then see a match and do nothing. */
++    /* The desktop's process owns the display configuration, the way the
++     * kernel does on Windows: it re-derives it, commits it in one step and
++     * then tells every window.  The event reaches every process that selected
++     * for it, and the desktop thread is not always among them, so any other
++     * thread that sees the host no longer matching what win32u reports hands
++     * the change to the desktop instead of publishing it itself.  Several
++     * processes each rewriting the configuration at once is how one of them
++     * came to read a screen half written, and a change applied anywhere but
++     * the desktop is one the other programs are never told about. */
+     desktop_thread = (hwnd == NtUserGetDesktopWindow() &&
+                       NtUserGetWindowThread( hwnd, NULL ) == GetCurrentThreadId());
+ 
+@@ -1249,12 +1244,13 @@ static BOOL xrandr14_device_change_handler( HWND hwnd, XEvent *event )
+     virt = NtUserGetVirtualScreenRect( MDT_RAW_DPI );
+     stale = !IsRectEmpty( &host ) && !EqualRect( &host, &virt );
+ 
+-    if (desktop_thread || stale)
+-    {
+-        if (stale && !desktop_thread)
+-            TRACE( "host screen %s no longer matches %s, updating.\n",
+-                   wine_dbgstr_rect( &host ), wine_dbgstr_rect( &virt ) );
++    if (desktop_thread)
+         NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
++    else if (stale)
++    {
++        TRACE( "host screen %s no longer matches %s, asking the desktop to update.\n",
++               wine_dbgstr_rect( &host ), wine_dbgstr_rect( &virt ) );
++        NtUserPostMessage( NtUserGetDesktopWindow(), WM_WINE_DISPLAYMODECHANGED, 0, 0 );
+     }
+ 
+     /* Update xinerama monitors for xinerama_get_fullscreen_monitors() */
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 260cdf489e8..58e50fac5c8 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -640,6 +640,7 @@ enum wine_internal_message
+     WM_WINE_UPDATEWINDOWSTATE,
+     WM_WINE_TRACKMOUSEEVENT,
+     WM_WINE_SETPIXELFORMAT,
++    WM_WINE_DISPLAYMODECHANGED,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,

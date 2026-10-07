@@ -1,0 +1,1171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 02:39:57 -0400
+Subject: [PATCH] combase, ole32: Ask the activation filter a process
+ registers, as Windows does.
+
+CoRegisterActivationFilter took the filter and never asked it.  Now
+every activation asks it first, before the class is looked for, and
+fails with what it answers or activates what it puts in the class's
+place, which it is asked about too.  It is told how the activation came
+about: from a moniker, stored data, a storage or a file, as each way
+OLE creates objects says on Windows.  Proxy and stub factories are
+asked about when they are first loaded, and COM's own not at all.
+There is only the one filter, kept for the life of the process and not
+referenced.
+
+Creating an object from data also needs the clipboard formats OLE uses,
+which were registered only once the clipboard had been used: until
+then OleQueryCreateFromData and OleCreateFromData saw no embedded
+object in any data.
+
+Office registers its filter at start-up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 5510cc7d40992911895592e31d2c5a2acf3d5e2e)
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index a62dbbadd93..14030504b28 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -1579,6 +1579,96 @@ static HRESULT return_multi_qi(IUnknown *unk, DWORD count, MULTI_QI *mqi, BOOL i
+     return fetched == count ? S_OK : CO_S_NOTALLINTERFACES;
+ }
+ 
++/* The filter the process registered, which every activation asks first. */
++static IActivationFilter *activation_filter;
++
++/* COM's own proxies and stubs, which it does not activate */
++static const CLSID CLSID_StdPSFactoryBuffer = {0x00000320,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
++
++/* The proxy/stub factories loaded so far: COM keeps them, and asks the filter about each only the first time. */
++static CLSID *ps_classes;
++static unsigned int ps_class_count;
++static SRWLOCK ps_classes_lock = SRWLOCK_INIT;
++
++static BOOL is_loaded_ps_class(const CLSID *clsid)
++{
++    BOOL loaded = FALSE;
++    unsigned int i;
++
++    AcquireSRWLockShared(&ps_classes_lock);
++    for (i = 0; i < ps_class_count && !loaded; i++) loaded = IsEqualCLSID(&ps_classes[i], clsid);
++    ReleaseSRWLockShared(&ps_classes_lock);
++    return loaded;
++}
++
++static void add_loaded_ps_class(const CLSID *clsid)
++{
++    CLSID *classes;
++
++    AcquireSRWLockExclusive(&ps_classes_lock);
++    if ((classes = realloc(ps_classes, (ps_class_count + 1) * sizeof(*classes))))
++    {
++        ps_classes = classes;
++        ps_classes[ps_class_count++] = *clsid;
++    }
++    ReleaseSRWLockExclusive(&ps_classes_lock);
++}
++
++/* Asks the filter whether the class may be activated, and whether another is to be activated in its place,
++ * which it is then asked about too, as what the caller said the activation is.  A proxy/stub factory is asked
++ * about only when it is first loaded. */
++static HRESULT filter_activation(const CLSID *clsid, DWORD clscontext, CLSID *actual)
++{
++    CLSID replacement = GUID_NULL, again = GUID_NULL;
++    DWORD type = ACTIVATIONTYPE_UNCATEGORIZED;
++    BOOL ps = clscontext & CLSCTX_PS_DLL;
++    IActivationFilter *filter;
++    struct tlsdata *tlsdata;
++    HRESULT hr;
++
++    *actual = *clsid;
++
++    if (ps && (IsEqualCLSID(clsid, &CLSID_StdPSFactoryBuffer) || is_loaded_ps_class(clsid))) return S_OK;
++
++    /* what the caller said this activation is, and not the ones it leads to */
++    if (!ps && SUCCEEDED(com_get_tlsdata(&tlsdata)))
++    {
++        type = tlsdata->activation_type;
++        tlsdata->activation_type = ACTIVATIONTYPE_UNCATEGORIZED;
++    }
++
++    if ((filter = activation_filter))
++    {
++        TRACE("asking the filter about %s, type %#lx\n", debugstr_guid(clsid), type);
++        if (FAILED(hr = IActivationFilter_HandleActivation(filter, type, clsid, &replacement)))
++        {
++            TRACE("filter refused %s, hr %#lx\n", debugstr_guid(clsid), hr);
++            return hr;
++        }
++        if (!IsEqualGUID(&replacement, &GUID_NULL) && !IsEqualGUID(&replacement, clsid))
++        {
++            TRACE("filter puts %s in the place of %s\n", debugstr_guid(&replacement), debugstr_guid(clsid));
++            if (FAILED(hr = IActivationFilter_HandleActivation(filter, type, &replacement, &again)))
++            {
++                TRACE("filter refused %s, hr %#lx\n", debugstr_guid(&replacement), hr);
++                return hr;
++            }
++            *actual = replacement;
++        }
++    }
++
++    if (ps) add_loaded_ps_class(clsid);
++    return S_OK;
++}
++
++/* Tells the activation filter how the next activation in this thread comes about. */
++static void set_activation_type(DWORD type)
++{
++    struct tlsdata *tlsdata;
++
++    if (SUCCEEDED(com_get_tlsdata(&tlsdata))) tlsdata->activation_type = type;
++}
++
+ /***********************************************************************
+  *          CoGetInstanceFromFile    (combase.@)
+  */
+@@ -1611,7 +1701,9 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetInstanceFromFile(COSERVERINFO *server_info
+         rclsid = &clsid;
+     }
+ 
++    set_activation_type(ACTIVATIONTYPE_FROM_FILE);
+     hr = CoCreateInstance(rclsid, outer, cls_context, &IID_IUnknown, (void **)&obj);
++    set_activation_type(ACTIVATIONTYPE_UNCATEGORIZED);
+     if (hr != S_OK)
+     {
+         init_multi_qi(count, results, hr);
+@@ -1671,7 +1763,9 @@ HRESULT WINAPI CoGetInstanceFromIStorage(COSERVERINFO *server_info, CLSID *rclsi
+         rclsid = &stat.clsid;
+     }
+ 
++    set_activation_type(ACTIVATIONTYPE_FROM_STORAGE);
+     hr = CoCreateInstance(rclsid, outer, cls_context, &IID_IUnknown, (void **)&obj);
++    set_activation_type(ACTIVATIONTYPE_UNCATEGORIZED);
+     if (hr != S_OK)
+         return hr;
+ 
+@@ -1721,13 +1815,15 @@ HRESULT WINAPI CoCreateInstanceFromApp(REFCLSID rclsid, IUnknown *outer, DWORD c
+             count, results);
+ }
+ 
+-static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
++static HRESULT com_get_class_object(REFCLSID requested, DWORD clscontext,
+         COSERVERINFO *server_info, REFIID riid, void **obj)
+ {
+     struct class_reg_data clsreg = { 0 };
+     HRESULT hr = E_UNEXPECTED;
+     IUnknown *registered_obj;
+     struct apartment *apt;
++    CLSID filtered;
++    REFCLSID rclsid = &filtered;
+ 
+     if (!obj)
+         return E_INVALIDARG;
+@@ -1740,6 +1836,13 @@ static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
+         return CO_E_NOTINITIALIZED;
+     }
+ 
++    if (FAILED(hr = filter_activation(requested, clscontext, &filtered)))
++    {
++        apartment_release(apt);
++        return hr;
++    }
++    hr = E_UNEXPECTED;
++
+     if (server_info)
+         FIXME("server_info name %s, authinfo %p\n", debugstr_w(server_info->pwszName), server_info->pAuthInfo);
+ 
+@@ -2227,6 +2330,25 @@ HRESULT WINAPI CoWaitForMultipleHandles(DWORD flags, DWORD timeout, ULONG handle
+     return hr;
+ }
+ 
++/***********************************************************************
++ *            CoRegisterActivationFilter        (combase.@)
++ *
++ * Registers the filter every activation in the process asks first, for as
++ * long as the process lives. There is only the one: registering it again
++ * succeeds, and registering another is not supported. It is not referenced.
++ */
++HRESULT WINAPI CoRegisterActivationFilter(IActivationFilter *filter)
++{
++    IActivationFilter *previous;
++
++    TRACE("%p\n", filter);
++
++    if (!filter) return E_INVALIDARG;
++
++    previous = InterlockedCompareExchangePointer((void **)&activation_filter, filter, NULL);
++    return !previous || previous == filter ? S_OK : CO_E_NOT_SUPPORTED;
++}
++
+ /******************************************************************************
+  *            CoRegisterMessageFilter        (combase.@)
+  */
+@@ -3602,16 +3724,6 @@ BOOL WINAPI CoIsOle1Class(REFCLSID clsid)
+     return FALSE;
+ }
+ 
+-/***********************************************************************
+- *           CoRegisterActivationFilter  (combase.@)
+- */
+-HRESULT WINAPI CoRegisterActivationFilter(IActivationFilter *filter)
+-{
+-    FIXME("%p stub\n", filter);
+-
+-    return E_NOTIMPL;
+-}
+-
+ static void com_cleanup_tlsdata(void)
+ {
+     struct tlsdata *tlsdata = NtCurrentTeb()->ReservedForOle;
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index 76393650f3a..5aabcc41bef 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -93,6 +93,7 @@ struct tlsdata
+     DWORD             spies_lock;
+     DWORD             cancelcount;
+     CO_MTA_USAGE_COOKIE implicit_mta_cookie; /* mta referenced by roapi from sta thread */
++    DWORD             activation_type; /* what the next activation is to the activation filter */
+ };
+ 
+ extern HRESULT WINAPI InternalTlsAllocData(struct tlsdata **data);
+diff --git a/dlls/ole32/classmoniker.c b/dlls/ole32/classmoniker.c
+index 4b95f577b84..aade81831be 100644
+--- a/dlls/ole32/classmoniker.c
++++ b/dlls/ole32/classmoniker.c
+@@ -19,6 +19,7 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#define USE_COM_CONTEXT_DEF
+ #include <assert.h>
+ #include <stdarg.h>
+ #include <string.h>
+@@ -32,6 +33,7 @@
+ #include "wine/debug.h"
+ #include "ole2.h"
+ #include "moniker.h"
++#include "compobj_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ole);
+ 
+@@ -246,8 +248,12 @@ static HRESULT WINAPI ClassMoniker_BindToObject(IMoniker* iface,
+     IBindCtx_GetBindOptions(pbc, (BIND_OPTS *)&bindopts);
+ 
+     if (!pmkToLeft)
+-        return CoGetClassObject(&moniker->header.clsid, bindopts.dwClassContext, NULL,
+-                                riid, ppvResult);
++    {
++        set_activation_type(ACTIVATIONTYPE_FROM_MONIKER);
++        hr = CoGetClassObject(&moniker->header.clsid, bindopts.dwClassContext, NULL, riid, ppvResult);
++        set_activation_type(ACTIVATIONTYPE_UNCATEGORIZED);
++        return hr;
++    }
+     else
+     {
+         hr = IMoniker_BindToObject(pmkToLeft, pbc, NULL, &IID_IClassActivator,
+diff --git a/dlls/ole32/clipboard.c b/dlls/ole32/clipboard.c
+index 0326e968bc2..24a753c9eb3 100644
+--- a/dlls/ole32/clipboard.c
++++ b/dlls/ole32/clipboard.c
+@@ -200,7 +200,7 @@ UINT ole_private_data_clipboard_format = 0;
+ 
+ static UINT wine_marshal_clipboard_format;
+ 
+-static void register_clipboard_formats(void)
++static BOOL WINAPI register_clipboard_formats(INIT_ONCE *once, void *parameter, void **context)
+ {
+     ownerlink_clipboard_format = RegisterClipboardFormatW(L"OwnerLink");
+     filename_clipboard_format = RegisterClipboardFormatW(L"FileName");
+@@ -215,6 +215,16 @@ static void register_clipboard_formats(void)
+     ole_private_data_clipboard_format = RegisterClipboardFormatW(L"Ole Private Data");
+ 
+     wine_marshal_clipboard_format = RegisterClipboardFormatW(L"Wine Marshalled DataObject");
++    return TRUE;
++}
++
++/* Registers the clipboard formats OLE uses, which creating objects from data needs whether or not the clipboard
++ * has been used yet. */
++void init_ole_clipboard_formats(void)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++
++    InitOnceExecuteOnce(&once, register_clipboard_formats, NULL, NULL);
+ }
+ 
+ static BOOL WINAPI clipbrd_create(INIT_ONCE *init_once, void *parameter, void **context)
+@@ -224,7 +234,7 @@ static BOOL WINAPI clipbrd_create(INIT_ONCE *init_once, void *parameter, void **
+ 
+     TRACE("()\n");
+ 
+-    register_clipboard_formats();
++    init_ole_clipboard_formats();
+ 
+     clipbrd = HeapAlloc( GetProcessHeap(), 0, sizeof(*clipbrd) );
+     if (!clipbrd)
+diff --git a/dlls/ole32/compobj_private.h b/dlls/ole32/compobj_private.h
+index f21c0ea099d..719a8930882 100644
+--- a/dlls/ole32/compobj_private.h
++++ b/dlls/ole32/compobj_private.h
+@@ -63,6 +63,7 @@ struct oletls
+     DWORD             spies_lock;
+     DWORD             cancelcount;
+     CO_MTA_USAGE_COOKIE implicit_mta_cookie; /* mta referenced by roapi from sta thread */
++    DWORD             activation_type; /* what the next activation is to the activation filter */
+ };
+ 
+ /* Global Interface Table Functions */
+@@ -89,6 +90,14 @@ static inline struct oletls *COM_CurrentInfo(void)
+     return NtCurrentTeb()->ReservedForOle;
+ }
+ 
++/* Tells the activation filter how the next activation in this thread comes about. */
++static inline void set_activation_type(DWORD type)
++{
++    struct oletls *info = COM_CurrentInfo();
++
++    if (info) info->activation_type = type;
++}
++
+ #define CHARS_IN_GUID 39 /* including NULL */
+ 
+ /* from dlldata.c */
+@@ -127,6 +136,8 @@ extern UINT object_descriptor_clipboard_format;
+ extern UINT link_source_descriptor_clipboard_format;
+ extern UINT ole_private_data_clipboard_format;
+ 
++void init_ole_clipboard_formats(void);
++
+ void clipbrd_destroy(void);
+ 
+ extern LSTATUS create_classes_key(HKEY, const WCHAR *, REGSAM, HKEY *);
+diff --git a/dlls/ole32/filemoniker.c b/dlls/ole32/filemoniker.c
+index 9368212124d..922c861c112 100644
+--- a/dlls/ole32/filemoniker.c
++++ b/dlls/ole32/filemoniker.c
+@@ -19,6 +19,7 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#define USE_COM_CONTEXT_DEF
+ #include <assert.h>
+ #include <stdarg.h>
+ #include <string.h>
+@@ -489,7 +490,9 @@ FileMonikerImpl_BindToObject(IMoniker* iface, IBindCtx* pbc, IMoniker* pmkToLeft
+                 res=GetClassFile(This->filePathName,&clsID);
+                 if (SUCCEEDED(res)){
+ 
++                    set_activation_type(ACTIVATIONTYPE_FROM_MONIKER | ACTIVATIONTYPE_FROM_FILE);
+                     res=CoCreateInstance(&clsID,NULL,CLSCTX_SERVER,&IID_IPersistFile,(void**)&ppf);
++                    set_activation_type(ACTIVATIONTYPE_UNCATEGORIZED);
+                     if (SUCCEEDED(res)){
+ 
+                         res=IPersistFile_Load(ppf,This->filePathName,STGM_READ);
+diff --git a/dlls/ole32/ole2.c b/dlls/ole32/ole2.c
+index c18a46a3131..432b6c990dd 100644
+--- a/dlls/ole32/ole2.c
++++ b/dlls/ole32/ole2.c
+@@ -24,6 +24,7 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#define USE_COM_CONTEXT_DEF
+ #include <assert.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
+@@ -1205,14 +1206,13 @@ HRESULT WINAPI DECLSPEC_HOTPATCH OleRun(LPUNKNOWN pUnknown)
+     return hres;
+ }
+ 
+-/******************************************************************************
+- *              OleLoad        [OLE32.@]
+- */
+-HRESULT WINAPI OleLoad(
++/* Loads the object a storage holds, activating its class as what the activation filter is told it is. */
++static HRESULT load_object(
+   LPSTORAGE       pStg,
+   REFIID          riid,
+   LPOLECLIENTSITE pClientSite,
+-  LPVOID*         ppvObj)
++  LPVOID*         ppvObj,
++  DWORD           activation_type)
+ {
+   IPersistStorage* persistStorage = NULL;
+   IUnknown*        pUnk;
+@@ -1238,11 +1238,13 @@ HRESULT WINAPI OleLoad(
+   /*
+    * Now, try and create the handler for the object
+    */
++  set_activation_type(activation_type);
+   hres = CoCreateInstance(&storageInfo.clsid,
+ 			  NULL,
+ 			  CLSCTX_INPROC_HANDLER|CLSCTX_INPROC_SERVER,
+ 			  riid,
+ 			  (void**)&pUnk);
++  set_activation_type(ACTIVATIONTYPE_UNCATEGORIZED);
+ 
+   /*
+    * If that fails, as it will most times, load the default
+@@ -1319,6 +1321,14 @@ HRESULT WINAPI OleLoad(
+   return hres;
+ }
+ 
++/******************************************************************************
++ *              OleLoad        [OLE32.@]
++ */
++HRESULT WINAPI OleLoad(IStorage *storage, REFIID riid, IOleClientSite *client_site, void **obj)
++{
++    return load_object(storage, riid, client_site, obj, ACTIVATIONTYPE_FROM_STORAGE);
++}
++
+ /***********************************************************************
+  *           OleSave     [OLE32.@]
+  */
+@@ -2739,6 +2749,8 @@ HRESULT WINAPI OleQueryCreateFromData(IDataObject *data)
+     BOOL found_static = FALSE;
+     HRESULT hr;
+ 
++    init_ole_clipboard_formats();
++
+     hr = IDataObject_EnumFormatEtc(data, DATADIR_GET, &enum_fmt);
+ 
+     if(FAILED(hr)) return hr;
+@@ -2796,12 +2808,15 @@ static HRESULT get_storage(IDataObject *data, IStorage *stg, UINT *src_cf, BOOL
+ 
+     if (src_cf) *src_cf = 0;
+ 
+-    /* CF_EMBEDEDOBJECT */
++    init_ole_clipboard_formats();
++
++    /* CF_EMBEDEDOBJECT, which Windows asks whether it has first */
+     init_fmtetc(&fmt, embedded_object_clipboard_format, TYMED_ISTORAGE);
+     med.tymed = TYMED_ISTORAGE;
+     med.pstg = stg;
+     med.pUnkForRelease = NULL;
+-    hr = IDataObject_GetDataHere(data, &fmt, &med);
++    hr = IDataObject_QueryGetData(data, &fmt);
++    if (SUCCEEDED(hr)) hr = IDataObject_GetDataHere(data, &fmt, &med);
+     if(SUCCEEDED(hr))
+     {
+         if (src_cf) *src_cf = embedded_object_clipboard_format;
+@@ -2876,7 +2891,7 @@ HRESULT WINAPI OleCreateFromDataEx(IDataObject *data, REFIID iid, DWORD flags,
+     hr = get_storage(data, stg, &src_cf, TRUE);
+     if(FAILED(hr)) return hr;
+ 
+-    hr = OleLoad(stg, iid, client_site, obj);
++    hr = load_object(stg, iid, client_site, obj, ACTIVATIONTYPE_FROM_DATA);
+     if(FAILED(hr)) return hr;
+ 
+     /* FIXME: Init cache */
+@@ -3040,7 +3055,7 @@ HRESULT WINAPI OleCreateFromFileEx(REFCLSID clsid, const OLECHAR *filename, REFI
+     hr = get_storage( data, stg, NULL, FALSE );
+     if (FAILED(hr)) goto end;
+ 
+-    hr = OleLoad( stg, &IID_IUnknown, client_site, (void**)&unk );
++    hr = load_object( stg, &IID_IUnknown, client_site, (void**)&unk, ACTIVATIONTYPE_FROM_FILE );
+     if (FAILED(hr)) goto end;
+ 
+     if (renderopt == OLERENDER_FORMAT)
+diff --git a/dlls/ole32/storage32.c b/dlls/ole32/storage32.c
+index 8f68c13015f..dc2b732b444 100644
+--- a/dlls/ole32/storage32.c
++++ b/dlls/ole32/storage32.c
+@@ -30,6 +30,7 @@
+  *  residing in a compound file object.
+  */
+ 
++#define USE_COM_CONTEXT_DEF
+ #include <assert.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -9093,7 +9094,10 @@ HRESULT  WINAPI OleLoadFromStream(IStream *pStm,REFIID iidInterface,void** ppvOb
+     res=ReadClassStm(pStm,&clsid);
+     if (FAILED(res))
+ 	return res;
++    /* Windows tells the activation filter this comes from a moniker */
++    set_activation_type(ACTIVATIONTYPE_FROM_MONIKER);
+     res=CoCreateInstance(&clsid,NULL,CLSCTX_INPROC_SERVER,iidInterface,ppvObj);
++    set_activation_type(ACTIVATIONTYPE_UNCATEGORIZED);
+     if (FAILED(res))
+ 	return res;
+     res=IUnknown_QueryInterface((IUnknown*)*ppvObj,&IID_IPersistStream,(LPVOID*)&xstm);
+diff --git a/dlls/ole32/tests/Makefile.in b/dlls/ole32/tests/Makefile.in
+index 17710fb9a9a..73a3804ab11 100644
+--- a/dlls/ole32/tests/Makefile.in
++++ b/dlls/ole32/tests/Makefile.in
+@@ -2,6 +2,7 @@ TESTDLL   = ole32.dll
+ IMPORTS   = oleaut32 ole32 user32 uuid gdi32 advapi32
+ 
+ SOURCES = \
++	activation.c \
+ 	clipboard.c \
+ 	compobj.c \
+ 	defaulthandler.c \
+diff --git a/dlls/ole32/tests/activation.c b/dlls/ole32/tests/activation.c
+new file mode 100644
+index 00000000000..0e85c3e1ecf
+--- /dev/null
++++ b/dlls/ole32/tests/activation.c
+@@ -0,0 +1,660 @@
++/*
++ * Unit tests for the activation filter a process registers with CoRegisterActivationFilter
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++#define USE_COM_CONTEXT_DEF
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "objbase.h"
++#include "ole2.h"
++#include "urlmon.h"
++#include "cguid.h"
++
++#include "wine/test.h"
++
++/* A filter, once registered, stays for the life of the process, so these tests have one of their own. */
++
++static HRESULT (WINAPI *pCoRegisterActivationFilter)(IActivationFilter *filter);
++
++static const CLSID CLSID_unregistered = {0x3f2d8a1e,0x55c1,0x4a7e,{0x9b,0x0e,0x61,0x2c,0x7d,0x13,0xa4,0x5f}};
++static const CLSID CLSID_registered = {0x1c9d5b3a,0x2e4f,0x4d6a,{0x8b,0x7c,0x9e,0x0f,0x1a,0x2b,0x3c,0x4d}};
++static const CLSID CLSID_PSDispatch = {0x00020420,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
++
++static struct
++{
++    DWORD type;
++    CLSID clsid, replacement;
++} calls[16];
++static unsigned int call_count;
++static enum { PASS, REFUSE, REPLACE, REPLACE_REFUSE, SUCCESS_CODE } mode;
++static LONG filter_refs;
++
++static HRESULT WINAPI filter_QueryInterface(IActivationFilter *iface, REFIID riid, void **obj)
++{
++    ok(0, "unexpected QueryInterface %s\n", wine_dbgstr_guid(riid));
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI filter_AddRef(IActivationFilter *iface)
++{
++    return InterlockedIncrement(&filter_refs);
++}
++
++static ULONG WINAPI filter_Release(IActivationFilter *iface)
++{
++    return InterlockedDecrement(&filter_refs);
++}
++
++static HRESULT WINAPI filter_HandleActivation(IActivationFilter *iface, DWORD type, REFCLSID clsid, CLSID *replacement)
++{
++    if (call_count < ARRAY_SIZE(calls))
++    {
++        calls[call_count].type = type;
++        calls[call_count].clsid = *clsid;
++        calls[call_count].replacement = *replacement;
++    }
++    call_count++;
++
++    if (mode == REFUSE && IsEqualCLSID(clsid, &CLSID_InternetZoneManager)) return E_ACCESSDENIED;
++    if ((mode == REPLACE || mode == REPLACE_REFUSE) && IsEqualCLSID(clsid, &CLSID_InternetZoneManager))
++        *replacement = CLSID_InternetSecurityManager;
++    if (mode == REPLACE_REFUSE && IsEqualCLSID(clsid, &CLSID_InternetSecurityManager)) return E_ACCESSDENIED;
++    return mode == SUCCESS_CODE ? S_FALSE : S_OK;
++}
++
++static const IActivationFilterVtbl filter_vtbl =
++{
++    filter_QueryInterface,
++    filter_AddRef,
++    filter_Release,
++    filter_HandleActivation,
++};
++static IActivationFilter filter = { &filter_vtbl };
++
++static HRESULT WINAPI other_filter_HandleActivation(IActivationFilter *iface, DWORD type, REFCLSID clsid,
++                                                    CLSID *replacement)
++{
++    ok(0, "a second filter was asked about %s\n", wine_dbgstr_guid(clsid));
++    return S_OK;
++}
++
++static const IActivationFilterVtbl other_filter_vtbl =
++{
++    filter_QueryInterface,
++    filter_AddRef,
++    filter_Release,
++    other_filter_HandleActivation,
++};
++static IActivationFilter other_filter = { &other_filter_vtbl };
++
++/* Windows asks about classes of its own too, around the ones it is told to activate; only the calls about
++ * the class given are checked, and the total count only when it is given. */
++#define check_calls(a, b, c, d) check_calls_(__LINE__, a, b, c, d)
++static void check_calls_(unsigned int line, const CLSID *clsid, DWORD type, unsigned int count, int total)
++{
++    unsigned int i, found = 0;
++
++    for (i = 0; i < min(call_count, ARRAY_SIZE(calls)); i++)
++    {
++        if (!IsEqualCLSID(&calls[i].clsid, clsid)) continue;
++        found++;
++        ok_(__FILE__, line)(calls[i].type == type, "got type %#lx.\n", calls[i].type);
++        ok_(__FILE__, line)(IsEqualCLSID(&calls[i].replacement, &GUID_NULL), "got replacement %s.\n",
++                            wine_dbgstr_guid(&calls[i].replacement));
++    }
++    ok_(__FILE__, line)(found == count, "asked %u times about %s.\n", found, wine_dbgstr_guid(clsid));
++    if (total >= 0) ok_(__FILE__, line)(call_count == total, "asked %u times.\n", call_count);
++    call_count = 0;
++}
++
++/* a class object CoRegisterClassObject is told about, and an object with IDispatch */
++static HRESULT WINAPI object_QueryInterface(IDispatch *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDispatch))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI object_AddRef(IDispatch *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI object_Release(IDispatch *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI object_GetTypeInfoCount(IDispatch *iface, UINT *count)
++{
++    *count = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI object_GetTypeInfo(IDispatch *iface, UINT index, LCID lcid, ITypeInfo **info)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI object_GetIDsOfNames(IDispatch *iface, REFIID riid, LPOLESTR *names, UINT count, LCID lcid,
++                                           DISPID *ids)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI object_Invoke(IDispatch *iface, DISPID id, REFIID riid, LCID lcid, WORD flags,
++                                    DISPPARAMS *params, VARIANT *result, EXCEPINFO *excep, UINT *arg)
++{
++    return E_NOTIMPL;
++}
++
++static const IDispatchVtbl object_vtbl =
++{
++    object_QueryInterface,
++    object_AddRef,
++    object_Release,
++    object_GetTypeInfoCount,
++    object_GetTypeInfo,
++    object_GetIDsOfNames,
++    object_Invoke,
++};
++static IDispatch object = { &object_vtbl };
++
++static HRESULT WINAPI factory_QueryInterface(IClassFactory *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IClassFactory))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef(IClassFactory *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release(IClassFactory *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID riid, void **obj)
++{
++    return IDispatch_QueryInterface(&object, riid, obj);
++}
++
++static HRESULT WINAPI factory_LockServer(IClassFactory *iface, BOOL lock)
++{
++    return S_OK;
++}
++
++static const IClassFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateInstance,
++    factory_LockServer,
++};
++static IClassFactory factory = { &factory_vtbl };
++
++/* a data object with an embedded object of the security manager's class, as the clipboard would have */
++static CLIPFORMAT cf_embed_source;
++
++static HRESULT WINAPI formats_QueryInterface(IEnumFORMATETC *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IEnumFORMATETC))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI formats_AddRef(IEnumFORMATETC *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI formats_Release(IEnumFORMATETC *iface)
++{
++    return 1;
++}
++
++static unsigned int format_index;
++
++static HRESULT WINAPI formats_Next(IEnumFORMATETC *iface, ULONG count, FORMATETC *formats, ULONG *fetched)
++{
++    ULONG done = 0;
++
++    if (count && !format_index++)
++    {
++        formats->cfFormat = cf_embed_source;
++        formats->ptd = NULL;
++        formats->dwAspect = DVASPECT_CONTENT;
++        formats->lindex = -1;
++        formats->tymed = TYMED_ISTORAGE;
++        done = 1;
++    }
++    if (fetched) *fetched = done;
++    return done == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI formats_Skip(IEnumFORMATETC *iface, ULONG count)
++{
++    format_index += count;
++    return format_index > 1 ? S_FALSE : S_OK;
++}
++
++static HRESULT WINAPI formats_Reset(IEnumFORMATETC *iface)
++{
++    format_index = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI formats_Clone(IEnumFORMATETC *iface, IEnumFORMATETC **clone)
++{
++    return E_NOTIMPL;
++}
++
++static const IEnumFORMATETCVtbl formats_vtbl =
++{
++    formats_QueryInterface,
++    formats_AddRef,
++    formats_Release,
++    formats_Next,
++    formats_Skip,
++    formats_Reset,
++    formats_Clone,
++};
++static IEnumFORMATETC formats = { &formats_vtbl };
++
++static HRESULT WINAPI data_QueryInterface(IDataObject *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDataObject))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI data_AddRef(IDataObject *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI data_Release(IDataObject *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI data_GetData(IDataObject *iface, FORMATETC *format, STGMEDIUM *medium)
++{
++    return DV_E_FORMATETC;
++}
++
++static HRESULT WINAPI data_GetDataHere(IDataObject *iface, FORMATETC *format, STGMEDIUM *medium)
++{
++    if (format->cfFormat != cf_embed_source || medium->tymed != TYMED_ISTORAGE) return DV_E_FORMATETC;
++    return WriteClassStg(medium->pstg, &CLSID_InternetSecurityManager);
++}
++
++static HRESULT WINAPI data_QueryGetData(IDataObject *iface, FORMATETC *format)
++{
++    return format->cfFormat == cf_embed_source && (format->tymed & TYMED_ISTORAGE) ? S_OK : DV_E_FORMATETC;
++}
++
++static HRESULT WINAPI data_GetCanonicalFormatEtc(IDataObject *iface, FORMATETC *in, FORMATETC *out)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI data_SetData(IDataObject *iface, FORMATETC *format, STGMEDIUM *medium, BOOL release)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI data_EnumFormatEtc(IDataObject *iface, DWORD direction, IEnumFORMATETC **enum_formats)
++{
++    if (direction != DATADIR_GET) return E_NOTIMPL;
++    format_index = 0;
++    *enum_formats = &formats;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_DAdvise(IDataObject *iface, FORMATETC *format, DWORD flags, IAdviseSink *sink,
++                                   DWORD *connection)
++{
++    return OLE_E_ADVISENOTSUPPORTED;
++}
++
++static HRESULT WINAPI data_DUnadvise(IDataObject *iface, DWORD connection)
++{
++    return OLE_E_ADVISENOTSUPPORTED;
++}
++
++static HRESULT WINAPI data_EnumDAdvise(IDataObject *iface, IEnumSTATDATA **advise)
++{
++    return OLE_E_ADVISENOTSUPPORTED;
++}
++
++static const IDataObjectVtbl data_vtbl =
++{
++    data_QueryInterface,
++    data_AddRef,
++    data_Release,
++    data_GetData,
++    data_GetDataHere,
++    data_QueryGetData,
++    data_GetCanonicalFormatEtc,
++    data_SetData,
++    data_EnumFormatEtc,
++    data_DAdvise,
++    data_DUnadvise,
++    data_EnumDAdvise,
++};
++static IDataObject data_object = { &data_vtbl };
++
++static IStorage *create_storage(void)
++{
++    IStorage *storage;
++    HRESULT hr;
++
++    hr = StgCreateDocfile(NULL, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE | STGM_DELETEONRELEASE, 0,
++                          &storage);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    return storage;
++}
++
++static DWORD CALLBACK thread_proc(void *arg)
++{
++    IUnknown *unk;
++    HRESULT hr;
++
++    CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    hr = CoCreateInstance(&CLSID_InternetSecurityManager, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    CoUninitialize();
++    return 0;
++}
++
++static void test_activation_filter(void)
++{
++    IInternetSecurityManager *manager;
++    WCHAR path[MAX_PATH];
++    IClassFactory *cf;
++    IStorage *storage;
++    IMoniker *moniker;
++    IStream *stream;
++    IBindCtx *bind;
++    MULTI_QI mqi;
++    IUnknown *unk;
++    HANDLE thread;
++    DWORD cookie;
++    HRESULT hr;
++
++    hr = OleInitialize(NULL);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    cf_embed_source = RegisterClipboardFormatA("Embed Source");
++
++    /* there is only the one filter, which COM does not reference */
++    hr = pCoRegisterActivationFilter(NULL);
++    ok(hr == E_INVALIDARG, "got %#lx.\n", hr);
++    hr = pCoRegisterActivationFilter(&filter);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    hr = pCoRegisterActivationFilter(&filter);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    hr = pCoRegisterActivationFilter(&other_filter);
++    ok(hr == CO_E_NOT_SUPPORTED, "got %#lx.\n", hr);
++    hr = pCoRegisterActivationFilter(NULL);
++    ok(hr == E_INVALIDARG, "got %#lx.\n", hr);
++    ok(!filter_refs, "got %ld references.\n", filter_refs);
++
++    /* every activation asks it once, before it knows whether there is such a class */
++    hr = CoCreateInstance(&CLSID_InternetSecurityManager, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    hr = CoCreateInstance(&CLSID_InternetSecurityManager, NULL, CLSCTX_ALL, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    hr = CoGetClassObject(&CLSID_InternetSecurityManager, CLSCTX_INPROC_SERVER, NULL, &IID_IClassFactory,
++                          (void **)&cf);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IClassFactory_Release(cf);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    hr = CoCreateInstance(&CLSID_StdGlobalInterfaceTable, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_StdGlobalInterfaceTable, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    hr = CoRegisterClassObject(&CLSID_registered, (IUnknown *)&factory, CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE,
++                               &cookie);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    hr = CoCreateInstance(&CLSID_registered, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_registered, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    CoRevokeClassObject(cookie);
++    hr = CoCreateInstance(&CLSID_unregistered, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == REGDB_E_CLASSNOTREG, "got %#lx.\n", hr);
++    check_calls(&CLSID_unregistered, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++
++    thread = CreateThread(NULL, 0, thread_proc, NULL, 0, NULL);
++    ok(!WaitForSingleObject(thread, 10000), "thread did not finish.\n");
++    CloseHandle(thread);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++
++    /* and it is told where the class came from */
++    storage = create_storage();
++    WriteClassStg(storage, &CLSID_InternetSecurityManager);
++    hr = OleLoad(storage, &IID_IUnknown, NULL, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_STORAGE, 1, -1);
++    IStorage_Release(storage);
++
++    CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    WriteClassStm(stream, &CLSID_InternetSecurityManager);
++    IStream_Seek(stream, (LARGE_INTEGER){{0}}, STREAM_SEEK_SET, NULL);
++    hr = OleLoadFromStream(stream, &IID_IUnknown, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_MONIKER, 1, 1);
++    IStream_Release(stream);
++
++    GetTempPathW(ARRAY_SIZE(path), path);
++    lstrcatW(path, L"wine_activation.stg");
++    hr = StgCreateDocfile(path, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, &storage);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    WriteClassStg(storage, &CLSID_InternetSecurityManager);
++    IStorage_Release(storage);
++    call_count = 0;
++
++    mqi.pIID = &IID_IUnknown;
++    mqi.pItf = NULL;
++    mqi.hr = S_OK;
++    hr = CoGetInstanceFromFile(NULL, NULL, NULL, CLSCTX_INPROC_SERVER, STGM_READ, path, 1, &mqi);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_FILE, 1, -1);
++
++    hr = CreateFileMoniker(path, &moniker);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    CreateBindCtx(0, &bind);
++    hr = IMoniker_BindToObject(moniker, bind, NULL, &IID_IUnknown, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_MONIKER | ACTIVATIONTYPE_FROM_FILE, 1, -1);
++    IBindCtx_Release(bind);
++    IMoniker_Release(moniker);
++    DeleteFileW(path);
++
++    hr = CreateClassMoniker(&CLSID_InternetSecurityManager, &moniker);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    CreateBindCtx(0, &bind);
++    hr = IMoniker_BindToObject(moniker, bind, NULL, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_MONIKER, 1, 1);
++    IBindCtx_Release(bind);
++    IMoniker_Release(moniker);
++
++    storage = create_storage();
++    hr = OleCreate(&CLSID_InternetSecurityManager, &IID_IUnknown, OLERENDER_NONE, NULL, NULL, storage, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, -1);
++    IStorage_Release(storage);
++
++    hr = OleQueryCreateFromData(&data_object);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    storage = create_storage();
++    hr = OleCreateFromData(&data_object, &IID_IUnknown, OLERENDER_NONE, NULL, NULL, storage, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_DATA, 1, -1);
++    IStorage_Release(storage);
++
++    {
++        /* an OBJREF whose custom marshaler is the security manager */
++        struct
++        {
++            ULONG signature, flags;
++            IID iid;
++            CLSID clsid;
++            ULONG extension, size;
++        }
++        objref = { 0x574f454d, 4, IID_IUnknown, CLSID_InternetSecurityManager, 0, 0 };
++
++        CreateStreamOnHGlobal(NULL, TRUE, &stream);
++        IStream_Write(stream, &objref, sizeof(objref), NULL);
++        IStream_Seek(stream, (LARGE_INTEGER){{0}}, STREAM_SEEK_SET, NULL);
++        hr = CoUnmarshalInterface(stream, &IID_IUnknown, (void **)&unk);
++        ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++        check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++        IStream_Release(stream);
++    }
++
++    /* COM's own proxies and stubs are no activation, and the others it asks about when it first loads them */
++    CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    hr = CoMarshalInterface(stream, &IID_IClassFactory, (IUnknown *)&factory, MSHCTX_INPROC, NULL,
++                            MSHLFLAGS_NORMAL);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    ok(!call_count, "asked %u times.\n", call_count);
++    IStream_Seek(stream, (LARGE_INTEGER){{0}}, STREAM_SEEK_SET, NULL);
++    CoReleaseMarshalData(stream);
++    IStream_Release(stream);
++    call_count = 0;
++
++    CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    hr = CoMarshalInterface(stream, &IID_IDispatch, (IUnknown *)&object, MSHCTX_INPROC, NULL, MSHLFLAGS_NORMAL);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    ok(call_count == 1, "asked %u times.\n", call_count);
++    ok(calls[0].type == ACTIVATIONTYPE_UNCATEGORIZED, "got type %#lx.\n", calls[0].type);
++    ok(IsEqualCLSID(&calls[0].clsid, &CLSID_PSDispatch), "got %s.\n", wine_dbgstr_guid(&calls[0].clsid));
++    ok(IsEqualCLSID(&calls[0].replacement, &GUID_NULL), "got replacement %s.\n",
++       wine_dbgstr_guid(&calls[0].replacement));
++    IStream_Seek(stream, (LARGE_INTEGER){{0}}, STREAM_SEEK_SET, NULL);
++    CoReleaseMarshalData(stream);
++    IStream_Release(stream);
++    call_count = 0;
++    CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    hr = CoMarshalInterface(stream, &IID_IDispatch, (IUnknown *)&object, MSHCTX_INPROC, NULL, MSHLFLAGS_NORMAL);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    ok(!call_count, "asked %u times.\n", call_count);
++    IStream_Seek(stream, (LARGE_INTEGER){{0}}, STREAM_SEEK_SET, NULL);
++    CoReleaseMarshalData(stream);
++    IStream_Release(stream);
++    call_count = 0;
++
++    /* what it refuses fails with what it answered, and what it puts in a class's place it is asked about too */
++    mode = REFUSE;
++    hr = CoCreateInstance(&CLSID_InternetZoneManager, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == E_ACCESSDENIED, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetZoneManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    hr = CoGetClassObject(&CLSID_InternetZoneManager, CLSCTX_INPROC_SERVER, NULL, &IID_IClassFactory, (void **)&cf);
++    ok(hr == E_ACCESSDENIED, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetZoneManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++
++    mode = REPLACE;
++    hr = CoCreateInstance(&CLSID_InternetZoneManager, NULL, CLSCTX_INPROC_SERVER, &IID_IInternetSecurityManager,
++                          (void **)&manager);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IInternetSecurityManager_Release(manager);
++    ok(call_count == 2, "asked %u times.\n", call_count);
++    ok(IsEqualCLSID(&calls[1].clsid, &CLSID_InternetSecurityManager), "got %s.\n", wine_dbgstr_guid(&calls[1].clsid));
++    check_calls(&CLSID_InternetZoneManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, -1);
++
++    hr = CreateClassMoniker(&CLSID_InternetZoneManager, &moniker);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    CreateBindCtx(0, &bind);
++    hr = IMoniker_BindToObject(moniker, bind, NULL, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    ok(call_count == 2, "asked %u times.\n", call_count);
++    ok(calls[1].type == ACTIVATIONTYPE_FROM_MONIKER, "got type %#lx.\n", calls[1].type);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_FROM_MONIKER, 1, -1);
++    IBindCtx_Release(bind);
++    IMoniker_Release(moniker);
++
++    mode = REPLACE_REFUSE;
++    hr = CoCreateInstance(&CLSID_InternetZoneManager, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == E_ACCESSDENIED, "got %#lx.\n", hr);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 2);
++
++    mode = SUCCESS_CODE;
++    hr = CoCreateInstance(&CLSID_InternetSecurityManager, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    mode = PASS;
++
++    /* and it stays when COM is uninitialized */
++    OleUninitialize();
++    CoInitialize(NULL);
++    hr = CoCreateInstance(&CLSID_InternetSecurityManager, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    IUnknown_Release(unk);
++    check_calls(&CLSID_InternetSecurityManager, ACTIVATIONTYPE_UNCATEGORIZED, 1, 1);
++    CoUninitialize();
++    ok(!filter_refs, "got %ld references.\n", filter_refs);
++}
++
++START_TEST(activation)
++{
++    pCoRegisterActivationFilter = (void *)GetProcAddress(GetModuleHandleA("ole32.dll"), "CoRegisterActivationFilter");
++    if (!pCoRegisterActivationFilter)
++    {
++        win_skip("CoRegisterActivationFilter is not available.\n");
++        return;
++    }
++
++    test_activation_filter();
++}

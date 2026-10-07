@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 08:14:23 -0400
+Subject: [PATCH] services: build each service's environment when it starts,
+ not once and forever.
+
+The block handed to every service process was built on the first service start
+and kept in a static for the life of services.exe. On a new prefix the first
+start happens while the registry is still almost empty: wineboot calls
+start_services_process() before update_wineprefix(), so wine.inf has not yet
+written System\CurrentControlSet\Control\Session Manager\Environment or
+ProgramFilesDir under CurrentVersion. Whatever CreateEnvironmentBlock can make
+of that is then what every service gets until wineserver is restarted.
+
+Measured on a prefix created and immediately used, which is what an install
+script does. A service that dumps its own environment saw 18 variables, none of
+them from the registry -- no PATH, no OS, no windir, no ProgramData, no
+USERPROFILE and no ProgramFiles. Restarting wineserver first and doing nothing
+else gave the same service 43 variables with all of those present.
+
+What it costs: Office's Click-to-Run service passes every value it is about to
+store through ExpandEnvironmentStringsW, so with no ProgramFiles to expand it
+wrote its install and download paths literally,
+
+  Scenario\INSTALL  PipelineInstallPath   = %ProgramFiles%\Microsoft Office
+                    PipelineDownloadPath  = %ProgramFiles%\Microsoft Office\...
+
+and read them back later in RepomanPipeline::OpenStreamSession, which asks
+PathGetDriveNumber which drive to check for space. A leading '%' is not a drive
+letter, so it answered -1:
+
+  Failed to get path root %ProgramFiles%\Microsoft Office\Updates\Download\
+  PackageFiles\116F7616-..., driveNumber=-1
+
+InvalidArgument, error 30029, the install stream task dead after costing 10205
+download tasks, every other task cancelled and the whole install rolled back --
+one minute in, with no sign of what went wrong short of the Click-to-Run log.
+
+Building the block per start is also what Windows does: a change to the system
+environment reaches a service when that service is restarted, not only when the
+service manager is. Services start rarely enough that the cost is nothing.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 6dce519c11db2144dfa86ff2e826467f9f7ee5ec)
+
+diff --git a/programs/services/services.c b/programs/services/services.c
+index 0830a75016b..988e8ba56f4 100644
+--- a/programs/services/services.c
++++ b/programs/services/services.c
+@@ -45,7 +45,6 @@ DWORD service_pipe_timeout = 10000;
+ DWORD service_kill_timeout = 60000;
+ static DWORD default_preshutdown_timeout = 180000;
+ static DWORD autostart_delay = 120000;
+-static void *environment = NULL;
+ static HKEY service_current_key = NULL;
+ static HANDLE job_object, job_completion_port;
+ 
+@@ -912,6 +911,56 @@ error:
+     return ERROR_NOT_ENOUGH_SERVER_MEMORY;
+ }
+ 
++/* Build the environment a service process starts with.
++ *
++ * This is done afresh for every service rather than once, because the answer
++ * changes underneath us.  wineboot starts this program before it runs wine.inf
++ * -- start_services_process() comes first in its main, update_wineprefix()
++ * after -- so on a new prefix the registry a block built here reads from is
++ * still nearly empty: no Session Manager\Environment, no ProgramFilesDir under
++ * CurrentVersion.  Held on to, that block is what every service started for the
++ * rest of the session gets, and it has no PATH, no windir, no ProgramData and
++ * no ProgramFiles in it.
++ *
++ * Measured, on a prefix created and then used without restarting wineserver:
++ * Office's Click-to-Run service runs each value it is about to store through
++ * ExpandEnvironmentStringsW, so with no ProgramFiles to expand it wrote
++ *
++ *     PipelineInstallPath  = %ProgramFiles%\Microsoft Office
++ *
++ * literally.  Its own installer later hands that string to PathGetDriveNumber,
++ * gets -1, and fails the install with InvalidArgument (30029) -- 10205 download
++ * tasks costed and then thrown away, and the whole thing rolled back.  Running
++ * the same install with a wineserver restart in between, which is the only
++ * difference, stores C:\Program Files\Microsoft Office instead.
++ *
++ * Rebuilding per start is also what a service sees on Windows: a change to the
++ * system environment reaches services as they are restarted, not only when the
++ * service manager is.  Services start rarely enough that the cost is nothing.
++ */
++static void *create_service_environment(void)
++{
++    void *environment = NULL;
++    HANDLE token;
++    WCHAR val[16];
++
++    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &token))
++        return NULL;
++
++    CreateEnvironmentBlock(&environment, token, FALSE);
++    CloseHandle(token);
++
++    if (environment && GetEnvironmentVariableW( L"WINEBOOTSTRAPMODE", val, ARRAY_SIZE(val) ))
++    {
++        UNICODE_STRING name = RTL_CONSTANT_STRING(L"WINEBOOTSTRAPMODE");
++        UNICODE_STRING value;
++
++        RtlInitUnicodeString( &value, val );
++        RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
++    }
++    return environment;
++}
++
+ static DWORD service_start_process(struct service_entry *service_entry, struct process_entry **new_process,
+                                    BOOL *shared_process)
+ {
+@@ -919,7 +968,7 @@ static DWORD service_start_process(struct service_entry *service_entry, struct p
+     PROCESS_INFORMATION pi;
+     STARTUPINFOW si;
+     BOOL is_wow64 = FALSE;
+-    HANDLE token;
++    void *environment;
+     WCHAR *path;
+     DWORD err;
+     BOOL r;
+@@ -1031,20 +1080,7 @@ found:
+         si.lpDesktop = (WCHAR *)L"__wineservice_winstation\\Default";
+     }
+ 
+-    if (!environment && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &token))
+-    {
+-        WCHAR val[16];
+-        CreateEnvironmentBlock(&environment, token, FALSE);
+-        if (GetEnvironmentVariableW( L"WINEBOOTSTRAPMODE", val, ARRAY_SIZE(val) ))
+-        {
+-            UNICODE_STRING name = RTL_CONSTANT_STRING(L"WINEBOOTSTRAPMODE");
+-            UNICODE_STRING value;
+-
+-            RtlInitUnicodeString( &value, val );
+-            RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+-        }
+-        CloseHandle(token);
+-    }
++    environment = create_service_environment();
+ 
+     service_entry->status.dwCurrentState = SERVICE_START_PENDING;
+     service_entry->status.dwControlsAccepted = 0;
+@@ -1058,6 +1094,7 @@ found:
+ 
+     r = CreateProcessW(NULL, path, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS, environment, NULL, &si, &pi);
+     free(path);
++    if (environment) DestroyEnvironmentBlock(environment);
+     if (!r)
+     {
+         err = GetLastError();
+@@ -1332,8 +1369,6 @@ int __cdecl main(int argc, char *argv[])
+         RPC_Stop();
+     }
+     scmdatabase_destroy(active_database);
+-    if (environment)
+-        DestroyEnvironmentBlock(environment);
+ 
+     WINE_TRACE("services.exe exited with code %ld\n", err);
+     return err;

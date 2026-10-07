@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 21:25:23 -0400
+Subject: [PATCH] gdiplus: Give dual metafiles GDI records of what they draw.
+
+A metafile recorded as EmfTypeEmfPlusDual is to carry two complete sets
+of records: EMF+ for renderers that know it, and GDI records for those
+that do not -- GDI itself, and GetWinMetaFileBits(), which PowerPoint's
+WMF export goes through.  Wine wrote only the EMF+ records, so a slide
+exported as WMF was empty (130 bytes, where Windows writes 13 MB), and
+PlayEnhMetaFile() drew nothing of such a metafile.
+
+Windows writes vector GDI records for each call.  Here, when recording
+ends, the EMF+ records are played into a bitmap of the metafile's
+bounds, which is appended as two StretchDIBits records: a mask with
+SRCAND, then the colours with SRCPAINT, so that where nothing was drawn
+stays transparent.  Renderers of EMF+ skip GDI records no GetDC record
+comes before, as these, and Wine's playback does too.  The test of a
+rectangle played by GDI passes on Windows (with its vector records) as
+here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 2718e9e6e27f566ac6d958403d7df8cb66d2c449)
+
+diff --git a/dlls/gdiplus/metafile.c b/dlls/gdiplus/metafile.c
+index feb2735a7f0..c108283c62f 100644
+--- a/dlls/gdiplus/metafile.c
++++ b/dlls/gdiplus/metafile.c
+@@ -1674,6 +1674,168 @@ GpStatus METAFILE_ReleaseDC(GpMetafile* metafile, HDC hdc)
+     return Ok;
+ }
+ 
++/* The GDI records of a dual metafile, which renderers that do not know EMF+ draw instead of the EMF+ records
++ * -- GDI itself, and GetWinMetaFileBits() when a WMF is made from it.  Windows writes vector records for each
++ * call; here the EMF+ records are played into a bitmap of the metafile's bounds, which is drawn at the end as a
++ * mask and the colours, so that what nothing covers stays transparent.  Renderers of EMF+ skip GDI records that
++ * no GetDC record comes before, as these. */
++static void METAFILE_AddGdiFallback(GpMetafile *metafile, const MetafileHeader *header)
++{
++    static const UINT max_pixels = 64 * 1024 * 1024;
++    UINT width = header->Width, height = header->Height, mask_stride, colour_stride, x, y;
++    UINT mask_size, colour_size, mask_record, colour_record, size, extra;
++    EMRSTRETCHDIBITS *record;
++    GpMetafile *copy = NULL;
++    GpBitmap *bitmap = NULL;
++    HENHMETAFILE hemf, new_hemf;
++    BITMAPINFOHEADER *bmi;
++    ENHMETAHEADER *emh;
++    GpGraphics *graphics;
++    BitmapData lock;
++    BYTE *buffer, *p;
++    EMR *eof;
++    GpRect rect;
++
++    if (!width || !height || (UINT64)width * height > max_pixels)
++        return;
++
++    if (!(hemf = CopyEnhMetaFileW(metafile->hemf, NULL)))
++        return;
++    if (GdipCreateMetafileFromEmf(hemf, TRUE, &copy) != Ok)
++    {
++        DeleteEnhMetaFile(hemf);
++        return;
++    }
++    if (GdipCreateBitmapFromScan0(width, height, 0, PixelFormat32bppPARGB, NULL, &bitmap) != Ok)
++        goto done;
++    if (GdipGetImageGraphicsContext((GpImage *)bitmap, &graphics) != Ok)
++        goto done;
++    GdipGraphicsClear(graphics, 0);
++    GdipDrawImageRectI(graphics, (GpImage *)copy, 0, 0, width, height);
++    GdipDeleteGraphics(graphics);
++
++    rect.X = rect.Y = 0;
++    rect.Width = width;
++    rect.Height = height;
++    if (GdipBitmapLockBits(bitmap, &rect, ImageLockModeRead, PixelFormat32bppPARGB, &lock) != Ok)
++        goto done;
++
++    /* a white mask where the picture is transparent, and its colours on black */
++    mask_stride = ((width + 31) / 32) * 4;
++    colour_stride = (width * 3 + 3) & ~3;
++    mask_size = mask_stride * height;
++    colour_size = colour_stride * height;
++    mask_record = sizeof(*record) + sizeof(*bmi) + 2 * sizeof(RGBQUAD) + mask_size;
++    colour_record = sizeof(*record) + sizeof(*bmi) + colour_size;
++    extra = mask_record + colour_record;
++
++    size = GetEnhMetaFileBits(metafile->hemf, 0, NULL);
++    if (!(buffer = calloc(1, size + extra)))
++    {
++        GdipBitmapUnlockBits(bitmap, &lock);
++        goto done;
++    }
++    GetEnhMetaFileBits(metafile->hemf, size, buffer);
++    emh = (ENHMETAHEADER *)buffer;
++    eof = (EMR *)(buffer + size);
++    for (p = buffer; p < buffer + size && ((EMR *)p)->nSize; p += ((EMR *)p)->nSize)
++        if (((EMR *)p)->iType == EMR_EOF) eof = (EMR *)p;
++    if ((BYTE *)eof >= buffer + size)
++    {
++        free(buffer);
++        GdipBitmapUnlockBits(bitmap, &lock);
++        goto done;
++    }
++    memmove((BYTE *)eof + extra, eof, buffer + size - (BYTE *)eof);
++
++    for (p = (BYTE *)eof; p < (BYTE *)eof + extra; p += record->emr.nSize)
++    {
++        BOOL mask = (p == (BYTE *)eof);
++        BYTE *bits;
++
++        record = (EMRSTRETCHDIBITS *)p;
++        record->emr.iType = EMR_STRETCHDIBITS;
++        record->emr.nSize = mask ? mask_record : colour_record;
++        record->rclBounds.left = header->X;
++        record->rclBounds.top = header->Y;
++        record->rclBounds.right = header->X + width - 1;
++        record->rclBounds.bottom = header->Y + height - 1;
++        record->xDest = header->X;
++        record->yDest = header->Y;
++        record->cxSrc = record->cxDest = width;
++        record->cySrc = record->cyDest = height;
++        record->offBmiSrc = sizeof(*record);
++        record->cbBmiSrc = sizeof(*bmi) + (mask ? 2 * sizeof(RGBQUAD) : 0);
++        record->offBitsSrc = record->offBmiSrc + record->cbBmiSrc;
++        record->cbBitsSrc = mask ? mask_size : colour_size;
++        record->iUsageSrc = DIB_RGB_COLORS;
++        record->dwRop = mask ? SRCAND : SRCPAINT;
++        bmi = (BITMAPINFOHEADER *)(p + record->offBmiSrc);
++        bmi->biSize = sizeof(*bmi);
++        bmi->biWidth = width;
++        bmi->biHeight = height;
++        bmi->biPlanes = 1;
++        bmi->biBitCount = mask ? 1 : 24;
++        bmi->biCompression = BI_RGB;
++        bmi->biSizeImage = record->cbBitsSrc;
++        if (mask)
++        {
++            RGBQUAD *colours = (RGBQUAD *)(bmi + 1);
++            colours[1].rgbRed = colours[1].rgbGreen = colours[1].rgbBlue = 0xff;
++        }
++        bits = p + record->offBitsSrc;
++        for (y = 0; y < height; y++)
++        {
++            const BYTE *src = (const BYTE *)lock.Scan0 + y * lock.Stride;
++            BYTE *dst = bits + (height - 1 - y) * (mask ? mask_stride : colour_stride);
++
++            for (x = 0; x < width; x++, src += 4)
++            {
++                BYTE alpha = src[3];
++
++                if (mask)
++                {
++                    if (alpha < 0x80) dst[x / 8] |= 0x80 >> (x % 8);
++                }
++                else if (alpha >= 0x80)
++                {
++                    dst[x * 3] = src[0] * 255 / alpha;
++                    dst[x * 3 + 1] = src[1] * 255 / alpha;
++                    dst[x * 3 + 2] = src[2] * 255 / alpha;
++                }
++            }
++        }
++    }
++    GdipBitmapUnlockBits(bitmap, &lock);
++
++    emh->nBytes = size + extra;
++    emh->nRecords += 2;
++    if (emh->rclBounds.right < emh->rclBounds.left || emh->rclBounds.bottom < emh->rclBounds.top)
++    {
++        emh->rclBounds.left = header->X;
++        emh->rclBounds.top = header->Y;
++        emh->rclBounds.right = header->X + width - 1;
++        emh->rclBounds.bottom = header->Y + height - 1;
++    }
++    else
++    {
++        emh->rclBounds.left = min(emh->rclBounds.left, header->X);
++        emh->rclBounds.top = min(emh->rclBounds.top, header->Y);
++        emh->rclBounds.right = max(emh->rclBounds.right, header->X + (LONG)width - 1);
++        emh->rclBounds.bottom = max(emh->rclBounds.bottom, header->Y + (LONG)height - 1);
++    }
++    if ((new_hemf = SetEnhMetaFileBits(size + extra, buffer)))
++    {
++        DeleteEnhMetaFile(metafile->hemf);
++        metafile->hemf = new_hemf;
++    }
++    free(buffer);
++
++done:
++    if (bitmap) GdipDisposeImage((GpImage *)bitmap);
++    GdipDisposeImage((GpImage *)copy);
++}
++
+ GpStatus METAFILE_GraphicsDeleted(GpMetafile* metafile)
+ {
+     GpStatus stat;
+@@ -1754,6 +1916,8 @@ GpStatus METAFILE_GraphicsDeleted(GpMetafile* metafile)
+             metafile->bounds.Y = header.Y;
+             metafile->bounds.Width = header.Width;
+             metafile->bounds.Height = header.Height;
++            if (metafile->metafile_type == MetafileTypeEmfPlusDual)
++                METAFILE_AddGdiFallback(metafile, &header);
+         }
+     }
+ 
+diff --git a/dlls/gdiplus/tests/metafile.c b/dlls/gdiplus/tests/metafile.c
+index 5b3adad413e..055f6e16860 100644
+--- a/dlls/gdiplus/tests/metafile.c
++++ b/dlls/gdiplus/tests/metafile.c
+@@ -4244,6 +4244,53 @@ static void test_emftowmfbits(void)
+     ReleaseDC(0, hdc);
+ }
+ 
++/* What GDI+ records in a dual metafile, GDI can draw without knowing EMF+. */
++static void test_dual_gdi_playback(void)
++{
++    static const GpRectF frame = { 0.0f, 0.0f, 100.0f, 100.0f };
++    BITMAPINFO bmi = {{ sizeof(bmi.bmiHeader), 100, -100, 1, 32, BI_RGB }};
++    GpMetafile *metafile;
++    GpGraphics *graphics;
++    HENHMETAFILE hemf;
++    HBITMAP dib, old;
++    GpBrush *brush;
++    GpStatus stat;
++    DWORD *pixels;
++    RECT rect;
++    HDC hdc, mem;
++
++    hdc = CreateCompatibleDC(0);
++    stat = GdipRecordMetafile(hdc, EmfTypeEmfPlusDual, &frame, MetafileFrameUnitPixel, L"winetest", &metafile);
++    expect(Ok, stat);
++    DeleteDC(hdc);
++    stat = GdipGetImageGraphicsContext((GpImage *)metafile, &graphics);
++    expect(Ok, stat);
++    stat = GdipCreateSolidFill(0xffff0000, (GpSolidFill **)&brush);
++    expect(Ok, stat);
++    stat = GdipFillRectangleI(graphics, brush, 25, 25, 50, 50);
++    expect(Ok, stat);
++    GdipDeleteBrush(brush);
++    GdipDeleteGraphics(graphics);
++    stat = GdipGetHemfFromMetafile(metafile, &hemf);
++    expect(Ok, stat);
++    GdipDisposeImage((GpImage *)metafile);
++
++    mem = CreateCompatibleDC(0);
++    dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
++    old = SelectObject(mem, dib);
++    memset(pixels, 0xff, 100 * 100 * 4);
++    SetRect(&rect, 0, 0, 100, 100);
++    ok(PlayEnhMetaFile(mem, hemf, &rect), "PlayEnhMetaFile failed\n");
++    ok((pixels[50 * 100 + 50] & 0xffffff) == 0xff0000, "got %#lx inside the rectangle\n", pixels[50 * 100 + 50]);
++    ok((pixels[5 * 100 + 5] & 0xffffff) == 0xffffff, "got %#lx outside it\n", pixels[5 * 100 + 5]);
++    ok((pixels[95 * 100 + 95] & 0xffffff) == 0xffffff, "got %#lx outside it\n", pixels[95 * 100 + 95]);
++
++    SelectObject(mem, old);
++    DeleteObject(dib);
++    DeleteDC(mem);
++    DeleteEnhMetaFile(hemf);
++}
++
+ START_TEST(metafile)
+ {
+     struct GdiplusStartupInput gdiplusStartupInput;
+@@ -4279,6 +4326,7 @@ START_TEST(metafile)
+     test_getdc();
+     test_emfonly();
+     test_emftowmfbits();
++    test_dual_gdi_playback();
+     test_fillrect();
+     test_clear();
+     test_nullframerect();

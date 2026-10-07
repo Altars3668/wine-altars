@@ -1,0 +1,1283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 20:58:40 -0400
+Subject: [PATCH] d2d1: Draw gradients with their extend mode, gamma and colour
+ spaces.
+
+A gradient stop collection kept its stops and nothing else: every gradient
+was clamped and interpolated in sRGB, GetColorInterpolationGamma() and
+GetExtendMode() were stubs, ID2D1DeviceContext::CreateGradientStopCollection()
+was not implemented and the collections were not ID2D1GradientStopCollection1.
+Nor were gradient colours premultiplied, so a gradient to a transparent colour
+was drawn as though it were opaque.
+
+What Windows (build 29671) draws was measured with the probes in wine-altars'
+tools/d2dgradprobe:
+
+- A position is brought into [0, 1] first -- clamped, wrapped, or mirrored
+  back and forth -- and then looked up among the stops, so stops outside
+  [0, 1] count only for the colours they make inside it.
+- Stops are sorted by position, those at one position keeping their order;
+  GetGradientStops() still gives them back as given.
+- Straight colours and alpha are interpolated, converted from the space they
+  are interpolated in to the one they are drawn in, and premultiplied;
+  premultiplied colours are unpremultiplied to be converted.  The first
+  collections are sRGB stops interpolated in sRGB, or with a gamma of 1.0 in
+  linear light, 8 bits a channel; GetGradientStops1() gives the linear stops.
+  The precisions with unsigned normalised values keep stops within [0, 1].
+- A linear gradient of no length is half its start and half its end, or its
+  mean colour if it repeats; a radial one of no radius is its end, or its
+  mean colour; a repeating gradient squeezed into a pixel shows its mean.
+- With the origin outside the ellipse, a point on a line from it that does
+  not meet the ellipse ahead gets the end colour.
+- No stops, a custom colour space, a precision of "unknown" and gamma,
+  extend or interpolation modes out of range are refused.
+
+The tests pass on Windows too (in a desktop session, on the GPU), and with
+the GL and Vulkan renderers.
+
+Not as Windows: Windows samples a texture made from the stops, so a
+repeating gradient blends its two ends within half a texel of where it
+repeats, and a clamped one squeezed into a pixel or two is filtered; here
+each pixel is worked out exactly, which differs by a few levels there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit cabc95c626c065824cb4234a58014b96be70c5aa)
+
+diff --git a/dlls/d2d1/brush.c b/dlls/d2d1/brush.c
+index ea09e6eebbd..800ac99f664 100644
+--- a/dlls/d2d1/brush.c
++++ b/dlls/d2d1/brush.c
+@@ -20,21 +20,22 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
+-static inline struct d2d_gradient *impl_from_ID2D1GradientStopCollection(ID2D1GradientStopCollection *iface)
++static inline struct d2d_gradient *impl_from_ID2D1GradientStopCollection1(ID2D1GradientStopCollection1 *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct d2d_gradient, ID2D1GradientStopCollection_iface);
++    return CONTAINING_RECORD(iface, struct d2d_gradient, ID2D1GradientStopCollection1_iface);
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE d2d_gradient_QueryInterface(ID2D1GradientStopCollection *iface,
++static HRESULT STDMETHODCALLTYPE d2d_gradient_QueryInterface(ID2D1GradientStopCollection1 *iface,
+         REFIID iid, void **out)
+ {
+     TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+ 
+-    if (IsEqualGUID(iid, &IID_ID2D1GradientStopCollection)
++    if (IsEqualGUID(iid, &IID_ID2D1GradientStopCollection1)
++            || IsEqualGUID(iid, &IID_ID2D1GradientStopCollection)
+             || IsEqualGUID(iid, &IID_ID2D1Resource)
+             || IsEqualGUID(iid, &IID_IUnknown))
+     {
+-        ID2D1GradientStopCollection_AddRef(iface);
++        ID2D1GradientStopCollection1_AddRef(iface);
+         *out = iface;
+         return S_OK;
+     }
+@@ -45,9 +46,9 @@ static HRESULT STDMETHODCALLTYPE d2d_gradient_QueryInterface(ID2D1GradientStopCo
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG STDMETHODCALLTYPE d2d_gradient_AddRef(ID2D1GradientStopCollection *iface)
++static ULONG STDMETHODCALLTYPE d2d_gradient_AddRef(ID2D1GradientStopCollection1 *iface)
+ {
+-    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection(iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
+     ULONG refcount = InterlockedIncrement(&gradient->refcount);
+ 
+     TRACE("%p increasing refcount to %lu.\n", iface, refcount);
+@@ -55,9 +56,9 @@ static ULONG STDMETHODCALLTYPE d2d_gradient_AddRef(ID2D1GradientStopCollection *
+     return refcount;
+ }
+ 
+-static ULONG STDMETHODCALLTYPE d2d_gradient_Release(ID2D1GradientStopCollection *iface)
++static ULONG STDMETHODCALLTYPE d2d_gradient_Release(ID2D1GradientStopCollection1 *iface)
+ {
+-    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection(iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
+     ULONG refcount = InterlockedDecrement(&gradient->refcount);
+ 
+     TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
+@@ -65,6 +66,7 @@ static ULONG STDMETHODCALLTYPE d2d_gradient_Release(ID2D1GradientStopCollection
+     if (!refcount)
+     {
+         free(gradient->stops);
++        free(gradient->stops1);
+         ID3D11ShaderResourceView_Release(gradient->view);
+         ID2D1Factory_Release(gradient->factory);
+         free(gradient);
+@@ -73,49 +75,101 @@ static ULONG STDMETHODCALLTYPE d2d_gradient_Release(ID2D1GradientStopCollection
+     return refcount;
+ }
+ 
+-static void STDMETHODCALLTYPE d2d_gradient_GetFactory(ID2D1GradientStopCollection *iface, ID2D1Factory **factory)
++static void STDMETHODCALLTYPE d2d_gradient_GetFactory(ID2D1GradientStopCollection1 *iface, ID2D1Factory **factory)
+ {
+-    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection(iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
+ 
+     TRACE("iface %p, factory %p.\n", iface, factory);
+ 
+     ID2D1Factory_AddRef(*factory = gradient->factory);
+ }
+ 
+-static UINT32 STDMETHODCALLTYPE d2d_gradient_GetGradientStopCount(ID2D1GradientStopCollection *iface)
++static UINT32 STDMETHODCALLTYPE d2d_gradient_GetGradientStopCount(ID2D1GradientStopCollection1 *iface)
+ {
+-    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection(iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
+ 
+     TRACE("iface %p.\n", iface);
+ 
+     return gradient->stop_count;
+ }
+ 
+-static void STDMETHODCALLTYPE d2d_gradient_GetGradientStops(ID2D1GradientStopCollection *iface,
++static void STDMETHODCALLTYPE d2d_gradient_GetGradientStops(ID2D1GradientStopCollection1 *iface,
+         D2D1_GRADIENT_STOP *stops, UINT32 stop_count)
+ {
+-    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection(iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
+ 
+     TRACE("iface %p, stops %p, stop_count %u.\n", iface, stops, stop_count);
+ 
+     memcpy(stops, gradient->stops, min(gradient->stop_count, stop_count) * sizeof(*stops));
+ }
+ 
+-static D2D1_GAMMA STDMETHODCALLTYPE d2d_gradient_GetColorInterpolationGamma(ID2D1GradientStopCollection *iface)
++static D2D1_GAMMA STDMETHODCALLTYPE d2d_gradient_GetColorInterpolationGamma(ID2D1GradientStopCollection1 *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
+ 
+-    return D2D1_GAMMA_1_0;
++    TRACE("iface %p.\n", iface);
++
++    return gradient->pre_space == D2D1_COLOR_SPACE_SCRGB ? D2D1_GAMMA_1_0 : D2D1_GAMMA_2_2;
++}
++
++static D2D1_EXTEND_MODE STDMETHODCALLTYPE d2d_gradient_GetExtendMode(ID2D1GradientStopCollection1 *iface)
++{
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    return gradient->extend_mode;
+ }
+ 
+-static D2D1_EXTEND_MODE STDMETHODCALLTYPE d2d_gradient_GetExtendMode(ID2D1GradientStopCollection *iface)
++/* The stops in the space they are interpolated in, which for a gamma of 1.0 is not the one they were given in. */
++static void STDMETHODCALLTYPE d2d_gradient_GetGradientStops1(ID2D1GradientStopCollection1 *iface,
++        D2D1_GRADIENT_STOP *stops, UINT32 stop_count)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
++
++    TRACE("iface %p, stops %p, stop_count %u.\n", iface, stops, stop_count);
+ 
+-    return D2D1_EXTEND_MODE_CLAMP;
++    memcpy(stops, gradient->stops1, min(gradient->stop_count, stop_count) * sizeof(*stops));
+ }
+ 
+-static const struct ID2D1GradientStopCollectionVtbl d2d_gradient_vtbl =
++static D2D1_COLOR_SPACE STDMETHODCALLTYPE d2d_gradient_GetPreInterpolationSpace(ID2D1GradientStopCollection1 *iface)
++{
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    return gradient->pre_space;
++}
++
++static D2D1_COLOR_SPACE STDMETHODCALLTYPE d2d_gradient_GetPostInterpolationSpace(ID2D1GradientStopCollection1 *iface)
++{
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    return gradient->post_space;
++}
++
++static D2D1_BUFFER_PRECISION STDMETHODCALLTYPE d2d_gradient_GetBufferPrecision(ID2D1GradientStopCollection1 *iface)
++{
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    return gradient->precision;
++}
++
++static D2D1_COLOR_INTERPOLATION_MODE STDMETHODCALLTYPE d2d_gradient_GetColorInterpolationMode(
++        ID2D1GradientStopCollection1 *iface)
++{
++    struct d2d_gradient *gradient = impl_from_ID2D1GradientStopCollection1(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    return gradient->interpolation_mode;
++}
++
++static const struct ID2D1GradientStopCollection1Vtbl d2d_gradient_vtbl =
+ {
+     d2d_gradient_QueryInterface,
+     d2d_gradient_AddRef,
+@@ -125,38 +179,170 @@ static const struct ID2D1GradientStopCollectionVtbl d2d_gradient_vtbl =
+     d2d_gradient_GetGradientStops,
+     d2d_gradient_GetColorInterpolationGamma,
+     d2d_gradient_GetExtendMode,
++    d2d_gradient_GetGradientStops1,
++    d2d_gradient_GetPreInterpolationSpace,
++    d2d_gradient_GetPostInterpolationSpace,
++    d2d_gradient_GetBufferPrecision,
++    d2d_gradient_GetColorInterpolationMode,
++};
++
++static float d2d_srgb_to_linear(float c)
++{
++    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
++}
++
++struct d2d_gradient_key
++{
++    float position;
++    UINT32 index;
+ };
+ 
++/* Stops at one position keep the order they were given in. */
++static int __cdecl d2d_gradient_key_compare(const void *a, const void *b)
++{
++    const struct d2d_gradient_key *key_a = a, *key_b = b;
++
++    if (key_a->position != key_b->position)
++        return key_a->position < key_b->position ? -1 : 1;
++    return key_a->index < key_b->index ? -1 : key_a->index > key_b->index;
++}
++
++static struct d2d_vec4 d2d_vec4_lerp(const struct d2d_vec4 *a, const struct d2d_vec4 *b, float t)
++{
++    struct d2d_vec4 c;
++
++    c.x = a->x + (b->x - a->x) * t;
++    c.y = a->y + (b->y - a->y) * t;
++    c.z = a->z + (b->z - a->z) * t;
++    c.w = a->w + (b->w - a->w) * t;
++    return c;
++}
++
++/* The mean colour over [0, 1], which a gradient repeating more often than once a pixel shows. "data" holds the
++ * stops sorted by position; before the first the colour is the first one's, after the last the last one's, and
++ * between two it is linear, so the mean over each piece is that of its ends. */
++static struct d2d_vec4 d2d_gradient_average(const struct d2d_vec4 *data, UINT32 stop_count)
++{
++    struct d2d_vec4 sum = {0.0f, 0.0f, 0.0f, 0.0f}, a, b;
++    float from = 0.0f, to, x0, x1;
++    UINT32 i;
++
++    for (i = 0; i <= stop_count; ++i)
++    {
++        to = i < stop_count ? min(data[i * 2].x, 1.0f) : 1.0f;
++        if (!(to > from))
++            continue;
++        if (!i)
++        {
++            a = b = data[1];
++        }
++        else if (i == stop_count)
++        {
++            a = b = data[i * 2 - 1];
++        }
++        else
++        {
++            x0 = data[(i - 1) * 2].x;
++            x1 = data[i * 2].x;
++            a = d2d_vec4_lerp(&data[(i - 1) * 2 + 1], &data[i * 2 + 1], (from - x0) / (x1 - x0));
++            b = d2d_vec4_lerp(&data[(i - 1) * 2 + 1], &data[i * 2 + 1], (to - x0) / (x1 - x0));
++        }
++        sum.x += (a.x + b.x) * 0.5f * (to - from);
++        sum.y += (a.y + b.y) * 0.5f * (to - from);
++        sum.z += (a.z + b.z) * 0.5f * (to - from);
++        sum.w += (a.w + b.w) * 0.5f * (to - from);
++        from = to;
++    }
++    return sum;
++}
++
++/* "srgb_stops" says the stops are given in sRGB, whatever space they are interpolated in, as those given to
++ * ID2D1RenderTarget::CreateGradientStopCollection() are. */
+ HRESULT d2d_gradient_create(ID2D1Factory *factory, ID3D11Device1 *device, const D2D1_GRADIENT_STOP *stops,
+-        UINT32 stop_count, D2D1_GAMMA gamma, D2D1_EXTEND_MODE extend_mode, struct d2d_gradient **out)
++        UINT32 stop_count, D2D1_COLOR_SPACE pre_space, D2D1_COLOR_SPACE post_space,
++        D2D1_BUFFER_PRECISION precision, D2D1_EXTEND_MODE extend_mode,
++        D2D1_COLOR_INTERPOLATION_MODE interpolation_mode, BOOL srgb_stops, struct d2d_gradient **out)
+ {
+     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+     D3D11_SUBRESOURCE_DATA buffer_data;
++    struct d2d_gradient_key *keys;
+     ID3D11ShaderResourceView *view;
+     struct d2d_gradient *gradient;
+     D3D11_BUFFER_DESC buffer_desc;
+-    struct d2d_vec4 *data;
++    struct d2d_vec4 *data, *c;
+     ID3D11Buffer *buffer;
+     unsigned int i;
++    BOOL unorm;
+     HRESULT hr;
+ 
+     *out = NULL;
+-    if (!(data = calloc(stop_count, 2 * sizeof(*data))))
++
++    if (!(gradient = calloc(1, sizeof(*gradient))))
++        return E_OUTOFMEMORY;
++    gradient->stop_count = stop_count;
++    if (!(gradient->stops = calloc(stop_count, sizeof(*stops))) || !(gradient->stops1 = calloc(stop_count, sizeof(*stops)))
++            || !(keys = calloc(stop_count, sizeof(*keys))))
+     {
+-        ERR("Failed to allocate data.\n");
++        free(gradient->stops1);
++        free(gradient->stops);
++        free(gradient);
++        return E_OUTOFMEMORY;
++    }
++    if (!(data = calloc(2 * stop_count + 1, sizeof(*data))))
++    {
++        free(keys);
++        free(gradient->stops1);
++        free(gradient->stops);
++        free(gradient);
+         return E_OUTOFMEMORY;
+     }
+ 
++    memcpy(gradient->stops, stops, stop_count * sizeof(*stops));
++    memcpy(gradient->stops1, stops, stop_count * sizeof(*stops));
++    for (i = 0; i < stop_count; ++i)
++    {
++        if (srgb_stops && pre_space == D2D1_COLOR_SPACE_SCRGB)
++        {
++            gradient->stops1[i].color.r = d2d_srgb_to_linear(stops[i].color.r);
++            gradient->stops1[i].color.g = d2d_srgb_to_linear(stops[i].color.g);
++            gradient->stops1[i].color.b = d2d_srgb_to_linear(stops[i].color.b);
++        }
++        keys[i].position = stops[i].position;
++        keys[i].index = i;
++    }
++    qsort(keys, stop_count, sizeof(*keys), d2d_gradient_key_compare);
++
++    /* What a buffer of unsigned normalised values holds is between 0 and 1. */
++    unorm = precision == D2D1_BUFFER_PRECISION_8BPC_UNORM || precision == D2D1_BUFFER_PRECISION_8BPC_UNORM_SRGB
++            || precision == D2D1_BUFFER_PRECISION_16BPC_UNORM;
+     for (i = 0; i < stop_count; ++i)
+     {
+-        data[i * 2].x = stops[i].position;
+-        data[i * 2 + 1].x = stops[i].color.r;
+-        data[i * 2 + 1].y = stops[i].color.g;
+-        data[i * 2 + 1].z = stops[i].color.b;
+-        data[i * 2 + 1].w = stops[i].color.a;
++        const D2D1_GRADIENT_STOP *stop = &gradient->stops1[keys[i].index];
++
++        data[i * 2].x = stop->position;
++        c = &data[i * 2 + 1];
++        c->x = stop->color.r;
++        c->y = stop->color.g;
++        c->z = stop->color.b;
++        c->w = stop->color.a;
++        if (unorm)
++        {
++            c->x = min(max(c->x, 0.0f), 1.0f);
++            c->y = min(max(c->y, 0.0f), 1.0f);
++            c->z = min(max(c->z, 0.0f), 1.0f);
++            c->w = min(max(c->w, 0.0f), 1.0f);
++        }
++        if (interpolation_mode == D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED)
++        {
++            c->x *= c->w;
++            c->y *= c->w;
++            c->z *= c->w;
++        }
+     }
++    free(keys);
++    data[stop_count * 2] = d2d_gradient_average(data, stop_count);
+ 
+-    buffer_desc.ByteWidth = 2 * stop_count * sizeof(*data);
++    buffer_desc.ByteWidth = (2 * stop_count + 1) * sizeof(*data);
+     buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+     buffer_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+     buffer_desc.CPUAccessFlags = 0;
+@@ -171,46 +357,37 @@ HRESULT d2d_gradient_create(ID2D1Factory *factory, ID3D11Device1 *device, const
+     if (FAILED(hr))
+     {
+         ERR("Failed to create buffer, hr %#lx.\n", hr);
++        free(gradient->stops1);
++        free(gradient->stops);
++        free(gradient);
+         return hr;
+     }
+ 
+     srv_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+     srv_desc.Buffer.ElementOffset = 0;
+-    srv_desc.Buffer.ElementWidth = 2 * stop_count;
++    srv_desc.Buffer.ElementWidth = 2 * stop_count + 1;
+ 
+     hr = ID3D11Device1_CreateShaderResourceView(device, (ID3D11Resource *)buffer, &srv_desc, &view);
+     ID3D11Buffer_Release(buffer);
+     if (FAILED(hr))
+     {
+         ERR("Failed to create view, hr %#lx.\n", hr);
++        free(gradient->stops1);
++        free(gradient->stops);
++        free(gradient);
+         return hr;
+     }
+ 
+-    if (!(gradient = calloc(1, sizeof(*gradient))))
+-    {
+-        ID3D11ShaderResourceView_Release(view);
+-        return E_OUTOFMEMORY;
+-    }
+-
+-    if (gamma != D2D1_GAMMA_2_2)
+-        FIXME("Ignoring gamma %#x.\n", gamma);
+-    if (extend_mode != D2D1_EXTEND_MODE_CLAMP)
+-        FIXME("Ignoring extend mode %#x.\n", extend_mode);
+-
+-    gradient->ID2D1GradientStopCollection_iface.lpVtbl = &d2d_gradient_vtbl;
++    gradient->ID2D1GradientStopCollection1_iface.lpVtbl = &d2d_gradient_vtbl;
+     gradient->refcount = 1;
+     ID2D1Factory_AddRef(gradient->factory = factory);
+     gradient->view = view;
+-
+-    gradient->stop_count = stop_count;
+-    if (!(gradient->stops = calloc(stop_count, sizeof(*stops))))
+-    {
+-        ID3D11ShaderResourceView_Release(view);
+-        free(gradient);
+-        return E_OUTOFMEMORY;
+-    }
+-    memcpy(gradient->stops, stops, stop_count * sizeof(*stops));
++    gradient->pre_space = pre_space;
++    gradient->post_space = post_space;
++    gradient->precision = precision;
++    gradient->extend_mode = extend_mode;
++    gradient->interpolation_mode = interpolation_mode;
+ 
+     TRACE("Created gradient %p.\n", gradient);
+     *out = gradient;
+@@ -221,8 +398,8 @@ static struct d2d_gradient *unsafe_impl_from_ID2D1GradientStopCollection(ID2D1Gr
+ {
+     if (!iface)
+         return NULL;
+-    assert(iface->lpVtbl == &d2d_gradient_vtbl);
+-    return CONTAINING_RECORD(iface, struct d2d_gradient, ID2D1GradientStopCollection_iface);
++    assert(iface->lpVtbl == (const ID2D1GradientStopCollectionVtbl *)&d2d_gradient_vtbl);
++    return CONTAINING_RECORD(iface, struct d2d_gradient, ID2D1GradientStopCollection1_iface);
+ }
+ 
+ static void d2d_gradient_bind(struct d2d_gradient *gradient, ID3D11Device1 *device, unsigned int brush_idx)
+@@ -445,7 +622,7 @@ static ULONG STDMETHODCALLTYPE d2d_linear_gradient_brush_Release(ID2D1LinearGrad
+ 
+     if (!refcount)
+     {
+-        ID2D1GradientStopCollection_Release(&brush->u.linear.gradient->ID2D1GradientStopCollection_iface);
++        ID2D1GradientStopCollection1_Release(&brush->u.linear.gradient->ID2D1GradientStopCollection1_iface);
+         d2d_brush_destroy(brush);
+     }
+ 
+@@ -549,7 +726,8 @@ static void STDMETHODCALLTYPE d2d_linear_gradient_brush_GetGradientStopCollectio
+ 
+     TRACE("iface %p, gradient %p.\n", iface, gradient);
+ 
+-    ID2D1GradientStopCollection_AddRef(*gradient = &brush->u.linear.gradient->ID2D1GradientStopCollection_iface);
++    ID2D1GradientStopCollection1_AddRef(&brush->u.linear.gradient->ID2D1GradientStopCollection1_iface);
++    *gradient = (ID2D1GradientStopCollection *)&brush->u.linear.gradient->ID2D1GradientStopCollection1_iface;
+ }
+ 
+ static const struct ID2D1LinearGradientBrushVtbl d2d_linear_gradient_brush_vtbl =
+@@ -579,7 +757,7 @@ HRESULT d2d_linear_gradient_brush_create(ID2D1Factory *factory,
+     d2d_brush_init(*brush, factory, D2D_BRUSH_TYPE_LINEAR, brush_desc,
+             (ID2D1BrushVtbl *)&d2d_linear_gradient_brush_vtbl);
+     (*brush)->u.linear.gradient = unsafe_impl_from_ID2D1GradientStopCollection(gradient);
+-    ID2D1GradientStopCollection_AddRef(&(*brush)->u.linear.gradient->ID2D1GradientStopCollection_iface);
++    ID2D1GradientStopCollection1_AddRef(&(*brush)->u.linear.gradient->ID2D1GradientStopCollection1_iface);
+     (*brush)->u.linear.start = gradient_brush_desc->startPoint;
+     (*brush)->u.linear.end = gradient_brush_desc->endPoint;
+ 
+@@ -632,7 +810,7 @@ static ULONG STDMETHODCALLTYPE d2d_radial_gradient_brush_Release(ID2D1RadialGrad
+ 
+     if (!refcount)
+     {
+-        ID2D1GradientStopCollection_Release(&brush->u.radial.gradient->ID2D1GradientStopCollection_iface);
++        ID2D1GradientStopCollection1_Release(&brush->u.radial.gradient->ID2D1GradientStopCollection1_iface);
+         d2d_brush_destroy(brush);
+     }
+ 
+@@ -772,7 +950,8 @@ static void STDMETHODCALLTYPE d2d_radial_gradient_brush_GetGradientStopCollectio
+ 
+     TRACE("iface %p, gradient %p.\n", iface, gradient);
+ 
+-    ID2D1GradientStopCollection_AddRef(*gradient = &brush->u.radial.gradient->ID2D1GradientStopCollection_iface);
++    ID2D1GradientStopCollection1_AddRef(&brush->u.radial.gradient->ID2D1GradientStopCollection1_iface);
++    *gradient = (ID2D1GradientStopCollection *)&brush->u.radial.gradient->ID2D1GradientStopCollection1_iface;
+ }
+ 
+ static const struct ID2D1RadialGradientBrushVtbl d2d_radial_gradient_brush_vtbl =
+@@ -807,7 +986,7 @@ HRESULT d2d_radial_gradient_brush_create(ID2D1Factory *factory,
+ 
+     d2d_brush_init(b, factory, D2D_BRUSH_TYPE_RADIAL, brush_desc, (ID2D1BrushVtbl *)&d2d_radial_gradient_brush_vtbl);
+     b->u.radial.gradient = unsafe_impl_from_ID2D1GradientStopCollection(gradient);
+-    ID2D1GradientStopCollection_AddRef(&b->u.radial.gradient->ID2D1GradientStopCollection_iface);
++    ID2D1GradientStopCollection1_AddRef(&b->u.radial.gradient->ID2D1GradientStopCollection1_iface);
+     b->u.radial.centre = gradient_desc->center;
+     b->u.radial.offset = gradient_desc->gradientOriginOffset;
+     b->u.radial.radius.x = gradient_desc->radiusX;
+@@ -1369,6 +1548,19 @@ static D3D11_TEXTURE_ADDRESS_MODE texture_address_mode_from_extend_mode(D2D1_EXT
+     }
+ }
+ 
++static void d2d_gradient_fill_cb(const struct d2d_gradient *gradient, struct d2d_gradient_cb *cb)
++{
++    cb->stop_count = gradient->stop_count;
++    cb->extend_mode = gradient->extend_mode;
++    if (gradient->pre_space == gradient->post_space)
++        cb->conversion = D2D_GRADIENT_CONVERSION_NONE;
++    else if (gradient->post_space == D2D1_COLOR_SPACE_SCRGB)
++        cb->conversion = D2D_GRADIENT_CONVERSION_TO_LINEAR;
++    else
++        cb->conversion = D2D_GRADIENT_CONVERSION_TO_SRGB;
++    cb->premultiplied = gradient->interpolation_mode == D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED;
++}
++
+ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
+ {
+     float theta, sin_theta, cos_theta;
+@@ -1403,7 +1595,7 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
+             b = brush->transform;
+             d2d_point_transform(&cb->u.linear.start, &b, brush->u.linear.start.x, brush->u.linear.start.y);
+             d2d_point_transform(&cb->u.linear.end, &b, brush->u.linear.end.x, brush->u.linear.end.y);
+-            cb->u.linear.stop_count = brush->u.linear.gradient->stop_count;
++            d2d_gradient_fill_cb(brush->u.linear.gradient, &cb->u.linear.gradient);
+ 
+             return TRUE;
+ 
+@@ -1445,7 +1637,7 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
+             t = sqrtf(s1 - s2);
+             d2d_point_set(&cb->u.radial.rb, t * -sin_theta, t * cos_theta);
+ 
+-            cb->u.radial.stop_count = brush->u.radial.gradient->stop_count;
++            d2d_gradient_fill_cb(brush->u.radial.gradient, &cb->u.radial.gradient);
+ 
+             return TRUE;
+ 
+diff --git a/dlls/d2d1/command_list.c b/dlls/d2d1/command_list.c
+index 3f7603c1c03..a048572b483 100644
+--- a/dlls/d2d1/command_list.c
++++ b/dlls/d2d1/command_list.c
+@@ -631,8 +631,8 @@ static bool d2d_command_list_create_brush(struct d2d_command_list *command_list,
+         case D2D_BRUSH_TYPE_LINEAR:
+             linear_properties.startPoint = brush->u.linear.start;
+             linear_properties.endPoint = brush->u.linear.end;
+-            hr = ID2D1DeviceContext_CreateLinearGradientBrush(context, &linear_properties,
+-                    &properties, &brush->u.linear.gradient->ID2D1GradientStopCollection_iface,
++            hr = ID2D1DeviceContext_CreateLinearGradientBrush(context, &linear_properties, &properties,
++                    (ID2D1GradientStopCollection *)&brush->u.linear.gradient->ID2D1GradientStopCollection1_iface,
+                     (ID2D1LinearGradientBrush **)ret);
+             break;
+         case D2D_BRUSH_TYPE_RADIAL:
+@@ -640,8 +640,8 @@ static bool d2d_command_list_create_brush(struct d2d_command_list *command_list,
+             radial_properties.gradientOriginOffset = brush->u.radial.offset;
+             radial_properties.radiusX = brush->u.radial.radius.x;
+             radial_properties.radiusY = brush->u.radial.radius.y;
+-            hr = ID2D1DeviceContext_CreateRadialGradientBrush(context, &radial_properties,
+-                    &properties, &brush->u.radial.gradient->ID2D1GradientStopCollection_iface,
++            hr = ID2D1DeviceContext_CreateRadialGradientBrush(context, &radial_properties, &properties,
++                    (ID2D1GradientStopCollection *)&brush->u.radial.gradient->ID2D1GradientStopCollection1_iface,
+                     (ID2D1RadialGradientBrush **)ret);
+             break;
+         case D2D_BRUSH_TYPE_BITMAP:
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index c07a0ff6015..3c0f29e222d 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -81,6 +81,21 @@ struct d2d_shape_resources
+     ID3D11VertexShader *vs;
+ };
+ 
++enum d2d_gradient_conversion
++{
++    D2D_GRADIENT_CONVERSION_NONE,
++    D2D_GRADIENT_CONVERSION_TO_LINEAR,
++    D2D_GRADIENT_CONVERSION_TO_SRGB,
++};
++
++struct d2d_gradient_cb
++{
++    unsigned int stop_count;
++    D2D1_EXTEND_MODE extend_mode;
++    enum d2d_gradient_conversion conversion;
++    BOOL premultiplied;
++};
++
+ struct d2d_brush_cb
+ {
+     enum d2d_brush_type type;
+@@ -96,7 +111,7 @@ struct d2d_brush_cb
+         {
+             D2D1_POINT_2F start;
+             D2D1_POINT_2F end;
+-            unsigned int stop_count;
++            struct d2d_gradient_cb gradient;
+         } linear;
+         struct
+         {
+@@ -104,8 +119,7 @@ struct d2d_brush_cb
+             D2D1_POINT_2F offset;
+             D2D1_POINT_2F ra;
+             D2D1_POINT_2F rb;
+-            unsigned int stop_count;
+-            float pad[3];
++            struct d2d_gradient_cb gradient;
+         } radial;
+         struct
+         {
+@@ -354,18 +368,26 @@ HRESULT d2d_bitmap_render_target_init(struct d2d_bitmap_render_target *render_ta
+ 
+ struct d2d_gradient
+ {
+-    ID2D1GradientStopCollection ID2D1GradientStopCollection_iface;
++    ID2D1GradientStopCollection1 ID2D1GradientStopCollection1_iface;
+     LONG refcount;
+ 
+     ID2D1Factory *factory;
++    /* The stops sorted by position, in the space they are interpolated in, then their mean colour. */
+     ID3D11ShaderResourceView *view;
+     D2D1_GRADIENT_STOP *stops;
++    D2D1_GRADIENT_STOP *stops1;
+     UINT32 stop_count;
++    D2D1_COLOR_SPACE pre_space;
++    D2D1_COLOR_SPACE post_space;
++    D2D1_BUFFER_PRECISION precision;
++    D2D1_EXTEND_MODE extend_mode;
++    D2D1_COLOR_INTERPOLATION_MODE interpolation_mode;
+ };
+ 
+ HRESULT d2d_gradient_create(ID2D1Factory *factory, ID3D11Device1 *device, const D2D1_GRADIENT_STOP *stops,
+-        UINT32 stop_count, D2D1_GAMMA gamma, D2D1_EXTEND_MODE extend_mode,
+-        struct d2d_gradient **gradient);
++        UINT32 stop_count, D2D1_COLOR_SPACE pre_space, D2D1_COLOR_SPACE post_space,
++        D2D1_BUFFER_PRECISION precision, D2D1_EXTEND_MODE extend_mode,
++        D2D1_COLOR_INTERPOLATION_MODE interpolation_mode, BOOL srgb_stops, struct d2d_gradient **gradient);
+ 
+ struct d2d_brush
+ {
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 3c0d9afef61..39e57a4caf8 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -536,9 +536,15 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateGradientStopCollection
+     TRACE("iface %p, stops %p, stop_count %u, gamma %#x, extend_mode %#x, gradient %p.\n",
+             iface, stops, stop_count, gamma, extend_mode, gradient);
+ 
+-    if (SUCCEEDED(hr = d2d_gradient_create(render_target->factory, render_target->d3d_device,
+-            stops, stop_count, gamma, extend_mode, &object)))
+-        *gradient = &object->ID2D1GradientStopCollection_iface;
++    *gradient = NULL;
++    if (!stop_count || (gamma != D2D1_GAMMA_2_2 && gamma != D2D1_GAMMA_1_0) || extend_mode > D2D1_EXTEND_MODE_MIRROR)
++        return E_INVALIDARG;
++
++    /* The stops are sRGB either way; with a gamma of 1.0 they are interpolated in linear light. */
++    if (SUCCEEDED(hr = d2d_gradient_create(render_target->factory, render_target->d3d_device, stops, stop_count,
++            gamma == D2D1_GAMMA_1_0 ? D2D1_COLOR_SPACE_SCRGB : D2D1_COLOR_SPACE_SRGB, D2D1_COLOR_SPACE_SRGB,
++            D2D1_BUFFER_PRECISION_8BPC_UNORM, extend_mode, D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, TRUE, &object)))
++        *gradient = (ID2D1GradientStopCollection *)&object->ID2D1GradientStopCollection1_iface;
+ 
+     return hr;
+ }
+@@ -2794,12 +2800,34 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_CreateGra
+         D2D1_BUFFER_PRECISION buffer_precision, D2D1_EXTEND_MODE extend_mode,
+         D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode, ID2D1GradientStopCollection1 **gradient)
+ {
+-    FIXME("iface %p, stops %p, stop_count %u, preinterpolation_space %#x, postinterpolation_space %#x, "
+-            "buffer_precision %#x, extend_mode %#x, color_interpolation_mode %#x, gradient %p stub!\n",
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    struct d2d_gradient *object;
++    HRESULT hr;
++
++    TRACE("iface %p, stops %p, stop_count %u, preinterpolation_space %#x, postinterpolation_space %#x, "
++            "buffer_precision %#x, extend_mode %#x, color_interpolation_mode %#x, gradient %p.\n",
+             iface, stops, stop_count, preinterpolation_space, postinterpolation_space,
+             buffer_precision, extend_mode, color_interpolation_mode, gradient);
+ 
+-    return E_NOTIMPL;
++    *gradient = NULL;
++    if (!stop_count || (preinterpolation_space != D2D1_COLOR_SPACE_SRGB
++            && preinterpolation_space != D2D1_COLOR_SPACE_SCRGB)
++            || (postinterpolation_space != D2D1_COLOR_SPACE_SRGB && postinterpolation_space != D2D1_COLOR_SPACE_SCRGB)
++            || extend_mode > D2D1_EXTEND_MODE_MIRROR
++            || color_interpolation_mode > D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED)
++        return E_INVALIDARG;
++    if (buffer_precision == D2D1_BUFFER_PRECISION_UNKNOWN)
++        return D2DERR_INVALID_CALL;
++    if (buffer_precision > D2D1_BUFFER_PRECISION_32BPC_FLOAT)
++        return E_INVALIDARG;
++
++    /* The stops are given in the space they are interpolated in. */
++    if (SUCCEEDED(hr = d2d_gradient_create(context->factory, context->d3d_device, stops, stop_count,
++            preinterpolation_space, postinterpolation_space, buffer_precision, extend_mode,
++            color_interpolation_mode, FALSE, &object)))
++        *gradient = &object->ID2D1GradientStopCollection1_iface;
++
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateImageBrush(ID2D1DeviceContext6 *iface,
+@@ -4979,6 +5007,14 @@ static const char shape_ps_code[] =
+     "#define BRUSH_TYPE_BITMAP   3\n"
+     "#define BRUSH_TYPE_COUNT    4\n"
+     "\n"
++    "#define EXTEND_MODE_CLAMP   0\n"
++    "#define EXTEND_MODE_WRAP    1\n"
++    "#define EXTEND_MODE_MIRROR  2\n"
++    "\n"
++    "#define GRADIENT_CONVERSION_NONE       0\n"
++    "#define GRADIENT_CONVERSION_TO_LINEAR  1\n"
++    "#define GRADIENT_CONVERSION_TO_SRGB    2\n"
++    "\n"
+     "bool outline;\n"
+     "bool is_arc;\n"
+     "bool round_joins;\n"
+@@ -5000,66 +5036,149 @@ static const char shape_ps_code[] =
+     "    nointerpolation float2x2 stroke_transform : STROKE_TRANSFORM;\n"
+     "};\n"
+     "\n"
+-    "float4 sample_gradient(Buffer<float4> gradient, uint stop_count, float position)\n"
++    "/* The colour at \"position\" in [0, 1] of stops sorted by position: the first stop's before it, the last one's\n"
++    " * after it, and where several stops share a position, the last of them. */\n"
++    "float4 gradient_colour(Buffer<float4> stops, uint stop_count, float position)\n"
+     "{\n"
+     "    float4 c_low, c_high;\n"
+     "    float p_low, p_high;\n"
+     "    uint i;\n"
+     "\n"
+-    "    p_low = gradient.Load(0).x;\n"
+-    "    c_low = gradient.Load(1);\n"
+-    "    c_high = c_low;\n"
+-    "\n"
+-    "    if (position < p_low)\n"
++    "    p_low = stops.Load(0).x;\n"
++    "    c_low = stops.Load(1);\n"
++    "    if (position <= p_low)\n"
+     "        return c_low;\n"
+     "\n"
+     "    [loop]\n"
+     "    for (i = 1; i < stop_count; ++i)\n"
+     "    {\n"
+-    "        p_high = gradient.Load(i * 2).x;\n"
+-    "        c_high = gradient.Load(i * 2 + 1);\n"
++    "        p_high = stops.Load(i * 2).x;\n"
++    "        c_high = stops.Load(i * 2 + 1);\n"
+     "\n"
+-    "        if (position >= p_low && position <= p_high)\n"
++    "        if (position < p_high)\n"
+     "            return lerp(c_low, c_high, (position - p_low) / (p_high - p_low));\n"
+     "\n"
+     "        p_low = p_high;\n"
+     "        c_low = c_high;\n"
+     "    }\n"
+     "\n"
+-    "    return c_high;\n"
++    "    return c_low;\n"
+     "}\n"
+     "\n"
+-    "float4 brush_linear(struct brush brush, Buffer<float4> gradient, float2 position)\n"
++    "float3 srgb_to_linear(float3 c)\n"
++    "{\n"
++    "    return c <= 0.04045f ? c / 12.92f : pow(abs((c + 0.055f) / 1.055f), 2.4f);\n"
++    "}\n"
++    "\n"
++    "float3 linear_to_srgb(float3 c)\n"
++    "{\n"
++    "    return c <= 0.0031308f ? c * 12.92f : 1.055f * pow(abs(c), 1.0f / 2.4f) - 0.055f;\n"
++    "}\n"
++    "\n"
++    "/* A colour as interpolated, converted to the space the gradient is drawn in and premultiplied. */\n"
++    "float4 gradient_output(uint4 gradient, float4 c)\n"
++    "{\n"
++    "    uint conversion = gradient.z;\n"
++    "    bool premultiplied = gradient.w;\n"
++    "\n"
++    "    if (conversion != GRADIENT_CONVERSION_NONE)\n"
++    "    {\n"
++    "        if (premultiplied)\n"
++    "            c.rgb = c.a ? c.rgb / c.a : float3(0.0f, 0.0f, 0.0f);\n"
++    "        if (conversion == GRADIENT_CONVERSION_TO_LINEAR)\n"
++    "            c.rgb = srgb_to_linear(c.rgb);\n"
++    "        else\n"
++    "            c.rgb = linear_to_srgb(c.rgb);\n"
++    "        c.rgb *= c.a;\n"
++    "    }\n"
++    "    else if (!premultiplied)\n"
++    "    {\n"
++    "        c.rgb *= c.a;\n"
++    "    }\n"
++    "    return c;\n"
++    "}\n"
++    "\n"
++    "/* \"gradient\" is the stop count, the extend mode, the conversion after interpolation and whether it is\n"
++    " * premultiplied colours that are interpolated. \"position\" is how far along the gradient a point is, and\n"
++    " * \"width\" how far that changes across a pixel; where it changes by a whole repetition of the gradient or\n"
++    " * more, the pixel shows the mean colour, which follows the stops. */\n"
++    "float4 sample_gradient(Buffer<float4> stops, uint4 gradient, float position, float width)\n"
++    "{\n"
++    "    uint stop_count = gradient.x, extend_mode = gradient.y;\n"
++    "    float4 c, average;\n"
++    "\n"
++    "    average = stops.Load(stop_count * 2);\n"
++    "    if (extend_mode == EXTEND_MODE_CLAMP)\n"
++    "        return gradient_output(gradient, gradient_colour(stops, stop_count, saturate(position)));\n"
++    "    /* Past 2²⁴ a float no longer tells one repetition from the next. */\n"
++    "    if (abs(position) >= 16777216.0f)\n"
++    "        return gradient_output(gradient, average);\n"
++    "    if (extend_mode == EXTEND_MODE_WRAP)\n"
++    "    {\n"
++    "        position = frac(position);\n"
++    "    }\n"
++    "    else\n"
++    "    {\n"
++    "        position = 2.0f * frac(0.5f * position);\n"
++    "        if (position > 1.0f)\n"
++    "            position = 2.0f - position;\n"
++    "    }\n"
++    "    c = gradient_colour(stops, stop_count, position);\n"
++    "    if (width > 0.5f)\n"
++    "        c = lerp(c, average, saturate(2.0f * width - 1.0f));\n"
++    "    return gradient_output(gradient, c);\n"
++    "}\n"
++    "\n"
++    "float4 brush_linear(struct brush brush, Buffer<float4> stops, float2 position)\n"
+     "{\n"
+     "    float2 start, end, v_p, v_q;\n"
+-    "    uint stop_count;\n"
+-    "    float p;\n"
++    "    uint4 gradient;\n"
++    "    float p, width;\n"
+     "\n"
+     "    start = brush.data[0].xy;\n"
+     "    end = brush.data[0].zw;\n"
+-    "    stop_count = asuint(brush.data[1].x);\n"
++    "    gradient = asuint(brush.data[1]);\n"
+     "\n"
+     "    v_p = position - start;\n"
+     "    v_q = end - start;\n"
++    "    /* A gradient of no length is all one step: a clamped one is half its start and half its end, one that\n"
++    "     * repeats its mean colour. */\n"
++    "    if (dot(v_q, v_q) == 0.0f)\n"
++    "    {\n"
++    "        if (gradient.y == EXTEND_MODE_CLAMP)\n"
++    "            return gradient_output(gradient, 0.5f * (gradient_colour(stops, gradient.x, 0.0f)\n"
++    "                    + gradient_colour(stops, gradient.x, 1.0f)));\n"
++    "        return gradient_output(gradient, stops.Load(gradient.x * 2));\n"
++    "    }\n"
+     "    p = dot(v_q, v_p) / dot(v_q, v_q);\n"
++    "    width = length(float2(ddx(p), ddy(p)));\n"
+     "\n"
+-    "    return sample_gradient(gradient, stop_count, p);\n"
++    "    return sample_gradient(stops, gradient, p, width);\n"
+     "}\n"
+     "\n"
+-    "float4 brush_radial(struct brush brush, Buffer<float4> gradient, float2 position)\n"
++    "float4 brush_radial(struct brush brush, Buffer<float4> stops, float2 position)\n"
+     "{\n"
+     "    float2 centre, offset, ra, rb, v_p, v_q, r;\n"
+-    "    float b, c, l, t;\n"
+-    "    uint stop_count;\n"
++    "    float b, c, d, l, t, p, width;\n"
++    "    bool outside = false;\n"
++    "    uint4 gradient;\n"
+     "\n"
+     "    centre = brush.data[0].xy;\n"
+     "    offset = brush.data[0].zw;\n"
+     "    ra = brush.data[1].xy;\n"
+     "    rb = brush.data[1].zw;\n"
+-    "    stop_count = asuint(brush.data[2].x);\n"
++    "    gradient = asuint(brush.data[2]);\n"
+     "\n"
+-    "    /* Project onto ra, rb. */\n"
++    "    /* An ellipse of no size leaves every point past its edge, infinitely far along a gradient that repeats. */\n"
+     "    r = float2(dot(ra, ra), dot(rb, rb));\n"
++    "    if (r.x == 0.0f || r.y == 0.0f)\n"
++    "    {\n"
++    "        if (gradient.y == EXTEND_MODE_CLAMP)\n"
++    "            return gradient_output(gradient, gradient_colour(stops, gradient.x, 1.0f));\n"
++    "        return gradient_output(gradient, stops.Load(gradient.x * 2));\n"
++    "    }\n"
++    "\n"
++    "    /* Project onto ra, rb. */\n"
+     "    v_p = position - (centre + offset);\n"
+     "    v_p = float2(dot(v_p, ra), dot(v_p, rb)) / r;\n"
+     "    v_q = float2(dot(offset, ra), dot(offset, rb)) / r;\n"
+@@ -5070,13 +5189,28 @@ static const char shape_ps_code[] =
+     "     *\n"
+     "     * b = p̂·q⃑\n"
+     "     * c = q⃑·q⃑ - 1\n"
+-    "     * t = -b + √(b² - c) */\n"
++    "     * t = -b + √(b² - c)\n"
++    "     *\n"
++    "     * With the origin outside the ellipse, a line from it may meet the ellipse twice, once, or not at all, or\n"
++    "     * only behind it; a point on one that does not meet it ahead is past the edge. */\n"
+     "    l = length(v_p);\n"
+-    "    b = dot(v_p, v_q) / l;\n"
+-    "    c = dot(v_q, v_q) - 1.0;\n"
+-    "    t = -b + sqrt(b * b - c);\n"
++    "    p = 0.0f;\n"
++    "    if (l > 0.0f)\n"
++    "    {\n"
++    "        b = dot(v_p, v_q) / l;\n"
++    "        c = dot(v_q, v_q) - 1.0f;\n"
++    "        d = b * b - c;\n"
++    "        t = -b + sqrt(max(d, 0.0f));\n"
++    "        if (d < 0.0f || t <= 0.0f)\n"
++    "            outside = true;\n"
++    "        else\n"
++    "            p = l / t;\n"
++    "    }\n"
++    "    width = length(float2(ddx(p), ddy(p)));\n"
++    "    if (outside)\n"
++    "        return gradient_output(gradient, gradient_colour(stops, gradient.x, 1.0f));\n"
+     "\n"
+-    "    return sample_gradient(gradient, stop_count, l / t);\n"
++    "    return sample_gradient(stops, gradient, p, width);\n"
+     "}\n"
+     "\n"
+     "float4 brush_bitmap(struct brush brush, Texture2D t, SamplerState s, float2 position)\n"
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index 180c82ca040..4a4647649e7 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -7909,6 +7909,7 @@ static void test_stroke_style(BOOL d3d11)
+ 
+ static void test_gradient(BOOL d3d11)
+ {
++    ID2D1GradientStopCollection1 *gradient1;
+     ID2D1GradientStopCollection *gradient;
+     D2D1_GRADIENT_STOP stops[3], stops2[3];
+     struct d2d1_test_context ctx;
+@@ -7947,6 +7948,310 @@ static void test_gradient(BOOL d3d11)
+ 
+     ID2D1GradientStopCollection_Release(gradient);
+ 
++    /* What the collections say about themselves; the first ones are the second ones, sRGB stops interpolated in
++     * sRGB, or with a gamma of 1.0 in linear light, 8 bits a channel, straight colours. */
++    stops2[0].position = 0.0f;
++    set_color(&stops2[0].color, 0.5f, 0.25f, 0.75f, 0.5f);
++    stops2[1].position = 1.0f;
++    set_color(&stops2[1].color, 0.0f, 0.0f, 0.0f, 1.0f);
++    for (i = 0; i < 2; ++i)
++    {
++        winetest_push_context("gamma %u", i);
++        hr = ID2D1RenderTarget_CreateGradientStopCollection(rt, stops2, 2, i ? D2D1_GAMMA_1_0 : D2D1_GAMMA_2_2,
++                D2D1_EXTEND_MODE_MIRROR, &gradient);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ok(ID2D1GradientStopCollection_GetColorInterpolationGamma(gradient) == (i ? D2D1_GAMMA_1_0 : D2D1_GAMMA_2_2),
++                "Got unexpected gamma.\n");
++        ok(ID2D1GradientStopCollection_GetExtendMode(gradient) == D2D1_EXTEND_MODE_MIRROR,
++                "Got unexpected extend mode.\n");
++        ID2D1GradientStopCollection_GetGradientStops(gradient, stops, 2);
++        ok(!memcmp(stops, stops2, 2 * sizeof(*stops)), "Got unexpected stops.\n");
++        hr = ID2D1GradientStopCollection_QueryInterface(gradient, &IID_ID2D1GradientStopCollection1,
++                (void **)&gradient1);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ok(ID2D1GradientStopCollection1_GetPreInterpolationSpace(gradient1)
++                == (i ? D2D1_COLOR_SPACE_SCRGB : D2D1_COLOR_SPACE_SRGB), "Got unexpected space.\n");
++        ok(ID2D1GradientStopCollection1_GetPostInterpolationSpace(gradient1) == D2D1_COLOR_SPACE_SRGB,
++                "Got unexpected space.\n");
++        ok(ID2D1GradientStopCollection1_GetBufferPrecision(gradient1) == D2D1_BUFFER_PRECISION_8BPC_UNORM,
++                "Got unexpected precision.\n");
++        ok(ID2D1GradientStopCollection1_GetColorInterpolationMode(gradient1) == D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT,
++                "Got unexpected interpolation mode.\n");
++        /* The stops as they are interpolated. */
++        ID2D1GradientStopCollection1_GetGradientStops1(gradient1, stops, 2);
++        if (i)
++        {
++            ok(stops[0].position == 0.0f && fabsf(stops[0].color.r - 0.214041f) < 1.0e-4f
++                    && fabsf(stops[0].color.g - 0.0508761f) < 1.0e-4f && fabsf(stops[0].color.b - 0.522522f) < 1.0e-4f
++                    && stops[0].color.a == 0.5f, "Got unexpected stop {%.8e, {%.8e, %.8e, %.8e, %.8e}}.\n",
++                    stops[0].position, stops[0].color.r, stops[0].color.g, stops[0].color.b, stops[0].color.a);
++            ok(!memcmp(&stops[1], &stops2[1], sizeof(*stops)), "Got unexpected stop.\n");
++        }
++        else
++        {
++            ok(!memcmp(stops, stops2, 2 * sizeof(*stops)), "Got unexpected stops.\n");
++        }
++        ID2D1GradientStopCollection1_Release(gradient1);
++        ID2D1GradientStopCollection_Release(gradient);
++        winetest_pop_context();
++    }
++
++    hr = ID2D1RenderTarget_CreateGradientStopCollection(rt, stops2, 0, D2D1_GAMMA_2_2,
++            D2D1_EXTEND_MODE_CLAMP, &gradient);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1RenderTarget_CreateGradientStopCollection(rt, stops2, 2, D2D1_GAMMA_1_0 + 1,
++            D2D1_EXTEND_MODE_CLAMP, &gradient);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1RenderTarget_CreateGradientStopCollection(rt, stops2, 2, D2D1_GAMMA_2_2,
++            D2D1_EXTEND_MODE_MIRROR + 1, &gradient);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++
++    /* The second ones keep the stops as they are given, in the space they are interpolated in, whatever the
++     * precision. */
++    set_color(&stops2[0].color, 2.0f, 0.5f, -0.5f, 1.0f);
++    hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, stops2, 2, D2D1_COLOR_SPACE_SCRGB,
++            D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_EXTEND_MODE_WRAP,
++            D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, &gradient1);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ok(ID2D1GradientStopCollection1_GetColorInterpolationGamma(gradient1) == D2D1_GAMMA_1_0,
++            "Got unexpected gamma.\n");
++    ok(ID2D1GradientStopCollection1_GetExtendMode(gradient1) == D2D1_EXTEND_MODE_WRAP, "Got unexpected extend mode.\n");
++    ok(ID2D1GradientStopCollection1_GetPreInterpolationSpace(gradient1) == D2D1_COLOR_SPACE_SCRGB,
++            "Got unexpected space.\n");
++    ok(ID2D1GradientStopCollection1_GetPostInterpolationSpace(gradient1) == D2D1_COLOR_SPACE_SRGB,
++            "Got unexpected space.\n");
++    ok(ID2D1GradientStopCollection1_GetBufferPrecision(gradient1) == D2D1_BUFFER_PRECISION_8BPC_UNORM,
++            "Got unexpected precision.\n");
++    ok(ID2D1GradientStopCollection1_GetColorInterpolationMode(gradient1)
++            == D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, "Got unexpected interpolation mode.\n");
++    ID2D1GradientStopCollection1_GetGradientStops(gradient1, stops, 2);
++    ok(!memcmp(stops, stops2, 2 * sizeof(*stops)), "Got unexpected stops.\n");
++    ID2D1GradientStopCollection1_GetGradientStops1(gradient1, stops, 2);
++    ok(!memcmp(stops, stops2, 2 * sizeof(*stops)), "Got unexpected stops.\n");
++    ID2D1GradientStopCollection1_Release(gradient1);
++
++    hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, stops2, 0, D2D1_COLOR_SPACE_SRGB,
++            D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_EXTEND_MODE_CLAMP,
++            D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, &gradient1);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, stops2, 2, D2D1_COLOR_SPACE_CUSTOM,
++            D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_EXTEND_MODE_CLAMP,
++            D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, &gradient1);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, stops2, 2, D2D1_COLOR_SPACE_SRGB,
++            D2D1_COLOR_SPACE_CUSTOM, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_EXTEND_MODE_CLAMP,
++            D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, &gradient1);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, stops2, 2, D2D1_COLOR_SPACE_SRGB,
++            D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_UNKNOWN, D2D1_EXTEND_MODE_CLAMP,
++            D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, &gradient1);
++    ok(hr == D2DERR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, stops2, 2, D2D1_COLOR_SPACE_SRGB,
++            D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_EXTEND_MODE_CLAMP,
++            D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED + 1, &gradient1);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++
++    release_test_context(&ctx);
++}
++
++/* Gradients are drawn at 16 pixels to a repetition, a linear one from x = 16 to x = 32, a radial one around
++ * {0, 2} of the row, and looked at in the second row of four. */
++static void test_gradient_drawing(BOOL d3d11)
++{
++    static const D2D1_GRADIENT_STOP red_blue[] = {{0.0f, {1.0f, 0.0f, 0.0f, 1.0f}}, {1.0f, {0.0f, 0.0f, 1.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP to_clear[] = {{0.0f, {1.0f, 1.0f, 1.0f, 1.0f}}, {1.0f, {0.0f, 1.0f, 0.0f, 0.0f}}};
++    static const D2D1_GRADIENT_STOP inside[] = {{0.25f, {1.0f, 0.0f, 0.0f, 1.0f}}, {0.75f, {0.0f, 0.0f, 1.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP bright[] = {{0.0f, {2.0f, 0.5f, -0.5f, 1.0f}}, {1.0f, {0.0f, 0.0f, 1.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP mid[] = {{0.0f, {0.5f, 0.25f, 0.75f, 0.5f}}, {1.0f, {0.0f, 0.0f, 0.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP translucent[] =
++            {{0.0f, {1.0f, 0.5f, 0.0f, 0.25f}}, {1.0f, {0.0f, 0.5f, 1.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP reversed[] = {{1.0f, {0.0f, 0.0f, 1.0f, 1.0f}}, {0.0f, {1.0f, 0.0f, 0.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP unsorted[] = {{0.0f, {1.0f, 0.0f, 0.0f, 1.0f}}, {1.0f, {0.0f, 0.0f, 1.0f, 1.0f}},
++            {0.5f, {0.0f, 1.0f, 0.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP outside[] = {{-1.0f, {1.0f, 0.0f, 0.0f, 1.0f}}, {2.0f, {0.0f, 0.0f, 1.0f, 1.0f}}};
++    static const D2D1_GRADIENT_STOP three[] = {{0.0f, {1.0f, 0.0f, 0.0f, 1.0f}}, {0.25f, {0.0f, 1.0f, 0.0f, 1.0f}},
++            {1.0f, {0.0f, 0.0f, 1.0f, 1.0f}}};
++    static const unsigned int xs[] = {0, 8, 20, 24, 28, 40, 63};
++    static const struct
++    {
++        const D2D1_GRADIENT_STOP *stops;
++        unsigned int stop_count;
++        /* A gamma for the first collections, D2D1_COLOR_SPACE_* + 1 for a second one from the pre- and
++         * post-interpolation spaces. */
++        unsigned int gamma, post;
++        D2D1_BUFFER_PRECISION precision;
++        D2D1_COLOR_INTERPOLATION_MODE mode;
++        D2D1_EXTEND_MODE extend;
++        BOOL radial;
++        /* A linear gradient's start and end, a radial one's radius and origin offset. */
++        float a, b;
++        float opacity;
++        DWORD colours[ARRAY_SIZE(xs)];
++        BYTE max_diff;
++    }
++    tests[] =
++    {
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffff0000, 0xffff0000, 0xffb80048, 0xff780088, 0xff3800c7, 0xff0000ff, 0xff0000ff}},
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xfff70008, 0xff780087, 0xffb70048, 0xff780087, 0xff3800c7, 0xff780087, 0xff0800f7}},
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xff0800f7, 0xff870078, 0xffb70048, 0xff780087, 0xff3800c7, 0xff870078, 0xff0800f7}},
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, TRUE, 16.0f, 0.0f, 1.0f,
++                {0xfff4000b, 0xff770088, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff}},
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, TRUE, 16.0f, 0.0f, 1.0f,
++                {0xfff4000b, 0xff780087, 0xffb70048, 0xff780087, 0xff3800c7, 0xff780087, 0xff0800f7}},
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, TRUE, 16.0f, 0.0f, 1.0f,
++                {0xfff4000b, 0xff780087, 0xff4800b7, 0xff870078, 0xffc70038, 0xff780087, 0xfff70008}},
++        /* Interpolated in linear light. */
++        {red_blue, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffff0000, 0xffff0000, 0xffdc0091, 0xffb600c1, 0xff8100e5, 0xff0000ff, 0xff0000ff}},
++        {red_blue, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xfffb0032, 0xffb600c1, 0xffdc0091, 0xffb600c1, 0xff8100e5, 0xffb600c1, 0xff3200fb}},
++        {red_blue, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xff3200fb, 0xffc100b6, 0xffdc0091, 0xffb600c1, 0xff8100e5, 0xffc100b6, 0xff3200fb}},
++        {red_blue, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, TRUE, 16.0f, 0.0f, 1.0f,
++                {0xfffa0039, 0xffb600c1, 0xffdc0091, 0xffb600c1, 0xff8100e5, 0xffb600c1, 0xff3200fb}, 2},
++        {red_blue, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, TRUE, 16.0f, 0.0f, 1.0f,
++                {0xfffa0039, 0xffb600c1, 0xff9100dc, 0xffc100b6, 0xffe50081, 0xffb600c1, 0xfffb0032}, 2},
++        /* Straight colours are interpolated, then premultiplied. */
++        {to_clear, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffffffff, 0xffffffff, 0xb884b884, 0x78397839, 0x380c380c, 0x00000000, 0x00000000}},
++        {to_clear, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffffffff, 0xffffffff, 0xb89fb89f, 0x78567856, 0x381c381c, 0x00000000, 0x00000000}},
++        {inside, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xff0000ff, 0xff8f0070, 0xffef0010, 0xff70008f, 0xff0000ff, 0xff8f0070, 0xff0000ff}},
++        {inside, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xff0000ff, 0xffc600b1, 0xfff80047, 0xffb100c6, 0xff0000ff, 0xffc600b1, 0xff0000ff}},
++        {mid, 2, D2D1_GAMMA_1_0, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0x80402060, 0x80402060, 0xa446236a, 0xc3452168, 0xe3361855, 0xff000000, 0xff000000}},
++        {translucent, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 0.5f,
++                {0x20201000, 0x20201000, 0x3b2b1e11, 0x5327292c, 0x6b173653, 0x80004080, 0x80004080}},
++        /* The second collections: interpolated premultiplied, converted to another space, or kept out of range
++         * by a precision with room for it. */
++        {to_clear, 2, D2D1_COLOR_SPACE_SRGB + 1, D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM,
++                D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffffffff, 0xffffffff, 0xb8b8b8b8, 0x78787878, 0x38383838, 0x00000000, 0x00000000}},
++        {mid, 2, D2D1_COLOR_SPACE_SRGB + 1, D2D1_COLOR_SPACE_SCRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM,
++                D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0x801b0643, 0x801b0643, 0xa4110429, 0xc3090314, 0xe3030105, 0xff000000, 0xff000000}},
++        {translucent, 2, D2D1_COLOR_SPACE_SCRGB + 1, D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_32BPC_FLOAT,
++                D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0x40402f00, 0x40402f00, 0x764d565e, 0xa54c7a97, 0xd53c9dcf, 0xff00bcff, 0xff00bcff}},
++        {bright, 2, D2D1_COLOR_SPACE_SCRGB + 1, D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM,
++                D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xff3221fb, 0xffc18db6, 0xffdca291, 0xffb685c1, 0xff815de5, 0xffc18db6, 0xff3221fb}},
++        {bright, 2, D2D1_COLOR_SPACE_SCRGB + 1, D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_16BPC_FLOAT,
++                D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xff4722fa, 0xffff8d7c, 0xffffa200, 0xfff88594, 0xffb15dd6, 0xffff8d7c, 0xff4722fa}},
++        /* Stops are sorted, and the colour between 0 and 1 is what is used. */
++        {reversed, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffff0000, 0xffff0000, 0xffb80048, 0xff780088, 0xff3800c7, 0xff0000ff, 0xff0000ff}},
++        {unsorted, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffff0000, 0xffff0000, 0xff6f9000, 0xff00f010, 0xff006f90, 0xff0000ff, 0xff0000ff}},
++        {outside, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffaa0055, 0xffaa0055, 0xff92006d, 0xff7d0082, 0xff670098, 0xff5500aa, 0xff5500aa}},
++        {outside, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, FALSE, 16.0f, 32.0f, 1.0f,
++                {0xffa70058, 0xff7d0082, 0xff92006d, 0xff7d0082, 0xff680097, 0xff7d0082, 0xff5800a7}},
++        /* An origin away from the centre, inside the ellipse and outside it; past the edge seen from the origin,
++         * the gradient ends. */
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, TRUE, 16.0f, 8.0f, 1.0f,
++                {0xffaf0050, 0xffeb0014, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff}},
++        {red_blue, 2, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, TRUE, 16.0f, 24.0f, 1.0f,
++                {0xff690096, 0xff9c0063, 0xffe80017, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff}},
++        /* Of no length: a clamped gradient is half its start and half its end, one that repeats its mean
++         * colour, as is one repeating once a pixel. */
++        {three, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, FALSE, 20.0f, 20.0f, 1.0f,
++                {0xff800080, 0xff800080, 0xff800080, 0xff800080, 0xff800080, 0xff800080, 0xff800080}},
++        {three, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, FALSE, 20.0f, 20.0f, 1.0f,
++                {0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060}},
++        {three, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_CLAMP, TRUE, 0.0f, 0.0f, 1.0f,
++                {0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff, 0xff0000ff}},
++        {three, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, TRUE, 0.0f, 0.0f, 1.0f,
++                {0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060}},
++        {three, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_WRAP, FALSE, 16.0f, 17.0f, 1.0f,
++                {0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060, 0xff208060}},
++        {three, 3, D2D1_GAMMA_2_2, 0, 0, 0, D2D1_EXTEND_MODE_MIRROR, FALSE, 16.0f, 20.0f, 1.0f,
++                {0xff808000, 0xff808000, 0xff002bd5, 0xff808000, 0xff002bd5, 0xff808000, 0xff808000}},
++    };
++    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES radial_properties;
++    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES linear_properties;
++    ID2D1GradientStopCollection1 *gradient1;
++    ID2D1GradientStopCollection *gradient;
++    D2D1_BRUSH_PROPERTIES brush_properties;
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    ID2D1Brush *brush;
++    D2D1_COLOR_F colour;
++    unsigned int i, j;
++    DWORD got;
++    D2D1_RECT_F r;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++
++    ID2D1RenderTarget_SetAntialiasMode(ctx.rt, D2D1_ANTIALIAS_MODE_ALIASED);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    set_color(&colour, 0.0f, 0.0f, 0.0f, 0.0f);
++    ID2D1RenderTarget_Clear(ctx.rt, &colour);
++    set_matrix_identity(&brush_properties.transform);
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        float y = i * 4.0f;
++
++        winetest_push_context("Test %u", i);
++        if (tests[i].post)
++        {
++            hr = ID2D1DeviceContext_CreateGradientStopCollection(ctx.context, tests[i].stops, tests[i].stop_count,
++                    tests[i].gamma - 1, tests[i].post, tests[i].precision, tests[i].extend, tests[i].mode, &gradient1);
++            gradient = (ID2D1GradientStopCollection *)gradient1;
++        }
++        else
++        {
++            hr = ID2D1RenderTarget_CreateGradientStopCollection(ctx.rt, tests[i].stops, tests[i].stop_count,
++                    tests[i].gamma, tests[i].extend, &gradient);
++        }
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        brush_properties.opacity = tests[i].opacity;
++        if (tests[i].radial)
++        {
++            set_point(&radial_properties.center, 0.0f, y + 2.0f);
++            set_point(&radial_properties.gradientOriginOffset, tests[i].b, 0.0f);
++            radial_properties.radiusX = radial_properties.radiusY = tests[i].a;
++            hr = ID2D1RenderTarget_CreateRadialGradientBrush(ctx.rt, &radial_properties, &brush_properties,
++                    gradient, (ID2D1RadialGradientBrush **)&brush);
++        }
++        else
++        {
++            set_point(&linear_properties.startPoint, tests[i].a, y);
++            set_point(&linear_properties.endPoint, tests[i].b, y);
++            hr = ID2D1RenderTarget_CreateLinearGradientBrush(ctx.rt, &linear_properties, &brush_properties,
++                    gradient, (ID2D1LinearGradientBrush **)&brush);
++        }
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        set_rect(&r, 0.0f, y, 64.0f, y + 4.0f);
++        ID2D1RenderTarget_FillRectangle(ctx.rt, &r, brush);
++        ID2D1Brush_Release(brush);
++        ID2D1GradientStopCollection_Release(gradient);
++        winetest_pop_context();
++    }
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    get_surface_readback(&ctx, &rb);
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        for (j = 0; j < ARRAY_SIZE(xs); ++j)
++        {
++            got = get_readback_colour(&rb, xs[j], i * 4 + 1);
++            ok(compare_colour(got, tests[i].colours[j], max(tests[i].max_diff, 1)),
++                    "Test %u: got unexpected colour 0x%08lx at x %u, expected 0x%08lx.\n",
++                    i, got, xs[j], tests[i].colours[j]);
++        }
++    }
++    release_resource_readback(&rb);
++
+     release_test_context(&ctx);
+ }
+ 
+@@ -20458,6 +20763,7 @@ START_TEST(d2d1)
+     queue_d3d10_test(test_desktop_dpi);
+     queue_d3d10_test(test_stroke_style);
+     queue_test(test_gradient);
++    queue_test(test_gradient_drawing);
+     queue_test(test_draw_geometry);
+     queue_test(test_fill_geometry);
+     queue_test(test_wic_gdi_interop);

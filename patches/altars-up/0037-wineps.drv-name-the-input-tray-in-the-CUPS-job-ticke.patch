@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 09:51:12 -0400
+Subject: [PATCH] wineps.drv: name the input tray in the CUPS job ticket, not
+ only in PostScript.
+
+Manual duplex already printed the odd pages, then sent the even ones asking
+for the manual feeder so the printer would hold the job at its own prompt and
+wait for the button.  It never did: both halves came straight out, two sheets,
+no prompt.
+
+The tray was being set the only way a PostScript printer understands it, as
+the PPD's invocation string inside %%BeginFeature.  A CUPS queue for a printer
+that is not PostScript rasterizes the job first -- this one goes through
+Ghostscript into hpcups -- and nothing in that chain reads a device-specific
+PostScript feature.  The ticket is what survives, so put the tray there too.
+
+The ticket already carried an empty AP_D_InputSlot whenever no tray was
+chosen, which is how CUPS is told to let the printer decide; that stays, and a
+chosen tray now writes InputSlot=<name> instead.
+
+Checked with the queue paused so no paper moves: printprobe -duplex 2 -print -
+leaves two jobs, the first with page-set=odd and the empty AP_D_InputSlot, the
+second with page-set=even and InputSlot=Manual.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 1a5f52ab38ab1d4941be05d4ea47b58de347c86f)
+
+diff --git a/dlls/msctf/Makefile.in b/dlls/msctf/Makefile.in
+index db78811b6d9..ef8e6a9a6bd 100644
+--- a/dlls/msctf/Makefile.in
++++ b/dlls/msctf/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = msctf.dll
+-IMPORTS   = uuid ole32 oleaut32 user32 advapi32
++IMPORTS   = uuid ole32 oleaut32 user32 advapi32 win32u
+ 
+ VER_PRODUCTVERSION = 5,1,2600,3319
+ 
+diff --git a/dlls/msctf/context.c b/dlls/msctf/context.c
+index 2a7feafae1e..7b0c8689434 100644
+--- a/dlls/msctf/context.c
++++ b/dlls/msctf/context.c
+@@ -32,6 +32,8 @@
+ #include "objbase.h"
+ #include "olectl.h"
+ 
++#include "ntuser.h"
++
+ #include "msctf.h"
+ #include "msctf_internal.h"
+ 
+@@ -65,6 +67,10 @@ typedef struct tagContext {
+ 
+     ITfEditSession* currentEditSession;
+ 
++    /* set when the caret has moved and the IME needs to be told where it is;
++     * the answer only comes out of the text store under a document lock. */
++    BOOL            want_ime_rect;
++
+     /* kept as separate lists to reduce unnecessary iterations */
+     struct list     pContextKeyEventSink;
+     struct list     pEditTransactionSink;
+@@ -822,6 +828,53 @@ static ULONG WINAPI TextStoreACPSink_Release(ITextStoreACPSink *iface)
+     return ITfContext_Release(&This->ITfContext_iface);
+ }
+ 
++
++/* Word and anything else built on TSF never calls ImmSetCompositionWindow: the
++ * position of the text it is editing comes out of its own text store instead.
++ * Nobody asked for it here, so the driver was left with no caret position at
++ * all and the IME drew its candidate list wherever it liked -- the top-left
++ * corner of the window, for X11.  Ask the store where the selection is and
++ * pass that on.  ITextStoreACP requires a document lock for this, so the
++ * request is made from the sink and answered from OnLockGranted. */
++static void context_report_ime_rect( Context *This )
++{
++    TS_SELECTION_ACP selection;
++    TsViewCookie view;
++    ULONG fetched = 0;
++    BOOL clipped;
++    RECT rect;
++    HWND hwnd;
++
++    if (!This->pITextStoreACP) return;
++    if (FAILED(ITextStoreACP_GetActiveView( This->pITextStoreACP, &view ))) return;
++    if (FAILED(ITextStoreACP_GetWnd( This->pITextStoreACP, view, &hwnd )) || !hwnd) return;
++    if (FAILED(ITextStoreACP_GetSelection( This->pITextStoreACP, TF_DEFAULT_SELECTION, 1,
++                                           &selection, &fetched )) || !fetched)
++        return;
++    if (FAILED(ITextStoreACP_GetTextExt( This->pITextStoreACP, view, selection.acpStart,
++                                         selection.acpEnd, &rect, &clipped )))
++        return;
++
++    TRACE( "hwnd %p, selection %ld-%ld, screen rect %s\n", hwnd, selection.acpStart,
++           selection.acpEnd, wine_dbgstr_rect( &rect ) );
++
++    /* the store answers in screen coordinates, the driver wants client ones */
++    ScreenToClient( hwnd, (POINT *)&rect );
++    ScreenToClient( hwnd, (POINT *)&rect + 1 );
++    NtUserCallTwoParam( (ULONG_PTR)hwnd, (ULONG_PTR)&rect, NtUserCallTwoParam_SetIMECompositionRect );
++}
++
++static void context_request_ime_rect( Context *This )
++{
++    HRESULT hr, hrSession;
++
++    if (!This->pITextStoreACP) return;
++
++    This->want_ime_rect = TRUE;
++    hr = ITextStoreACP_RequestLock( This->pITextStoreACP, TS_LF_READ, &hrSession );
++    if (FAILED(hr)) This->want_ime_rect = FALSE;
++}
++
+ /*****************************************************
+  * ITextStoreACPSink functions
+  *****************************************************/
+@@ -837,7 +890,10 @@ static HRESULT WINAPI TextStoreACPSink_OnTextChange(ITextStoreACPSink *iface,
+ static HRESULT WINAPI TextStoreACPSink_OnSelectionChange(ITextStoreACPSink *iface)
+ {
+     Context *This = impl_from_ITextStoreACPSink(iface);
+-    FIXME("STUB:(%p)\n",This);
++
++    TRACE("(%p)\n",This);
++
++    context_request_ime_rect( This );
+     return S_OK;
+ }
+ 
+@@ -845,7 +901,10 @@ static HRESULT WINAPI TextStoreACPSink_OnLayoutChange(ITextStoreACPSink *iface,
+     TsLayoutCode lcode, TsViewCookie vcView)
+ {
+     Context *This = impl_from_ITextStoreACPSink(iface);
+-    FIXME("STUB:(%p)\n",This);
++
++    TRACE("(%p) %d %ld\n",This, lcode, vcView);
++
++    if (lcode != TS_LC_DESTROY) context_request_ime_rect( This );
+     return S_OK;
+ }
+ 
+@@ -890,8 +949,15 @@ static HRESULT WINAPI TextStoreACPSink_OnLockGranted(ITextStoreACPSink *iface,
+ 
+     TRACE("(%p) %lx\n",This, dwLockFlags);
+ 
++    if (This->want_ime_rect)
++    {
++        This->want_ime_rect = FALSE;
++        context_report_ime_rect( This );
++    }
++
+     if (!This->currentEditSession)
+     {
++        if (!This->want_ime_rect) return S_OK;
+         FIXME("OnLockGranted called for something other than an EditSession\n");
+         return S_OK;
+     }
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index c24bbab1d4a..39d6c9e6c82 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2591,6 +2591,22 @@ BOOL WINAPI NtUserGetCaretPos( POINT *pt )
+ BOOL set_ime_composition_rect( HWND hwnd, RECT rect )
+ {
+     if (!NtUserIsWindow( hwnd )) return FALSE;
++
++    {   /* TEMPORARY DIAGNOSTIC: which window's caret is driving the IME spot. */
++        WCHAR cbuf[64] = {0}, rbuf[64] = {0};
++        UNICODE_STRING cname = { 0, sizeof(cbuf), cbuf }, rname = { 0, sizeof(rbuf), rbuf };
++        HWND root = NtUserGetAncestor( hwnd, GA_ROOT );
++        RECT wr = {0};
++
++        NtUserGetClassName( hwnd, FALSE, &cname );
++        NtUserGetClassName( root, FALSE, &rname );
++        NtUserGetWindowRect( root, &wr, 0 );
++        ERR( "IMESPOT: caret hwnd %p class %s rect (%d,%d,%d,%d) | root %p class %s rect (%d,%d,%d,%d) | focus %p\n",
++             hwnd, debugstr_w(cbuf), (int)rect.left, (int)rect.top, (int)rect.right, (int)rect.bottom,
++             root, debugstr_w(rbuf), (int)wr.left, (int)wr.top, (int)wr.right, (int)wr.bottom,
++             get_focus() );
++    }
++
+     NtUserMapWindowPoints( hwnd, 0, (POINT *)&rect, 2, 0 /* per-monitor DPI */ );
+     rect = map_rect_virt_to_raw( rect, no_dpi /* per-monitor DPI */ );
+     return user_driver->pSetIMECompositionRect( NtUserGetAncestor( hwnd, GA_ROOT ), rect );
+diff --git a/dlls/wineps.drv/ps.c b/dlls/wineps.drv/ps.c
+index 5538b876272..2c555f22256 100644
+--- a/dlls/wineps.drv/ps.c
++++ b/dlls/wineps.drv/ps.c
+@@ -347,6 +347,7 @@ struct ticket_info
+ {
+     PAGESIZE *page;
+     DUPLEX *duplex;
++    INPUTSLOT *slot;
+ };
+ 
+ static void write_cups_job_ticket( print_ctx *ctx, const struct ticket_info *info )
+@@ -400,8 +401,21 @@ static void write_cups_job_ticket( print_ctx *ctx, const struct ticket_info *inf
+             write_spool( ctx, buf, len );
+     }
+ 
+-    if (!(ctx->Devmode->dmPublic.dmFields & DM_DEFAULTSOURCE) ||
+-        ctx->Devmode->dmPublic.dmDefaultSource == DMBIN_AUTO)
++    /* The tray only reaches a PostScript printer through the PPD's invocation
++     * string, which means nothing to a queue that rasterizes the job instead --
++     * and every CUPS queue for a non-PostScript printer does.  Name it in the
++     * ticket as well, so the filters honour it.  This is what makes manual
++     * duplex work: the second side asks for the manual feeder, and the printer
++     * holds the job at its own prompt until the paper goes back in. */
++    if ((ctx->Devmode->dmPublic.dmFields & DM_DEFAULTSOURCE) &&
++        ctx->Devmode->dmPublic.dmDefaultSource != DMBIN_AUTO &&
++        info->slot && info->slot->Name)
++    {
++        len = snprintf( buf, sizeof(buf), "%%cupsJobTicket: InputSlot=%s\n", info->slot->Name );
++        if (len > 0 && len < sizeof(buf))
++            write_spool( ctx, buf, len );
++    }
++    else
+         write_spool( ctx, cups_ap_d_inputslot, sizeof(cups_ap_d_inputslot) - 1 );
+ }
+ 
+@@ -424,7 +438,7 @@ INT PSDRV_WriteHeader( print_ctx *ctx, LPCWSTR title )
+     DUPLEX *duplex = find_duplex( ctx->pi->ppd, &ctx->Devmode->dmPublic );
+     int ret, len;
+ 
+-    struct ticket_info ticket_info = { page, duplex };
++    struct ticket_info ticket_info = { page, duplex, slot };
+ 
+     TRACE("%s\n", debugstr_w(title));
+ 
+diff --git a/dlls/winex11.drv/xim.c b/dlls/winex11.drv/xim.c
+index e1de83e3077..0429b6d5337 100644
+--- a/dlls/winex11.drv/xim.c
++++ b/dlls/winex11.drv/xim.c
+@@ -579,16 +579,25 @@ BOOL X11DRV_SetIMECompositionRect( HWND hwnd, RECT rect )
+     XPoint xpoint;
+ 
+     if (!(input_style & XIMPreeditPosition))
++    {
++        ERR( "SPOT: style %#lx has no PreeditPosition, hwnd %p\n", input_style, hwnd );
+         return FALSE;
++    }
+ 
+     if (!(data = get_win_data( hwnd )) || !data->xic)
+     {
++        ERR( "SPOT: hwnd %p has %s\n", hwnd, data ? "no xic" : "no win data" );
+         if (data) release_win_data( data );
+         return FALSE;
+     }
+ 
+     xpoint.x = rect.left - data->rects.visible.left;
+     xpoint.y = rect.top - data->rects.visible.top;
++    ERR( "SPOT: hwnd %p rect (%d,%d,%d,%d) visible (%d,%d,%d,%d) -> spot (%d,%d) xic %p\n", hwnd,
++         (int)rect.left, (int)rect.top, (int)rect.right, (int)rect.bottom,
++         (int)data->rects.visible.left, (int)data->rects.visible.top,
++         (int)data->rects.visible.right, (int)data->rects.visible.bottom,
++         (int)xpoint.x, (int)xpoint.y, data->xic );
+     attr = XVaCreateNestedList( 0, XNSpotLocation, &xpoint, NULL );
+     if (attr)
+     {

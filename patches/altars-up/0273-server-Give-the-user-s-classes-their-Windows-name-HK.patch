@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 13:53:50 -0400
+Subject: [PATCH] server: Give the user's classes their Windows name,
+ HKEY_USERS\<sid>_Classes.
+
+On Windows the user's classes are a hive of their own, loaded at
+HKEY_USERS\<sid>_Classes, and HKEY_CURRENT_USER\Software\Classes is a
+link to it.  Wine keeps them in the user's key and had nothing under the
+other name, so a lookup through it failed: Excel's start, through the
+App-V layer that merges Office's virtual registry, looks up the user's
+side of some hundred classes as \Registry\User\<sid>_Classes\... and
+found none.  The server now creates that name as a volatile link to the
+user's Software\Classes.  Not yet checked on the reference machine,
+which was unreachable; the layout is the documented one.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/advapi32/tests/registry.c b/dlls/advapi32/tests/registry.c
+index 28391542bb7..9b2a42bf606 100644
+--- a/dlls/advapi32/tests/registry.c
++++ b/dlls/advapi32/tests/registry.c
+@@ -33,6 +33,7 @@
+ #include "winsvc.h"
+ #include "winerror.h"
+ #include "aclapi.h"
++#include "sddl.h"
+ 
+ #define IS_HKCR(hk) ((UINT_PTR)hk > 0 && ((UINT_PTR)hk & 3) == 2)
+ 
+@@ -3904,6 +3905,44 @@ static void test_classesroot_mask(void)
+     RegCloseKey( hkey );
+ }
+ 
++static void test_user_classes_hive(void)
++{
++    char buffer[256], path[128], *sid;
++    TOKEN_USER *user = (TOKEN_USER *)buffer;
++    HKEY users_classes, hkey, subkey;
++    HANDLE token;
++    DWORD size;
++    LSTATUS res;
++    BOOL ret;
++
++    ret = OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token );
++    ok( ret, "OpenProcessToken failed: %lu\n", GetLastError() );
++    ret = GetTokenInformation( token, TokenUser, buffer, sizeof(buffer), &size );
++    ok( ret, "GetTokenInformation failed: %lu\n", GetLastError() );
++    CloseHandle( token );
++    ret = ConvertSidToStringSidA( user->User.Sid, &sid );
++    ok( ret, "ConvertSidToStringSidA failed: %lu\n", GetLastError() );
++    sprintf( path, "%s_Classes", sid );
++    LocalFree( sid );
++
++    /* the user's classes are a hive of their own, HKEY_CURRENT_USER\Software\Classes links to */
++    res = RegOpenKeyExA( HKEY_USERS, path, 0, KEY_READ, &users_classes );
++    ok( res == ERROR_SUCCESS, "RegOpenKeyExA %s failed: %ld\n", path, res );
++    if (res) return;
++
++    res = RegCreateKeyExA( HKEY_CURRENT_USER, "Software\\Classes\\WineTestUserHive", 0, NULL, 0,
++                           KEY_ALL_ACCESS, NULL, &hkey, NULL );
++    ok( res == ERROR_SUCCESS, "RegCreateKeyExA failed: %ld\n", res );
++    res = RegOpenKeyExA( users_classes, "WineTestUserHive", 0, KEY_READ, &subkey );
++    ok( res == ERROR_SUCCESS, "key not found through HKEY_USERS\\%s: %ld\n", path, res );
++    if (!res) RegCloseKey( subkey );
++    delete_key( hkey );
++    RegCloseKey( hkey );
++    res = RegOpenKeyExA( users_classes, "WineTestUserHive", 0, KEY_READ, &subkey );
++    ok( res == ERROR_FILE_NOT_FOUND, "deleted key found through HKEY_USERS\\%s: %ld\n", path, res );
++    RegCloseKey( users_classes );
++}
++
+ static void test_deleted_key(void)
+ {
+     HKEY hkey, hkey2;
+@@ -5196,6 +5235,7 @@ START_TEST(registry)
+     test_classesroot();
+     test_classesroot_enum();
+     test_classesroot_mask();
++    test_user_classes_hive();
+     test_reg_load_key();
+     test_reg_load_app_key();
+     test_reg_copy_tree();
+diff --git a/server/registry.c b/server/registry.c
+index e71d02350b2..b31c7de0b18 100644
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -1825,6 +1825,42 @@ static void init_supported_machines(void)
+     native_machine = supported_machines[0];
+ }
+ 
++/* Windows keeps the user's classes in a hive of their own, HKEY_USERS\<sid>_Classes, which
++ * HKEY_CURRENT_USER\Software\Classes links to; here they stay in the user's key, and the
++ * name Windows gives them is a link to it */
++static void create_user_classes_link( const struct unicode_str *user )
++{
++    static const WCHAR suffix[] = {'_','C','l','a','s','s','e','s'};
++    static const WCHAR registry[] = {'\\','R','e','g','i','s','t','r','y','\\'};
++    static const WCHAR classes[] = {'\\','S','o','f','t','w','a','r','e','\\','C','l','a','s','s','e','s'};
++    data_size_t target_len = sizeof(registry) + user->len + sizeof(classes);
++    struct unicode_str name;
++    char *link, *target;
++    struct key *key;
++
++    if (!(link = malloc( user->len + sizeof(suffix) ))) return;
++    if (!(target = malloc( target_len )))
++    {
++        free( link );
++        return;
++    }
++    memcpy( link, user->str, user->len );
++    memcpy( link + user->len, suffix, sizeof(suffix) );
++    memcpy( target, registry, sizeof(registry) );
++    memcpy( target + sizeof(registry), user->str, user->len );
++    memcpy( target + sizeof(registry) + user->len, classes, sizeof(classes) );
++    name.str = (const WCHAR *)link;
++    name.len = user->len + sizeof(suffix);
++    if ((key = create_key_recursive( root_key, name, current_time )))
++    {
++        key->flags |= KEY_SYMLINK | KEY_VOLATILE;
++        set_value( key, symlink_str, REG_LINK, target, target_len );
++        release_object( key );
++    }
++    free( target );
++    free( link );
++}
++
+ /* registry initialisation */
+ void init_registry(void)
+ {
+@@ -1913,8 +1949,9 @@ void init_registry(void)
+     if (!current_user_path ||
+         !(hkcu = create_key_recursive( root_key, current_user_str, current_time )))
+         fatal_error( "could not create HKEY_CURRENT_USER registry key\n" );
+-    free( current_user_path );
+     load_init_registry_from_file( "user.reg", hkcu );
++    create_user_classes_link( &current_user_str );
++    free( current_user_path );
+ 
+     /* set the shared flag on Software\Classes\Wow6432Node for all platforms */
+     for (i = 1; i < supported_machines_count; i++)

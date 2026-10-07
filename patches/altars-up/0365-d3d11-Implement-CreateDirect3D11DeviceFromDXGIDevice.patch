@@ -1,0 +1,427 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 06:43:14 -0400
+Subject: [PATCH] d3d11: Implement CreateDirect3D11DeviceFromDXGIDevice() and
+ CreateDirect3D11SurfaceFromDXGISurface().
+
+The WinRT APIs that take Direct3D objects (Windows.Graphics.Capture
+among them) take these wrappers: an IDirect3DDevice or IDirect3DSurface
+holding the DXGI object until closed, handing it back through
+IDirect3DDxgiInterfaceAccess, agile.  The interop header now declares
+the surface function too, and both stdcall as the SDK does.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/d3d11/Makefile.in b/dlls/d3d11/Makefile.in
+index c51ec398d98..edb983bee2f 100644
+--- a/dlls/d3d11/Makefile.in
++++ b/dlls/d3d11/Makefile.in
+@@ -1,6 +1,7 @@
+ MODULE    = d3d11.dll
+ IMPORTLIB = d3d11
+ IMPORTS   = dxguid uuid dxgi wined3d
++DELAYIMPORTS = combase
+ EXTRAINCL = $(VKD3D_PE_CFLAGS)
+ 
+ VER_FILEDESCRIPTION_STR = "Wine Direct3D"
+@@ -18,4 +19,5 @@ SOURCES = \
+ 	state.c \
+ 	texture.c \
+ 	utils.c \
+-	view.c
++	view.c \
++	winrt.c
+diff --git a/dlls/d3d11/d3d11.spec b/dlls/d3d11/d3d11.spec
+index bb755e2e869..a04c7ada2b7 100644
+--- a/dlls/d3d11/d3d11.spec
++++ b/dlls/d3d11/d3d11.spec
+@@ -1,3 +1,5 @@
++@ stdcall CreateDirect3D11DeviceFromDXGIDevice(ptr ptr)
++@ stdcall CreateDirect3D11SurfaceFromDXGISurface(ptr ptr)
+ @ stdcall D3D11CoreCreateDevice(ptr ptr long ptr long ptr)
+ @ stub D3D11CoreCreateLayeredDevice
+ @ stub D3D11CoreGetLayeredDeviceSize
+diff --git a/dlls/d3d11/winrt.c b/dlls/d3d11/winrt.c
+new file mode 100644
+index 00000000000..b4573237de6
+--- /dev/null
++++ b/dlls/d3d11/winrt.c
+@@ -0,0 +1,364 @@
++/*
++ * Direct3D 11 devices and surfaces as Windows.Graphics.DirectX.Direct3D11 objects
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "winstring.h"
++#include "objbase.h"
++#include "dxgi1_6.h"
++#include "initguid.h"
++#include "roapi.h"
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Graphics_DirectX
++#define WIDL_using_Windows_Graphics_DirectX_Direct3D11
++#include "windows.foundation.h"
++#include "windows.graphics.directx.direct3d11.h"
++#include "windows.graphics.directx.direct3d11.interop.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(d3d11);
++
++/*
++ * The wrappers WinRT APIs take a DXGI device or surface in: each holds its
++ * DXGI object until it is closed, hands it back through
++ * IDirect3DDxgiInterfaceAccess, and is agile, as the objects are.
++ */
++struct winrt_object
++{
++    IInspectable IInspectable_iface;    /* IDirect3DDevice or IDirect3DSurface */
++    IClosable IClosable_iface;
++    IDirect3DDxgiInterfaceAccess IDirect3DDxgiInterfaceAccess_iface;
++    LONG ref;
++    const IID *iid;
++    const WCHAR *class_name;
++    SRWLOCK lock;
++    IUnknown *dxgi;     /* NULL once closed */
++};
++
++static inline struct winrt_object *impl_from_IInspectable( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct winrt_object, IInspectable_iface );
++}
++
++static HRESULT WINAPI object_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, object->iid ))
++        *out = &object->IInspectable_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &object->IClosable_iface;
++    else if (IsEqualGUID( iid, &IID_IDirect3DDxgiInterfaceAccess ))
++        *out = &object->IDirect3DDxgiInterfaceAccess_iface;
++    else
++    {
++        WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI object_AddRef( IInspectable *iface )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++    ULONG ref = InterlockedIncrement( &object->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI object_Release( IInspectable *iface )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &object->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (object->dxgi) IUnknown_Release( object->dxgi );
++        free( object );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI object_GetIids( IInspectable *iface, ULONG *count, IID **iids )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, count %p, iids %p.\n", iface, count, iids );
++
++    if (!(*iids = CoTaskMemAlloc( 2 * sizeof(**iids) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = *object->iid;
++    (*iids)[1] = IID_IClosable;
++    *count = 2;
++    return S_OK;
++}
++
++static HRESULT WINAPI object_GetRuntimeClassName( IInspectable *iface, HSTRING *class_name )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++
++    return WindowsCreateString( object->class_name, wcslen( object->class_name ), class_name );
++}
++
++static HRESULT WINAPI object_GetTrustLevel( IInspectable *iface, TrustLevel *level )
++{
++    TRACE( "iface %p, level %p.\n", iface, level );
++
++    *level = BaseTrust;
++    return S_OK;
++}
++
++/* a closed object answers RO_E_CLOSED; the DXGI object comes back referenced */
++static HRESULT object_get_dxgi( struct winrt_object *object, REFIID iid, void **out )
++{
++    HRESULT hr;
++
++    AcquireSRWLockShared( &object->lock );
++    if (!object->dxgi) hr = RO_E_CLOSED;
++    else hr = IUnknown_QueryInterface( object->dxgi, iid, out );
++    ReleaseSRWLockShared( &object->lock );
++    return hr;
++}
++
++/*** IDirect3DDevice ***/
++
++static HRESULT WINAPI device_Trim( IInspectable *iface )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++    IDXGIDevice3 *device;
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    if (FAILED(hr = object_get_dxgi( object, &IID_IDXGIDevice3, (void **)&device ))) return hr;
++    IDXGIDevice3_Trim( device );
++    IDXGIDevice3_Release( device );
++    return S_OK;
++}
++
++static const struct IDirect3DDeviceVtbl device_vtbl =
++{
++    (void *)object_QueryInterface,
++    (void *)object_AddRef,
++    (void *)object_Release,
++    /* IInspectable methods */
++    (void *)object_GetIids,
++    (void *)object_GetRuntimeClassName,
++    (void *)object_GetTrustLevel,
++    /* IDirect3DDevice methods */
++    (void *)device_Trim,
++};
++
++/*** IDirect3DSurface ***/
++
++static HRESULT WINAPI surface_get_Description( IInspectable *iface, Direct3DSurfaceDescription *value )
++{
++    struct winrt_object *object = impl_from_IInspectable( iface );
++    IDXGISurface *surface;
++    DXGI_SURFACE_DESC desc;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (FAILED(hr = object_get_dxgi( object, &IID_IDXGISurface, (void **)&surface ))) return hr;
++    hr = IDXGISurface_GetDesc( surface, &desc );
++    IDXGISurface_Release( surface );
++    if (FAILED(hr)) return hr;
++    value->Width = desc.Width;
++    value->Height = desc.Height;
++    value->Format = desc.Format;
++    value->MultisampleDescription.Count = desc.SampleDesc.Count;
++    value->MultisampleDescription.Quality = desc.SampleDesc.Quality;
++    return S_OK;
++}
++
++static const struct IDirect3DSurfaceVtbl surface_vtbl =
++{
++    (void *)object_QueryInterface,
++    (void *)object_AddRef,
++    (void *)object_Release,
++    /* IInspectable methods */
++    (void *)object_GetIids,
++    (void *)object_GetRuntimeClassName,
++    (void *)object_GetTrustLevel,
++    /* IDirect3DSurface methods */
++    (void *)surface_get_Description,
++};
++
++/*** IClosable ***/
++
++static inline struct winrt_object *impl_from_IClosable( IClosable *iface )
++{
++    return CONTAINING_RECORD( iface, struct winrt_object, IClosable_iface );
++}
++
++static HRESULT WINAPI closable_QueryInterface( IClosable *iface, REFIID iid, void **out )
++{
++    return object_QueryInterface( &impl_from_IClosable( iface )->IInspectable_iface, iid, out );
++}
++
++static ULONG WINAPI closable_AddRef( IClosable *iface )
++{
++    return object_AddRef( &impl_from_IClosable( iface )->IInspectable_iface );
++}
++
++static ULONG WINAPI closable_Release( IClosable *iface )
++{
++    return object_Release( &impl_from_IClosable( iface )->IInspectable_iface );
++}
++
++static HRESULT WINAPI closable_GetIids( IClosable *iface, ULONG *count, IID **iids )
++{
++    return object_GetIids( &impl_from_IClosable( iface )->IInspectable_iface, count, iids );
++}
++
++static HRESULT WINAPI closable_GetRuntimeClassName( IClosable *iface, HSTRING *class_name )
++{
++    return object_GetRuntimeClassName( &impl_from_IClosable( iface )->IInspectable_iface, class_name );
++}
++
++static HRESULT WINAPI closable_GetTrustLevel( IClosable *iface, TrustLevel *level )
++{
++    return object_GetTrustLevel( &impl_from_IClosable( iface )->IInspectable_iface, level );
++}
++
++static HRESULT WINAPI closable_Close( IClosable *iface )
++{
++    struct winrt_object *object = impl_from_IClosable( iface );
++    IUnknown *dxgi;
++
++    TRACE( "iface %p.\n", iface );
++
++    AcquireSRWLockExclusive( &object->lock );
++    dxgi = object->dxgi;
++    object->dxgi = NULL;
++    ReleaseSRWLockExclusive( &object->lock );
++    if (dxgi) IUnknown_Release( dxgi );
++    return S_OK;
++}
++
++static const struct IClosableVtbl closable_vtbl =
++{
++    closable_QueryInterface,
++    closable_AddRef,
++    closable_Release,
++    /* IInspectable methods */
++    closable_GetIids,
++    closable_GetRuntimeClassName,
++    closable_GetTrustLevel,
++    /* IClosable methods */
++    closable_Close,
++};
++
++/*** IDirect3DDxgiInterfaceAccess ***/
++
++static inline struct winrt_object *impl_from_IDirect3DDxgiInterfaceAccess( IDirect3DDxgiInterfaceAccess *iface )
++{
++    return CONTAINING_RECORD( iface, struct winrt_object, IDirect3DDxgiInterfaceAccess_iface );
++}
++
++static HRESULT WINAPI access_QueryInterface( IDirect3DDxgiInterfaceAccess *iface, REFIID iid, void **out )
++{
++    return object_QueryInterface( &impl_from_IDirect3DDxgiInterfaceAccess( iface )->IInspectable_iface, iid, out );
++}
++
++static ULONG WINAPI access_AddRef( IDirect3DDxgiInterfaceAccess *iface )
++{
++    return object_AddRef( &impl_from_IDirect3DDxgiInterfaceAccess( iface )->IInspectable_iface );
++}
++
++static ULONG WINAPI access_Release( IDirect3DDxgiInterfaceAccess *iface )
++{
++    return object_Release( &impl_from_IDirect3DDxgiInterfaceAccess( iface )->IInspectable_iface );
++}
++
++static HRESULT WINAPI access_GetInterface( IDirect3DDxgiInterfaceAccess *iface, REFIID iid, void **out )
++{
++    struct winrt_object *object = impl_from_IDirect3DDxgiInterfaceAccess( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    return object_get_dxgi( object, iid, out );
++}
++
++static const struct IDirect3DDxgiInterfaceAccessVtbl access_vtbl =
++{
++    access_QueryInterface,
++    access_AddRef,
++    access_Release,
++    /* IDirect3DDxgiInterfaceAccess methods */
++    access_GetInterface,
++};
++
++static HRESULT winrt_object_create( IUnknown *dxgi, const void *vtbl, const IID *iid, const WCHAR *class_name,
++                                    IInspectable **out )
++{
++    struct winrt_object *object;
++
++    if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
++    object->IInspectable_iface.lpVtbl = vtbl;
++    object->IClosable_iface.lpVtbl = &closable_vtbl;
++    object->IDirect3DDxgiInterfaceAccess_iface.lpVtbl = &access_vtbl;
++    object->ref = 1;
++    object->iid = iid;
++    object->class_name = class_name;
++    InitializeSRWLock( &object->lock );
++    object->dxgi = dxgi;
++    IUnknown_AddRef( dxgi );
++    *out = &object->IInspectable_iface;
++    return S_OK;
++}
++
++HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice( IDXGIDevice *device, IInspectable **out )
++{
++    TRACE( "device %p, out %p.\n", device, out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!device) return E_INVALIDARG;
++    return winrt_object_create( (IUnknown *)device, &device_vtbl, &IID_IDirect3DDevice,
++                                L"Windows.Graphics.DirectX.Direct3D11.IDirect3DDevice", out );
++}
++
++HRESULT WINAPI CreateDirect3D11SurfaceFromDXGISurface( IDXGISurface *surface, IInspectable **out )
++{
++    TRACE( "surface %p, out %p.\n", surface, out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!surface) return E_INVALIDARG;
++    return winrt_object_create( (IUnknown *)surface, &surface_vtbl, &IID_IDirect3DSurface,
++                                L"Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface", out );
++}
+diff --git a/include/windows.graphics.directx.direct3d11.interop.idl b/include/windows.graphics.directx.direct3d11.interop.idl
+index 345080449de..11ef0bd9b7e 100644
+--- a/include/windows.graphics.directx.direct3d11.interop.idl
++++ b/include/windows.graphics.directx.direct3d11.interop.idl
+@@ -23,7 +23,8 @@ import "inspectable.idl";
+ import "windows.graphics.directx.direct3d11.idl";
+ 
+ namespace Windows.Graphics.DirectX.Direct3D11 {
+-    HRESULT CreateDirect3D11DeviceFromDXGIDevice([in] IDXGIDevice* dxgiDevice, [out] IInspectable** graphicsDevice);
++    HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice([in] IDXGIDevice* dxgiDevice, [out] IInspectable** graphicsDevice);
++    HRESULT __stdcall CreateDirect3D11SurfaceFromDXGISurface([in] IDXGISurface* dgxiSurface, [out] IInspectable** graphicsSurface);
+ 
+     [
+         uuid(A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1)

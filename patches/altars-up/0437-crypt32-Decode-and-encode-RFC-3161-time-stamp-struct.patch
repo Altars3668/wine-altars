@@ -1,0 +1,935 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 08:52:08 -0400
+Subject: [PATCH] crypt32: Decode and encode RFC 3161 time stamp structures.
+
+TIMESTAMP_INFO, the TSTInfo a time stamp token signs, decodes and
+encodes; TIMESTAMP_REQUEST encodes and TIMESTAMP_RESPONSE decodes.  The
+tests are what Windows 11 build 29671 answers for TSTInfos with each
+optional part on its own, measured with tools/wintrustprobe's
+tstinfoprobe: the sizes, the serial number and nonce little-endian, the
+TSA name kept as the GeneralName's encoding, the time to the
+millisecond; and the accuracy, which Windows makes room for whatever it
+holds and still leaves pvAccuracy NULL.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/crypt32/decode.c b/dlls/crypt32/decode.c
+index 686525a9048..d3e34e5a3d8 100644
+--- a/dlls/crypt32/decode.c
++++ b/dlls/crypt32/decode.c
+@@ -6744,6 +6744,243 @@ static BOOL WINAPI CRYPT_AsnDecodeOCSPBasicResponse(DWORD dwCertEncodingType,
+     return ret;
+ }
+ 
++/* MessageImprint, the hash a time stamp is of: the HashAlgorithm and
++ * HashedMessage that follow each other in a CRYPT_TIMESTAMP_INFO
++ */
++static BOOL CRYPT_AsnDecodeMessageImprint(const BYTE *pbEncoded,
++ DWORD cbEncoded, DWORD dwFlags, void *pvStructInfo, DWORD *pcbStructInfo,
++ DWORD *pcbDecoded)
++{
++    CRYPT_ALGORITHM_IDENTIFIER *algo = pvStructInfo;
++    struct AsnDecodeSequenceItem items[] = {
++     { ASN_SEQUENCEOF, 0, CRYPT_AsnDecodeAlgorithmId,
++       sizeof(CRYPT_ALGORITHM_IDENTIFIER), FALSE, TRUE,
++       offsetof(CRYPT_ALGORITHM_IDENTIFIER, pszObjId), 0 },
++     { ASN_OCTETSTRING,
++       MEMBERSIZE(CRYPT_TIMESTAMP_INFO, HashAlgorithm, HashedMessage),
++       CRYPT_AsnDecodeOctets, sizeof(CRYPT_DER_BLOB), FALSE, TRUE,
++       MEMBERSIZE(CRYPT_TIMESTAMP_INFO, HashAlgorithm, HashedMessage) +
++       offsetof(CRYPT_DER_BLOB, pbData), 0 },
++    };
++
++    return CRYPT_AsnDecodeSequence(items, ARRAY_SIZE(items), pbEncoded,
++     cbEncoded, dwFlags, NULL, pvStructInfo, pcbStructInfo, pcbDecoded,
++     algo ? algo->pszObjId : NULL);
++}
++
++/* Accuracy, into the CRYPT_TIMESTAMP_ACCURACY pvStructInfo points to */
++static BOOL CRYPT_AsnDecodeTimeStampAccuracy(const BYTE *pbEncoded,
++ DWORD cbEncoded, DWORD dwFlags, void *pvStructInfo, DWORD *pcbStructInfo,
++ DWORD *pcbDecoded)
++{
++    struct AsnDecodeSequenceItem items[] = {
++     { ASN_INTEGER, offsetof(CRYPT_TIMESTAMP_ACCURACY, dwSeconds),
++       CRYPT_AsnDecodeIntInternal, sizeof(DWORD), TRUE, FALSE, 0, 0 },
++     { ASN_CONTEXT, offsetof(CRYPT_TIMESTAMP_ACCURACY, dwMillis),
++       CRYPT_AsnDecodeIntInternal, sizeof(DWORD), TRUE, FALSE, 0, 0 },
++     { ASN_CONTEXT | 1, offsetof(CRYPT_TIMESTAMP_ACCURACY, dwMicros),
++       CRYPT_AsnDecodeIntInternal, sizeof(DWORD), TRUE, FALSE, 0, 0 },
++    };
++    DWORD bytesNeeded = sizeof(CRYPT_TIMESTAMP_ACCURACY *) +
++     sizeof(CRYPT_TIMESTAMP_ACCURACY), size = sizeof(CRYPT_TIMESTAMP_ACCURACY);
++    BOOL ret;
++
++    if (pvStructInfo && *pcbStructInfo < bytesNeeded)
++    {
++        *pcbStructInfo = bytesNeeded;
++        SetLastError(ERROR_MORE_DATA);
++        return FALSE;
++    }
++    ret = CRYPT_AsnDecodeSequence(items, ARRAY_SIZE(items), pbEncoded,
++     cbEncoded, dwFlags, NULL,
++     pvStructInfo ? *(CRYPT_TIMESTAMP_ACCURACY **)pvStructInfo : NULL, &size,
++     pcbDecoded, NULL);
++    if (ret)
++        *pcbStructInfo = bytesNeeded;
++    return ret;
++}
++
++/* tsa [0] GeneralName, kept as the GeneralName's encoding */
++static BOOL CRYPT_AsnDecodeTimeStampTsa(const BYTE *pbEncoded, DWORD cbEncoded,
++ DWORD dwFlags, void *pvStructInfo, DWORD *pcbStructInfo, DWORD *pcbDecoded)
++{
++    BOOL ret;
++    DWORD dataLen;
++
++    if (pbEncoded[0] != (ASN_CONTEXT | ASN_CONSTRUCTOR))
++    {
++        SetLastError(CRYPT_E_ASN1_BADTAG);
++        return FALSE;
++    }
++    if ((ret = CRYPT_GetLen(pbEncoded, cbEncoded, &dataLen)))
++    {
++        BYTE lenBytes = GET_LEN_BYTES(pbEncoded[1]);
++
++        ret = CRYPT_AsnDecodeDerBlob(pbEncoded + 1 + lenBytes, dataLen, dwFlags,
++         pvStructInfo, pcbStructInfo, NULL);
++        if (ret && pcbDecoded)
++            *pcbDecoded = 1 + lenBytes + dataLen;
++    }
++    return ret;
++}
++
++/* extensions [1] IMPLICIT Extensions */
++static BOOL CRYPT_AsnDecodeTimeStampExtensions(const BYTE *pbEncoded,
++ DWORD cbEncoded, DWORD dwFlags, void *pvStructInfo, DWORD *pcbStructInfo,
++ DWORD *pcbDecoded)
++{
++    struct AsnArrayDescriptor arrayDesc = { ASN_CONTEXT | ASN_CONSTRUCTOR | 1,
++     offsetof(CRYPT_TIMESTAMP_INFO, cExtension),
++     offsetof(CRYPT_TIMESTAMP_INFO, rgExtension),
++     FINALMEMBERSIZE(CRYPT_TIMESTAMP_INFO, cExtension),
++     CRYPT_AsnDecodeExtension, sizeof(CERT_EXTENSION), TRUE,
++     offsetof(CERT_EXTENSION, pszObjId) };
++
++    return CRYPT_AsnDecodeArray(&arrayDesc, pbEncoded, cbEncoded, dwFlags,
++     NULL, pvStructInfo, pcbStructInfo, pcbDecoded);
++}
++
++/* TSTInfo, what a time stamp token signs (RFC 3161) */
++static BOOL WINAPI CRYPT_AsnDecodeTimeStampInfo(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const BYTE *pbEncoded, DWORD cbEncoded, DWORD dwFlags,
++ CRYPT_DECODE_PARA *pDecodePara, void *pvStructInfo, DWORD *pcbStructInfo)
++{
++    struct AsnDecodeSequenceItem items[] = {
++     { ASN_INTEGER, offsetof(CRYPT_TIMESTAMP_INFO, dwVersion),
++       CRYPT_AsnDecodeIntInternal, sizeof(DWORD), FALSE, FALSE, 0, 0 },
++     { ASN_OBJECTIDENTIFIER, offsetof(CRYPT_TIMESTAMP_INFO, pszTSAPolicyId),
++       CRYPT_AsnDecodeOidIgnoreTag, sizeof(LPSTR), FALSE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_INFO, pszTSAPolicyId), 0 },
++     { ASN_SEQUENCEOF, offsetof(CRYPT_TIMESTAMP_INFO, HashAlgorithm),
++       CRYPT_AsnDecodeMessageImprint,
++       MEMBERSIZE(CRYPT_TIMESTAMP_INFO, HashAlgorithm, SerialNumber), FALSE,
++       TRUE, offsetof(CRYPT_TIMESTAMP_INFO, HashAlgorithm.pszObjId), 0 },
++     { ASN_INTEGER, offsetof(CRYPT_TIMESTAMP_INFO, SerialNumber),
++       CRYPT_AsnDecodeIntegerInternal, sizeof(CRYPT_INTEGER_BLOB), FALSE,
++       TRUE, offsetof(CRYPT_TIMESTAMP_INFO, SerialNumber.pbData), 0 },
++     { ASN_GENERALTIME, offsetof(CRYPT_TIMESTAMP_INFO, ftTime),
++       CRYPT_AsnDecodeGeneralizedTime, sizeof(FILETIME), FALSE, FALSE, 0, 0 },
++     { ASN_SEQUENCEOF, offsetof(CRYPT_TIMESTAMP_INFO, pvAccuracy),
++       CRYPT_AsnDecodeTimeStampAccuracy, sizeof(PCRYPT_TIMESTAMP_ACCURACY),
++       TRUE, TRUE, offsetof(CRYPT_TIMESTAMP_INFO, pvAccuracy), 0 },
++     { ASN_BOOL, offsetof(CRYPT_TIMESTAMP_INFO, fOrdering),
++       CRYPT_AsnDecodeBool, sizeof(BOOL), TRUE, FALSE, 0, 0 },
++     { ASN_INTEGER, offsetof(CRYPT_TIMESTAMP_INFO, Nonce),
++       CRYPT_AsnDecodeIntegerInternal, sizeof(CRYPT_INTEGER_BLOB), TRUE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_INFO, Nonce.pbData), 0 },
++     { ASN_CONTEXT | ASN_CONSTRUCTOR, offsetof(CRYPT_TIMESTAMP_INFO, Tsa),
++       CRYPT_AsnDecodeTimeStampTsa, sizeof(CRYPT_DER_BLOB), TRUE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_INFO, Tsa.pbData), 0 },
++     { ASN_CONTEXT | ASN_CONSTRUCTOR | 1,
++       offsetof(CRYPT_TIMESTAMP_INFO, cExtension),
++       CRYPT_AsnDecodeTimeStampExtensions,
++       FINALMEMBERSIZE(CRYPT_TIMESTAMP_INFO, cExtension), TRUE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_INFO, rgExtension), 0 },
++    };
++    BOOL ret;
++
++    __TRY
++    {
++        ret = CRYPT_AsnDecodeSequence(items, ARRAY_SIZE(items),
++         pbEncoded, cbEncoded, dwFlags, pDecodePara, pvStructInfo,
++         pcbStructInfo, NULL, NULL);
++        if (ret && pvStructInfo)
++        {
++            CRYPT_TIMESTAMP_INFO *info = dwFlags & CRYPT_DECODE_ALLOC_FLAG ?
++             *(CRYPT_TIMESTAMP_INFO **)pvStructInfo : pvStructInfo;
++
++            /* Windows makes room for the accuracy, and leaves pvAccuracy NULL */
++            info->pvAccuracy = NULL;
++        }
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        SetLastError(STATUS_ACCESS_VIOLATION);
++        ret = FALSE;
++    }
++    __ENDTRY
++    return ret;
++}
++
++/* PKIFreeText, a sequence of UTF8Strings */
++static BOOL CRYPT_AsnDecodeFreeText(const BYTE *pbEncoded, DWORD cbEncoded,
++ DWORD dwFlags, void *pvStructInfo, DWORD *pcbStructInfo, DWORD *pcbDecoded)
++{
++    struct AsnArrayDescriptor arrayDesc = { ASN_SEQUENCEOF,
++     offsetof(CRYPT_TIMESTAMP_RESPONSE, cFreeText),
++     offsetof(CRYPT_TIMESTAMP_RESPONSE, rgFreeText),
++     MEMBERSIZE(CRYPT_TIMESTAMP_RESPONSE, cFreeText, FailureInfo),
++     CRYPT_AsnDecodeUnicodeString, sizeof(LPWSTR), TRUE, 0 };
++
++    return CRYPT_AsnDecodeArray(&arrayDesc, pbEncoded, cbEncoded, dwFlags,
++     NULL, pvStructInfo, pcbStructInfo, pcbDecoded);
++}
++
++/* PKIStatusInfo, the fields of a CRYPT_TIMESTAMP_RESPONSE before ContentInfo */
++static BOOL CRYPT_AsnDecodePKIStatusInfo(const BYTE *pbEncoded,
++ DWORD cbEncoded, DWORD dwFlags, void *pvStructInfo, DWORD *pcbStructInfo,
++ DWORD *pcbDecoded)
++{
++    CRYPT_TIMESTAMP_RESPONSE *response = pvStructInfo;
++    struct AsnDecodeSequenceItem items[] = {
++     { ASN_INTEGER, offsetof(CRYPT_TIMESTAMP_RESPONSE, dwStatus),
++       CRYPT_AsnDecodeIntInternal, sizeof(DWORD), FALSE, FALSE, 0, 0 },
++     { ASN_SEQUENCEOF, offsetof(CRYPT_TIMESTAMP_RESPONSE, cFreeText),
++       CRYPT_AsnDecodeFreeText,
++       MEMBERSIZE(CRYPT_TIMESTAMP_RESPONSE, cFreeText, FailureInfo), TRUE,
++       TRUE, offsetof(CRYPT_TIMESTAMP_RESPONSE, rgFreeText), 0 },
++     { ASN_BITSTRING, offsetof(CRYPT_TIMESTAMP_RESPONSE, FailureInfo),
++       CRYPT_AsnDecodeBitsInternal, sizeof(CRYPT_BIT_BLOB), TRUE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_RESPONSE, FailureInfo.pbData), 0 },
++    };
++
++    return CRYPT_AsnDecodeSequence(items, ARRAY_SIZE(items), pbEncoded,
++     cbEncoded, dwFlags, NULL, pvStructInfo, pcbStructInfo, pcbDecoded,
++     response ? (void *)response->rgFreeText : NULL);
++}
++
++/* TimeStampResp, a time stamp authority's answer (RFC 3161) */
++static BOOL WINAPI CRYPT_AsnDecodeTimeStampResponse(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const BYTE *pbEncoded, DWORD cbEncoded, DWORD dwFlags,
++ CRYPT_DECODE_PARA *pDecodePara, void *pvStructInfo, DWORD *pcbStructInfo)
++{
++    struct AsnDecodeSequenceItem items[] = {
++     { ASN_SEQUENCEOF, 0, CRYPT_AsnDecodePKIStatusInfo,
++       offsetof(CRYPT_TIMESTAMP_RESPONSE, ContentInfo), FALSE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_RESPONSE, rgFreeText), 0 },
++     { ASN_SEQUENCEOF, offsetof(CRYPT_TIMESTAMP_RESPONSE, ContentInfo),
++       CRYPT_AsnDecodeDerBlob, sizeof(CRYPT_DER_BLOB), TRUE, TRUE,
++       offsetof(CRYPT_TIMESTAMP_RESPONSE, ContentInfo.pbData), 0 },
++    };
++    BOOL ret;
++
++    __TRY
++    {
++        ret = CRYPT_AsnDecodeSequence(items, ARRAY_SIZE(items),
++         pbEncoded, cbEncoded, dwFlags, pDecodePara, pvStructInfo,
++         pcbStructInfo, NULL, NULL);
++        if (ret && pvStructInfo)
++        {
++            CRYPT_TIMESTAMP_RESPONSE *response = dwFlags & CRYPT_DECODE_ALLOC_FLAG ?
++             *(CRYPT_TIMESTAMP_RESPONSE **)pvStructInfo : pvStructInfo;
++
++            if (!response->cFreeText)
++                response->rgFreeText = NULL;
++            if (!response->FailureInfo.cbData)
++                response->FailureInfo.pbData = NULL;
++            if (!response->ContentInfo.cbData)
++                response->ContentInfo.pbData = NULL;
++        }
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        SetLastError(STATUS_ACCESS_VIOLATION);
++        ret = FALSE;
++    }
++    __ENDTRY
++    return ret;
++}
++
+ static CryptDecodeObjectExFunc CRYPT_GetBuiltinDecoder(DWORD dwCertEncodingType,
+  LPCSTR lpszStructType)
+ {
+@@ -6901,6 +7138,12 @@ static CryptDecodeObjectExFunc CRYPT_GetBuiltinDecoder(DWORD dwCertEncodingType,
+         case LOWORD(OCSP_BASIC_RESPONSE):
+             decodeFunc = CRYPT_AsnDecodeOCSPBasicResponse;
+             break;
++        case LOWORD(TIMESTAMP_RESPONSE):
++            decodeFunc = CRYPT_AsnDecodeTimeStampResponse;
++            break;
++        case LOWORD(TIMESTAMP_INFO):
++            decodeFunc = CRYPT_AsnDecodeTimeStampInfo;
++            break;
+         default:
+             break;
+         }
+diff --git a/dlls/crypt32/encode.c b/dlls/crypt32/encode.c
+index 6390810c137..68b9cc18ddd 100644
+--- a/dlls/crypt32/encode.c
++++ b/dlls/crypt32/encode.c
+@@ -4673,6 +4673,207 @@ static BOOL WINAPI CRYPT_AsnEncodeOCSPSignedRequest(DWORD dwCertEncodingType,
+     return ret;
+ }
+ 
++/* MessageImprint, from a HashAlgorithm and the HashedMessage after it, as in
++ * a CRYPT_TIMESTAMP_REQUEST and a CRYPT_TIMESTAMP_INFO
++ */
++static BOOL WINAPI CRYPT_AsnEncodeMessageImprint(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const void *pvStructInfo, DWORD dwFlags,
++ PCRYPT_ENCODE_PARA pEncodePara, BYTE *pbEncoded, DWORD *pcbEncoded)
++{
++    const CRYPT_ALGORITHM_IDENTIFIER *algo = pvStructInfo;
++    struct AsnEncodeSequenceItem items[] = {
++     { algo,                               CRYPT_AsnEncodeAlgorithmIdWithNullParams, 0 },
++     { (const CRYPT_DER_BLOB *)(algo + 1), CRYPT_AsnEncodeOctets, 0 },
++    };
++
++    return CRYPT_AsnEncodeSequence(dwCertEncodingType, items, ARRAY_SIZE(items),
++     dwFlags, pEncodePara, pbEncoded, pcbEncoded);
++}
++
++/* GeneralizedTime with the milliseconds, if there are any, without trailing
++ * zeroes as DER wants
++ */
++static BOOL WINAPI CRYPT_AsnEncodeTimeStampTime(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const void *pvStructInfo, DWORD dwFlags,
++ PCRYPT_ENCODE_PARA pEncodePara, BYTE *pbEncoded, DWORD *pcbEncoded)
++{
++    SYSTEMTIME sysTime;
++    char buf[32];
++    DWORD len;
++    BOOL ret;
++
++    if (!FileTimeToSystemTime(pvStructInfo, &sysTime))
++        return FALSE;
++    len = snprintf(buf, sizeof(buf), "%04d%02d%02d%02d%02d%02d", sysTime.wYear,
++     sysTime.wMonth, sysTime.wDay, sysTime.wHour, sysTime.wMinute,
++     sysTime.wSecond);
++    if (sysTime.wMilliseconds)
++    {
++        len += snprintf(buf + len, sizeof(buf) - len, ".%03d",
++         sysTime.wMilliseconds);
++        while (buf[len - 1] == '0')
++            len--;
++    }
++    buf[len++] = 'Z';
++    if (!pbEncoded)
++    {
++        *pcbEncoded = 2 + len;
++        return TRUE;
++    }
++    if ((ret = CRYPT_EncodeEnsureSpace(dwFlags, pEncodePara, pbEncoded,
++     pcbEncoded, 2 + len)))
++    {
++        if (dwFlags & CRYPT_ENCODE_ALLOC_FLAG)
++            pbEncoded = *(BYTE **)pbEncoded;
++        pbEncoded[0] = ASN_GENERALTIME;
++        pbEncoded[1] = len;
++        memcpy(pbEncoded + 2, buf, len);
++    }
++    return ret;
++}
++
++static BOOL WINAPI CRYPT_AsnEncodeTimeStampAccuracy(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const void *pvStructInfo, DWORD dwFlags,
++ PCRYPT_ENCODE_PARA pEncodePara, BYTE *pbEncoded, DWORD *pcbEncoded)
++{
++    const CRYPT_TIMESTAMP_ACCURACY *accuracy = pvStructInfo;
++    struct AsnEncodeTagSwappedItem millis = { ASN_CONTEXT, &accuracy->dwMillis,
++     CRYPT_AsnEncodeInt };
++    struct AsnEncodeTagSwappedItem micros = { ASN_CONTEXT | 1,
++     &accuracy->dwMicros, CRYPT_AsnEncodeInt };
++    struct AsnEncodeSequenceItem items[3] = { { 0 } };
++    DWORD count = 0;
++
++    if (accuracy->dwSeconds)
++    {
++        items[count].pvStructInfo = &accuracy->dwSeconds;
++        items[count++].encodeFunc = CRYPT_AsnEncodeInt;
++    }
++    if (accuracy->dwMillis)
++    {
++        items[count].pvStructInfo = &millis;
++        items[count++].encodeFunc = CRYPT_AsnEncodeSwapTag;
++    }
++    if (accuracy->dwMicros)
++    {
++        items[count].pvStructInfo = &micros;
++        items[count++].encodeFunc = CRYPT_AsnEncodeSwapTag;
++    }
++    return CRYPT_AsnEncodeSequence(dwCertEncodingType, items, count, dwFlags,
++     pEncodePara, pbEncoded, pcbEncoded);
++}
++
++/* TSTInfo, what a time stamp token signs (RFC 3161) */
++static BOOL WINAPI CRYPT_AsnEncodeTimeStampInfo(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const void *pvStructInfo, DWORD dwFlags,
++ PCRYPT_ENCODE_PARA pEncodePara, BYTE *pbEncoded, DWORD *pcbEncoded)
++{
++    BOOL ret;
++
++    __TRY
++    {
++        const CRYPT_TIMESTAMP_INFO *info = pvStructInfo;
++        struct AsnEncodeTagSwappedItem extensions = {
++         ASN_CONTEXT | ASN_CONSTRUCTOR | 1, &info->cExtension,
++         CRYPT_AsnEncodeExtensions };
++        struct AsnConstructedItem tsa = { 0, &info->Tsa, CRYPT_CopyEncodedBlob };
++        struct AsnEncodeSequenceItem items[10] = {
++         { &info->dwVersion,     CRYPT_AsnEncodeInt, 0 },
++         { info->pszTSAPolicyId, CRYPT_AsnEncodeOid, 0 },
++         { &info->HashAlgorithm, CRYPT_AsnEncodeMessageImprint, 0 },
++         { &info->SerialNumber,  CRYPT_AsnEncodeInteger, 0 },
++         { &info->ftTime,        CRYPT_AsnEncodeTimeStampTime, 0 },
++        };
++        DWORD count = 5;
++
++        if (info->pvAccuracy)
++        {
++            items[count].pvStructInfo = info->pvAccuracy;
++            items[count++].encodeFunc = CRYPT_AsnEncodeTimeStampAccuracy;
++        }
++        if (info->fOrdering)
++        {
++            items[count].pvStructInfo = &info->fOrdering;
++            items[count++].encodeFunc = CRYPT_AsnEncodeBool;
++        }
++        if (info->Nonce.cbData)
++        {
++            items[count].pvStructInfo = &info->Nonce;
++            items[count++].encodeFunc = CRYPT_AsnEncodeInteger;
++        }
++        if (info->Tsa.cbData)
++        {
++            items[count].pvStructInfo = &tsa;
++            items[count++].encodeFunc = CRYPT_AsnEncodeConstructed;
++        }
++        if (info->cExtension)
++        {
++            items[count].pvStructInfo = &extensions;
++            items[count++].encodeFunc = CRYPT_AsnEncodeSwapTag;
++        }
++        ret = CRYPT_AsnEncodeSequence(dwCertEncodingType, items, count,
++         dwFlags, pEncodePara, pbEncoded, pcbEncoded);
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        SetLastError(STATUS_ACCESS_VIOLATION);
++        ret = FALSE;
++    }
++    __ENDTRY
++    return ret;
++}
++
++/* TimeStampReq, a request for a time stamp (RFC 3161) */
++static BOOL WINAPI CRYPT_AsnEncodeTimeStampRequest(DWORD dwCertEncodingType,
++ LPCSTR lpszStructType, const void *pvStructInfo, DWORD dwFlags,
++ PCRYPT_ENCODE_PARA pEncodePara, BYTE *pbEncoded, DWORD *pcbEncoded)
++{
++    BOOL ret;
++
++    __TRY
++    {
++        const CRYPT_TIMESTAMP_REQUEST *request = pvStructInfo;
++        struct AsnEncodeTagSwappedItem extensions = {
++         ASN_CONTEXT | ASN_CONSTRUCTOR, &request->cExtension,
++         CRYPT_AsnEncodeExtensions };
++        struct AsnEncodeSequenceItem items[6] = {
++         { &request->dwVersion,     CRYPT_AsnEncodeInt, 0 },
++         { &request->HashAlgorithm, CRYPT_AsnEncodeMessageImprint, 0 },
++        };
++        DWORD count = 2;
++
++        if (request->pszTSAPolicyId)
++        {
++            items[count].pvStructInfo = request->pszTSAPolicyId;
++            items[count++].encodeFunc = CRYPT_AsnEncodeOid;
++        }
++        if (request->Nonce.cbData)
++        {
++            items[count].pvStructInfo = &request->Nonce;
++            items[count++].encodeFunc = CRYPT_AsnEncodeInteger;
++        }
++        if (request->fCertReq)
++        {
++            items[count].pvStructInfo = &request->fCertReq;
++            items[count++].encodeFunc = CRYPT_AsnEncodeBool;
++        }
++        if (request->cExtension)
++        {
++            items[count].pvStructInfo = &extensions;
++            items[count++].encodeFunc = CRYPT_AsnEncodeSwapTag;
++        }
++        ret = CRYPT_AsnEncodeSequence(dwCertEncodingType, items, count,
++         dwFlags, pEncodePara, pbEncoded, pcbEncoded);
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        SetLastError(STATUS_ACCESS_VIOLATION);
++        ret = FALSE;
++    }
++    __ENDTRY
++    return ret;
++}
++
+ static CryptEncodeObjectExFunc CRYPT_GetBuiltinEncoder(DWORD dwCertEncodingType,
+  LPCSTR lpszStructType)
+ {
+@@ -4819,6 +5020,12 @@ static CryptEncodeObjectExFunc CRYPT_GetBuiltinEncoder(DWORD dwCertEncodingType,
+         case LOWORD(OCSP_SIGNED_REQUEST):
+             encodeFunc = CRYPT_AsnEncodeOCSPSignedRequest;
+             break;
++        case LOWORD(TIMESTAMP_REQUEST):
++            encodeFunc = CRYPT_AsnEncodeTimeStampRequest;
++            break;
++        case LOWORD(TIMESTAMP_INFO):
++            encodeFunc = CRYPT_AsnEncodeTimeStampInfo;
++            break;
+         }
+     }
+     else if (!strcmp(lpszStructType, szOID_CERT_EXTENSIONS))
+diff --git a/dlls/crypt32/tests/encode.c b/dlls/crypt32/tests/encode.c
+index 2d714f71931..429e8fc009c 100644
+--- a/dlls/crypt32/tests/encode.c
++++ b/dlls/crypt32/tests/encode.c
+@@ -9068,6 +9068,288 @@ static void test_decodeOCSPBasicResponseInfo(DWORD dwEncoding)
+     LocalFree(info);
+ }
+ 
++/* RFC 3161 TSTInfo with each optional part on its own; the sizes are what
++ * Windows 11 decodes them into.  Windows makes room for the accuracy but
++ * leaves pvAccuracy NULL.
++ */
++static const BYTE tst_plain[] = {
++    0x30, 0x57, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a,
++};
++static const BYTE tst_seconds_millis[] = {
++    0x30, 0x60, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a, 0x30, 0x07, 0x02, 0x01, 0x01, 0x80, 0x02,
++    0x01, 0xf4,
++};
++static const BYTE tst_ordering[] = {
++    0x30, 0x5a, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a, 0x01, 0x01, 0xff,
++};
++static const BYTE tst_nonce[] = {
++    0x30, 0x61, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a, 0x02, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05,
++    0x06, 0x07, 0x08,
++};
++static const BYTE tst_tsa[] = {
++    0x30, 0x6b, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a, 0xa0, 0x12, 0xa4, 0x10, 0x30, 0x0e, 0x31,
++    0x0c, 0x30, 0x0a, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13, 0x03, 0x54, 0x53, 0x41,
++};
++static const BYTE tst_extensions[] = {
++    0x30, 0x64, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a, 0xa1, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x2a,
++    0x03, 0x05, 0x04, 0x02, 0x05, 0x00,
++};
++static const BYTE tst_everything[] = {
++    0x30, 0x81, 0x8b, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06,
++    0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05,
++    0x01, 0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30,
++    0x37, 0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a, 0x30, 0x0a, 0x02, 0x01, 0x01, 0x80,
++    0x02, 0x01, 0xf4, 0x81, 0x01, 0x63, 0x01, 0x01, 0xff, 0x02, 0x02, 0x7f, 0xfe, 0xa0, 0x12, 0xa4,
++    0x10, 0x30, 0x0e, 0x31, 0x0c, 0x30, 0x0a, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13, 0x03, 0x54, 0x53,
++    0x41, 0xa1, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x2a, 0x03, 0x05, 0x04, 0x02, 0x05, 0x00,
++};
++static const BYTE tst_no_fraction[] = {
++    0x30, 0x53, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x0f, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x5a,
++};
++static const BYTE tst_one_digit[] = {
++    0x30, 0x55, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x11, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x35, 0x5a,
++};
++static const BYTE tst_four_digits[] = {
++    0x30, 0x58, 0x02, 0x01, 0x01, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x14, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x35, 0x5a,
++};
++static const BYTE tst_version2[] = {
++    0x30, 0x57, 0x02, 0x01, 0x02, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
++    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
++    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02, 0x05, 0x01,
++    0x02, 0x03, 0x04, 0x05, 0x18, 0x13, 0x32, 0x30, 0x32, 0x33, 0x30, 0x37, 0x30, 0x33, 0x30, 0x37,
++    0x31, 0x34, 0x33, 0x34, 0x2e, 0x30, 0x37, 0x34, 0x5a,
++};
++
++static void test_decodeTimeStampInfo(DWORD dwEncoding)
++{
++    static const BYTE serial[] = { 5, 4, 3, 2, 1 };
++    static const struct
++    {
++        const BYTE *encoded;
++        DWORD size, decoded_size;
++        DWORD version;
++        WORD millis;
++        BOOL ordering;
++        DWORD nonce, tsa, extensions;
++    }
++    tests[] =
++    {
++        { tst_plain,          sizeof(tst_plain),          224, 1, 74 },
++        { tst_seconds_millis, sizeof(tst_seconds_millis), 240, 1, 74 },
++        { tst_ordering,       sizeof(tst_ordering),       224, 1, 74, TRUE },
++        { tst_nonce,          sizeof(tst_nonce),          232, 1, 74, FALSE, 8 },
++        { tst_tsa,            sizeof(tst_tsa),            248, 1, 74, FALSE, 0, 18 },
++        { tst_extensions,     sizeof(tst_extensions),     272, 1, 74, FALSE, 0, 0, 1 },
++        { tst_everything,     sizeof(tst_everything),     320, 1, 74, TRUE, 2, 18, 1 },
++        { tst_no_fraction,    sizeof(tst_no_fraction),    224, 1, 0 },
++        { tst_one_digit,      sizeof(tst_one_digit),      224, 1, 500 },
++        { tst_four_digits,    sizeof(tst_four_digits),    224, 1, 74 },
++        { tst_version2,       sizeof(tst_version2),       224, 2, 74 },
++    };
++    CRYPT_TIMESTAMP_INFO *info;
++    SYSTEMTIME st;
++    DWORD i, size;
++    BOOL ret;
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context("%lu", i);
++        size = 0;
++        ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_INFO, tests[i].encoded, tests[i].size, 0, NULL, NULL, &size);
++        ok(ret, "got error %#lx.\n", GetLastError());
++        ok(size == tests[i].decoded_size, "got size %lu.\n", size);
++        ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_INFO, tests[i].encoded, tests[i].size,
++         CRYPT_DECODE_ALLOC_FLAG, NULL, &info, &size);
++        ok(ret, "got error %#lx.\n", GetLastError());
++        if (!ret)
++        {
++            winetest_pop_context();
++            continue;
++        }
++        ok(info->dwVersion == tests[i].version, "got version %lu.\n", info->dwVersion);
++        ok(!strcmp(info->pszTSAPolicyId, "1.2.3.4"), "got policy %s.\n", info->pszTSAPolicyId);
++        ok(!strcmp(info->HashAlgorithm.pszObjId, szOID_NIST_sha256), "got hash %s.\n", info->HashAlgorithm.pszObjId);
++        ok(info->HashAlgorithm.Parameters.cbData == 2, "got %lu bytes of parameters.\n",
++         info->HashAlgorithm.Parameters.cbData);
++        ok(info->HashedMessage.cbData == 32 && info->HashedMessage.pbData[0] == 0x11 &&
++         info->HashedMessage.pbData[31] == 0x11, "got %lu bytes of imprint.\n", info->HashedMessage.cbData);
++        ok(info->SerialNumber.cbData == sizeof(serial) &&
++         !memcmp(info->SerialNumber.pbData, serial, sizeof(serial)), "got a serial of %lu bytes.\n",
++         info->SerialNumber.cbData);
++        FileTimeToSystemTime(&info->ftTime, &st);
++        ok(st.wYear == 2023 && st.wMonth == 7 && st.wDay == 3 && st.wHour == 7 && st.wMinute == 14 &&
++         st.wSecond == 34 && st.wMilliseconds == tests[i].millis, "got %u-%u-%u %u:%u:%u.%u.\n", st.wYear,
++         st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
++        ok(!info->pvAccuracy, "got accuracy %p.\n", info->pvAccuracy);
++        ok(info->fOrdering == tests[i].ordering, "got ordering %d.\n", info->fOrdering);
++        ok(info->Nonce.cbData == tests[i].nonce, "got a nonce of %lu bytes.\n", info->Nonce.cbData);
++        if (tests[i].nonce == 8)
++            ok(info->Nonce.pbData[0] == 8 && info->Nonce.pbData[7] == 1, "got nonce %02x...%02x.\n",
++             info->Nonce.pbData[0], info->Nonce.pbData[7]);
++        ok(info->Tsa.cbData == tests[i].tsa, "got a TSA name of %lu bytes.\n", info->Tsa.cbData);
++        if (tests[i].tsa)
++            ok(info->Tsa.pbData[0] == 0xa4, "got tag %02x.\n", info->Tsa.pbData[0]);
++        ok(info->cExtension == tests[i].extensions, "got %lu extensions.\n", info->cExtension);
++        if (tests[i].extensions)
++            ok(!strcmp(info->rgExtension[0].pszObjId, "1.2.3.5") && !info->rgExtension[0].fCritical &&
++             info->rgExtension[0].Value.cbData == 2, "got extension %s.\n", info->rgExtension[0].pszObjId);
++        LocalFree(info);
++
++        SetLastError(0xdeadbeef);
++        ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_INFO, tests[i].encoded, tests[i].size - 1,
++         CRYPT_DECODE_ALLOC_FLAG, NULL, &info, &size);
++        ok(!ret && GetLastError() == CRYPT_E_ASN1_EOD, "got %d, error %#lx.\n", ret, GetLastError());
++        winetest_pop_context();
++    }
++
++    size = 100;
++    info = malloc(tests[0].decoded_size);
++    SetLastError(0xdeadbeef);
++    ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_INFO, tst_plain, sizeof(tst_plain), 0, NULL, info, &size);
++    ok(!ret && GetLastError() == ERROR_MORE_DATA, "got %d, error %#lx.\n", ret, GetLastError());
++    ok(size == tests[0].decoded_size, "got size %lu.\n", size);
++    ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_INFO, tst_plain, sizeof(tst_plain), 0, NULL, info, &size);
++    ok(ret, "got error %#lx.\n", GetLastError());
++    free(info);
++}
++
++static void test_encodeTimeStampInfo(DWORD dwEncoding)
++{
++    CRYPT_TIMESTAMP_INFO *info;
++    DWORD size;
++    BYTE *buf;
++    BOOL ret;
++
++    ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_INFO, tst_plain, sizeof(tst_plain), CRYPT_DECODE_ALLOC_FLAG,
++     NULL, &info, &size);
++    ok(ret, "got error %#lx.\n", GetLastError());
++    if (!ret) return;
++    ret = CryptEncodeObjectEx(dwEncoding, TIMESTAMP_INFO, info, CRYPT_ENCODE_ALLOC_FLAG, NULL, &buf, &size);
++    ok(ret, "got error %#lx.\n", GetLastError());
++    if (ret)
++    {
++        ok(size == sizeof(tst_plain) && !memcmp(buf, tst_plain, size), "got %lu bytes.\n", size);
++        LocalFree(buf);
++    }
++    LocalFree(info);
++}
++
++static void test_encodeTimeStampRequest(DWORD dwEncoding)
++{
++    static BYTE hash[32] = { 0x11 }, nonce[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
++    static const BYTE request_head[] = { 0x30, 0x43, 0x02, 0x01, 0x01, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60,
++     0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0x11 };
++    static const BYTE request_tail[] = { 0x02, 0x08, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x01, 0x01,
++     0xff };
++    static const BYTE policy_tail[] = { 0x06, 0x03, 0x2a, 0x03, 0x04, 0x02, 0x08, 0x08, 0x07, 0x06, 0x05, 0x04,
++     0x03, 0x02, 0x01 };
++    CRYPT_TIMESTAMP_REQUEST request = { 0 };
++    DWORD size;
++    BYTE *buf;
++    BOOL ret;
++
++    request.dwVersion = TIMESTAMP_VERSION;
++    request.HashAlgorithm.pszObjId = (char *)szOID_NIST_sha256;
++    request.HashedMessage.cbData = sizeof(hash);
++    request.HashedMessage.pbData = hash;
++    request.Nonce.cbData = sizeof(nonce);
++    request.Nonce.pbData = nonce;
++    request.fCertReq = TRUE;
++    ret = CryptEncodeObjectEx(dwEncoding, TIMESTAMP_REQUEST, &request, CRYPT_ENCODE_ALLOC_FLAG, NULL, &buf, &size);
++    ok(ret, "got error %#lx.\n", GetLastError());
++    if (ret)
++    {
++        ok(size == 69, "got %lu bytes.\n", size);
++        ok(!memcmp(buf, request_head, sizeof(request_head)), "got a different start.\n");
++        ok(!memcmp(buf + size - sizeof(request_tail), request_tail, sizeof(request_tail)), "got a different end.\n");
++        LocalFree(buf);
++    }
++
++    /* a policy goes after the imprint; certReq FALSE, the default, is left out */
++    request.pszTSAPolicyId = (char *)"1.2.3.4";
++    request.fCertReq = FALSE;
++    ret = CryptEncodeObjectEx(dwEncoding, TIMESTAMP_REQUEST, &request, CRYPT_ENCODE_ALLOC_FLAG, NULL, &buf, &size);
++    ok(ret, "got error %#lx.\n", GetLastError());
++    if (ret)
++    {
++        ok(size == 71, "got %lu bytes.\n", size);
++        ok(!memcmp(buf + size - sizeof(policy_tail), policy_tail, sizeof(policy_tail)), "got a different end.\n");
++        LocalFree(buf);
++    }
++}
++
++static void test_decodeTimeStampResponse(DWORD dwEncoding)
++{
++    /* rejected, with the text "no" and the failure badAlg, and no token */
++    static const BYTE rejected[] = { 0x30, 0x10, 0x30, 0x0e, 0x02, 0x01, 0x02, 0x30, 0x04, 0x0c, 0x02, 0x6e, 0x6f,
++     0x03, 0x03, 0x07, 0x80, 0x00 };
++    CRYPT_TIMESTAMP_RESPONSE *response;
++    DWORD size;
++    BOOL ret;
++
++    ret = CryptDecodeObjectEx(dwEncoding, TIMESTAMP_RESPONSE, rejected, sizeof(rejected), CRYPT_DECODE_ALLOC_FLAG,
++     NULL, &response, &size);
++    ok(ret, "got error %#lx.\n", GetLastError());
++    if (!ret) return;
++    ok(size == 88, "got size %lu.\n", size);
++    ok(response->dwStatus == TIMESTAMP_STATUS_REJECTED, "got status %lu.\n", response->dwStatus);
++    ok(response->cFreeText == 1 && !wcscmp(response->rgFreeText[0], L"no"), "got %lu texts.\n",
++     response->cFreeText);
++    ok(response->FailureInfo.cbData == 2 && response->FailureInfo.cUnusedBits == 7 &&
++     response->FailureInfo.pbData[0] == 0x80, "got %lu bytes of failure information.\n",
++     response->FailureInfo.cbData);
++    ok(!response->ContentInfo.cbData, "got %lu bytes of content.\n", response->ContentInfo.cbData);
++    LocalFree(response);
++}
++
+ START_TEST(encode)
+ {
+     static const DWORD encodings[] = { X509_ASN_ENCODING, PKCS_7_ASN_ENCODING,
+@@ -9155,6 +9437,10 @@ START_TEST(encode)
+         test_decodeOCSPResponseInfo(encodings[i]);
+         test_decodeOCSPBasicSignedResponseInfo(encodings[i]);
+         test_decodeOCSPBasicResponseInfo(encodings[i]);
++        test_decodeTimeStampInfo(encodings[i]);
++        test_encodeTimeStampInfo(encodings[i]);
++        test_encodeTimeStampRequest(encodings[i]);
++        test_decodeTimeStampResponse(encodings[i]);
+     }
+     testPortPublicKeyInfo();
+ }
+diff --git a/include/wincrypt.h b/include/wincrypt.h
+index 80a9459a129..1e3720857bf 100644
+--- a/include/wincrypt.h
++++ b/include/wincrypt.h
+@@ -716,6 +716,82 @@ typedef struct _OCSP_BASIC_RESPONSE_INFO {
+     PCERT_EXTENSION            rgExtension;
+ } OCSP_BASIC_RESPONSE_INFO, *POCSP_BASIC_RESPONSE_INFO;
+ 
++#define TIMESTAMP_VERSION 1
++
++typedef struct _CRYPT_TIMESTAMP_REQUEST {
++    DWORD                      dwVersion;
++    CRYPT_ALGORITHM_IDENTIFIER HashAlgorithm;
++    CRYPT_DER_BLOB             HashedMessage;
++    LPSTR                      pszTSAPolicyId;
++    CRYPT_INTEGER_BLOB         Nonce;
++    BOOL                       fCertReq;
++    DWORD                      cExtension;
++    PCERT_EXTENSION            rgExtension;
++} CRYPT_TIMESTAMP_REQUEST, *PCRYPT_TIMESTAMP_REQUEST;
++
++typedef struct _CRYPT_TIMESTAMP_RESPONSE {
++    DWORD          dwStatus;
++    DWORD          cFreeText;
++    LPWSTR        *rgFreeText;
++    CRYPT_BIT_BLOB FailureInfo;
++    CRYPT_DER_BLOB ContentInfo;
++} CRYPT_TIMESTAMP_RESPONSE, *PCRYPT_TIMESTAMP_RESPONSE;
++
++#define TIMESTAMP_STATUS_GRANTED            0
++#define TIMESTAMP_STATUS_GRANTED_WITH_MODS  1
++#define TIMESTAMP_STATUS_REJECTED           2
++#define TIMESTAMP_STATUS_WAITING            3
++#define TIMESTAMP_STATUS_REVOCATION_WARNING 4
++#define TIMESTAMP_STATUS_REVOKED            5
++
++#define TIMESTAMP_FAILURE_BAD_ALG                 0
++#define TIMESTAMP_FAILURE_BAD_REQUEST             2
++#define TIMESTAMP_FAILURE_BAD_FORMAT              5
++#define TIMESTAMP_FAILURE_TIME_NOT_AVAILABLE      14
++#define TIMESTAMP_FAILURE_POLICY_NOT_SUPPORTED    15
++#define TIMESTAMP_FAILURE_EXTENSION_NOT_SUPPORTED 16
++#define TIMESTAMP_FAILURE_INFO_NOT_AVAILABLE      17
++#define TIMESTAMP_FAILURE_SYSTEM_FAILURE          25
++
++typedef struct _CRYPT_TIMESTAMP_ACCURACY {
++    DWORD dwSeconds;
++    DWORD dwMillis;
++    DWORD dwMicros;
++} CRYPT_TIMESTAMP_ACCURACY, *PCRYPT_TIMESTAMP_ACCURACY;
++
++typedef struct _CRYPT_TIMESTAMP_INFO {
++    DWORD                      dwVersion;
++    LPSTR                      pszTSAPolicyId;
++    CRYPT_ALGORITHM_IDENTIFIER HashAlgorithm;
++    CRYPT_DER_BLOB             HashedMessage;
++    CRYPT_INTEGER_BLOB         SerialNumber;
++    FILETIME                   ftTime;
++    PCRYPT_TIMESTAMP_ACCURACY  pvAccuracy;
++    BOOL                       fOrdering;
++    CRYPT_DER_BLOB             Nonce;
++    CRYPT_DER_BLOB             Tsa;
++    DWORD                      cExtension;
++    PCERT_EXTENSION            rgExtension;
++} CRYPT_TIMESTAMP_INFO, *PCRYPT_TIMESTAMP_INFO;
++
++typedef struct _CRYPT_TIMESTAMP_CONTEXT {
++    DWORD                 cbEncoded;
++    BYTE                 *pbEncoded;
++    PCRYPT_TIMESTAMP_INFO pTimeStamp;
++} CRYPT_TIMESTAMP_CONTEXT, *PCRYPT_TIMESTAMP_CONTEXT;
++
++typedef struct _CRYPT_TIMESTAMP_PARA {
++    LPCSTR             pszTSAPolicyId;
++    BOOL               fRequestCerts;
++    CRYPT_INTEGER_BLOB Nonce;
++    DWORD              cExtension;
++    PCERT_EXTENSION    rgExtension;
++} CRYPT_TIMESTAMP_PARA, *PCRYPT_TIMESTAMP_PARA;
++
++#define TIMESTAMP_DONT_HASH_DATA           0x00000001
++#define TIMESTAMP_VERIFY_CONTEXT_SIGNATURE 0x00000020
++#define TIMESTAMP_NO_AUTH_RETRIEVAL        0x00020000
++
+ typedef struct _CRL_CONTEXT {
+     DWORD      dwCertEncodingType;
+     BYTE      *pbCrlEncoded;
+@@ -2907,6 +2983,7 @@ typedef struct _CTL_FIND_SUBJECT_PARA
+ #define szOID_RSA_certExtensions            "1.2.840.113549.1.9.14"
+ #define szOID_RSA_SMIMECapabilities         "1.2.840.113549.1.9.15"
+ #define szOID_RSA_preferSignedData          "1.2.840.113549.1.9.15.1"
++#define szOID_TIMESTAMP_TOKEN               "1.2.840.113549.1.9.16.1.4"
+ #define szOID_RSA_SMIMEalg                  "1.2.840.113549.1.9.16.3"
+ #define szOID_RSA_SMIMEalgESDH              "1.2.840.113549.1.9.16.3.5"
+ #define szOID_RSA_SMIMEalgCMS3DESwrap       "1.2.840.113549.1.9.16.3.6"
+@@ -3075,6 +3152,7 @@ typedef struct _CTL_FIND_SUBJECT_PARA
+ #define szOID_NEXT_UPDATE_LOCATION           "1.3.6.1.4.1.311.10.2"
+ #define szOID_KP_CTL_USAGE_SIGNING           "1.3.6.1.4.1.311.10.3.1"
+ #define szOID_KP_TIME_STAMP_SIGNING          "1.3.6.1.4.1.311.10.3.2"
++#define szOID_RFC3161_counterSign            "1.3.6.1.4.1.311.3.3.1"
+ #ifndef szOID_SERVER_GATED_CRYPTO
+ #define szOID_SERVER_GATED_CRYPTO            "1.3.6.1.4.1.311.10.3.3"
+ #endif
+@@ -3301,6 +3379,9 @@ typedef struct _CTL_FIND_SUBJECT_PARA
+ #define OCSP_BASIC_RESPONSE                  ((LPCSTR)69)
+ #define CNG_RSA_PUBLIC_KEY_BLOB              ((LPCSTR)72)
+ #define X509_OBJECT_IDENTIFIER               ((LPCSTR)73)
++#define TIMESTAMP_REQUEST                    ((LPCSTR)78)
++#define TIMESTAMP_RESPONSE                   ((LPCSTR)79)
++#define TIMESTAMP_INFO                       ((LPCSTR)80)
+ #define PKCS7_SIGNER_INFO                    ((LPCSTR)500)
+ #define CMS_SIGNER_INFO                      ((LPCSTR)501)
+ 
+@@ -4707,6 +4788,15 @@ BOOL WINAPI CryptRetrieveObjectByUrlW(LPCWSTR pszURL, LPCSTR pszObjectOid,
+  PCRYPT_RETRIEVE_AUX_INFO pAuxInfo);
+ #define CryptRetrieveObjectByUrl WINELIB_NAME_AW(CryptRetrieveObjectByUrl)
+ 
++WINCRYPT32API BOOL WINAPI CryptRetrieveTimeStamp(LPCWSTR wszUrl, DWORD dwRetrievalFlags,
++ DWORD dwTimeout, LPCSTR pszHashId, const CRYPT_TIMESTAMP_PARA *pPara,
++ const BYTE *pbData, DWORD cbData, PCRYPT_TIMESTAMP_CONTEXT *ppTsContext,
++ PCCERT_CONTEXT *ppTsSigner, HCERTSTORE *phStore);
++WINCRYPT32API BOOL WINAPI CryptVerifyTimeStampSignature(const BYTE *pbTSContentInfo,
++ DWORD cbTSContentInfo, const BYTE *pbData, DWORD cbData,
++ HCERTSTORE hAdditionalStore, PCRYPT_TIMESTAMP_CONTEXT *ppTsContext,
++ PCCERT_CONTEXT *ppTsSigner, HCERTSTORE *phStore);
++
+ /* Not found in crypt32.dll but in softpub.dll */
+ HRESULT WINAPI FindCertsByIssuer(PCERT_CHAIN pCertChains, DWORD *pcbCertChains,
+  DWORD *pcCertChains, BYTE* pbEncodedIssuerName, DWORD cbEncodedIssuerName,

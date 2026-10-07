@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 23:18:35 -0400
+Subject: [PATCH] server, ntdll: Carry wait completion packets over to the
+ current object model.
+
+The merge request was written before objects took their parameters in struct object_params and were
+set up by an init hook, and before the loose object attributes helper was renamed: the packet now
+declares only the operations it has and fills itself in init.  Its target's sync object is taken
+with get_obj_sync(), as an object may have no get_sync of its own, and a sync that cannot be
+signaled is taken as not signaled.  Waking the packets walks their queue with the safe iterator, as
+each one leaves it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 07a67773c0e..748d26a0077 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -3748,7 +3748,7 @@ NTSTATUS WINAPI NtCreateWaitCompletionPacket( HANDLE *handle, ACCESS_MASK access
+     TRACE( "%p, %08x, %p\n", handle, (int)access, attr );
+ 
+     *handle = 0;
+-    if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
++    if ((ret = wine_server_alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
+     SERVER_START_REQ( create_completion_packet )
+     {
+diff --git a/server/completion.c b/server/completion.c
+index ebce2ab66a7..941df9f5716 100644
+--- a/server/completion.c
++++ b/server/completion.c
+@@ -317,32 +317,17 @@ struct type_descr completion_packet_type =
+     },
+ };
+ 
+-static void completion_packet_dump( struct object *, int );
+-static void completion_packet_destroy( struct object * );
++static void completion_packet_dump( struct object *obj, int verbose );
++static bool completion_packet_init( struct object *obj, const void *init_data );
++static void completion_packet_destroy( struct object *obj );
+ 
+ static const struct object_ops completion_packet_ops =
+ {
+-    sizeof(struct completion_packet), /* size */
+-    &completion_packet_type,          /* type */
+-    completion_packet_dump,           /* dump */
+-    no_add_queue,                     /* add_queue */
+-    NULL,                             /* remove_queue */
+-    NULL,                             /* signaled */
+-    NULL,                             /* satisfied */
+-    no_signal,                        /* signal */
+-    no_get_fd,                        /* get_fd */
+-    default_get_sync,                 /* get_sync */
+-    default_map_access,               /* map_access */
+-    default_get_sd,                   /* get_sd */
+-    default_set_sd,                   /* set_sd */
+-    default_get_full_name,            /* get_full_name */
+-    no_lookup_name,                   /* lookup_name */
+-    directory_link_name,              /* link_name */
+-    default_unlink_name,              /* unlink_name */
+-    no_open_file,                     /* open_file */
+-    no_kernel_obj_list,               /* get_kernel_obj_list */
+-    no_close_handle,                  /* close_handle */
+-    completion_packet_destroy         /* destroy */
++    .size    = sizeof(struct completion_packet),
++    .type    = &completion_packet_type,
++    .dump    = completion_packet_dump,
++    .init    = completion_packet_init,
++    .destroy = completion_packet_destroy,
+ };
+ 
+ static void completion_packet_dump( struct object *obj, int verbose )
+@@ -364,32 +349,25 @@ static struct completion_packet *get_completion_packet_obj( struct process *proc
+     return (struct completion_packet *)get_handle_obj( process, handle, access, &completion_packet_ops );
+ }
+ 
+-static struct completion_packet *create_completion_packet( struct object *root,
+-                                                           const struct unicode_str *name,
+-                                                           unsigned int attr,
+-                                                           const struct security_descriptor *sd )
++static bool completion_packet_init( struct object *obj, const void *init_data )
+ {
+-    struct completion_packet *packet;
++    struct completion_packet *packet = (struct completion_packet *)obj;
+ 
+-    if ((packet = create_named_object( root, &completion_packet_ops, name, attr, sd ))
+-        && get_error() != STATUS_OBJECT_NAME_EXISTS)
+-    {
+-        packet->target = NULL;
+-        packet->completion = NULL;
+-        packet->ckey = 0;
+-        packet->cvalue = 0;
+-        packet->information = 0;
+-        packet->status = 0;
+-        packet->in_target_packet_queue = 0;
+-        packet->in_completion_queue = 0;
+-    }
+-    return packet;
++    packet->target = NULL;
++    packet->completion = NULL;
++    packet->ckey = 0;
++    packet->cvalue = 0;
++    packet->information = 0;
++    packet->status = 0;
++    packet->in_target_packet_queue = 0;
++    packet->in_completion_queue = 0;
++    return true;
+ }
+ 
+ /* try to wake up completion packets in the object when it's signaled */
+ void wake_up_completion_packets( struct object *obj )
+ {
+-    struct completion_packet *packet;
++    struct completion_packet *packet, *next;
+ 
+     if (list_empty( &obj->completion_packet_queue ))
+         return;
+@@ -397,7 +375,7 @@ void wake_up_completion_packets( struct object *obj )
+     if (!is_obj_signaled( obj ))
+         return;
+ 
+-    LIST_FOR_EACH_ENTRY( packet, &obj->completion_packet_queue, struct completion_packet, entry )
++    LIST_FOR_EACH_ENTRY_SAFE( packet, next, &obj->completion_packet_queue, struct completion_packet, entry )
+     {
+         assert( packet->in_target_packet_queue );
+         assert( packet->target );
+@@ -600,24 +578,11 @@ DECL_HANDLER(query_completion)
+ /* create a wait completion packet */
+ DECL_HANDLER(create_completion_packet)
+ {
+-    struct completion_packet *packet;
+-    struct unicode_str name;
+-    struct object *root;
+-    const struct security_descriptor *sd;
+-    const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, &root );
+-
+-    if (!objattr) return;
+-    if ((packet = create_completion_packet( root, &name, objattr->attributes, sd )))
+-    {
+-        if (get_error() == STATUS_OBJECT_NAME_EXISTS)
+-            reply->handle = alloc_handle( current->process, packet, req->access, objattr->attributes );
+-        else
+-            reply->handle = alloc_handle_no_access_check( current->process, packet,
+-                                                          req->access, objattr->attributes );
+-        release_object( packet );
+-    }
++    struct object_params params = { .ops = &completion_packet_ops, .access = req->access };
+ 
+-    if (root) release_object( root );
++    if (!get_req_object_attributes( &params )) return;
++    reply->handle = create_named_obj_handle( current->process, &params );
++    if (params.root) release_object( params.root );
+ }
+ 
+ /* associate a wait completion packet */
+@@ -685,7 +650,7 @@ DECL_HANDLER(associate_completion_packet)
+     else
+     {
+         packet->target = grab_object( target );
+-        sync = target->ops->get_sync( target );
++        sync = get_obj_sync( target );
+         list_add_tail( &sync->completion_packet_queue, &packet->entry );
+         packet->in_target_packet_queue = 1;
+         release_object( sync );
+diff --git a/server/thread.c b/server/thread.c
+index d2b86577ede..d2073e1eabd 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1347,13 +1347,10 @@ static int select_on( const union select_op *select_op, data_size_t op_size, cli
+ /* check if an object is signaled for wait completion packets */
+ int is_obj_signaled( struct object *obj )
+ {
+-    struct object *sync;
+-    int signaled;
++    struct object *sync = get_obj_sync( obj );
++    int signaled = sync->ops->signaled && sync->ops->signaled( sync, NULL );
+ 
+-    sync = obj->ops->get_sync( obj );
+-    signaled = sync->ops->signaled( sync, NULL );
+-    if (signaled)
+-        sync->ops->satisfied( sync, NULL );
++    if (signaled && sync->ops->satisfied) sync->ops->satisfied( sync, NULL );
+     release_object( sync );
+     return signaled;
+ }

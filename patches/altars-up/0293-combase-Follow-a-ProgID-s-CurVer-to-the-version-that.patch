@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 22:03:21 -0400
+Subject: [PATCH] combase: Follow a ProgID's CurVer to the version that names a
+ class.
+
+A version-independent ProgID often has no CLSID key of its own, only
+CurVer naming the ProgID of its current version; Windows follows that,
+through as many versions as it takes, and CLSIDFromProgID() and
+CLSIDFromString() answered CO_E_CLASSSTRING for all of them.  In the
+Office prefix 97 of 331 ProgIDs with a CurVer have no class of their
+own, among them MSCOMCTL's controls (MSComctlLib.ListViewCtrl,
+ImageListCtrl, ProgCtrl, SbarCtrl) that VBA forms create by name.
+
+What ole32's tests measured on Windows, and now hold: a ProgID's own
+CLSID key comes first; CurVer chains are followed; one that comes back
+on itself is REGDB_E_INVALIDVALUE, which CLSIDFromProgID() reports as
+CO_E_CLASSSTRING with a null CLSID; a CurVer without a value fails;
+and CLSIDFromString() leaves the CLSID as it was when a registered
+ProgID does not resolve, where an unregistered one still gives a null
+CLSID and a broken GUID stays as far as it was read.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 7acd1b0601b..62b650d4c06 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -1455,35 +1455,99 @@ static BOOL guid_from_string(LPCWSTR s, GUID *id)
+     return FALSE;
+ }
+ 
+-static HRESULT clsid_from_string_reg(LPCOLESTR progid, CLSID *clsid)
++/* the default value of HKCR\<progid>\<name>, allocated, or NULL when it is empty; an error when the key is not there */
++static LSTATUS get_progid_value(const WCHAR *progid, const WCHAR *name, WCHAR **value)
+ {
+-    WCHAR buf2[CHARS_IN_GUID];
+-    LONG buf2len = sizeof(buf2);
+-    HKEY xhkey;
+-    WCHAR *buf;
++    DWORD size = 0;
++    WCHAR *path;
++    LSTATUS res;
++    HKEY key;
+ 
+-    memset(clsid, 0, sizeof(*clsid));
+-    buf = malloc((lstrlenW(progid) + 8) * sizeof(WCHAR));
+-    if (!buf) return E_OUTOFMEMORY;
++    *value = NULL;
++    if (!(path = malloc((lstrlenW(progid) + lstrlenW(name) + 2) * sizeof(WCHAR)))) return ERROR_OUTOFMEMORY;
++    lstrcpyW(path, progid);
++    lstrcatW(path, L"\\");
++    lstrcatW(path, name);
++    res = open_classes_key(HKEY_CLASSES_ROOT, path, KEY_READ, &key);
++    free(path);
++    if (res) return res;
+ 
+-    lstrcpyW(buf, progid);
+-    lstrcatW(buf, L"\\CLSID");
+-    if (open_classes_key(HKEY_CLASSES_ROOT, buf, MAXIMUM_ALLOWED, &xhkey))
++    if (!RegQueryValueExW(key, NULL, NULL, NULL, NULL, &size) && size > sizeof(WCHAR)
++            && (*value = malloc(size + sizeof(WCHAR))))
+     {
+-        free(buf);
+-        WARN("couldn't open key for ProgID %s\n", debugstr_w(progid));
++        if (RegQueryValueExW(key, NULL, NULL, NULL, (BYTE *)*value, &size))
++        {
++            free(*value);
++            *value = NULL;
++        }
++        else (*value)[size / sizeof(WCHAR)] = 0;
++    }
++    RegCloseKey(key);
++    return ERROR_SUCCESS;
++}
++
++/* A ProgID names its class under its CLSID key.  One without that key -- a version-independent ProgID --
++ * may name the ProgID of its current version under CurVer, which is followed to one that has a class; a
++ * chain that comes back on itself is an invalid value.  Whether the ProgID itself is registered is
++ * reported as well, as CLSIDFromString() treats the two failures differently. */
++static HRESULT clsid_from_string_reg(LPCOLESTR progid, CLSID *clsid, BOOL *registered)
++{
++    WCHAR *names[32], *value;
++    unsigned int depth = 0, i;
++    LSTATUS res;
++    HRESULT hr;
++    HKEY key;
++
++    memset(clsid, 0, sizeof(*clsid));
++    *registered = FALSE;
++    if (!*progid)
+         return CO_E_CLASSSTRING;
++    if (!open_classes_key(HKEY_CLASSES_ROOT, progid, KEY_READ, &key))
++    {
++        *registered = TRUE;
++        RegCloseKey(key);
+     }
+-    free(buf);
+ 
+-    if (RegQueryValueW(xhkey, NULL, buf2, &buf2len))
++    if (!(names[0] = malloc((lstrlenW(progid) + 1) * sizeof(WCHAR)))) return E_OUTOFMEMORY;
++    lstrcpyW(names[0], progid);
++    for (;;)
+     {
+-        RegCloseKey(xhkey);
+-        WARN("couldn't query clsid value for ProgID %s\n", debugstr_w(progid));
+-        return CO_E_CLASSSTRING;
++        if ((res = get_progid_value(names[depth], L"CLSID", &value)) != ERROR_FILE_NOT_FOUND)
++        {
++            if (res == ERROR_OUTOFMEMORY) hr = E_OUTOFMEMORY;
++            else if (value && guid_from_string(value, clsid)) hr = S_OK;
++            else
++            {
++                WARN("couldn't query clsid value for ProgID %s\n", debugstr_w(names[depth]));
++                memset(clsid, 0, sizeof(*clsid));
++                hr = CO_E_CLASSSTRING;
++            }
++            free(value);
++            break;
++        }
++
++        get_progid_value(names[depth], L"CurVer", &value);
++        if (!value)
++        {
++            WARN("couldn't open key for ProgID %s\n", debugstr_w(names[depth]));
++            hr = CO_E_CLASSSTRING;
++            break;
++        }
++        for (i = 0; i <= depth; i++)
++            if (!wcsicmp(names[i], value)) break;
++        if (i <= depth || depth + 1 == ARRAY_SIZE(names))
++        {
++            WARN("the current versions of ProgID %s go round\n", debugstr_w(progid));
++            free(value);
++            hr = REGDB_E_INVALIDVALUE;
++            break;
++        }
++        TRACE("%s: current version %s\n", debugstr_w(names[depth]), debugstr_w(value));
++        names[++depth] = value;
+     }
+-    RegCloseKey(xhkey);
+-    return guid_from_string(buf2, clsid) ? S_OK : CO_E_CLASSSTRING;
++
++    for (i = 0; i <= depth; i++) free(names[i]);
++    return hr;
+ }
+ 
+ /******************************************************************************
+@@ -1492,6 +1556,8 @@ static HRESULT clsid_from_string_reg(LPCOLESTR progid, CLSID *clsid)
+ HRESULT WINAPI DECLSPEC_HOTPATCH CLSIDFromProgID(LPCOLESTR progid, CLSID *clsid)
+ {
+     ACTCTX_SECTION_KEYED_DATA data;
++    BOOL registered;
++    HRESULT hr;
+ 
+     if (!progid || !clsid)
+         return E_INVALIDARG;
+@@ -1506,7 +1572,8 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CLSIDFromProgID(LPCOLESTR progid, CLSID *clsid)
+         return S_OK;
+     }
+ 
+-    return clsid_from_string_reg(progid, clsid);
++    hr = clsid_from_string_reg(progid, clsid, &registered);
++    return hr == REGDB_E_INVALIDVALUE ? CO_E_CLASSSTRING : hr;
+ }
+ 
+ /******************************************************************************
+@@ -1524,19 +1591,23 @@ HRESULT WINAPI CLSIDFromProgIDEx(LPCOLESTR progid, CLSID *clsid)
+  */
+ HRESULT WINAPI CLSIDFromString(LPCOLESTR str, LPCLSID clsid)
+ {
++    BOOL registered;
+     CLSID tmp_id;
+     HRESULT hr;
+ 
+     if (!clsid)
+         return E_INVALIDARG;
+ 
+-    if (guid_from_string(str, clsid))
++    /* A GUID that does not parse stays as far as it was read.  A ProgID is also valid: one that is not
++     * registered gives a null CLSID, one that is but does not resolve leaves it as it was. */
++    if ((!str || str[0] == '{') && guid_from_string(str, clsid))
+         return S_OK;
+ 
+-    /* It appears a ProgID is also valid */
+-    hr = clsid_from_string_reg(str, &tmp_id);
++    hr = clsid_from_string_reg(str, &tmp_id, &registered);
+     if (SUCCEEDED(hr))
+         *clsid = tmp_id;
++    else if (!registered && str[0] != '{')
++        memset(clsid, 0, sizeof(*clsid));
+ 
+     return hr;
+ }
+diff --git a/dlls/ole32/tests/compobj.c b/dlls/ole32/tests/compobj.c
+index c9bef098a85..91ebb0f4919 100644
+--- a/dlls/ole32/tests/compobj.c
++++ b/dlls/ole32/tests/compobj.c
+@@ -528,15 +528,11 @@ static void test_CLSIDFromProgID(void)
+     ok(!ret, "Failed to create a test key.\n");
+ 
+     hr = CLSIDFromProgID(L"MyApp.DocumentTest", &clsid);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(IsEqualCLSID(&clsid, &CLSID_non_existent), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     hr = CLSIDFromProgID(L"MyApp.DocumentTest.1", &clsid);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(IsEqualCLSID(&clsid, &CLSID_non_existent), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     hr = CLSIDFromProgID(L"MyApp.DocumentTest.2", &clsid);
+@@ -554,15 +550,11 @@ static void test_CLSIDFromProgID(void)
+     ok(IsEqualCLSID(&clsid, &CLSID_NULL), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     hr = CLSIDFromString(L"MyApp.DocumentTest", &clsid);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(IsEqualCLSID(&clsid, &CLSID_non_existent), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     hr = CLSIDFromString(L"MyApp.DocumentTest.1", &clsid);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(IsEqualCLSID(&clsid, &CLSID_non_existent), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     hr = CLSIDFromString(L"MyApp.DocumentTest.2", &clsid);
+@@ -571,15 +563,12 @@ static void test_CLSIDFromProgID(void)
+ 
+     clsid = CLSID_StdFont;
+     hr = CLSIDFromString(L"MyApp.DocumentTest.3", &clsid);
+-    todo_wine
+     ok(hr == REGDB_E_INVALIDVALUE, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(IsEqualCLSID(&clsid, &CLSID_StdFont), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     clsid = CLSID_StdFont;
+     hr = CLSIDFromString(L"MyApp.DocumentTest.5", &clsid);
+     ok(hr == CO_E_CLASSSTRING, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(IsEqualCLSID(&clsid, &CLSID_StdFont), "Unexpected clsid %s.\n", wine_dbgstr_guid(&clsid));
+ 
+     RegDeleteTreeW(HKEY_CLASSES_ROOT, L"MyApp.DocumentTest");

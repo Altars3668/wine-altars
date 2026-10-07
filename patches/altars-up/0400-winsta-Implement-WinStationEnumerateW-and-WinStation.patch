@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:08:04 -0400
+Subject: [PATCH] winsta: Implement WinStationEnumerateW and
+ WinStationBroadcastSystemMessage.
+
+The sessions are the numbered directories of \Sessions: session 0, the services', and the one on the
+screen.  WinStationBroadcastSystemMessage is BroadcastSystemMessage to the desktops of another
+session, or of all of them, which is how a service in session 0 tells the programs of the user's
+session about a device: a BroadcastSystemMessage of its own reaches the desktops of session 0 only.
+
+winsta.h moves to include, for the modules that broadcast.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/winsta/Makefile.in b/dlls/winsta/Makefile.in
+index 9b975b96a21..bcaec5d48a1 100644
+--- a/dlls/winsta/Makefile.in
++++ b/dlls/winsta/Makefile.in
+@@ -1,4 +1,6 @@
+ MODULE    = winsta.dll
++IMPORTLIB = winsta
++IMPORTS   = user32 win32u
+ 
+ SOURCES = \
+ 	main.c
+diff --git a/dlls/winsta/main.c b/dlls/winsta/main.c
+index 80588392ca4..abf957174f1 100644
+--- a/dlls/winsta/main.c
++++ b/dlls/winsta/main.c
+@@ -18,15 +18,86 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winuser.h"
+ #include "winternl.h"
++#include "ddk/wdm.h"
++#include "ntuser.h"
+ #include "wine/debug.h"
+ #include "winsta.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsta);
+ 
++static const KUSER_SHARED_DATA *user_shared_data = (KUSER_SHARED_DATA *)0x7ffe0000;
++
++static BOOL is_type( const DIRECTORY_BASIC_INFORMATION *info, const WCHAR *type )
++{
++    return info->ObjectTypeName.Length == wcslen( type ) * sizeof(WCHAR) &&
++           !wcsncmp( info->ObjectTypeName.Buffer, type, wcslen( type ) );
++}
++
++/* the sessions there are, from \Sessions, which holds a directory named by its number for each one */
++static ULONG *get_sessions( ULONG *count )
++{
++    UNICODE_STRING name = RTL_CONSTANT_STRING( L"\\Sessions" );
++    char data[1024];
++    DIRECTORY_BASIC_INFORMATION *info = (DIRECTORY_BASIC_INFORMATION *)data;
++    ULONG *ids = NULL, *tmp, ctx = 0, len, id, size = 0, i;
++    OBJECT_ATTRIBUTES attr;
++    HANDLE dir;
++    WCHAR *p, *end;
++
++    *count = 0;
++    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL );
++    if (NtOpenDirectoryObject( &dir, DIRECTORY_QUERY, &attr )) return NULL;
++    while (!NtQueryDirectoryObject( dir, info, sizeof(data), TRUE, FALSE, &ctx, &len ))
++    {
++        if (!is_type( info, L"Directory" )) continue;
++        p = info->ObjectName.Buffer;
++        end = p + info->ObjectName.Length / sizeof(WCHAR);
++        for (id = 0; p < end && *p >= '0' && *p <= '9'; p++) id = id * 10 + *p - '0';
++        if (p == info->ObjectName.Buffer || p != end) continue;
++        if (*count == size)
++        {
++            size = size ? size * 2 : 4;
++            if (!(tmp = realloc( ids, size * sizeof(*ids) ))) break;
++            ids = tmp;
++        }
++        /* in order */
++        for (i = *count; i && ids[i - 1] > id; i--) ids[i] = ids[i - 1];
++        ids[i] = id;
++        (*count)++;
++    }
++    NtClose( dir );
++    return ids;
++}
++
++/* session 0 is the services', never connected to anything; the console session is the one on the screen */
++static void get_session_info( ULONG id, SESSIONIDW *session )
++{
++    session->SessionId = id;
++    if (!id)
++    {
++        wcscpy( session->WinStationName, L"Services" );
++        session->State = State_Disconnected;
++    }
++    else if (id == user_shared_data->ActiveConsoleId)
++    {
++        wcscpy( session->WinStationName, L"Console" );
++        session->State = State_Active;
++    }
++    else
++    {
++        session->WinStationName[0] = 0;
++        session->State = State_Disconnected;
++    }
++}
++
+ BOOLEAN WINAPI WinStationQueryInformationA( HANDLE server, ULONG logon_id, WINSTATIONINFOCLASS class,
+                                             void *info, ULONG len, ULONG *ret_len )
+ {
+@@ -85,7 +156,172 @@ BOOL WINAPI WinStationVirtualOpen( PVOID a, PVOID b, PVOID c )
+ 
+ BOOLEAN WINAPI WinStationEnumerateW( HANDLE server, PSESSIONIDW *sessionids, ULONG *count )
+ {
+-    FIXME( "%p %p %p\n", server, sessionids, count );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    ULONG *ids, i;
++
++    TRACE( "%p %p %p\n", server, sessionids, count );
++
++    if (server)
++    {
++        FIXME( "remote server %p not supported\n", server );
++        SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++        return FALSE;
++    }
++    if (!(ids = get_sessions( count )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    if (!(*sessionids = malloc( *count * sizeof(**sessionids) )))
++    {
++        free( ids );
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    for (i = 0; i < *count; i++) get_session_info( ids[i], *sessionids + i );
++    free( ids );
++    return TRUE;
++}
++
++BOOLEAN WINAPI WinStationFreeMemory( void *ptr )
++{
++    TRACE( "%p\n", ptr );
++    free( ptr );
++    return TRUE;
++}
++
++struct broadcast
++{
++    DWORD   flags;
++    UINT    msg;
++    WPARAM  wparam;
++    LPARAM  lparam;
++    UINT    timeout;
++    HWINSTA winstation;  /* the one whose desktops are being told */
++    LONG    result;      /* 0 once a window denies a query */
++};
++
++/* as BroadcastSystemMessage tells a window */
++static BOOL CALLBACK broadcast_window( HWND hwnd, LPARAM lparam )
++{
++    struct broadcast *broadcast = (struct broadcast *)lparam;
++    DWORD_PTR result = 0;
++    DWORD pid;
++
++    if (broadcast->flags & BSF_IGNORECURRENTTASK && GetWindowThreadProcessId( hwnd, &pid ) &&
++        pid == GetCurrentProcessId())
++        return TRUE;
++
++    if (broadcast->flags & BSF_QUERY)
++    {
++        UINT flags = SMTO_NORMAL;
++
++        if (broadcast->flags & (BSF_FORCEIFHUNG | BSF_NOHANG)) flags = SMTO_ABORTIFHUNG;
++        else if (broadcast->flags & BSF_NOTIMEOUTIFNOTHUNG) flags = SMTO_NOTIMEOUTIFNOTHUNG;
++        if (!SendMessageTimeoutW( hwnd, broadcast->msg, broadcast->wparam, broadcast->lparam, flags,
++                                  broadcast->timeout, &result ) &&
++            GetLastError() == ERROR_TIMEOUT && !(broadcast->flags & BSF_FORCEIFHUNG))
++        {
++            broadcast->result = 0;
++            return FALSE;
++        }
++        if (result == BROADCAST_QUERY_DENY)
++        {
++            broadcast->result = 0;
++            return FALSE;
++        }
++    }
++    else if (broadcast->flags & BSF_POSTMESSAGE)
++        PostMessageW( hwnd, broadcast->msg, broadcast->wparam, broadcast->lparam );
++    else
++        SendNotifyMessageW( hwnd, broadcast->msg, broadcast->wparam, broadcast->lparam );
++    return TRUE;
++}
++
++static BOOL CALLBACK broadcast_desktop( WCHAR *name, LPARAM lparam )
++{
++    struct broadcast *broadcast = (struct broadcast *)lparam;
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING str;
++    HDESK desktop;
++
++    RtlInitUnicodeString( &str, name );
++    InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE, broadcast->winstation, NULL );
++    if (!(desktop = NtUserOpenDesktop( &attr, 0, DESKTOP_ENUMERATE | DESKTOP_READOBJECTS )))
++    {
++        WARN( "cannot open desktop %s\n", debugstr_w(name) );
++        return TRUE;
++    }
++    EnumDesktopWindows( desktop, broadcast_window, lparam );
++    NtUserCloseDesktop( desktop );
++    return broadcast->result;
++}
++
++/* to every desktop of every window station of the session, as BroadcastSystemMessage does in its own */
++static void broadcast_session( ULONG session, struct broadcast *broadcast )
++{
++    char data[1024];
++    DIRECTORY_BASIC_INFORMATION *info = (DIRECTORY_BASIC_INFORMATION *)data;
++    UNICODE_STRING name;
++    OBJECT_ATTRIBUTES attr;
++    WCHAR path[64];
++    ULONG ctx = 0, len;
++    HANDLE dir;
++
++    swprintf( path, ARRAY_SIZE(path), L"\\Sessions\\%lu\\Windows\\WindowStations", session );
++    RtlInitUnicodeString( &name, path );
++    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL );
++    if (NtOpenDirectoryObject( &dir, DIRECTORY_QUERY | DIRECTORY_TRAVERSE, &attr )) return;
++
++    while (broadcast->result && !NtQueryDirectoryObject( dir, info, sizeof(data), TRUE, FALSE, &ctx, &len ))
++    {
++        if (!is_type( info, L"WindowStation" )) continue;
++        InitializeObjectAttributes( &attr, &info->ObjectName, OBJ_CASE_INSENSITIVE, dir, NULL );
++        if (!(broadcast->winstation = NtUserOpenWindowStation( &attr, WINSTA_ENUMDESKTOPS )))
++        {
++            WARN( "cannot open window station %s in session %lu\n",
++                  debugstr_wn( info->ObjectName.Buffer, info->ObjectName.Length / sizeof(WCHAR) ), session );
++            continue;
++        }
++        TRACE( "session %lu window station %s\n", session,
++               debugstr_wn( info->ObjectName.Buffer, info->ObjectName.Length / sizeof(WCHAR) ) );
++        EnumDesktopsW( broadcast->winstation, broadcast_desktop, (LPARAM)broadcast );
++        NtUserCloseWindowStation( broadcast->winstation );
++    }
++    NtClose( dir );
++}
++
++/***********************************************************************
++ *              WinStationBroadcastSystemMessage   (WINSTA.@)
++ *
++ * BroadcastSystemMessage to another session, or to all of them: what a service in session 0 uses to tell the
++ * programs of the user's session about a device, say, which a BroadcastSystemMessage of its own does not
++ * reach.  "WinStation" is a session here, and the timeout is in seconds.
++ */
++BOOLEAN WINAPI WinStationBroadcastSystemMessage( HANDLE server, BOOL all_sessions, ULONG session, ULONG timeout,
++                                                 DWORD flags, DWORD *recipients, ULONG msg, WPARAM wparam,
++                                                 LPARAM lparam, LONG *response )
++{
++    struct broadcast broadcast = { flags, msg, wparam, lparam, timeout ? timeout * 1000 : 2000, NULL, 1 };
++    ULONG *ids, count, i;
++
++    TRACE( "%p %d %lu %lu %#lx %p %#lx %#Ix %#Ix %p\n", server, all_sessions, session, timeout, flags, recipients,
++           msg, wparam, lparam, response );
++
++    if (server)
++    {
++        FIXME( "remote server %p not supported\n", server );
++        SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++        return FALSE;
++    }
++    if (recipients && *recipients && !(*recipients & (BSM_APPLICATIONS | BSM_ALLDESKTOPS)))
++        FIXME( "recipients %#lx not supported\n", *recipients );
++
++    if (!all_sessions) broadcast_session( session, &broadcast );
++    else if ((ids = get_sessions( &count )))
++    {
++        for (i = 0; i < count && broadcast.result; i++) broadcast_session( ids[i], &broadcast );
++        free( ids );
++    }
++    if (response) *response = broadcast.result;
++    return TRUE;
+ }
+diff --git a/dlls/winsta/winsta.spec b/dlls/winsta/winsta.spec
+index a582a7336bb..cba2386abd1 100644
+--- a/dlls/winsta/winsta.spec
++++ b/dlls/winsta/winsta.spec
+@@ -19,7 +19,7 @@
+ @ stub ServerSetInternetConnectorStatus
+ @ stub WinStationActivateLicense
+ @ stub WinStationAutoReconnect
+-@ stub WinStationBroadcastSystemMessage
++@ stdcall WinStationBroadcastSystemMessage(ptr long long long long ptr long long long ptr)
+ @ stub WinStationCheckLoopBack
+ @ stub WinStationCloseServer
+ @ stub WinStationConnectA
+@@ -33,7 +33,7 @@
+ @ stub WinStationEnumerate_IndexedA
+ @ stub WinStationEnumerate_IndexedW
+ @ stub WinStationFreeGAPMemory
+-@ stub WinStationFreeMemory
++@ stdcall WinStationFreeMemory(ptr)
+ @ stub WinStationGenerateLicense
+ @ stdcall WinStationGetAllProcesses(ptr long ptr ptr)
+ @ stub WinStationGetLanAdapterNameA
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 82f4a58a075..bcfad0c30aa 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1197,6 +1197,7 @@ SOURCES = \
+ 	winsock2.h \
+ 	winspool.h \
+ 	winsqlite/winsqlite3.h \
++	winsta.h \
+ 	winstring.h \
+ 	winsvc.h \
+ 	winsxs.idl \
+diff --git a/dlls/winsta/winsta.h b/include/winsta.h
+similarity index 94%
+rename from dlls/winsta/winsta.h
+rename to include/winsta.h
+index bbe84a03cb7..b3958bf5648 100644
+--- a/dlls/winsta/winsta.h
++++ b/include/winsta.h
+@@ -85,7 +85,9 @@ typedef struct _TS_ALL_PROCESSES_INFO
+     PBYTE pSid;
+ } TS_ALL_PROCESSES_INFO, *PTS_ALL_PROCESSES_INFO;
+ 
++BOOLEAN WINAPI WinStationBroadcastSystemMessage(HANDLE,BOOL,ULONG,ULONG,DWORD,DWORD *,ULONG,WPARAM,LPARAM,LONG *);
+ BOOLEAN WINAPI WinStationEnumerateW(HANDLE,PSESSIONIDW *,PULONG);
++BOOLEAN WINAPI WinStationFreeMemory(void *);
+ BOOLEAN WINAPI WinStationGetAllProcesses(HANDLE,ULONG,PULONG,PTS_ALL_PROCESSES_INFO *);
+ BOOLEAN WINAPI WinStationGetProcessSid(HANDLE,ULONG,FILETIME,PVOID,PULONG);
+ BOOLEAN WINAPI WinStationQueryInformationW(HANDLE,ULONG,WINSTATIONINFOCLASS,PVOID,ULONG,PULONG);

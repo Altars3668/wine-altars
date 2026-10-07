@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:28:02 -0400
+Subject: [PATCH] rtscom: Take only free-threaded synchronous plugins, and
+ answer as Windows 11 does.
+
+A synchronous plugin is called on the thread that takes the input, and
+Windows asks it for its marshaler before anything else, the index or what
+it is interested in, and refuses one that is not the free-threaded
+marshaler with E_INVALIDARG; one that aggregates it is taken.  Measured on
+build 29671 as well: enabling with no window is 0x80280005 and changing the
+window while enabled 0x80280006; there are no tablet contexts until input is
+taken; GetTablet in all-tablets mode gives S_OK and no tablet; and the input
+rectangle is the window's client area once input is taken.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/rtscom/rtscom_main.c b/dlls/rtscom/rtscom_main.c
+index 57aa305f020..0a3140e99d1 100644
+--- a/dlls/rtscom/rtscom_main.c
++++ b/dlls/rtscom/rtscom_main.c
+@@ -43,6 +43,11 @@ DEFINE_GUID(GUID_PACKETPROPERTY_GUID_PACKET_STATUS, 0x6e0e07bf, 0xafe7, 0x4cf7,
+ 
+ /* the mouse is the one tablet there is, with one stylus: not measured what numbers Windows gives them */
+ #define MOUSE_TABLET_CONTEXT 1
++
++/* What Windows 11 answers when there is no window to take input from, and when the window is changed while
++ * input is taken, in a facility it shares with the TPM's errors. */
++#define RTS_E_NO_WINDOW ((HRESULT)0x80280005)
++#define RTS_E_ENABLED   ((HRESULT)0x80280006)
+ #define MOUSE_STYLUS 1
+ 
+ /* packet status bits */
+@@ -593,7 +598,9 @@ static HRESULT WINAPI rtstylus_put_Enabled(IRealTimeStylus *iface, BOOL fEnable)
+     }
+     if (fEnable)
+     {
+-        if (!This->hwnd || !IsWindow( This->hwnd ))
++        if (!This->hwnd)
++            hr = RTS_E_NO_WINDOW;
++        else if (!IsWindow( This->hwnd ))
+             hr = HRESULT_FROM_WIN32( ERROR_INVALID_WINDOW_HANDLE );
+         else if (SUCCEEDED(hr = start_input( This )))
+             This->enabled = TRUE;
+@@ -633,9 +640,9 @@ static HRESULT WINAPI rtstylus_put_HWND(IRealTimeStylus *iface, HANDLE_PTR hwnd)
+     TRACE( "%p, %Ix\n", This, hwnd );
+ 
+     EnterCriticalSection( &This->cs );
+-    /* the window can't change under enabled input (what Windows answers is not measured) */
++    /* the window can't change under enabled input */
+     if (This->enabled)
+-        hr = E_UNEXPECTED;
++        hr = RTS_E_ENABLED;
+     else if (hwnd && !IsWindow( (HWND)hwnd ))
+         hr = HRESULT_FROM_WIN32( ERROR_INVALID_WINDOW_HANDLE );
+     else
+@@ -651,7 +658,11 @@ static HRESULT WINAPI rtstylus_get_WindowInputRectangle(IRealTimeStylus *iface,
+     TRACE( "%p, %p\n", This, prcWndInputRect );
+ 
+     if (!prcWndInputRect) return E_POINTER;
++    EnterCriticalSection( &This->cs );
+     *prcWndInputRect = This->input_rect;
++    /* none set is the whole window, which is what Windows says once input is taken */
++    if (IsRectEmpty( prcWndInputRect ) && This->enabled) GetClientRect( This->hwnd, prcWndInputRect );
++    LeaveCriticalSection( &This->cs );
+     return S_OK;
+ }
+ 
+@@ -737,12 +748,33 @@ static HRESULT get_plugin( struct rtstylus *This, struct plugin *plugins, ULONG
+     return hr;
+ }
+ 
++/* A synchronous plugin is called on the thread that takes the input, so it has to be free-threaded: Windows asks
++ * for its marshaler and refuses one that is not the free-threaded one before anything else, even the index. */
++static BOOL is_free_threaded( IStylusPlugin *plugin )
++{
++    IMarshal *marshal;
++    CLSID clsid;
++    HRESULT hr;
++
++    if (FAILED(IStylusPlugin_QueryInterface( plugin, &IID_IMarshal, (void **)&marshal ))) return FALSE;
++    hr = IMarshal_GetUnmarshalClass( marshal, &IID_IStylusSyncPlugin, plugin, MSHCTX_INPROC, NULL,
++                                     MSHLFLAGS_NORMAL, &clsid );
++    IMarshal_Release( marshal );
++    return SUCCEEDED(hr) && IsEqualCLSID( &clsid, &CLSID_InProcFreeMarshaler );
++}
++
+ static HRESULT WINAPI rtstylus_AddStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin *piPlugin)
+ {
+     struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+ 
+     TRACE( "%p, %lu, %p\n", This, iIndex, piPlugin );
+ 
++    if (!piPlugin) return E_POINTER;
++    if (!is_free_threaded( (IStylusPlugin *)piPlugin ))
++    {
++        WARN( "Plugin %p is not free-threaded.\n", piPlugin );
++        return E_INVALIDARG;
++    }
+     return add_plugin( This, &This->sync_plugins, &This->sync_count, iIndex, (IStylusPlugin *)piPlugin );
+ }
+ 
+@@ -963,9 +995,9 @@ static HRESULT WINAPI rtstylus_GetTablet(IRealTimeStylus *iface, IInkTablet **pp
+     TRACE( "%p, %p\n", This, ppiSingleTablet );
+ 
+     if (!ppiSingleTablet) return E_POINTER;
++    /* none in all-tablets mode, which is not an error */
+     EnterCriticalSection( &This->cs );
+-    if (!(*ppiSingleTablet = This->single_tablet)) hr = E_FAIL;
+-    else IInkTablet_AddRef( *ppiSingleTablet );
++    if ((*ppiSingleTablet = This->single_tablet)) IInkTablet_AddRef( *ppiSingleTablet );
+     LeaveCriticalSection( &This->cs );
+     return hr;
+ }
+@@ -993,7 +1025,8 @@ static HRESULT WINAPI rtstylus_GetAllTabletContextIds(IRealTimeStylus *iface, UL
+     TRACE( "%p, %p, %p\n", This, pcTcidCount, ppTcids );
+ 
+     if (!pcTcidCount || !ppTcids) return E_POINTER;
+-    if (!This->use_mouse)
++    /* there are none until input is taken */
++    if (!This->use_mouse || !This->enabled)
+     {
+         *pcTcidCount = 0;
+         *ppTcids = NULL;
+diff --git a/dlls/rtscom/tests/rtscom.c b/dlls/rtscom/tests/rtscom.c
+index 692678a3ee1..ba9ea14542b 100644
+--- a/dlls/rtscom/tests/rtscom.c
++++ b/dlls/rtscom/tests/rtscom.c
+@@ -42,6 +42,9 @@ struct plugin
+     LONG interest_calls;
+     LONG enabled_calls;
+     RealTimeStylusDataInterest interest;
++    IUnknown *marshaler;    /* the free-threaded marshaler, once the plugin aggregates it */
++    GUID asked[8];          /* what else it was asked for */
++    LONG asked_count;
+ };
+ 
+ static struct plugin *impl_from_IStylusSyncPlugin(IStylusSyncPlugin *iface)
+@@ -51,6 +54,9 @@ static struct plugin *impl_from_IStylusSyncPlugin(IStylusSyncPlugin *iface)
+ 
+ static HRESULT WINAPI plugin_QueryInterface(IStylusSyncPlugin *iface, REFIID riid, void **out)
+ {
++    struct plugin *plugin = impl_from_IStylusSyncPlugin(iface);
++    LONG i;
++
+     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IStylusPlugin)
+             || IsEqualGUID(riid, &IID_IStylusSyncPlugin))
+     {
+@@ -58,6 +64,10 @@ static HRESULT WINAPI plugin_QueryInterface(IStylusSyncPlugin *iface, REFIID rii
+         IStylusSyncPlugin_AddRef(iface);
+         return S_OK;
+     }
++    if (IsEqualGUID(riid, &IID_IMarshal) && plugin->marshaler)
++        return IUnknown_QueryInterface(plugin->marshaler, riid, out);
++    if ((i = InterlockedIncrement(&plugin->asked_count) - 1) < ARRAY_SIZE(plugin->asked))
++        plugin->asked[i] = *riid;
+     *out = NULL;
+     return E_NOINTERFACE;
+ }
+@@ -205,9 +215,12 @@ static void test_realtime_stylus(void)
+     IUnknown *unk;
+     ULONG count, i;
+     GUID *guids;
++    TABLET_CONTEXT_ID *tcids;
+     HANDLE_PTR hwnd_value;
++    IInkTablet *tablet;
++    RECT rect, client;
+     BOOL enabled;
+-    HWND hwnd;
++    HWND hwnd, hwnd2;
+     HRESULT hr;
+ 
+     hr = CoCreateInstance(&CLSID_RealTimeStylus, NULL, CLSCTX_INPROC_SERVER, &IID_IRealTimeStylus, (void **)&rts);
+@@ -236,8 +249,24 @@ static void test_realtime_stylus(void)
+     ok(hr == S_OK && !count, "Got hr %#lx, count %lu.\n", hr, count);
+     hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 1, &plugin.IStylusSyncPlugin_iface);
+     ok(FAILED(hr), "Got hr %#lx.\n", hr);
++
++    /* A synchronous plugin is called on the stylus's own thread, so it has to be free-threaded: Windows
++     * refuses one that is not before it asks what it is interested in. */
++    hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 0, &plugin.IStylusSyncPlugin_iface);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    ok(!plugin.interest_calls, "Got %ld calls.\n", plugin.interest_calls);
++    for (i = 0; i < min(plugin.asked_count, ARRAY_SIZE(plugin.asked)); ++i)
++        trace("asked for %s\n", wine_dbgstr_guid(&plugin.asked[i]));
++    hr = IRealTimeStylus_GetStylusSyncPluginCount(rts, &count);
++    ok(hr == S_OK && !count, "Got hr %#lx, count %lu.\n", hr, count);
++
++    hr = CoCreateFreeThreadedMarshaler((IUnknown *)&plugin.IStylusSyncPlugin_iface, &plugin.marshaler);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    plugin.asked_count = 0;
+     hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 0, &plugin.IStylusSyncPlugin_iface);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    for (i = 0; i < min(plugin.asked_count, ARRAY_SIZE(plugin.asked)); ++i)
++        trace("then asked for %s\n", wine_dbgstr_guid(&plugin.asked[i]));
+     ok(plugin.interest_calls == 1, "Got %ld calls.\n", plugin.interest_calls);
+     ok(plugin.refcount == 2, "Got refcount %ld.\n", plugin.refcount);
+     hr = IRealTimeStylus_GetStylusSyncPluginCount(rts, &count);
+@@ -246,7 +275,19 @@ static void test_realtime_stylus(void)
+     ok(hr == S_OK && out == &plugin.IStylusSyncPlugin_iface, "Got hr %#lx, plugin %p.\n", hr, out);
+     if (hr == S_OK) IStylusSyncPlugin_Release(out);
+ 
++    /* nothing to take input from yet: no window, no tablet context, and in all-tablets mode no single tablet */
++    hr = IRealTimeStylus_put_Enabled(rts, TRUE);
++    ok(hr == 0x80280005, "Got hr %#lx.\n", hr);
++    tcids = (void *)0xdeadbeef;
++    hr = IRealTimeStylus_GetAllTabletContextIds(rts, &count, &tcids);
++    ok(hr == S_OK && !count, "Got hr %#lx, count %lu.\n", hr, count);
++    if (count) CoTaskMemFree(tcids);
++    tablet = (void *)0xdeadbeef;
++    hr = IRealTimeStylus_GetTablet(rts, &tablet);
++    ok(hr == S_OK && !tablet, "Got hr %#lx, tablet %p.\n", hr, tablet);
++
+     hwnd = CreateWindowA("static", "rtscom", WS_POPUP, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
++    hwnd2 = CreateWindowA("static", "rtscom", WS_POPUP, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
+     hr = IRealTimeStylus_put_HWND(rts, (HANDLE_PTR)hwnd);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     hr = IRealTimeStylus_put_Enabled(rts, TRUE);
+@@ -254,6 +295,17 @@ static void test_realtime_stylus(void)
+     ok(plugin.enabled_calls == 1, "Got %ld calls.\n", plugin.enabled_calls);
+     hr = IRealTimeStylus_get_Enabled(rts, &enabled);
+     ok(hr == S_OK && enabled, "Got hr %#lx, enabled %d.\n", hr, enabled);
++
++    /* the input rectangle is the window's once input is taken, and the window can't change under it */
++    hr = IRealTimeStylus_get_WindowInputRectangle(rts, &rect);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    GetClientRect(hwnd, &client);
++    ok(EqualRect(&rect, &client), "Got %s.\n", wine_dbgstr_rect(&rect));
++    hr = IRealTimeStylus_put_HWND(rts, (HANDLE_PTR)hwnd2);
++    ok(hr == 0x80280006, "Got hr %#lx.\n", hr);
++    hr = IRealTimeStylus_GetAllTabletContextIds(rts, &count, &tcids);
++    ok(hr == S_OK && count == 1, "Got hr %#lx, count %lu.\n", hr, count);
++    if (count) CoTaskMemFree(tcids);
+     hr = IRealTimeStylus_put_Enabled(rts, FALSE);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
+@@ -265,6 +317,8 @@ static void test_realtime_stylus(void)
+ 
+     IRealTimeStylus_Release(rts);
+     DestroyWindow(hwnd);
++    DestroyWindow(hwnd2);
++    if (plugin.marshaler) IUnknown_Release(plugin.marshaler);
+ }
+ 
+ static void test_stroke_builder(void)

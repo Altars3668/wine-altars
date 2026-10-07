@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 19:54:36 -0400
+Subject: [PATCH] wininet: send a request's headers as Windows does.
+
+As measured on Windows, through a test server that echoes what it gets:
+
+- The headers the caller hands HttpSendRequest go first, and the ones
+  WinINet adds after them: Host, Content-Length, then Connection,
+  Cache-Control and Cookie.  WinINet put Host, Content-Length and
+  Cache-Control before the caller's.
+- HEAD says nothing of a length; only the other verbs without a body
+  send "Content-Length: 0".
+- Cache-Control, added with every attempt, stays once a POST is
+  redirected to a GET, as it does on Windows.
+- Connection keeps its place when a request is sent again: it was taken
+  out and put back at the end.
+- A kept-alive connection the server has reset since is given up for a
+  new one, as one it had closed already was.  The request failed with
+  ERROR_INTERNET_CONNECTION_ABORTED where Windows sends it again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 50d5db65a5c379c5867297a2c54b5a1a887632f9)
+
+diff --git a/dlls/wininet/http.c b/dlls/wininet/http.c
+index 5b80b71cc6d..4d24537017f 100644
+--- a/dlls/wininet/http.c
++++ b/dlls/wininet/http.c
+@@ -5042,8 +5042,23 @@ static DWORD create_request(http_request_t *request, void *optional, DWORD optle
+         HTTP_FixURL(request);
+         if (request->hdr.dwFlags & INTERNET_FLAG_KEEP_CONNECTION)
+         {
+-            HTTP_ProcessHeader(request, L"Connection", L"Keep-Alive",
+-                               HTTP_ADDHDR_FLAG_REQ | HTTP_ADDREQ_FLAG_REPLACE | HTTP_ADDREQ_FLAG_ADD);
++            INT index;
++            BOOL keep_alive;
++
++            /* set once, so that it keeps its place when the request is sent again */
++            EnterCriticalSection( &request->headers_section );
++            index = HTTP_GetCustomHeaderIndex(request, L"Connection", 0, TRUE);
++            keep_alive = index != -1 && !wcsicmp(request->custHeaders[index].lpszValue, L"Keep-Alive");
++            LeaveCriticalSection( &request->headers_section );
++            if (!keep_alive)
++                HTTP_ProcessHeader(request, L"Connection", L"Keep-Alive",
++                                   HTTP_ADDHDR_FLAG_REQ | HTTP_ADDREQ_FLAG_REPLACE | HTTP_ADDREQ_FLAG_ADD);
++        }
++        /* once there, it stays: a POST redirected to a GET still says it */
++        if ((request->hdr.dwFlags & INTERNET_FLAG_NO_CACHE_WRITE) && wcscmp(request->verb, L"GET"))
++        {
++            HTTP_HttpAddRequestHeadersW(request, L"Cache-Control: no-cache\r\n",
++                                        lstrlenW(L"Cache-Control: no-cache\r\n"), HTTP_ADDREQ_FLAG_ADD_IF_NEW);
+         }
+         HTTP_InsertAuthorization(request, request->authInfo, L"Authorization");
+         HTTP_InsertAuthorization(request, request->proxyAuthInfo, L"Proxy-Authorization");
+@@ -5133,6 +5148,13 @@ static DWORD create_request(http_request_t *request, void *optional, DWORD optle
+             if (HTTP_GetResponseHeaders(request, &responseLen))
+             {
+                 http_release_netconn(request, FALSE);
++                /* a kept-alive connection the server has since reset is
++                 * given up for a new one, as for one it closed */
++                if(reusing_connection) {
++                    TRACE("Connection reset by server, reconnecting\n");
++                    loop_next = TRUE;
++                    continue;
++                }
+                 res = ERROR_INTERNET_CONNECTION_ABORTED;
+                 goto lend;
+             }
+@@ -5306,10 +5328,23 @@ static DWORD HTTP_HttpSendRequestW(http_request_t *request, LPCWSTR lpszHeaders,
+     if (!request->verb)
+         request->verb = wcsdup(L"GET");
+ 
++    /* The headers the caller supplied go first, and the ones added here after
++     * them, in the order Windows sends them in: Host, Content-Length, then
++     * Connection, Cache-Control and Cookie with every attempt. */
++    if (lpszHeaders)
++    {
++        if (dwHeaderLength == 0)
++            dwHeaderLength = lstrlenW(lpszHeaders);
++
++        HTTP_HttpAddRequestHeadersW(request, lpszHeaders, dwHeaderLength, HTTP_ADDREQ_FLAG_ADD | HTTP_ADDREQ_FLAG_REPLACE);
++    }
++
+     HTTP_ProcessHeader(request, L"Host", request->server->canon_host_port,
+                        HTTP_ADDREQ_FLAG_ADD_IF_NEW | HTTP_ADDHDR_FLAG_REQ);
+ 
+-    if (dwContentLength || wcscmp(request->verb, L"GET"))
++    /* A request other than GET and HEAD says how long its body is, even when
++     * it has none; HEAD does not, on Windows. */
++    if (dwContentLength || (wcscmp(request->verb, L"GET") && wcscmp(request->verb, L"HEAD")))
+     {
+         set_content_length_header(request, dwContentLength, HTTP_ADDREQ_FLAG_ADD_IF_NEW);
+         request->bytesToWrite = dwContentLength;
+@@ -5334,20 +5369,6 @@ static DWORD HTTP_HttpSendRequestW(http_request_t *request, LPCWSTR lpszHeaders,
+         HTTP_HttpAddRequestHeadersW(request, L"Pragma: no-cache\r\n",
+                                     lstrlenW(L"Pragma: no-cache\r\n"), HTTP_ADDREQ_FLAG_ADD_IF_NEW);
+     }
+-    if ((request->hdr.dwFlags & INTERNET_FLAG_NO_CACHE_WRITE) && wcscmp(request->verb, L"GET"))
+-    {
+-        HTTP_HttpAddRequestHeadersW(request, L"Cache-Control: no-cache\r\n",
+-                                    lstrlenW(L"Cache-Control: no-cache\r\n"), HTTP_ADDREQ_FLAG_ADD_IF_NEW);
+-    }
+-
+-    /* add the headers the caller supplied */
+-    if (lpszHeaders)
+-    {
+-        if (dwHeaderLength == 0)
+-            dwHeaderLength = lstrlenW(lpszHeaders);
+-
+-        HTTP_HttpAddRequestHeadersW(request, lpszHeaders, dwHeaderLength, HTTP_ADDREQ_FLAG_ADD | HTTP_ADDREQ_FLAG_REPLACE);
+-    }
+ 
+     res = create_request(request, lpOptional, dwOptionalLength, dwContentLength, bEndRequest);
+ 
+diff --git a/dlls/wininet/tests/http.c b/dlls/wininet/tests/http.c
+index 8dcec0b0ef6..bb791e13d7b 100644
+--- a/dlls/wininet/tests/http.c
++++ b/dlls/wininet/tests/http.c
+@@ -2719,6 +2719,21 @@ static DWORD CALLBACK server_thread(LPVOID param)
+             static const char msg[] = "HTTP/1.1 200 OK\r\nSet-Cookie: c1=3\r\nContent-Length: 0\r\n\r\n";
+             send(c, msg, sizeof msg-1, 0);
+         }
++        if (strstr(buffer, "HEAD /head_length "))
++        {
++            static const char yes[] = "HTTP/1.1 200 OK\r\nX-Length: yes\r\nContent-Length: 0\r\n\r\n";
++            static const char no[] = "HTTP/1.1 200 OK\r\nX-Length: no\r\nContent-Length: 0\r\n\r\n";
++            if (strstr(buffer, "Content-Length:")) send(c, yes, sizeof yes-1, 0);
++            else send(c, no, sizeof no-1, 0);
++        }
++        if (strstr(buffer, "PUT /order_echo "))
++        {
++            char head[64];
++            int len = strlen(buffer);
++            sprintf(head, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len);
++            send(c, head, strlen(head), 0);
++            send(c, buffer, len, 0);
++        }
+         if (strstr(buffer, "/testC"))
+         {
+             if (strstr(buffer, "Cookie: cookie=biscuit"))
+@@ -4529,6 +4544,50 @@ static void test_response_cookies(int port)
+     ok(ret && strstr(buffer, "c1=3; c2=2") != NULL, "got %s\n", ret ? buffer : "nothing");
+ }
+ 
++/* The headers WinINet sends with a request, and the order it sends them in. */
++static void test_request_header_order(int port)
++{
++    const char *custom, *host, *length, *connection, *cache;
++    HINTERNET session, connect, request;
++    test_request_t req;
++    char buffer[1024];
++    DWORD size, read;
++    BOOL ret;
++
++    /* HEAD says nothing of a length */
++    open_simple_request(&req, "localhost", port, "HEAD", "/head_length");
++    ret = HttpSendRequestA(req.request, NULL, 0, NULL, 0);
++    ok(ret, "HttpSendRequest failed: %lu\n", GetLastError());
++    strcpy(buffer, "X-Length");
++    size = sizeof(buffer);
++    ret = HttpQueryInfoA(req.request, HTTP_QUERY_CUSTOM, buffer, &size, NULL);
++    ok(ret, "HttpQueryInfo failed: %lu\n", GetLastError());
++    ok(!strcmp(buffer, "no"), "got %s\n", buffer);
++    close_request(&req);
++
++    /* the caller's headers first, then Host, Content-Length, Connection and Cache-Control */
++    session = InternetOpenA(NULL, INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
++    connect = InternetConnectA(session, "localhost", port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
++    request = HttpOpenRequestA(connect, "PUT", "/order_echo", NULL, NULL, NULL,
++                               INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_NO_CACHE_WRITE, 0);
++    ok(request != NULL, "HttpOpenRequest failed: %lu\n", GetLastError());
++    ret = HttpSendRequestA(request, "X-First: 1\r\n", ~0u, NULL, 0);
++    ok(ret, "HttpSendRequest failed: %lu\n", GetLastError());
++    memset(buffer, 0, sizeof(buffer));
++    ret = InternetReadFile(request, buffer, sizeof(buffer) - 1, &read);
++    ok(ret, "InternetReadFile failed: %lu\n", GetLastError());
++    custom = strstr(buffer, "X-First: 1\r\n");
++    host = strstr(buffer, "Host: ");
++    length = strstr(buffer, "Content-Length: 0\r\n");
++    connection = strstr(buffer, "Connection: Keep-Alive\r\n");
++    cache = strstr(buffer, "Cache-Control: no-cache\r\n");
++    ok(custom && host && length && connection && cache, "got %s\n", buffer);
++    ok(custom < host && host < length && length < connection && connection < cache, "got %s\n", buffer);
++    InternetCloseHandle(request);
++    InternetCloseHandle(connect);
++    InternetCloseHandle(session);
++}
++
+ static void test_basic_authentication(int port)
+ {
+     HINTERNET session, connect, request;
+@@ -6965,6 +7024,7 @@ static void test_http_connection(void)
+     test_header_override(si.port);
+     test_cookie_header(si.port);
+     test_response_cookies(si.port);
++    test_request_header_order(si.port);
+     test_basic_authentication(si.port);
+     test_invalid_response_headers(si.port);
+     test_response_without_headers(si.port);

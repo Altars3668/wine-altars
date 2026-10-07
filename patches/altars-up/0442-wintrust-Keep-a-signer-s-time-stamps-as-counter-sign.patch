@@ -1,0 +1,560 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 08:53:01 -0400
+Subject: [PATCH] wintrust: Keep a signer's time stamps as counter signers, and
+ verify it as of the first that holds.
+
+A legacy counter signature and an RFC 3161 time stamp token are both
+kept as counter signers of type SGNR_TYPE_TIMESTAMP, each verified (the
+legacy one with CryptMsgVerifyCountersignatureEncodedEx, the token with
+CryptVerifyTimeStampSignature) and with its own chain, built as of its
+time for time stamping from the message's and the token's certificates.
+A signer is verified as of the first time stamp whose signature and
+chain hold, else as of the call.  RFC 3161 time stamps were not read at
+all, so a signature whose certificate has since expired, which is most
+of Office's, was verified as of now; and the legacy time was taken
+unverified.  On Windows 11 build 29671, measured with
+tools/wintrustprobe on files of Office and OfficePLUS, each time stamp is
+a counter signer of type 0x10 with a chain of three, and the signer is
+verified as of its time to the millisecond.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/wintrust/softpub.c b/dlls/wintrust/softpub.c
+index 6d5f62bfc84..6279ca961d1 100644
+--- a/dlls/wintrust/softpub.c
++++ b/dlls/wintrust/softpub.c
+@@ -652,35 +652,29 @@ static CMSG_SIGNER_INFO *WINTRUST_GetSigner(CRYPT_PROVIDER_DATA *data,
+     return signerInfo;
+ }
+ 
+-static BOOL WINTRUST_GetTimeFromCounterSigner(
+- const CMSG_CMS_SIGNER_INFO *counterSignerInfo, FILETIME *time)
++/* the signing time a legacy counter signature carries in its authenticated attributes */
++static BOOL WINTRUST_GetTimeFromCounterSigner(const CMSG_SIGNER_INFO *counterSignerInfo,
++ FILETIME *time)
+ {
+-    DWORD i;
+-    BOOL foundTimeStamp = FALSE;
++    DWORD i, j;
+ 
+-    for (i = 0; !foundTimeStamp && i < counterSignerInfo->AuthAttrs.cAttr; i++)
++    for (i = 0; i < counterSignerInfo->AuthAttrs.cAttr; i++)
+     {
+-        if (!strcmp(counterSignerInfo->AuthAttrs.rgAttr[i].pszObjId,
+-         szOID_RSA_signingTime))
++        const CRYPT_ATTRIBUTE *attr = &counterSignerInfo->AuthAttrs.rgAttr[i];
++
++        if (strcmp(attr->pszObjId, szOID_RSA_signingTime))
++            continue;
++        for (j = 0; j < attr->cValue; j++)
+         {
+-            const CRYPT_ATTRIBUTE *attr =
+-             &counterSignerInfo->AuthAttrs.rgAttr[i];
+-            DWORD j;
++            DWORD size = sizeof(FILETIME);
+ 
+-            for (j = 0; !foundTimeStamp && j < attr->cValue; j++)
+-            {
+-                static const DWORD encoding = X509_ASN_ENCODING |
+-                 PKCS_7_ASN_ENCODING;
+-                DWORD size = sizeof(FILETIME);
+-
+-                foundTimeStamp = CryptDecodeObjectEx(encoding,
+-                 X509_CHOICE_OF_TIME,
+-                 attr->rgValue[j].pbData, attr->rgValue[j].cbData, 0, NULL,
+-                 time, &size);
+-            }
++            if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
++             X509_CHOICE_OF_TIME, attr->rgValue[j].pbData, attr->rgValue[j].cbData,
++             0, NULL, time, &size))
++                return TRUE;
+         }
+     }
+-    return foundTimeStamp;
++    return FALSE;
+ }
+ 
+ static LPCSTR filetime_to_str(const FILETIME *time)
+@@ -697,49 +691,149 @@ static LPCSTR filetime_to_str(const FILETIME *time)
+     return date;
+ }
+ 
+-static FILETIME WINTRUST_GetTimeFromSigner(const CRYPT_PROVIDER_DATA *data,
+- const CMSG_SIGNER_INFO *signerInfo)
++/* a legacy (PKCS #9) counter signature, signed with a certificate the message carries */
++static void WINTRUST_SaveLegacyCounterSigner(CRYPT_PROVIDER_DATA *data,
++ DWORD signerIdx, const CRYPT_ATTR_BLOB *value)
+ {
+-    DWORD i;
+-    FILETIME time;
+-    BOOL foundTimeStamp = FALSE;
++    CRYPT_PROVIDER_SGNR counter = { sizeof(counter) };
++    const CERT_CONTEXT *cert = NULL;
++    CERT_INFO certInfo = { 0 };
++    BYTE *encodedSigner = NULL;
++    DWORD size;
+ 
+-    for (i = 0; !foundTimeStamp && i < signerInfo->UnauthAttrs.cAttr; i++)
++    if (!CryptDecodeObjectEx(data->dwEncoding, PKCS7_SIGNER_INFO, value->pbData,
++     value->cbData, 0, NULL, NULL, &size) ||
++     !(counter.psSigner = data->psPfns->pfnAlloc(size)))
++        return;
++    if (!CryptDecodeObjectEx(data->dwEncoding, PKCS7_SIGNER_INFO, value->pbData,
++     value->cbData, 0, NULL, counter.psSigner, &size))
+     {
+-        if (!strcmp(signerInfo->UnauthAttrs.rgAttr[i].pszObjId,
+-         szOID_RSA_counterSign))
+-        {
+-            const CRYPT_ATTRIBUTE *attr = &signerInfo->UnauthAttrs.rgAttr[i];
+-            DWORD j;
++        data->psPfns->pfnFree(counter.psSigner);
++        return;
++    }
++    counter.dwSignerType = SGNR_TYPE_TIMESTAMP;
++    if (!WINTRUST_GetTimeFromCounterSigner(counter.psSigner, &counter.sftVerifyAsOf))
++    {
++        counter.sftVerifyAsOf = data->sftSystemTime;
++        counter.dwError = TRUST_E_TIME_STAMP;
++    }
+ 
+-            for (j = 0; j < attr->cValue; j++)
+-            {
+-                static const DWORD encoding = X509_ASN_ENCODING |
+-                 PKCS_7_ASN_ENCODING;
+-                CMSG_CMS_SIGNER_INFO *counterSignerInfo;
+-                DWORD size;
+-                BOOL ret = CryptDecodeObjectEx(encoding, CMS_SIGNER_INFO,
+-                 attr->rgValue[j].pbData, attr->rgValue[j].cbData,
+-                 CRYPT_DECODE_ALLOC_FLAG, NULL, &counterSignerInfo, &size);
+-                if (ret)
+-                {
+-                    /* FIXME: need to verify countersigner signature too */
+-                    foundTimeStamp = WINTRUST_GetTimeFromCounterSigner(
+-                     counterSignerInfo, &time);
+-                    LocalFree(counterSignerInfo);
+-                }
+-            }
++    certInfo.Issuer = counter.psSigner->Issuer;
++    certInfo.SerialNumber = counter.psSigner->SerialNumber;
++    if (data->chStores)
++        cert = CertGetSubjectCertificateFromStore(data->pahStores[0],
++         data->dwEncoding, &certInfo);
++    if (!cert)
++        counter.dwError = TRUST_E_NO_SIGNER_CERT;
++    else if (!counter.dwError)
++    {
++        if (!CryptMsgGetParam(data->hMsg, CMSG_ENCODED_SIGNER, signerIdx, NULL, &size) ||
++         !(encodedSigner = malloc(size)) ||
++         !CryptMsgGetParam(data->hMsg, CMSG_ENCODED_SIGNER, signerIdx, encodedSigner, &size) ||
++         !CryptMsgVerifyCountersignatureEncodedEx(0, data->dwEncoding, encodedSigner,
++         size, value->pbData, value->cbData, CMSG_VERIFY_SIGNER_CERT, (void *)cert, 0, NULL))
++        {
++            WARN("counter signature not verified: %08lx\n", GetLastError());
++            counter.dwError = TRUST_E_COUNTER_SIGNER;
+         }
++        free(encodedSigner);
++    }
++
++    if (!data->psPfns->pfnAddSgnr2Chain(data, TRUE, signerIdx, &counter))
++        data->psPfns->pfnFree(counter.psSigner);
++    else if (cert)
++        data->psPfns->pfnAddCert2Chain(data, signerIdx, TRUE,
++         data->pasSigners[signerIdx].csCounterSigners - 1, cert);
++    CertFreeCertificateContext(cert);
++}
++
++/* an RFC 3161 time stamp of the signature, signed with a certificate the token carries */
++static void WINTRUST_SaveTimeStampCounterSigner(CRYPT_PROVIDER_DATA *data,
++ DWORD signerIdx, const CRYPT_ATTR_BLOB *token)
++{
++    const CMSG_SIGNER_INFO *signerInfo = data->pasSigners[signerIdx].psSigner;
++    CRYPT_PROVIDER_SGNR counter = { sizeof(counter) };
++    CRYPT_TIMESTAMP_CONTEXT *context;
++    const CERT_CONTEXT *cert;
++    HCERTSTORE store;
++    HCRYPTMSG msg;
++    DWORD size;
++
++    if (!CryptVerifyTimeStampSignature(token->pbData, token->cbData,
++     signerInfo->EncryptedHash.pbData, signerInfo->EncryptedHash.cbData, NULL,
++     &context, &cert, &store))
++    {
++        WARN("time stamp not verified: %08lx\n", GetLastError());
++        return;
+     }
+-    if (!foundTimeStamp)
++    counter.sftVerifyAsOf = context->pTimeStamp->ftTime;
++    counter.dwSignerType = SGNR_TYPE_TIMESTAMP;
++    if ((msg = CryptMsgOpenToDecode(data->dwEncoding, 0, 0, 0, NULL, NULL)))
+     {
+-        TRACE("returning system time %s\n",
+-         filetime_to_str(&data->sftSystemTime));
+-        time = data->sftSystemTime;
++        if (CryptMsgUpdate(msg, token->pbData, token->cbData, TRUE) &&
++         CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, NULL, &size) &&
++         (counter.psSigner = data->psPfns->pfnAlloc(size)) &&
++         !CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, counter.psSigner, &size))
++        {
++            data->psPfns->pfnFree(counter.psSigner);
++            counter.psSigner = NULL;
++        }
++        CryptMsgClose(msg);
+     }
++    /* the token's certificates are where the time stamp's chain is found */
++    data->psPfns->pfnAddStore2Chain(data, store);
++    if (!data->psPfns->pfnAddSgnr2Chain(data, TRUE, signerIdx, &counter))
++        data->psPfns->pfnFree(counter.psSigner);
+     else
+-        TRACE("returning time from message %s\n", filetime_to_str(&time));
+-    return time;
++        data->psPfns->pfnAddCert2Chain(data, signerIdx, TRUE,
++         data->pasSigners[signerIdx].csCounterSigners - 1, cert);
++    CertFreeCertificateContext(cert);
++    CertCloseStore(store, 0);
++    CryptMemFree(context);
++}
++
++/* the time of the first counter signer that holds, else the time WinVerifyTrust was called */
++static void WINTRUST_ChooseTime(CRYPT_PROVIDER_DATA *data, DWORD signerIdx)
++{
++    CRYPT_PROVIDER_SGNR *sgnr = &data->pasSigners[signerIdx];
++    DWORD i;
++
++    sgnr->sftVerifyAsOf = data->sftSystemTime;
++    for (i = 0; i < sgnr->csCounterSigners; i++)
++    {
++        if (sgnr->pasCounterSigners[i].dwError)
++            continue;
++        sgnr->sftVerifyAsOf = sgnr->pasCounterSigners[i].sftVerifyAsOf;
++        break;
++    }
++    TRACE("signer %lu: verifying as of %s\n", signerIdx,
++     filetime_to_str(&sgnr->sftVerifyAsOf));
++}
++
++/*
++ * A signer's counter signers time stamp its signature, either the legacy way
++ * or with an RFC 3161 token; the first one verified is the time it is verified
++ * as of, else it is the time WinVerifyTrust was called.
++ */
++static void WINTRUST_SaveCounterSigners(CRYPT_PROVIDER_DATA *data, DWORD signerIdx)
++{
++    const CMSG_SIGNER_INFO *signerInfo = data->pasSigners[signerIdx].psSigner;
++    DWORD i, j;
++
++    for (i = 0; i < signerInfo->UnauthAttrs.cAttr; i++)
++    {
++        const CRYPT_ATTRIBUTE *attr = &signerInfo->UnauthAttrs.rgAttr[i];
++
++        for (j = 0; j < attr->cValue; j++)
++        {
++            if (!strcmp(attr->pszObjId, szOID_RSA_counterSign))
++                WINTRUST_SaveLegacyCounterSigner(data, signerIdx, &attr->rgValue[j]);
++            else if (!strcmp(attr->pszObjId, szOID_RFC3161_counterSign))
++                WINTRUST_SaveTimeStampCounterSigner(data, signerIdx, &attr->rgValue[j]);
++        }
++    }
++
++    WINTRUST_ChooseTime(data, signerIdx);
+ }
+ 
+ static DWORD WINTRUST_SaveSigner(CRYPT_PROVIDER_DATA *data, DWORD signerIdx)
+@@ -752,11 +846,14 @@ static DWORD WINTRUST_SaveSigner(CRYPT_PROVIDER_DATA *data, DWORD signerIdx)
+         CRYPT_PROVIDER_SGNR sgnr = { sizeof(sgnr), { 0 } };
+ 
+         sgnr.psSigner = signerInfo;
+-        sgnr.sftVerifyAsOf = WINTRUST_GetTimeFromSigner(data, signerInfo);
++        sgnr.sftVerifyAsOf = data->sftSystemTime;
+         if (!data->psPfns->pfnAddSgnr2Chain(data, FALSE, signerIdx, &sgnr))
+             err = GetLastError();
+         else
++        {
++            WINTRUST_SaveCounterSigners(data, signerIdx);
+             err = ERROR_SUCCESS;
++        }
+     }
+     else
+         err = GetLastError();
+@@ -960,34 +1057,30 @@ BOOL WINAPI SoftpubCheckCert(CRYPT_PROVIDER_DATA *data, DWORD idxSigner,
+     TRACE("(%p, %ld, %d, %ld)\n", data, idxSigner, fCounterSignerChain,
+      idxCounterSigner);
+ 
+-    if (fCounterSignerChain)
+-    {
+-        FIXME("unimplemented for counter signers\n");
+-        ret = FALSE;
+-    }
+-    else
+     {
+-        PCERT_SIMPLE_CHAIN simpleChain =
+-         data->pasSigners[idxSigner].pChainContext->rgpChain[0];
++        CRYPT_PROVIDER_SGNR *sgnr = fCounterSignerChain ?
++         &data->pasSigners[idxSigner].pasCounterSigners[idxCounterSigner] :
++         &data->pasSigners[idxSigner];
++        PCERT_SIMPLE_CHAIN simpleChain = sgnr->pChainContext->rgpChain[0];
+         DWORD i;
+ 
+         ret = TRUE;
+         for (i = 0; i < simpleChain->cElement; i++)
+         {
+             /* Set confidence */
+-            data->pasSigners[idxSigner].pasCertChain[i].dwConfidence =
++            sgnr->pasCertChain[i].dwConfidence =
+              WINTRUST_TrustStatusToConfidence(
+              simpleChain->rgpElement[i]->TrustStatus.dwErrorStatus);
+             /* Set additional flags */
+             if (!(simpleChain->rgpElement[i]->TrustStatus.dwErrorStatus &
+              CERT_TRUST_IS_UNTRUSTED_ROOT))
+-                data->pasSigners[idxSigner].pasCertChain[i].fTrustedRoot = TRUE;
++                sgnr->pasCertChain[i].fTrustedRoot = TRUE;
+             if (simpleChain->rgpElement[i]->TrustStatus.dwInfoStatus &
+              CERT_TRUST_IS_SELF_SIGNED)
+-                data->pasSigners[idxSigner].pasCertChain[i].fSelfSigned = TRUE;
++                sgnr->pasCertChain[i].fSelfSigned = TRUE;
+             if (simpleChain->rgpElement[i]->TrustStatus.dwErrorStatus &
+              CERT_TRUST_IS_CYCLIC)
+-                data->pasSigners[idxSigner].pasCertChain[i].fIsCyclic = TRUE;
++                sgnr->pasCertChain[i].fIsCyclic = TRUE;
+         }
+     }
+     return ret;
+@@ -1038,36 +1131,44 @@ static DWORD WINTRUST_TrustStatusToError(DWORD errorStatus)
+     return error;
+ }
+ 
+-static DWORD WINTRUST_CopyChain(CRYPT_PROVIDER_DATA *data, DWORD signerIdx)
++static CRYPT_PROVIDER_SGNR *WINTRUST_GetSgnr(CRYPT_PROVIDER_DATA *data,
++ DWORD signerIdx, BOOL counterSigner, DWORD counterIdx)
++{
++    if (counterSigner)
++        return &data->pasSigners[signerIdx].pasCounterSigners[counterIdx];
++    return &data->pasSigners[signerIdx];
++}
++
++static DWORD WINTRUST_CopyChain(CRYPT_PROVIDER_DATA *data, DWORD signerIdx,
++ BOOL counterSigner, DWORD counterIdx)
+ {
+     DWORD err, i;
+-    PCERT_SIMPLE_CHAIN simpleChain =
+-     data->pasSigners[signerIdx].pChainContext->rgpChain[0];
++    CRYPT_PROVIDER_SGNR *sgnr = WINTRUST_GetSgnr(data, signerIdx, counterSigner,
++     counterIdx);
++    PCERT_SIMPLE_CHAIN simpleChain = sgnr->pChainContext->rgpChain[0];
+ 
+-    data->pasSigners[signerIdx].pasCertChain[0].dwConfidence =
+-     WINTRUST_TrustStatusToConfidence(
++    sgnr->pasCertChain[0].dwConfidence = WINTRUST_TrustStatusToConfidence(
+      simpleChain->rgpElement[0]->TrustStatus.dwErrorStatus);
+-    data->pasSigners[signerIdx].pasCertChain[0].pChainElement =
+-     simpleChain->rgpElement[0];
++    sgnr->pasCertChain[0].pChainElement = simpleChain->rgpElement[0];
+     err = ERROR_SUCCESS;
+     for (i = 1; !err && i < simpleChain->cElement; i++)
+     {
+-        if (data->psPfns->pfnAddCert2Chain(data, signerIdx, FALSE, 0,
+-         simpleChain->rgpElement[i]->pCertContext))
++        if (data->psPfns->pfnAddCert2Chain(data, signerIdx, counterSigner,
++         counterIdx, simpleChain->rgpElement[i]->pCertContext))
+         {
+-            data->pasSigners[signerIdx].pasCertChain[i].pChainElement =
+-             simpleChain->rgpElement[i];
+-            data->pasSigners[signerIdx].pasCertChain[i].dwConfidence =
++            /* the array may have moved */
++            sgnr = WINTRUST_GetSgnr(data, signerIdx, counterSigner, counterIdx);
++            sgnr->pasCertChain[i].pChainElement = simpleChain->rgpElement[i];
++            sgnr->pasCertChain[i].dwConfidence =
+              WINTRUST_TrustStatusToConfidence(
+              simpleChain->rgpElement[i]->TrustStatus.dwErrorStatus);
+         }
+         else
+             err = GetLastError();
+     }
+-    data->pasSigners[signerIdx].pasCertChain[simpleChain->cElement - 1].dwError
+-     = WINTRUST_TrustStatusToError(
+-     simpleChain->rgpElement[simpleChain->cElement - 1]->
+-     TrustStatus.dwErrorStatus);
++    sgnr->pasCertChain[simpleChain->cElement - 1].dwError =
++     WINTRUST_TrustStatusToError(
++     simpleChain->rgpElement[simpleChain->cElement - 1]->TrustStatus.dwErrorStatus);
+     return err;
+ }
+ 
+@@ -1097,6 +1198,59 @@ static void WINTRUST_CreateChainPolicyCreateInfo(
+     info->pvReserved = NULL;
+ }
+ 
++/*
++ * The time stamps' chains, each as of its time and for time stamping; what is
++ * wrong with one is its counter signer's error, and the signer's time is then
++ * the time WinVerifyTrust was called.
++ */
++static void WINTRUST_CreateChainsForCounterSigners(CRYPT_PROVIDER_DATA *data,
++ DWORD signer, PWTD_GENERIC_CHAIN_POLICY_CREATE_INFO createInfo,
++ HCERTSTORE store)
++{
++    static char timeStampUsage[] = szOID_PKIX_KP_TIMESTAMP_SIGNING;
++    char *usage[] = { timeStampUsage };
++    CERT_CHAIN_PARA chainPara = { sizeof(chainPara) };
++    CRYPT_PROVIDER_SGNR *counter;
++    DWORD i, err;
++
++    chainPara.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
++    chainPara.RequestedUsage.Usage.cUsageIdentifier = ARRAY_SIZE(usage);
++    chainPara.RequestedUsage.Usage.rgpszUsageIdentifier = usage;
++    for (i = 0; i < data->pasSigners[signer].csCounterSigners; i++)
++    {
++        counter = &data->pasSigners[signer].pasCounterSigners[i];
++        if (counter->dwError || !counter->csCertChain)
++            continue;
++        if (!CertGetCertificateChain(createInfo->hChainEngine,
++         counter->pasCertChain[0].pCert, &counter->sftVerifyAsOf, store,
++         &chainPara, createInfo->dwFlags, createInfo->pvReserved,
++         &counter->pChainContext))
++        {
++            counter->dwError = GetLastError();
++            continue;
++        }
++        if (counter->pChainContext->cChain != 1)
++        {
++            FIXME("unimplemented for more than 1 simple chain\n");
++            continue;
++        }
++        if ((err = WINTRUST_CopyChain(data, signer, TRUE, i)))
++        {
++            data->pasSigners[signer].pasCounterSigners[i].dwError = err;
++            continue;
++        }
++        counter = &data->pasSigners[signer].pasCounterSigners[i];
++        if (data->psPfns->pfnCertCheckPolicy)
++            data->psPfns->pfnCertCheckPolicy(data, signer, TRUE, i);
++        if ((err = WINTRUST_TrustStatusToError(
++         counter->pChainContext->TrustStatus.dwErrorStatus)))
++        {
++            WARN("time stamp's chain: %08lx\n", err);
++            counter->dwError = err;
++        }
++    }
++}
++
+ static DWORD WINTRUST_CreateChainForSigner(CRYPT_PROVIDER_DATA *data,
+  DWORD signer, PWTD_GENERIC_CHAIN_POLICY_CREATE_INFO createInfo,
+  PCERT_CHAIN_PARA chainPara)
+@@ -1120,6 +1274,10 @@ static DWORD WINTRUST_CreateChainForSigner(CRYPT_PROVIDER_DATA *data,
+     }
+     if (!err)
+     {
++        /* a time stamp counts only if its own chain holds */
++        WINTRUST_CreateChainsForCounterSigners(data, signer, createInfo, store);
++        WINTRUST_ChooseTime(data, signer);
++
+         /* Expect the end certificate for each signer to be the only cert in
+          * the chain:
+          */
+@@ -1142,7 +1300,7 @@ static DWORD WINTRUST_CreateChainForSigner(CRYPT_PROVIDER_DATA *data,
+                 }
+                 else
+                 {
+-                    if (!(err = WINTRUST_CopyChain(data, signer)))
++                    if (!(err = WINTRUST_CopyChain(data, signer, FALSE, 0)))
+                     {
+                         if (data->psPfns->pfnCertCheckPolicy)
+                         {
+@@ -1426,6 +1584,18 @@ HRESULT WINAPI SoftpubCleanup(CRYPT_PROVIDER_DATA *data)
+ 
+     for (i = 0; i < data->csSigners; i++)
+     {
++        for (j = 0; j < data->pasSigners[i].csCounterSigners; j++)
++        {
++            CRYPT_PROVIDER_SGNR *counter = &data->pasSigners[i].pasCounterSigners[j];
++            DWORD k;
++
++            for (k = 0; k < counter->csCertChain; k++)
++                CertFreeCertificateContext(counter->pasCertChain[k].pCert);
++            free(counter->pasCertChain);
++            data->psPfns->pfnFree(counter->psSigner);
++            CertFreeCertificateChain(counter->pChainContext);
++        }
++        free(data->pasSigners[i].pasCounterSigners);
+         for (j = 0; j < data->pasSigners[i].csCertChain; j++)
+             CertFreeCertificateContext(data->pasSigners[i].pasCertChain[j].pCert);
+         data->psPfns->pfnFree(data->pasSigners[i].pasCertChain);
+diff --git a/dlls/wintrust/wintrust_main.c b/dlls/wintrust/wintrust_main.c
+index 3673d402ce5..60d89ad60f1 100644
+--- a/dlls/wintrust/wintrust_main.c
++++ b/dlls/wintrust/wintrust_main.c
+@@ -1020,9 +1020,27 @@ BOOL WINAPI WINTRUST_AddSgnr(CRYPT_PROVIDER_DATA *data,
+     }
+     if (fCounterSigner)
+     {
+-        FIXME("unimplemented for counter signers\n");
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
++        CRYPT_PROVIDER_SGNR *signer, *counters;
++
++        if (idxSigner >= data->csSigners)
++        {
++            SetLastError(ERROR_INVALID_PARAMETER);
++            return FALSE;
++        }
++        signer = &data->pasSigners[idxSigner];
++        if (!(counters = realloc(signer->pasCounterSigners,
++         (signer->csCounterSigners + 1) * sizeof(*counters))))
++        {
++            SetLastError(ERROR_OUTOFMEMORY);
++            return FALSE;
++        }
++        signer->pasCounterSigners = counters;
++        if (sgnr->cbStruct == sizeof(CRYPT_PROVIDER_SGNR))
++            memcpy(&counters[signer->csCounterSigners], sgnr, sizeof(*sgnr));
++        else
++            memset(&counters[signer->csCounterSigners], 0, sizeof(*sgnr));
++        signer->csCounterSigners++;
++        return TRUE;
+     }
+     data->pasSigners = realloc(data->pasSigners,
+      (data->csSigners + 1) * sizeof(CRYPT_PROVIDER_SGNR));
+@@ -1056,30 +1074,32 @@ BOOL WINAPI WINTRUST_AddSgnr(CRYPT_PROVIDER_DATA *data,
+ BOOL WINAPI WINTRUST_AddCert(CRYPT_PROVIDER_DATA *data, DWORD idxSigner,
+  BOOL fCounterSigner, DWORD idxCounterSigner, PCCERT_CONTEXT pCert2Add)
+ {
++    CRYPT_PROVIDER_SGNR *sgnr;
+     BOOL ret = FALSE;
+ 
+     TRACE("(%p, %ld, %d, %ld, %p)\n", data, idxSigner, fCounterSigner,
+-     idxSigner, pCert2Add);
++     idxCounterSigner, pCert2Add);
+ 
+-    if (fCounterSigner)
++    if (idxSigner >= data->csSigners || (fCounterSigner &&
++     idxCounterSigner >= data->pasSigners[idxSigner].csCounterSigners))
+     {
+-        FIXME("unimplemented for counter signers\n");
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return FALSE;
+     }
+-    data->pasSigners[idxSigner].pasCertChain =
+-     realloc(data->pasSigners[idxSigner].pasCertChain,
+-     (data->pasSigners[idxSigner].csCertChain + 1) *
+-     sizeof(CRYPT_PROVIDER_CERT));
+-    if (data->pasSigners[idxSigner].pasCertChain)
++    if (fCounterSigner)
++        sgnr = &data->pasSigners[idxSigner].pasCounterSigners[idxCounterSigner];
++    else
++        sgnr = &data->pasSigners[idxSigner];
++    sgnr->pasCertChain = realloc(sgnr->pasCertChain,
++     (sgnr->csCertChain + 1) * sizeof(CRYPT_PROVIDER_CERT));
++    if (sgnr->pasCertChain)
+     {
+-        CRYPT_PROVIDER_CERT *cert = &data->pasSigners[idxSigner].pasCertChain[
+-         data->pasSigners[idxSigner].csCertChain];
++        CRYPT_PROVIDER_CERT *cert = &sgnr->pasCertChain[sgnr->csCertChain];
+ 
+         memset(cert, 0, sizeof(*cert));
+         cert->cbStruct = sizeof(CRYPT_PROVIDER_CERT);
+         cert->pCert = CertDuplicateCertificateContext(pCert2Add);
+-        data->pasSigners[idxSigner].csCertChain++;
++        sgnr->csCertChain++;
+         ret = TRUE;
+     }
+     else

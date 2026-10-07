@@ -1,0 +1,808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 17:23:40 -0400
+Subject: [PATCH] wined3d, dxgi, d3d11: Hand out shared handles the way Windows
+ does.
+
+GetSharedHandle gave every resource an event handle, whether it was
+shared or not and whichever way; CreateSharedHandle, OpenSharedResource1
+and OpenSharedResourceByName were stubs.  A shared resource is now a
+D3DKMT resource of its own, on the win32u support Wine 11 has for them:
+
+ - shared plainly or through a keyed mutex, it has a global handle, which
+   is not a handle of the process: CloseHandle and DuplicateHandle refuse
+   it, and OpenSharedResource takes it;
+ - shared through NT handles, GetSharedHandle refuses it, and
+   CreateSharedHandle gives a new handle of type DxgkSharedResource each
+   time, named in the session's directory if asked, which
+   OpenSharedResource1 and, by name, OpenSharedResourceByName take;
+ - a resource that is not shared has no handle, and says so.
+
+What the D3DKMT resource carries is the process and a serial number, so a
+handle can be told again among this process's resources.  Opening one of
+another process's is not done: the storage is not shared.  A texture
+asking to be shared both ways at once, only through NT handles, or on a
+feature level below 10.0 is refused, as Windows refuses it.
+
+The opener's copy of a shared texture reports its owner's flags and is
+not shared again, so GetSharedHandle on it gives no handle, where Windows
+gives the owner's.
+
+test_shared_resource passes on GL and Vulkan, and the d3d11 tests give no
+other new failures; Word, Excel and PowerPoint draw and save as before.
+The new test_shared_resource_nt_handle goes on where test_shared_resource
+stops, through a named NT handle, OpenSharedResource1 and
+OpenSharedResourceByName; it was not run on Windows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 4a064df87dc6f317102b4277056e8e291f4ecd71)
+
+diff --git a/dlls/d3d11/device.c b/dlls/d3d11/device.c
+index cdea3b57af7..475db971fe3 100644
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -4750,24 +4750,14 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateDeferredContext(ID3D11Device
+     return S_OK;
+ }
+ 
+-HRESULT d3d_device_open_shared_resource(struct d3d_device *device, HANDLE handle, REFIID iid, void **out)
++static HRESULT d3d_device_open_wined3d_resource(struct d3d_device *device, struct wined3d_resource *wined3d_resource,
++        HANDLE handle, REFIID iid, void **out)
+ {
+     struct wined3d_resource_desc wined3d_desc;
+-    struct wined3d_resource *wined3d_resource;
+     struct d3d_texture2d *owner, *texture;
+     D3D11_TEXTURE2D_DESC desc;
+     HRESULT hr;
+ 
+-    if (!out)
+-        return E_INVALIDARG;
+-    *out = NULL;
+-
+-    if (!(wined3d_resource = wined3d_resource_from_shared_handle(handle)))
+-    {
+-        WARN("Unknown shared handle %p.\n", handle);
+-        return E_INVALIDARG;
+-    }
+-
+     wined3d_mutex_lock();
+     wined3d_resource_get_desc(wined3d_resource, &wined3d_desc);
+     wined3d_mutex_unlock();
+@@ -4791,13 +4781,17 @@ HRESULT d3d_device_open_shared_resource(struct d3d_device *device, HANDLE handle
+      * the keyed mutex handoff. */
+     desc = owner->desc;
+     /* The opener's copy is never the one GDI draws into, and asking for a
+-     * GDI-compatible texture here wedges Word before its main window appears. */
+-    desc.MiscFlags &= ~D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
++     * GDI-compatible texture here wedges Word before its main window appears.
++     * Nor is it shared a second time: it is the owner's resource, as far as
++     * the application can tell, and it says it is shared the way that is. */
++    desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_GDI_COMPATIBLE | D3D11_RESOURCE_MISC_SHARED
++            | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+     if (FAILED(hr = d3d_texture2d_create(device, &desc, NULL, NULL, &texture)))
+     {
+         WARN("Failed to create a texture for shared handle %p, hr %#lx.\n", handle, hr);
+         return hr;
+     }
++    texture->desc.MiscFlags = owner->desc.MiscFlags & ~D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+ 
+     if (FAILED(hr = d3d_shared_surface_attach(owner, texture)))
+     {
+@@ -4814,6 +4808,42 @@ HRESULT d3d_device_open_shared_resource(struct d3d_device *device, HANDLE handle
+     return hr;
+ }
+ 
++/* A global handle, as GetSharedHandle gives; not an NT handle. */
++HRESULT d3d_device_open_shared_resource(struct d3d_device *device, HANDLE handle, REFIID iid, void **out)
++{
++    struct wined3d_resource *wined3d_resource;
++
++    if (!out)
++        return E_INVALIDARG;
++    *out = NULL;
++
++    if (!(wined3d_resource = wined3d_resource_from_shared_handle(handle)))
++    {
++        WARN("Unknown shared handle %p.\n", handle);
++        return E_INVALIDARG;
++    }
++
++    return d3d_device_open_wined3d_resource(device, wined3d_resource, handle, iid, out);
++}
++
++/* An NT handle, as CreateSharedHandle gives; not a global one. */
++static HRESULT d3d_device_open_shared_resource_nt(struct d3d_device *device, HANDLE handle, REFIID iid, void **out)
++{
++    struct wined3d_resource *wined3d_resource;
++
++    if (!out)
++        return E_INVALIDARG;
++    *out = NULL;
++
++    if (!(wined3d_resource = wined3d_resource_from_nt_shared_handle(device->wined3d_device, handle)))
++    {
++        WARN("Unknown shared NT handle %p.\n", handle);
++        return E_INVALIDARG;
++    }
++
++    return d3d_device_open_wined3d_resource(device, wined3d_resource, handle, iid, out);
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResource(ID3D11Device5 *iface, HANDLE resource, REFIID iid,
+         void **out)
+ {
+@@ -5464,18 +5494,33 @@ fail:
+ static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResource1(ID3D11Device5 *iface, HANDLE handle,
+         REFIID iid, void **resource)
+ {
+-    FIXME("iface %p, handle %p, iid %s, resource %p stub!\n", iface, handle, debugstr_guid(iid), resource);
++    struct d3d_device *device = impl_from_ID3D11Device5(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, handle %p, iid %s, resource %p.\n", iface, handle, debugstr_guid(iid), resource);
++
++    return d3d_device_open_shared_resource_nt(device, handle, iid, resource);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResourceByName(ID3D11Device5 *iface, const WCHAR *name,
+         DWORD access, REFIID iid, void **resource)
+ {
+-    FIXME("iface %p, name %s, access %#lx, iid %s, resource %p stub!\n", iface, debugstr_w(name), access,
++    struct d3d_device *device = impl_from_ID3D11Device5(iface);
++    struct wined3d_resource *wined3d_resource;
++
++    TRACE("iface %p, name %s, access %#lx, iid %s, resource %p.\n", iface, debugstr_w(name), access,
+             debugstr_guid(iid), resource);
+ 
+-    return E_NOTIMPL;
++    if (!resource)
++        return E_INVALIDARG;
++    *resource = NULL;
++
++    if (!name || !(wined3d_resource = wined3d_resource_from_shared_name(device->wined3d_device, name, access)))
++    {
++        WARN("Unknown shared resource name %s.\n", debugstr_w(name));
++        return E_INVALIDARG;
++    }
++
++    return d3d_device_open_wined3d_resource(device, wined3d_resource, NULL, iid, resource);
+ }
+ 
+ static void STDMETHODCALLTYPE d3d11_device_GetImmediateContext2(ID3D11Device5 *iface,
+diff --git a/dlls/d3d11/tests/d3d11.c b/dlls/d3d11/tests/d3d11.c
+index ba7b4414ead..a0b9c365895 100644
+--- a/dlls/d3d11/tests/d3d11.c
++++ b/dlls/d3d11/tests/d3d11.c
+@@ -35577,7 +35577,7 @@ static void test_shared_resource(D3D_FEATURE_LEVEL feature_level)
+         keyed_mutex = NULL;
+         hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIKeyedMutex, (void **)&keyed_mutex);
+         if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
+-            todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
++            ok(hr == S_OK, "got %#lx.\n", hr);
+         else
+             ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
+ 
+@@ -35592,19 +35592,19 @@ static void test_shared_resource(D3D_FEATURE_LEVEL feature_level)
+         hr = IDXGIResource_GetSharedHandle(res, &h);
+         if (nthandle)
+         {
+-            todo_wine ok(hr == E_INVALIDARG, "got %#lx.\n", hr);
++            ok(hr == E_INVALIDARG, "got %#lx.\n", hr);
+             ok(h == (HANDLE)0xdeadbeef, "got %p.\n", h);
+         }
+         else if (desc.MiscFlags)
+         {
+-            todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
++            ok(hr == S_OK, "got %#lx.\n", hr);
+             ok(is_kmt_handle(h), "wrong handle %p.\n", h);
+             handle = h;
+         }
+         else
+         {
+-            todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
+-            todo_wine ok(!h, "got %p.\n", h);
++            ok(hr == S_OK, "got %#lx.\n", hr);
++            ok(!h, "got %p.\n", h);
+         }
+ 
+         if (FAILED(hr))
+@@ -35678,6 +35678,97 @@ test_done:
+     ok(!ref, "got %ld.\n", ref);
+ }
+ 
++/* test_shared_resource stops at GetSharedHandle for a texture shared through NT handles; these go on. */
++static void test_shared_resource_nt_handle(void)
++{
++    static const WCHAR name[] = L"wine_d3d11_test_shared_resource";
++    char buffer[1024];
++    OBJECT_TYPE_INFORMATION *type = (OBJECT_TYPE_INFORMATION *)buffer;
++    D3D11_TEXTURE2D_DESC desc, desc2;
++    ID3D11Texture2D *tex, *tex2;
++    ID3D11Device1 *device1;
++    ID3D11Device *device;
++    IDXGIResource1 *res1;
++    NTSTATUS status;
++    HANDLE h, h2;
++    ULONG len;
++    HRESULT hr;
++    BOOL bret;
++
++    if (!(device = create_device(NULL)))
++    {
++        skip("Failed to create device.\n");
++        return;
++    }
++    if (FAILED(hr = ID3D11Device_QueryInterface(device, &IID_ID3D11Device1, (void **)&device1)))
++    {
++        win_skip("ID3D11Device1 is not supported.\n");
++        ID3D11Device_Release(device);
++        return;
++    }
++
++    memset(&desc, 0, sizeof(desc));
++    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    desc.Width = 64;
++    desc.Height = 64;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.SampleDesc.Count = 1;
++    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
++    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &tex);
++    ok(hr == S_OK || broken(hr == E_INVALIDARG) /* before Windows 8 */, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++    {
++        ID3D11Device1_Release(device1);
++        ID3D11Device_Release(device);
++        return;
++    }
++    hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&res1);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    hr = IDXGIResource1_CreateSharedHandle(res1, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++            name, &h);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    status = NtQueryObject(h, ObjectTypeInformation, buffer, sizeof(buffer), &len);
++    ok(!status, "Got status %#lx.\n", status);
++    ok(!wcscmp(type->TypeName.Buffer, L"DxgkSharedResource"), "Got type %s.\n",
++            debugstr_w(type->TypeName.Buffer));
++
++    /* Each call gives another handle to the same resource. */
++    hr = IDXGIResource1_CreateSharedHandle(res1, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++            NULL, &h2);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(h2 != h, "Got the same handle %p.\n", h);
++    bret = CloseHandle(h2);
++    ok(bret, "Failed to close the handle, error %lu.\n", GetLastError());
++
++    hr = ID3D11Device1_OpenSharedResource1(device1, h, &IID_ID3D11Texture2D, (void **)&tex2);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ID3D11Texture2D_GetDesc(tex2, &desc2);
++    ok(desc2.Width == desc.Width && desc2.Height == desc.Height, "Got size %ux%u.\n", desc2.Width, desc2.Height);
++    ok(desc2.MiscFlags == desc.MiscFlags, "Got flags %#x.\n", desc2.MiscFlags);
++    ID3D11Texture2D_Release(tex2);
++
++    hr = ID3D11Device1_OpenSharedResourceByName(device1, name, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++            &IID_ID3D11Texture2D, (void **)&tex2);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++        ID3D11Texture2D_Release(tex2);
++
++    /* An NT handle is not a global one. */
++    hr = ID3D11Device_OpenSharedResource(device, h, &IID_ID3D11Texture2D, (void **)&tex2);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++
++    bret = CloseHandle(h);
++    ok(bret, "Failed to close the handle, error %lu.\n", GetLastError());
++
++    IDXGIResource1_Release(res1);
++    ID3D11Texture2D_Release(tex);
++    ID3D11Device1_Release(device1);
++    ID3D11Device_Release(device);
++}
++
+ static void test_keyed_mutex(void)
+ {
+     IDXGIKeyedMutex *keyed_mutex, *keyed_mutex2;
+@@ -35715,7 +35806,7 @@ static void test_keyed_mutex(void)
+     }
+ 
+     hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIKeyedMutex, (void **)&keyed_mutex);
+-    todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
++    ok(hr == S_OK, "got %#lx.\n", hr);
+     if (FAILED(hr))
+     {
+         ID3D11Texture2D_Release(tex);
+@@ -38150,6 +38241,7 @@ START_TEST(d3d11)
+     queue_test(test_vertex_formats);
+     queue_test(test_dxgi_resources);
+     queue_for_each_feature_level(test_shared_resource);
++    queue_test(test_shared_resource_nt_handle);
+     queue_test(test_keyed_mutex);
+     queue_test(test_clear_during_render);
+     queue_test(test_stencil_export);
+diff --git a/dlls/d3d11/texture.c b/dlls/d3d11/texture.c
+index 1452ee8babc..5639f264254 100644
+--- a/dlls/d3d11/texture.c
++++ b/dlls/d3d11/texture.c
+@@ -969,6 +969,22 @@ static BOOL validate_texture2d_desc(const D3D11_TEXTURE2D_DESC *desc, D3D_FEATUR
+         return FALSE;
+     }
+ 
++    /* A texture is shared one way, plainly or through a keyed mutex; NT
++     * handles are a way of handing out either. */
++    if (desc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
++            | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
++    {
++        unsigned int sharing = desc->MiscFlags
++                & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
++
++        if (feature_level < D3D_FEATURE_LEVEL_10_0 || (sharing != D3D11_RESOURCE_MISC_SHARED
++                && sharing != D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
++        {
++            WARN("Invalid sharing flags in %#x, feature level %#x.\n", desc->MiscFlags, feature_level);
++            return FALSE;
++        }
++    }
++
+     return TRUE;
+ }
+ 
+@@ -1057,6 +1073,10 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
+         wined3d_mutex_unlock();
+         return hr;
+     }
++    if (!wined3d_texture && (desc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
++            && FAILED(hr = wined3d_resource_set_shared(wined3d_texture_get_resource(texture->wined3d_texture),
++            !!(desc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))))
++        WARN("Failed to share texture %p, hr %#lx.\n", texture, hr);
+     wined3d_mutex_unlock();
+ 
+     ID3D11Device5_AddRef(texture->device = &device->ID3D11Device5_iface);
+diff --git a/dlls/dxgi/resource.c b/dlls/dxgi/resource.c
+index 1539179e44c..36c6522effa 100644
+--- a/dlls/dxgi/resource.c
++++ b/dlls/dxgi/resource.c
+@@ -488,10 +488,12 @@ static HRESULT STDMETHODCALLTYPE dxgi_resource_CreateSubresourceSurface(IDXGIRes
+ static HRESULT STDMETHODCALLTYPE dxgi_resource_CreateSharedHandle(IDXGIResource1 *iface,
+         const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle)
+ {
+-    FIXME("iface %p, attributes %p, access %#lx, name %s, handle %p stub!\n", iface, attributes,
++    struct dxgi_resource *resource = impl_from_IDXGIResource1(iface);
++
++    TRACE("iface %p, attributes %p, access %#lx, name %s, handle %p.\n", iface, attributes,
+             access, wine_dbgstr_w(name), handle);
+ 
+-    return E_NOTIMPL;
++    return wined3d_resource_create_shared_handle(resource->wined3d_resource, attributes, access, name, handle);
+ }
+ 
+ static const struct IDXGIResource1Vtbl dxgi_resource_vtbl =
+diff --git a/dlls/wined3d/resource.c b/dlls/wined3d/resource.c
+index f8a3acafd17..891e9bef17e 100644
+--- a/dlls/wined3d/resource.c
++++ b/dlls/wined3d/resource.c
+@@ -232,10 +232,39 @@ static void wined3d_resource_destroy_object(void *object)
+  * A resource created with D3D11_RESOURCE_MISC_SHARED* is handed to another
+  * device by handle.  Wine cannot yet share the storage across two
+  * wined3d_devices, but the handle has to exist and resolve back to the
+- * originating resource before any of that can be built on top, and returning
+- * a failure from GetSharedHandle is what stops applications one step earlier
+- * than they need to be stopped.  This is the registry, and nothing more: what
+- * the opening device does with the resource is its own business. */
++ * originating resource before any of that can be built on top.  This is the
++ * registry, and nothing more: what the opening device does with the resource
++ * is its own business.
++ *
++ * The handles are the ones Windows gives: each shared resource is a D3DKMT
++ * resource, and a resource shared the older way has a global handle that is
++ * not a handle of the process -- CloseHandle() and DuplicateHandle() refuse
++ * it -- while one shared through NT handles gives a new NT handle each time
++ * it is asked, of type DxgkSharedResource.  What the D3DKMT resource carries
++ * is enough to tell it again among this process's resources. */
++
++NTSTATUS WINAPI BaseGetNamedObjectDirectory(HANDLE *dir);
++
++struct wined3d_shared_runtime_data
++{
++    DWORD magic;
++    DWORD pid;
++    UINT64 serial;
++};
++
++#define WINED3D_SHARED_RUNTIME_MAGIC 0x52533357 /* "W3SR" */
++
++struct wined3d_shared_resource
++{
++    struct list entry;
++    struct wined3d_resource *resource;
++    UINT64 serial;
++    BOOL nt_handle;
++    HANDLE handle;
++    D3DKMT_HANDLE kmt_device;
++    D3DKMT_HANDLE kmt_resource;
++    void *memory;
++};
+ 
+ static struct list wined3d_shared_resources = LIST_INIT(wined3d_shared_resources);
+ 
+@@ -251,59 +280,183 @@ static CRITICAL_SECTION_DEBUG wined3d_shared_resources_cs_debug =
+ };
+ static CRITICAL_SECTION wined3d_shared_resources_cs = {&wined3d_shared_resources_cs_debug, -1, 0, 0, 0, 0};
+ 
+-struct wined3d_shared_resource
++static void wined3d_shared_resource_destroy(struct wined3d_shared_resource *shared)
+ {
+-    struct list entry;
+-    HANDLE handle;
+-    struct wined3d_resource *resource;
+-};
++    D3DKMT_DESTROYALLOCATION2 destroy_allocation = {0};
++    D3DKMT_DESTROYDEVICE destroy_device = {0};
++
++    if (shared->kmt_resource)
++    {
++        destroy_allocation.hDevice = shared->kmt_device;
++        destroy_allocation.hResource = shared->kmt_resource;
++        D3DKMTDestroyAllocation2(&destroy_allocation);
++    }
++    if (shared->kmt_device)
++    {
++        destroy_device.hDevice = shared->kmt_device;
++        D3DKMTDestroyDevice(&destroy_device);
++    }
++    if (shared->memory)
++        VirtualFree(shared->memory, 0, MEM_RELEASE);
++    free(shared);
++}
++
++HRESULT CDECL wined3d_resource_set_shared(struct wined3d_resource *resource, BOOL nt_handle)
++{
++    D3DKMT_CREATESTANDARDALLOCATION standard = {0};
++    struct wined3d_shared_runtime_data runtime_data;
++    D3DKMT_CREATEALLOCATION create = {0};
++    D3DKMT_CREATEDEVICE create_device = {0};
++    D3DDDI_ALLOCATIONINFO allocation = {0};
++    struct wined3d_shared_resource *shared;
++    static LONG64 serial;
++    NTSTATUS status;
++
++    TRACE("resource %p, nt_handle %#x.\n", resource, nt_handle);
++
++    if (!(shared = calloc(1, sizeof(*shared))))
++        return E_OUTOFMEMORY;
++    shared->resource = resource;
++    shared->serial = InterlockedIncrement64(&serial);
++    shared->nt_handle = nt_handle;
++
++    create_device.hAdapter = resource->device->adapter->kmt_adapter;
++    if ((status = D3DKMTCreateDevice(&create_device)))
++    {
++        WARN("Failed to create a D3DKMT device, status %#lx.\n", status);
++        free(shared);
++        return E_FAIL;
++    }
++    shared->kmt_device = create_device.hDevice;
++
++    /* The D3DKMT resource stands on a page of its own; the pixels are
++     * wined3d's, and are not in it. */
++    if (!(shared->memory = VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE)))
++    {
++        wined3d_shared_resource_destroy(shared);
++        return E_OUTOFMEMORY;
++    }
++    standard.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
++    standard.ExistingHeapData.Size = 0x1000;
++    allocation.pSystemMem = shared->memory;
++
++    runtime_data.magic = WINED3D_SHARED_RUNTIME_MAGIC;
++    runtime_data.pid = GetCurrentProcessId();
++    runtime_data.serial = shared->serial;
++
++    create.hDevice = shared->kmt_device;
++    create.pPrivateRuntimeData = &runtime_data;
++    create.PrivateRuntimeDataSize = sizeof(runtime_data);
++    create.pStandardAllocation = &standard;
++    create.NumAllocations = 1;
++    create.pAllocationInfo = &allocation;
++    create.Flags.CreateResource = 1;
++    create.Flags.CreateShared = 1;
++    create.Flags.NtSecuritySharing = !!nt_handle;
++    create.Flags.StandardAllocation = 1;
++    create.Flags.ExistingSysMem = 1;
++    if ((status = D3DKMTCreateAllocation2(&create)))
++    {
++        WARN("Failed to create a shared D3DKMT resource, status %#lx.\n", status);
++        wined3d_shared_resource_destroy(shared);
++        return E_FAIL;
++    }
++    shared->kmt_resource = create.hResource;
++    if (!nt_handle)
++        shared->handle = ULongToHandle(create.hGlobalShare);
++
++    EnterCriticalSection(&wined3d_shared_resources_cs);
++    list_add_head(&wined3d_shared_resources, &shared->entry);
++    LeaveCriticalSection(&wined3d_shared_resources_cs);
++
++    TRACE("Shared resource %p, global handle %p.\n", resource, shared->handle);
++
++    return WINED3D_OK;
++}
+ 
+ HRESULT CDECL wined3d_resource_get_shared_handle(struct wined3d_resource *resource, HANDLE *handle)
+ {
+     struct wined3d_shared_resource *shared;
++    HRESULT hr = S_OK;
+ 
+     TRACE("resource %p, handle %p.\n", resource, handle);
+ 
+     if (!handle)
+         return E_INVALIDARG;
+ 
++    /* A resource that is not shared has no handle and says so; one shared
++     * through NT handles has no global one to give. */
+     EnterCriticalSection(&wined3d_shared_resources_cs);
++    LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
++    {
++        if (shared->resource != resource)
++            continue;
++        if (shared->nt_handle)
++            hr = E_INVALIDARG;
++        else
++            *handle = shared->handle;
++        LeaveCriticalSection(&wined3d_shared_resources_cs);
++        return hr;
++    }
++    LeaveCriticalSection(&wined3d_shared_resources_cs);
++
++    *handle = NULL;
++    return S_OK;
++}
+ 
++HRESULT CDECL wined3d_resource_create_shared_handle(struct wined3d_resource *resource,
++        const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle)
++{
++    struct wined3d_shared_resource *shared;
++    D3DKMT_HANDLE device = 0, kmt_resource = 0;
++    HANDLE directory = NULL;
++    UNICODE_STRING name_str;
++    OBJECT_ATTRIBUTES attr;
++    NTSTATUS status;
++
++    TRACE("resource %p, attributes %p, access %#lx, name %s, handle %p.\n",
++            resource, attributes, access, debugstr_w(name), handle);
++
++    if (!handle)
++        return E_INVALIDARG;
++    *handle = NULL;
++
++    EnterCriticalSection(&wined3d_shared_resources_cs);
+     LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
+     {
+-        if (shared->resource == resource)
++        if (shared->resource == resource && shared->nt_handle)
+         {
+-            *handle = shared->handle;
+-            LeaveCriticalSection(&wined3d_shared_resources_cs);
+-            TRACE("Returning existing handle %p.\n", *handle);
+-            return WINED3D_OK;
++            device = shared->kmt_device;
++            kmt_resource = shared->kmt_resource;
++            break;
+         }
+     }
++    LeaveCriticalSection(&wined3d_shared_resources_cs);
+ 
+-    if (!(shared = malloc(sizeof(*shared))))
++    if (!kmt_resource)
++        return E_INVALIDARG;
++
++    /* Named ones live where named events do. */
++    if (name)
+     {
+-        LeaveCriticalSection(&wined3d_shared_resources_cs);
+-        return E_OUTOFMEMORY;
++        if ((status = BaseGetNamedObjectDirectory(&directory)))
++            return HRESULT_FROM_NT(status);
++        name_str.Buffer = (WCHAR *)name;
++        name_str.Length = wcslen(name) * sizeof(WCHAR);
++        name_str.MaximumLength = name_str.Length + sizeof(WCHAR);
+     }
++    InitializeObjectAttributes(&attr, name ? &name_str : NULL,
++            attributes && attributes->bInheritHandle ? OBJ_INHERIT : 0, directory,
++            attributes ? attributes->lpSecurityDescriptor : NULL);
+ 
+-    /* A real kernel handle, so the value is unique for as long as the resource
+-     * lives and an application that duplicates or closes it does something
+-     * sane. */
+-    if (!(shared->handle = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    if ((status = D3DKMTShareObjects(1, &kmt_resource, &attr, access, handle)))
+     {
+-        free(shared);
+-        LeaveCriticalSection(&wined3d_shared_resources_cs);
+-        return E_FAIL;
++        WARN("Failed to share resource %p, status %#lx.\n", resource, status);
++        return status == STATUS_OBJECT_NAME_COLLISION ? DXGI_ERROR_NAME_ALREADY_EXISTS : E_FAIL;
+     }
+-    shared->resource = resource;
+-    list_add_head(&wined3d_shared_resources, &shared->entry);
+-
+-    LeaveCriticalSection(&wined3d_shared_resources_cs);
+-
+-    *handle = shared->handle;
+-    TRACE("Created handle %p.\n", *handle);
+ 
+-    return WINED3D_OK;
++    TRACE("Created handle %p for resource %p on D3DKMT device %#x.\n", *handle, resource, device);
++    return S_OK;
+ }
+ 
+ struct wined3d_resource * CDECL wined3d_resource_from_shared_handle(HANDLE handle)
+@@ -313,10 +466,13 @@ struct wined3d_resource * CDECL wined3d_resource_from_shared_handle(HANDLE handl
+ 
+     TRACE("handle %p.\n", handle);
+ 
++    if (!handle)
++        return NULL;
++
+     EnterCriticalSection(&wined3d_shared_resources_cs);
+     LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
+     {
+-        if (shared->handle == handle)
++        if (!shared->nt_handle && shared->handle == handle)
+         {
+             resource = shared->resource;
+             break;
+@@ -327,6 +483,105 @@ struct wined3d_resource * CDECL wined3d_resource_from_shared_handle(HANDLE handl
+     return resource;
+ }
+ 
++struct wined3d_resource * CDECL wined3d_resource_from_nt_shared_handle(struct wined3d_device *device,
++        HANDLE handle)
++{
++    D3DKMT_OPENRESOURCEFROMNTHANDLE open = {0};
++    D3DKMT_DESTROYALLOCATION2 destroy = {0};
++    D3DKMT_CREATEDEVICE create_device = {0};
++    D3DKMT_DESTROYDEVICE destroy_device = {0};
++    struct wined3d_shared_runtime_data runtime_data = {0};
++    D3DDDI_OPENALLOCATIONINFO2 allocation = {0};
++    struct wined3d_shared_resource *shared;
++    struct wined3d_resource *resource = NULL;
++    char driver_data[16];
++    NTSTATUS status;
++
++    TRACE("device %p, handle %p.\n", device, handle);
++
++    create_device.hAdapter = device->adapter->kmt_adapter;
++    if ((status = D3DKMTCreateDevice(&create_device)))
++    {
++        WARN("Failed to create a D3DKMT device, status %#lx.\n", status);
++        return NULL;
++    }
++
++    open.hDevice = create_device.hDevice;
++    open.hNtHandle = handle;
++    open.NumAllocations = 1;
++    open.pOpenAllocationInfo2 = &allocation;
++    open.pPrivateRuntimeData = &runtime_data;
++    open.PrivateRuntimeDataSize = sizeof(runtime_data);
++    open.pTotalPrivateDriverDataBuffer = driver_data;
++    open.TotalPrivateDriverDataBufferSize = sizeof(driver_data);
++    if ((status = D3DKMTOpenResourceFromNtHandle(&open)))
++    {
++        WARN("Failed to open NT handle %p, status %#lx.\n", handle, status);
++    }
++    else
++    {
++        destroy.hDevice = create_device.hDevice;
++        destroy.hResource = open.hResource;
++        D3DKMTDestroyAllocation2(&destroy);
++
++        if (open.PrivateRuntimeDataSize != sizeof(runtime_data)
++                || runtime_data.magic != WINED3D_SHARED_RUNTIME_MAGIC)
++            WARN("Handle %p is not a wined3d resource.\n", handle);
++        else if (runtime_data.pid != GetCurrentProcessId())
++            FIXME("Handle %p is a resource of process %#lx, which cannot be shared yet.\n",
++                    handle, runtime_data.pid);
++        else
++        {
++            EnterCriticalSection(&wined3d_shared_resources_cs);
++            LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
++            {
++                if (shared->serial == runtime_data.serial)
++                {
++                    resource = shared->resource;
++                    break;
++                }
++            }
++            LeaveCriticalSection(&wined3d_shared_resources_cs);
++        }
++    }
++
++    destroy_device.hDevice = create_device.hDevice;
++    D3DKMTDestroyDevice(&destroy_device);
++
++    return resource;
++}
++
++struct wined3d_resource * CDECL wined3d_resource_from_shared_name(struct wined3d_device *device,
++        const WCHAR *name, DWORD access)
++{
++    D3DKMT_OPENNTHANDLEFROMNAME open = {0};
++    struct wined3d_resource *resource;
++    UNICODE_STRING name_str;
++    OBJECT_ATTRIBUTES attr;
++    HANDLE directory;
++    NTSTATUS status;
++
++    TRACE("device %p, name %s, access %#lx.\n", device, debugstr_w(name), access);
++
++    if (BaseGetNamedObjectDirectory(&directory))
++        return NULL;
++    name_str.Buffer = (WCHAR *)name;
++    name_str.Length = wcslen(name) * sizeof(WCHAR);
++    name_str.MaximumLength = name_str.Length + sizeof(WCHAR);
++    InitializeObjectAttributes(&attr, &name_str, 0, directory, NULL);
++    open.dwDesiredAccess = access;
++    open.pObjAttrib = &attr;
++    if ((status = D3DKMTOpenNtHandleFromName(&open)))
++    {
++        WARN("Failed to open %s, status %#lx.\n", debugstr_w(name), status);
++        return NULL;
++    }
++
++    resource = wined3d_resource_from_nt_shared_handle(device, open.hNtHandle);
++    CloseHandle(open.hNtHandle);
++    return resource;
++}
++
+ static void wined3d_resource_release_shared_handle(struct wined3d_resource *resource)
+ {
+     struct wined3d_shared_resource *shared, *next;
+@@ -337,8 +592,7 @@ static void wined3d_resource_release_shared_handle(struct wined3d_resource *reso
+         if (shared->resource != resource)
+             continue;
+         list_remove(&shared->entry);
+-        CloseHandle(shared->handle);
+-        free(shared);
++        wined3d_shared_resource_destroy(shared);
+     }
+     LeaveCriticalSection(&wined3d_shared_resources_cs);
+ }
+diff --git a/dlls/wined3d/wined3d.spec b/dlls/wined3d/wined3d.spec
+index 92930a90887..a845e40538f 100644
+--- a/dlls/wined3d/wined3d.spec
++++ b/dlls/wined3d/wined3d.spec
+@@ -209,9 +209,13 @@
+ @ cdecl wined3d_rendertarget_view_set_parent(ptr ptr ptr)
+ 
+ @ cdecl wined3d_resource_get_desc(ptr ptr)
++@ cdecl wined3d_resource_create_shared_handle(ptr ptr long ptr ptr)
+ @ cdecl wined3d_resource_from_shared_handle(ptr)
++@ cdecl wined3d_resource_from_nt_shared_handle(ptr ptr)
++@ cdecl wined3d_resource_from_shared_name(ptr ptr long)
+ @ cdecl wined3d_resource_get_parent(ptr)
+ @ cdecl wined3d_resource_get_shared_handle(ptr ptr)
++@ cdecl wined3d_resource_set_shared(ptr long)
+ @ cdecl wined3d_resource_get_priority(ptr)
+ @ cdecl wined3d_resource_get_sub_resource_count(ptr)
+ @ cdecl wined3d_resource_get_sub_resource_desc(ptr long ptr)
+diff --git a/include/wine/wined3d.h b/include/wine/wined3d.h
+index 47f2bd56ff9..7c810f145e5 100644
+--- a/include/wine/wined3d.h
++++ b/include/wine/wined3d.h
+@@ -2759,7 +2759,14 @@ void __cdecl wined3d_resource_get_desc(const struct wined3d_resource *resource,
+         struct wined3d_resource_desc *desc);
+ void * __cdecl wined3d_resource_get_parent(const struct wined3d_resource *resource);
+ HRESULT __cdecl wined3d_resource_get_shared_handle(struct wined3d_resource *resource, HANDLE *handle);
++HRESULT __cdecl wined3d_resource_create_shared_handle(struct wined3d_resource *resource,
++        const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle);
+ struct wined3d_resource * __cdecl wined3d_resource_from_shared_handle(HANDLE handle);
++struct wined3d_resource * __cdecl wined3d_resource_from_nt_shared_handle(struct wined3d_device *device,
++        HANDLE handle);
++struct wined3d_resource * __cdecl wined3d_resource_from_shared_name(struct wined3d_device *device,
++        const WCHAR *name, DWORD access);
++HRESULT __cdecl wined3d_resource_set_shared(struct wined3d_resource *resource, BOOL nt_handle);
+ unsigned int __cdecl wined3d_resource_get_priority(const struct wined3d_resource *resource);
+ unsigned int __cdecl wined3d_resource_get_sub_resource_count(struct wined3d_resource *resource);
+ HRESULT __cdecl wined3d_resource_get_sub_resource_desc(struct wined3d_resource *resource,

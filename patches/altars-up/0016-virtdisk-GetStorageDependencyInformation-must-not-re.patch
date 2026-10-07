@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 07:42:31 -0400
+Subject: [PATCH] virtdisk: GetStorageDependencyInformation must not report
+ success.
+
+The stub answered ERROR_SUCCESS with NumberEntries == 0, which reads like
+the safe answer and is not: callers take a success as a guarantee that
+Version2Entries[0] exists and read it without looking at NumberEntries.
+Word does exactly that -- it resolves a document's volume, opens it, asks
+for its host volumes, and runs wcsstr over
+Version2Entries[0].HostVolumeName -- so it dereferenced whatever was in
+the uninitialised buffer and died before its main window appeared.
+
+Measured on Windows 11, on a handle to a plain NTFS volume:
+
+  GetStorageDependencyInformation(h, HOST_VOLUMES, 0x400, info, &used)
+      -> ERROR_VIRTDISK_NOT_VIRTUAL_DISK (0xc03a0015), used = 0
+  ... with an undersized buffer
+      -> ERROR_INVALID_PARAMETER, not ERROR_INSUFFICIENT_BUFFER
+
+Wine has no virtual disk stack at all, so "not a virtual disk" is the
+honest answer for any handle. The DISK_HANDLE flag stays on the same
+answer: Windows can also reject that call outright because it knows the
+handle is not a disk, and Wine cannot tell.
+
+The size check now spells out header + one entry, because inside Wine the
+entry union is not part of STORAGE_DEPENDENCY_INFO and sizeof() alone
+would accept the header-sized buffer Windows rejects.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit ecfb56d1ab05b4041a42ce4e344355016a8549c7)
+
+diff --git a/dlls/virtdisk/tests/virtdisk.c b/dlls/virtdisk/tests/virtdisk.c
+index 13c7dd7e693..03af79651be 100644
+--- a/dlls/virtdisk/tests/virtdisk.c
++++ b/dlls/virtdisk/tests/virtdisk.c
+@@ -30,13 +30,14 @@ static void test_GetStorageDependencyInformation(void)
+     DWORD ret;
+     HANDLE handle;
+     STORAGE_DEPENDENCY_INFO *info;
+-    ULONG size;
++    ULONG size, used;
+ 
+     handle = CreateFileA("C:", 0, 0, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+     ok(handle != INVALID_HANDLE_VALUE, "Expected a handle\n");
+ 
+-    size = sizeof(STORAGE_DEPENDENCY_INFO);
++    size = sizeof(STORAGE_DEPENDENCY_INFO) + sizeof(STORAGE_DEPENDENCY_INFO_TYPE_2);
+     info = malloc(size);
++    info->Version = STORAGE_DEPENDENCY_INFO_VERSION_2;
+ 
+     ret = pGetStorageDependencyInformation(handle, GET_STORAGE_DEPENDENCY_FLAG_DISK_HANDLE, 0, info, 0);
+     ok(ret == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", ret);
+@@ -44,6 +45,18 @@ static void test_GetStorageDependencyInformation(void)
+     ret = pGetStorageDependencyInformation(handle, GET_STORAGE_DEPENDENCY_FLAG_DISK_HANDLE, size, NULL, 0);
+     ok(ret == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", ret);
+ 
++    /* A handle to an ordinary volume has no virtual disk behind it. Windows 11
++     * answers ERROR_VIRTDISK_NOT_VIRTUAL_DISK rather than succeeding with an
++     * empty list -- callers rely on that, and read entry 0 on success. */
++    used = 0xdeadbeef;
++    ret = pGetStorageDependencyInformation(handle, GET_STORAGE_DEPENDENCY_FLAG_HOST_VOLUMES, size, info, &used);
++    ok(ret == ERROR_VIRTDISK_NOT_VIRTUAL_DISK, "Expected ERROR_VIRTDISK_NOT_VIRTUAL_DISK, got %ld\n", ret);
++    ok(used == 0, "Expected used 0, got %lu\n", used);
++
++    /* and a buffer too small for the header is a bad parameter, not a short buffer */
++    ret = pGetStorageDependencyInformation(handle, GET_STORAGE_DEPENDENCY_FLAG_HOST_VOLUMES, 4, info, &used);
++    ok(ret == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld\n", ret);
++
+     free(info);
+     CloseHandle(handle);
+ }
+diff --git a/dlls/virtdisk/virtdisk_main.c b/dlls/virtdisk/virtdisk_main.c
+index bad01a31f46..3c34fe42db7 100644
+--- a/dlls/virtdisk/virtdisk_main.c
++++ b/dlls/virtdisk/virtdisk_main.c
+@@ -28,21 +28,45 @@ WINE_DEFAULT_DEBUG_CHANNEL(virtdisk);
+ 
+ DWORD WINAPI GetStorageDependencyInformation(HANDLE obj, GET_STORAGE_DEPENDENCY_FLAG flags, ULONG size, STORAGE_DEPENDENCY_INFO *info, ULONG *used)
+ {
+-    ULONG temp_size = sizeof(STORAGE_DEPENDENCY_INFO);
++    ULONG entry_size;
+ 
+     FIXME("(%p, 0x%x, %lu, %p, %p): stub\n", obj, flags, size, info, used);
+ 
+-    if (used) *used = temp_size;
+-
+     if (!info || !size)
+         return ERROR_INVALID_PARAMETER;
+ 
+-    if (size < temp_size)
+-        return ERROR_INSUFFICIENT_BUFFER;
++    /* inside Wine the union of entries is not part of the struct, so the
++     * minimum has to be spelled out: the header plus room for one entry of
++     * the requested version. Windows rejects a header-sized buffer, which is
++     * how that shape was arrived at. */
++    if (info->Version == STORAGE_DEPENDENCY_INFO_VERSION_1)
++        entry_size = sizeof(STORAGE_DEPENDENCY_INFO_TYPE_1);
++    else if (info->Version == STORAGE_DEPENDENCY_INFO_VERSION_2)
++        entry_size = sizeof(STORAGE_DEPENDENCY_INFO_TYPE_2);
++    else
++        return ERROR_INVALID_PARAMETER;
+ 
+-    info->NumberEntries = 0;
++    if (size < sizeof(STORAGE_DEPENDENCY_INFO) + entry_size)
++        return ERROR_INVALID_PARAMETER;
+ 
+-    return ERROR_SUCCESS;
++    /* Reporting success with NumberEntries == 0 looks like the harmless
++     * answer, and is not: callers read Version2Entries[0] whenever the call
++     * succeeds, because on Windows a success always carries an entry. Word
++     * does exactly that -- it opens the volume, asks for its host volumes and
++     * runs wcsstr over Version2Entries[0].HostVolumeName -- and crashed on the
++     * uninitialised buffer this used to leave behind.
++     *
++     * Measured on Windows 11 against a handle to a plain NTFS volume:
++     * GET_STORAGE_DEPENDENCY_FLAG_HOST_VOLUMES returns
++     * ERROR_VIRTDISK_NOT_VIRTUAL_DISK (0xc03a0015) and leaves *used at 0, and
++     * an undersized buffer returns ERROR_INVALID_PARAMETER rather than
++     * ERROR_INSUFFICIENT_BUFFER. Wine has no virtual disk stack at all, so
++     * "not a virtual disk" is the honest answer for every handle -- including
++     * GET_STORAGE_DEPENDENCY_FLAG_DISK_HANDLE, where Windows can additionally
++     * reject the call because it knows the handle is not a disk. */
++    if (used) *used = 0;
++
++    return ERROR_VIRTDISK_NOT_VIRTUAL_DISK;
+ }
+ 
+ DWORD WINAPI OpenVirtualDisk(VIRTUAL_STORAGE_TYPE *type, const WCHAR *path, VIRTUAL_DISK_ACCESS_MASK mask, OPEN_VIRTUAL_DISK_FLAG flags,

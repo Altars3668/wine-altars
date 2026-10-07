@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 09:54:57 -0400
+Subject: [PATCH] d3d11: drop a call that sets a scissor rectangle inside out,
+ as Windows does.
+
+While Word scrolls, its renderer sets scissor rectangles whose bottom is
+above their top.  wined3d handed them to OpenGL as a negative height, which
+OpenGL refuses with GL_INVALID_VALUE, hundreds of times a second.  What it
+then clipped with was whatever OpenGL had last: a clear resets the scissor,
+so a draw after one was not clipped at all.
+
+Measured on Windows 11 with WARP and with the hardware driver, for Direct3D
+11 and 10 alike: a rectangle with its right left of its left, or its bottom
+above its top, drops the whole RSSetScissorRects call, the good rectangles
+in it too.  RSGetScissorRects still returns what was set before, and draws
+are clipped by that.  An empty rectangle, left equal
+to right, is kept and clips everything.
+
+The call is now dropped the same way, so what is clipped does not depend on
+what the driver last had.  The ad hoc trace of each rectangle becomes an
+ordinary one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 9ba5d82168fa7966f48a432ca5deebd2290d5e2c)
+
+diff --git a/dlls/d3d10core/tests/d3d10core.c b/dlls/d3d10core/tests/d3d10core.c
+index 02cce064265..c523eba3fbe 100644
+--- a/dlls/d3d10core/tests/d3d10core.c
++++ b/dlls/d3d10core/tests/d3d10core.c
+@@ -5173,12 +5173,13 @@ static void test_device_removed_reason(void)
+ 
+ static void test_scissor(void)
+ {
++    D3D10_RECT scissor_rect, scissor_rects[2], got_rects[4];
+     struct d3d10core_test_context test_context;
+     D3D10_RASTERIZER_DESC rs_desc;
+     ID3D10RasterizerState *rs;
+-    D3D10_RECT scissor_rect;
+     ID3D10Device *device;
+     unsigned int color;
++    UINT count;
+     HRESULT hr;
+ 
+     static const float red[] = {1.0f, 0.0f, 0.0f, 1.0f};
+@@ -5251,6 +5252,28 @@ static void test_scissor(void)
+     color = get_texture_color(test_context.backbuffer, 320, 420);
+     ok(compare_color(color, 0xff00ff00, 1), "Got unexpected color 0x%08x.\n", color);
+ 
++    /* A rectangle inside out is dropped, with any others set in the same call: the ones set before stay. */
++    set_viewport(device, 0.0f, 0.0f, 640, 480, 0.0f, 1.0f);
++    SetRect(&scissor_rect, 160, 120, 480, 360);
++    ID3D10Device_RSSetScissorRects(device, 1, &scissor_rect);
++    SetRect(&scissor_rects[0], 0, 0, 640, 480);
++    scissor_rects[1].left = 0;
++    scissor_rects[1].top = 400;
++    scissor_rects[1].right = 640;
++    scissor_rects[1].bottom = 100;
++    ID3D10Device_RSSetScissorRects(device, 2, scissor_rects);
++    count = ARRAY_SIZE(got_rects);
++    memset(got_rects, 0xcc, sizeof(got_rects));
++    ID3D10Device_RSGetScissorRects(device, &count, got_rects);
++    ok(count == 1, "Got unexpected count %u.\n", count);
++    ok(EqualRect(&got_rects[0], &scissor_rect), "Got unexpected rect %s.\n", wine_dbgstr_rect(&got_rects[0]));
++    ID3D10Device_ClearRenderTargetView(device, test_context.backbuffer_rtv, red);
++    draw_color_quad(&test_context, &green);
++    color = get_texture_color(test_context.backbuffer, 320, 60);
++    ok(compare_color(color, 0xff0000ff, 1), "Got unexpected color 0x%08x.\n", color);
++    color = get_texture_color(test_context.backbuffer, 320, 240);
++    ok(compare_color(color, 0xff00ff00, 1), "Got unexpected color 0x%08x.\n", color);
++
+     ID3D10RasterizerState_Release(rs);
+     release_test_context(&test_context);
+ }
+diff --git a/dlls/d3d11/device.c b/dlls/d3d11/device.c
+index 6f4983c3221..b7e2e1d0c9c 100644
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -1363,24 +1363,34 @@ static void STDMETHODCALLTYPE d3d11_device_context_RSSetViewports(ID3D11DeviceCo
+     wined3d_device_context_set_viewports(context->wined3d_context, viewport_count, wined3d_vp);
+ }
+ 
++/* A rectangle inside out, its right left of its left or its bottom above its top, drops the whole call on Windows:
++ * the rectangles set before stay, and draws are clipped by them. */
++static BOOL scissor_rects_valid(UINT rect_count, const RECT *rects)
++{
++    unsigned int i;
++
++    for (i = 0; i < rect_count; ++i)
++    {
++        if (rects[i].left > rects[i].right || rects[i].top > rects[i].bottom)
++        {
++            WARN("Ignoring inverted scissor rect %s.\n", wine_dbgstr_rect(&rects[i]));
++            return FALSE;
++        }
++    }
++    return TRUE;
++}
++
+ static void STDMETHODCALLTYPE d3d11_device_context_RSSetScissorRects(ID3D11DeviceContext4 *iface,
+         UINT rect_count, const D3D11_RECT *rects)
+ {
+     struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
++    unsigned int i;
+ 
+     TRACE("iface %p, rect_count %u, rects %p.\n", iface, rect_count, rects);
+-    if (TRACE_ON(d3d11))
+-    {
+-        unsigned int j;
+-
+-        for (j = 0; j < rect_count; ++j)
+-            TRACE("altars-scissor ctx %p (%ld,%ld)-(%ld,%ld).\n", iface, (long)rects[j].left,
+-                    (long)rects[j].top, (long)rects[j].right, (long)rects[j].bottom);
+-        if (!rect_count)
+-            TRACE("altars-scissor ctx %p (none).\n", iface);
+-    }
++    for (i = 0; i < rect_count; ++i)
++        TRACE("Scissor rect %u: %s.\n", i, wine_dbgstr_rect(&rects[i]));
+ 
+-    if (rect_count > WINED3D_MAX_VIEWPORTS)
++    if (rect_count > WINED3D_MAX_VIEWPORTS || !scissor_rects_valid(rect_count, rects))
+         return;
+ 
+     wined3d_device_context_set_scissor_rects(context->wined3d_context, rect_count, rects);
+@@ -6313,7 +6323,7 @@ static void STDMETHODCALLTYPE d3d10_device_RSSetScissorRects(ID3D10Device1 *ifac
+ 
+     TRACE("iface %p, rect_count %u, rects %p.\n", iface, rect_count, rects);
+ 
+-    if (rect_count > WINED3D_MAX_VIEWPORTS)
++    if (rect_count > WINED3D_MAX_VIEWPORTS || !scissor_rects_valid(rect_count, rects))
+         return;
+ 
+     wined3d_device_context_set_scissor_rects(device->immediate_context.wined3d_context, rect_count, rects);
+diff --git a/dlls/d3d11/tests/d3d11.c b/dlls/d3d11/tests/d3d11.c
+index a037bf07a01..fc7acca2286 100644
+--- a/dlls/d3d11/tests/d3d11.c
++++ b/dlls/d3d11/tests/d3d11.c
+@@ -12085,13 +12085,15 @@ done:
+ 
+ static void test_scissor(void)
+ {
++    D3D11_RECT scissor_rect, scissor_rects[2], got_rects[4];
+     struct d3d11_test_context test_context;
+     ID3D11DeviceContext *immediate_context;
+     D3D11_RASTERIZER_DESC rs_desc;
+     ID3D11RasterizerState *rs;
+-    D3D11_RECT scissor_rect;
+     ID3D11Device *device;
++    unsigned int i;
+     DWORD color;
++    UINT count;
+     HRESULT hr;
+ 
+     static const float red[] = {1.0f, 0.0f, 0.0f, 1.0f};
+@@ -12165,6 +12167,46 @@ static void test_scissor(void)
+     color = get_texture_color(test_context.backbuffer, 320, 420);
+     ok(compare_color(color, 0xff00ff00, 1), "Got unexpected colour 0x%08lx.\n", color);
+ 
++    /* A rectangle inside out is dropped, with any others set in the same call: the ones set before stay. */
++    set_viewport(immediate_context, 0.0f, 0.0f, 640, 480, 0.0f, 1.0f);
++    SetRect(&scissor_rect, 160, 120, 480, 360);
++    ID3D11DeviceContext_RSSetScissorRects(immediate_context, 1, &scissor_rect);
++    SetRect(&scissor_rects[0], 0, 0, 640, 480);
++    scissor_rects[1].left = 0;
++    scissor_rects[1].top = 400;
++    scissor_rects[1].right = 640;
++    scissor_rects[1].bottom = 100;
++    for (i = 0; i < 3; ++i)
++    {
++        winetest_push_context("Test %u", i);
++        if (i == 0)
++            ID3D11DeviceContext_RSSetScissorRects(immediate_context, 1, &scissor_rects[1]);
++        else if (i == 1)
++            ID3D11DeviceContext_RSSetScissorRects(immediate_context, 2, scissor_rects);
++        else
++        {
++            scissor_rects[1].left = 500;
++            scissor_rects[1].top = 0;
++            scissor_rects[1].right = 100;
++            scissor_rects[1].bottom = 480;
++            ID3D11DeviceContext_RSSetScissorRects(immediate_context, 1, &scissor_rects[1]);
++        }
++        count = ARRAY_SIZE(got_rects);
++        memset(got_rects, 0xcc, sizeof(got_rects));
++        ID3D11DeviceContext_RSGetScissorRects(immediate_context, &count, got_rects);
++        ok(count == 1, "Got unexpected count %u.\n", count);
++        ok(EqualRect(&got_rects[0], &scissor_rect), "Got unexpected rect %s.\n", wine_dbgstr_rect(&got_rects[0]));
++        ID3D11DeviceContext_ClearRenderTargetView(immediate_context, test_context.backbuffer_rtv, red);
++        draw_color_quad(&test_context, &green);
++        color = get_texture_color(test_context.backbuffer, 320, 60);
++        ok(compare_color(color, 0xff0000ff, 1), "Got unexpected colour 0x%08lx.\n", color);
++        color = get_texture_color(test_context.backbuffer, 320, 240);
++        ok(compare_color(color, 0xff00ff00, 1), "Got unexpected colour 0x%08lx.\n", color);
++        color = get_texture_color(test_context.backbuffer, 80, 240);
++        ok(compare_color(color, 0xff0000ff, 1), "Got unexpected colour 0x%08lx.\n", color);
++        winetest_pop_context();
++    }
++
+     ID3D11RasterizerState_Release(rs);
+     release_test_context(&test_context);
+ }

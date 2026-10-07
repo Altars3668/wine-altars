@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 16:12:13 -0400
+Subject: [PATCH] d2d1: Hand out a GDI DC only while drawing, refuse straight
+ alpha for surface targets, and draw ClearType by default only on opaque
+ targets.
+
+As measured on Windows 11 build 29671:
+- ID2D1GdiInteropRenderTarget::GetDC outside BeginDraw and EndDraw, or with no target, is D2DERR_WRONG_STATE,
+  which comes before whether the target is GDI compatible;
+- CreateDxgiSurfaceRenderTarget with D2D1_ALPHA_MODE_STRAIGHT is D2DERR_UNSUPPORTED_PIXEL_FORMAT;
+- with D2D1_TEXT_ANTIALIAS_MODE_DEFAULT, text is ClearType only on a target with D2D1_ALPHA_MODE_IGNORE; one with
+  alpha gets grayscale text, even over an opaque background.
+
+Device context options and the GDI compatible usage are what the target is made with; neither is a FIXME.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 8505363fef9..561985b99d7 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2252,7 +2252,10 @@ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_cont
+     switch (context->drawing_state.textAntialiasMode)
+     {
+         case D2D1_TEXT_ANTIALIAS_MODE_DEFAULT:
+-            if (IDWriteRenderingParams_GetClearTypeLevel(rendering_params) > 0.0f)
++            /* ClearType by default only where nothing shows through the target, as on Windows 11: a target with
++             * alpha gets grayscale text even on an opaque background */
++            if (context->desc.pixelFormat.alphaMode == D2D1_ALPHA_MODE_IGNORE
++                    && IDWriteRenderingParams_GetClearTypeLevel(rendering_params) > 0.0f)
+                 *antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE;
+             break;
+ 
+@@ -5128,7 +5131,8 @@ static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_GetDC(ID2D1GdiInt
+ 
+     *dc = NULL;
+ 
+-    if (render_target->target.hdc)
++    /* GDI draws between BeginDraw and EndDraw on a target, one DC at a time; that comes before whether it can */
++    if (render_target->target.hdc || !render_target->drawing || render_target->target.type == D2D_TARGET_UNKNOWN)
+         return D2DERR_WRONG_STATE;
+ 
+     if (FAILED(hr = d2d_gdi_interop_get_surface(render_target, &surface)))
+@@ -6148,8 +6152,10 @@ HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *su
+ 
+     if (desc->type != D2D1_RENDER_TARGET_TYPE_DEFAULT && desc->type != D2D1_RENDER_TARGET_TYPE_HARDWARE)
+         WARN("Ignoring render target type %#x.\n", desc->type);
+-    if (desc->usage != D2D1_RENDER_TARGET_USAGE_NONE)
++    /* GDI compatibility is what the target bitmap is made with; there is no remoting to force */
++    if (desc->usage & ~(D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE | D2D1_RENDER_TARGET_USAGE_FORCE_BITMAP_REMOTING))
+         FIXME("Ignoring render target usage %#x.\n", desc->usage);
++
+     if (desc->minLevel != D2D1_FEATURE_LEVEL_DEFAULT)
+         WARN("Ignoring feature level %#x.\n", desc->minLevel);
+ 
+@@ -6292,8 +6298,9 @@ static HRESULT d2d_device_create_device_context(struct d2d_device *device,
+     struct d2d_device_context *object;
+     HRESULT hr;
+ 
+-    if (options)
+-        FIXME("Options are ignored %#x.\n", options);
++    /* Windows takes any options; the one it knows lets it spread work over threads, which this does not need to */
++    if (options & ~D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS)
++        WARN("Ignoring options %#x.\n", options);
+ 
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+diff --git a/dlls/d2d1/factory.c b/dlls/d2d1/factory.c
+index 7fa2c0e2af6..95ccd3ce544 100644
+--- a/dlls/d2d1/factory.c
++++ b/dlls/d2d1/factory.c
+@@ -525,6 +525,13 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_CreateDxgiSurfaceRenderTarget(ID2D1
+ 
+     TRACE("iface %p, surface %p, desc %p, render_target %p.\n", iface, surface, desc, render_target);
+ 
++    /* as for windows, a surface is not drawn on with straight alpha */
++    if (desc->pixelFormat.alphaMode == D2D1_ALPHA_MODE_STRAIGHT)
++    {
++        WARN("Alpha mode %u is not supported.\n", desc->pixelFormat.alphaMode);
++        return D2DERR_UNSUPPORTED_PIXEL_FORMAT;
++    }
++
+     if (FAILED(hr = IDXGISurface_GetDevice(surface, &IID_IDXGIDevice, (void **)&dxgi_device)))
+     {
+         WARN("Failed to get DXGI device, hr %#lx.\n", hr);
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index f3282925a06..5cd22d7abfa 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -7100,7 +7100,6 @@ static void test_dc_target_gdi_interop(BOOL d3d11)
+     ID2D1DCRenderTarget_BeginDraw(rt);
+     hdc = (void *)0xdeadbeef;
+     hr = ID2D1GdiInteropRenderTarget_GetDC(interop, D2D1_DC_INITIALIZE_MODE_COPY, &hdc);
+-    todo_wine
+     ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
+     ok(!hdc, "Got unexpected DC %p.\n", hdc);
+     hr = ID2D1DCRenderTarget_EndDraw(rt, NULL, NULL);
+@@ -7342,8 +7341,8 @@ static IDXGISurface *create_surface(IDXGIDevice *dxgi_device, unsigned int width
+ 
+ static void test_dxgi_surface_target_gdi_interop(BOOL d3d11)
+ {
++    D2D1_RENDER_TARGET_PROPERTIES desc, straight_desc;
+     ID2D1GdiInteropRenderTarget *interop;
+-    D2D1_RENDER_TARGET_PROPERTIES desc;
+     ID2D1DeviceContext *device_context;
+     struct d2d1_test_context ctx;
+     ID2D1RenderTarget *rt;
+@@ -7399,6 +7398,12 @@ static void test_dxgi_surface_target_gdi_interop(BOOL d3d11)
+             D3D10_RESOURCE_MISC_GDI_COMPATIBLE, DXGI_FORMAT_B8G8R8A8_UNORM);
+     ok(!!surface, "Failed to create a surface.\n");
+ 
++    /* not with straight alpha */
++    straight_desc = desc;
++    straight_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_STRAIGHT;
++    hr = ID2D1Factory_CreateDxgiSurfaceRenderTarget(ctx.factory, surface, &straight_desc, &rt);
++    ok(hr == D2DERR_UNSUPPORTED_PIXEL_FORMAT, "Got unexpected hr %#lx.\n", hr);
++
+     hr = ID2D1Factory_CreateDxgiSurfaceRenderTarget(ctx.factory, surface, &desc, &rt);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
+@@ -7412,6 +7417,11 @@ static void test_dxgi_surface_target_gdi_interop(BOOL d3d11)
+ 
+     hr = ID2D1RenderTarget_QueryInterface(rt, &IID_ID2D1GdiInteropRenderTarget, (void **)&interop);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    /* only while drawing */
++    dc = (void *)0xdeadbeef;
++    hr = ID2D1GdiInteropRenderTarget_GetDC(interop, D2D1_DC_INITIALIZE_MODE_COPY, &dc);
++    ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
++    ok(!dc, "Got unexpected DC %p.\n", dc);
+     ID2D1RenderTarget_BeginDraw(rt);
+     dc = (void *)0xdeadbeef;
+     hr = ID2D1GdiInteropRenderTarget_GetDC(interop, D2D1_DC_INITIALIZE_MODE_COPY, &dc);
+@@ -7435,6 +7445,11 @@ static void test_dxgi_surface_target_gdi_interop(BOOL d3d11)
+ 
+     hr = ID2D1RenderTarget_QueryInterface(rt, &IID_ID2D1GdiInteropRenderTarget, (void **)&interop);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    /* the state is checked first */
++    dc = (void *)0xdeadbeef;
++    hr = ID2D1GdiInteropRenderTarget_GetDC(interop, D2D1_DC_INITIALIZE_MODE_COPY, &dc);
++    ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
++    ok(!dc, "Got unexpected DC %p.\n", dc);
+     ID2D1RenderTarget_BeginDraw(rt);
+     dc = (void *)0xdeadbeef;
+     hr = ID2D1GdiInteropRenderTarget_GetDC(interop, D2D1_DC_INITIALIZE_MODE_COPY, &dc);

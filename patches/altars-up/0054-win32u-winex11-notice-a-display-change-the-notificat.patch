@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 03:26:12 -0400
+Subject: [PATCH] win32u, winex11: notice a display change the notification
+ missed.
+
+The configuration every process reads is a copy, refreshed when the driver
+says the host changed.  That works while the notification arrives.  When it
+does not, nothing goes back to check: the copy goes on describing a screen that
+is gone, every process sizes its windows from it, and none of them can be
+resized past it -- which from outside is not a display problem anyone
+recognises as one.  Windows has no such state to be in.  There the
+configuration is the live one, and a program that asks gets what is true now.
+
+Three things kept the notification from arriving.
+
+RandR has two event types, RRScreenChangeNotify and RRNotify; crtc, output and
+provider changes are subtypes carried inside the second, not event numbers of
+their own.  Registering by subtype put one handler on RRScreenChangeNotify by
+accident, one on RRNotify, and one on an event the extension does not have.
+The screen change was never asked for either, so a host that resizes the screen
+without reconfiguring a crtc -- a remote desktop whose viewport moved, a nested
+server whose window was resized -- reported it in the one form nobody was
+listening for.
+
+Publishing the new configuration is the desktop thread's job, and keeping it to
+one thread is what stops every process enumerating at once.  But the event
+reaches every process that selected for it and the desktop thread is not always
+among them; when it was not, the handler returned having done nothing.  It now
+publishes from any thread that finds what win32u reports no longer matching the
+host, and the first one through fixes it for the rest.
+
+That publish cannot use a synchronous send: it waits for the desktop thread to
+answer, and a desktop thread waiting on this one never will.  From anywhere but
+the desktop thread the notification is posted instead.
+
+And a floor under all of it: the driver gains pGetHostDisplayKey, something
+cheap that moves when the host's display does -- the root window geometry on
+X11, one round trip and no enumeration.  win32u takes it beside the
+configuration it belongs to and compares before serving that configuration
+again, rate limited because this runs in front of every display query,
+GetSystemMetrics included.  A stale configuration can still be served between
+checks; what it cannot do any more is last for the life of the session.
+
+Measured against a nested server whose screen is resized under a running
+session, with a wineserver session held open across the change: the build
+before this follows the change and so does the build after, so nothing here
+regresses what already worked.  The failure this was written for -- a remote
+desktop resized from the client, where the configuration stayed behind for
+good -- has not been reproduced in a harness, and the causal chain from these
+three to that failure is not yet proven.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+(cherry picked from commit d2fb8bc4ad8a697803fecbac23a90dab6e1317bb)
+
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 4598ac715bf..30cb2b3f6aa 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -748,6 +748,11 @@ static LONG nulldrv_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_
+     return DISP_CHANGE_SUCCESSFUL;
+ }
+ 
++static BOOL nulldrv_GetHostDisplayKey( UINT64 *key )
++{
++    return FALSE;
++}
++
+ static UINT nulldrv_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
+ {
+     return STATUS_NOT_IMPLEMENTED;
+@@ -1212,6 +1217,11 @@ static UINT loaderdrv_UpdateDisplayDevices( const struct gdi_device_manager *man
+     return load_driver()->pUpdateDisplayDevices( manager, param );
+ }
+ 
++static BOOL loaderdrv_GetHostDisplayKey( UINT64 *key )
++{
++    return load_driver()->pGetHostDisplayKey( key );
++}
++
+ static BOOL loaderdrv_CreateDesktop( const WCHAR *name, UINT width, UINT height )
+ {
+     return load_driver()->pCreateDesktop( name, width, height );
+@@ -1305,6 +1315,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     /* display modes */
+     loaderdrv_ChangeDisplaySettings,
+     loaderdrv_UpdateDisplayDevices,
++    loaderdrv_GetHostDisplayKey,
+     /* windowing functions */
+     loaderdrv_CreateDesktop,
+     loaderdrv_CreateWindow,
+@@ -1406,6 +1417,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(UpdateClipboard);
+     SET_USER_FUNC(ChangeDisplaySettings);
+     SET_USER_FUNC(UpdateDisplayDevices);
++    SET_USER_FUNC(GetHostDisplayKey);
+     SET_USER_FUNC(CreateDesktop);
+     SET_USER_FUNC(CreateWindow);
+     SET_USER_FUNC(DesktopWindowProc);
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 7880e75318a..5fed7ec6ca8 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -162,6 +162,11 @@ static struct list gpus = LIST_INIT(gpus);
+ static struct list sources = LIST_INIT(sources);
+ static struct list monitors = LIST_INIT(monitors);
+ static INT64 last_query_display_time;
++/* What the driver answered when the configuration in use was read, and when it
++ * was last asked since.  See host_display_changed(). */
++static UINT64 last_host_display_key;
++static BOOL have_host_display_key;
++static ULONG last_host_display_check;
+ static UINT64 monitor_update_serial;
+ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+@@ -2886,6 +2891,46 @@ void reset_monitor_update_serial(void)
+     pthread_mutex_unlock( &display_lock );
+ }
+ 
++/* Has the host left the configuration we are about to serve behind?
++ *
++ * Every other way of finding out depends on a notification arriving: the
++ * driver sees the host change and publishes a new configuration, and everyone
++ * else picks it up.  That is how it normally goes, and it is cheap.  But a
++ * notification that never arrives -- the process that would have published it
++ * was not there, the host reported the change in a form nobody asked for --
++ * leaves every process in the session sizing its windows from a screen that is
++ * gone, with nothing to put it right.  Windows has no such state to be in:
++ * there the configuration is the live one, and a program that asks gets what
++ * is true now.
++ *
++ * So ask the driver for something cheap that moves when the host's display
++ * does, and compare it with what it answered when the configuration in use was
++ * read.  The answer is not a description of the configuration and is not used
++ * as one -- only the comparison matters.
++ *
++ * The check is rate limited because this runs in front of every display query,
++ * GetSystemMetrics included.  Between checks a stale configuration can still be
++ * served, so this is a floor under how wrong things can get, not a replacement
++ * for the notification: it bounds the damage at a fraction of a second where it
++ * used to last for the life of the session. */
++#define HOST_DISPLAY_CHECK_INTERVAL 500 /* ms */
++
++static BOOL host_display_changed(void)
++{
++    ULONG now = NtGetTickCount();
++    UINT64 key;
++
++    if (!have_host_display_key) return FALSE;
++    if (now - last_host_display_check < HOST_DISPLAY_CHECK_INTERVAL) return FALSE;
++    last_host_display_check = now;
++
++    if (!user_driver->pGetHostDisplayKey( &key )) return FALSE;
++    if (key == last_host_display_key) return FALSE;
++
++    TRACE( "host display key changed from %#I64x to %#I64x.\n", last_host_display_key, key );
++    return TRUE;
++}
++
+ static BOOL lock_display_devices( BOOL force )
+ {
+     static const WCHAR wine_service_station_name[] =
+@@ -2933,6 +2978,7 @@ static BOOL lock_display_devices( BOOL force )
+      * yet.  Keying it on the process would put a full enumeration, vulkan GPUs
+      * and all, in front of every program's first window. */
+     if (serial <= 1) force = TRUE;
++    if (!force && host_display_changed()) force = TRUE;
+     if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
+     if (force)
+     {
+@@ -2942,6 +2988,11 @@ static BOOL lock_display_devices( BOOL force )
+         else WARN( "Failed to update display devices, status %#x\n", status );
+         release_display_manager_ctx( &ctx );
+ 
++        /* Taken now, beside the configuration it belongs to: a key read at any
++         * other moment describes a host this configuration was not read from. */
++        have_host_display_key = user_driver->pGetHostDisplayKey( &last_host_display_key );
++        last_host_display_check = NtGetTickCount();
++
+         ret = update_display_cache_from_registry( serial );
+     }
+ 
+@@ -4500,8 +4551,22 @@ static void display_mode_changed( BOOL broadcast )
+     }
+ 
+     if (!broadcast)
+-        send_message( get_desktop_window(), WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
+-                      MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ) );
++    {
++        HWND desktop = get_desktop_window();
++
++        /* The desktop thread tells itself synchronously, as it always has.
++         * A change noticed from any other thread cannot be delivered that way:
++         * a synchronous send into the desktop thread waits for it to answer,
++         * and a desktop thread that is itself waiting on this one never will.
++         * The notification is worth nothing if it can wedge the session, so
++         * from elsewhere it is posted instead. */
++        if (NtUserGetWindowThread( desktop, NULL ) == GetCurrentThreadId())
++            send_message( desktop, WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
++                          MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ) );
++        else
++            send_notify_message( desktop, WM_DISPLAYCHANGE, current_mode.dmBitsPerPel,
++                                 MAKELPARAM( current_mode.dmPelsWidth, current_mode.dmPelsHeight ), FALSE );
++    }
+     else
+     {
+         /* broadcast to all the windows as well if an application changed the display settings */
+diff --git a/dlls/winex11.drv/display.c b/dlls/winex11.drv/display.c
+index 5bd999a50b5..8b6c73f6390 100644
+--- a/dlls/winex11.drv/display.c
++++ b/dlls/winex11.drv/display.c
+@@ -284,6 +284,74 @@ POINT root_to_virtual_screen(INT x, INT y)
+     return pt;
+ }
+ 
++/* What the X server says the screen is right now.
++ *
++ * One round trip and no enumeration: this is asked whenever a cached display
++ * configuration is about to be served, so it has to stay cheap.  The framebuffer
++ * size is not a description of the configuration -- with two monitors it is
++ * larger than either -- and is not used as one.  It is only ever compared with
++ * the value taken at the moment the configuration was read, so a difference
++ * means the host has moved on since, whatever the layout. */
++BOOL X11DRV_GetHostDisplayKey( UINT64 *key )
++{
++    Window root_return;
++    int x, y;
++    unsigned int width, height, border, depth;
++
++    if (!gdi_display) return FALSE;
++    if (!XGetGeometry( gdi_display, DefaultRootWindow( gdi_display ), &root_return,
++                       &x, &y, &width, &height, &border, &depth ))
++        return FALSE;
++
++    *key = ((UINT64)width << 32) | height;
++    return TRUE;
++}
++
++/* The union of every monitor the host has, which is what win32u calls the
++ * virtual screen.  get_host_primary_monitor_rect() below answers for one
++ * monitor and cannot be compared against that: with two monitors side by side
++ * they differ permanently, and a caller watching for a change would see one
++ * every time it looked. */
++RECT get_host_virtual_screen_rect(void)
++{
++    INT gpu_count, adapter_count, monitor_count, i, j, k;
++    struct x11drv_gpu *gpus = NULL;
++    RECT rect = {0};
++
++    if (!host_handler.get_gpus( &gpus, &gpu_count, FALSE )) return rect;
++
++    for (i = 0; i < gpu_count; i++)
++    {
++        struct x11drv_adapter *adapters = NULL;
++
++        if (!host_handler.get_adapters( gpus[i].id, &adapters, &adapter_count )) continue;
++        for (j = 0; j < adapter_count; j++)
++        {
++            struct gdi_monitor *monitors = NULL;
++
++            if (!host_handler.get_monitors( adapters[j].id, &monitors, &monitor_count )) continue;
++            for (k = 0; k < monitor_count; k++)
++            {
++                const RECT *mon = &monitors[k].rc_monitor;
++
++                if (IsRectEmpty( &rect )) rect = *mon;
++                else if (!IsRectEmpty( mon ))
++                {
++                    rect.left = min( rect.left, mon->left );
++                    rect.top = min( rect.top, mon->top );
++                    rect.right = max( rect.right, mon->right );
++                    rect.bottom = max( rect.bottom, mon->bottom );
++                }
++            }
++            host_handler.free_monitors( monitors, monitor_count );
++        }
++        host_handler.free_adapters( adapters );
++    }
++
++    host_handler.free_gpus( gpus, gpu_count );
++    return rect;
++}
++
+ /* Get the primary monitor rect from the host system */
+ RECT get_host_primary_monitor_rect(void)
+ {
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index cf032cb3bf9..eda30c491c2 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -634,6 +634,7 @@ static const struct user_driver_funcs x11drv_funcs =
+     .pSystrayDockRemove = X11DRV_SystrayDockRemove,
+     .pChangeDisplaySettings = X11DRV_ChangeDisplaySettings,
+     .pUpdateDisplayDevices = X11DRV_UpdateDisplayDevices,
++    .pGetHostDisplayKey = X11DRV_GetHostDisplayKey,
+     .pCreateDesktop = X11DRV_CreateDesktop,
+     .pCreateWindow = X11DRV_CreateWindow,
+     .pDesktopWindowProc = X11DRV_DesktopWindowProc,
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 22462df6051..d72123638d0 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -782,6 +782,8 @@ extern int X11DRV_check_error(void);
+ extern POINT virtual_screen_to_root( INT x, INT y );
+ extern POINT root_to_virtual_screen( INT x, INT y );
+ extern RECT get_host_primary_monitor_rect(void);
++extern RECT get_host_virtual_screen_rect(void);
++extern BOOL X11DRV_GetHostDisplayKey( UINT64 *key );
+ extern RECT get_work_area( const RECT *monitor_rect );
+ extern BOOL xinerama_get_fullscreen_monitors( const RECT *rect, unsigned long *generation, long *indices );
+ extern void xinerama_init( unsigned int width, unsigned int height );
+diff --git a/dlls/winex11.drv/xrandr.c b/dlls/winex11.drv/xrandr.c
+index 5cfebe67084..3b88388fee0 100644
+--- a/dlls/winex11.drv/xrandr.c
++++ b/dlls/winex11.drv/xrandr.c
+@@ -1223,11 +1223,40 @@ static void xrandr14_free_monitors( struct gdi_monitor *monitors, int count )
+ 
+ static BOOL xrandr14_device_change_handler( HWND hwnd, XEvent *event )
+ {
+-    RECT rect;
++    BOOL desktop_thread, stale;
++    RECT rect, host, virt;
+ 
+     xrandr14_invalidate_current_mode_cache();
+-    if (hwnd == NtUserGetDesktopWindow() && NtUserGetWindowThread( hwnd, NULL ) == GetCurrentThreadId())
++
++    /* Publishing the new configuration is the desktop thread's job, and doing
++     * it from one thread is what keeps every process in the session from
++     * enumerating at once.  But the event reaches every process that selected
++     * for it, and the desktop thread is not always among them: when it is not,
++     * this used to return having done nothing at all, and nothing went back to
++     * check afterwards.  The configuration in the registry then went on
++     * describing a screen that was gone -- every process sized its windows
++     * from it, and none of them could be resized past it, which does not look
++     * like a display problem from the outside.
++     *
++     * So publish from the desktop thread as before, and from any other thread
++     * only once what win32u reports has actually stopped matching the host.
++     * The first process through rewrites the shared configuration and moves
++     * the window station's serial; the rest then see a match and do nothing. */
++    desktop_thread = (hwnd == NtUserGetDesktopWindow() &&
++                      NtUserGetWindowThread( hwnd, NULL ) == GetCurrentThreadId());
++
++    host = get_host_virtual_screen_rect();
++    virt = NtUserGetVirtualScreenRect( MDT_RAW_DPI );
++    stale = !IsRectEmpty( &host ) && !EqualRect( &host, &virt );
++
++    if (desktop_thread || stale)
++    {
++        if (stale && !desktop_thread)
++            TRACE( "host screen %s no longer matches %s, updating.\n",
++                   wine_dbgstr_rect( &host ), wine_dbgstr_rect( &virt ) );
+         NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
++    }
++
+     /* Update xinerama monitors for xinerama_get_fullscreen_monitors() */
+     rect = get_host_primary_monitor_rect();
+     xinerama_init( rect.right - rect.left, rect.bottom - rect.top );
+@@ -1242,14 +1271,23 @@ static void xrandr14_register_event_handlers(void)
+     if (!pXRRQueryExtension( display, &event_base, &error_base ))
+         return;
+ 
++    /* RandR has two event types, RRScreenChangeNotify and RRNotify; the crtc,
++     * output and provider changes are subtypes carried inside the second and
++     * are not event numbers of their own.  Registering by subtype put one
++     * handler on RRScreenChangeNotify by accident, one on RRNotify, and one on
++     * an event number the extension does not have.
++     *
++     * Ask for the screen change as well.  A host that resizes the screen
++     * without reconfiguring a crtc -- a remote desktop whose viewport the
++     * client dragged, a nested server whose window was resized -- reports it
++     * only that way, and without it the size Wine believes stays behind. */
+     pXRRSelectInput( display, root_window,
+-                     RRCrtcChangeNotifyMask | RROutputChangeNotifyMask | RRProviderChangeNotifyMask );
+-    X11DRV_register_event_handler( event_base + RRNotify_CrtcChange, xrandr14_device_change_handler,
+-                                   "XRandR CrtcChange" );
+-    X11DRV_register_event_handler( event_base + RRNotify_OutputChange, xrandr14_device_change_handler,
+-                                   "XRandR OutputChange" );
+-    X11DRV_register_event_handler( event_base + RRNotify_ProviderChange, xrandr14_device_change_handler,
+-                                   "XRandR ProviderChange" );
++                     RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask |
++                     RROutputChangeNotifyMask | RRProviderChangeNotifyMask );
++    X11DRV_register_event_handler( event_base + RRScreenChangeNotify, xrandr14_device_change_handler,
++                                   "XRandR ScreenChange" );
++    X11DRV_register_event_handler( event_base + RRNotify, xrandr14_device_change_handler,
++                                   "XRandR Notify" );
+ }
+ 
+ /* XRandR 1.4 display settings handler */
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 4d7d71c6bbf..a1fb4845b36 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -219,7 +219,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 110
++#define WINE_GDI_DRIVER_VERSION 111
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -404,6 +404,11 @@ struct user_driver_funcs
+     /* display modes */
+     LONG    (*pChangeDisplaySettings)(LPDEVMODEW,LPCWSTR,HWND,DWORD,LPVOID);
+     UINT    (*pUpdateDisplayDevices)(const struct gdi_device_manager *,void*);
++    /* A value that changes when the host's display configuration does.  Not a
++     * description of it: something cheap to fetch and compare against what was
++     * seen when the configuration was last read, so a configuration the host
++     * has already left behind can be noticed without enumerating again. */
++    BOOL    (*pGetHostDisplayKey)(UINT64 *);
+     /* windowing functions */
+     BOOL    (*pCreateDesktop)(const WCHAR *,UINT,UINT);
+     BOOL    (*pCreateWindow)(HWND);

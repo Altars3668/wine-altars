@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 13:16:30 -0400
+Subject: [PATCH] win32u: count the GDI and USER objects of a process for
+ GetGuiResources.
+
+GetGuiResources was a stub that answered 0 with
+ERROR_CALL_NOT_IMPLEMENTED; Word asks it for its GDI objects.  It is
+NtUserGetGuiResources now, as on Windows, which counts this process's
+GDI objects in its handle table, stock objects not included, and a
+process's USER objects in the session's table, or the whole session's
+for GR_GLOBAL; the peaks are the most it has counted.  As
+tools/procpolicyprobe measured Windows: a NULL process is
+ERROR_INVALID_PARAMETER and a flag it does not know answers 0 and
+leaves the last error alone.  The GDI objects of another process are
+not to be seen from here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 9ddb24754503f0fc17363685862fd1382d5a7a02)
+
+diff --git a/dlls/user32/resource.c b/dlls/user32/resource.c
+index b050e1eba8c..244c11cc255 100644
+--- a/dlls/user32/resource.c
++++ b/dlls/user32/resource.c
+@@ -228,13 +228,5 @@ INT WINAPI DECLSPEC_HOTPATCH LoadStringA( HINSTANCE instance, UINT resource_id,
+  */
+ DWORD WINAPI GetGuiResources( HANDLE hProcess, DWORD uiFlags )
+ {
+-    static BOOL warn = TRUE;
+-
+-    if (warn) {
+-        FIXME("(%p,%lx): stub\n",hProcess,uiFlags);
+-       warn = FALSE;
+-    }
+-
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return 0;
++    return NtUserGetGuiResources( hProcess, uiFlags );
+ }
+diff --git a/dlls/user32/tests/win.c b/dlls/user32/tests/win.c
+index 53a4beece1c..b3cfdd78ff6 100644
+--- a/dlls/user32/tests/win.c
++++ b/dlls/user32/tests/win.c
+@@ -14666,6 +14666,37 @@ static LRESULT WINAPI print_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     return DefWindowProcA(hwnd, msg, wparam, lparam);
+ }
+ 
++static void test_GetGuiResources(void)
++{
++    DWORD gdi, user, gdi2, user2, peak;
++    HBRUSH brushes[10];
++    unsigned int i;
++    HWND hwnd;
++
++    gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
++    user = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
++    for (i = 0; i < ARRAY_SIZE(brushes); i++) brushes[i] = CreateSolidBrush(RGB(i, i, i));
++    hwnd = CreateWindowA("static", NULL, WS_POPUP, 0, 0, 10, 10, NULL, NULL, NULL, NULL);
++    gdi2 = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
++    user2 = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
++    ok(gdi2 >= gdi + ARRAY_SIZE(brushes), "got %lu, then %lu\n", gdi, gdi2);
++    ok(user2 > user, "got %lu, then %lu\n", user, user2);
++    peak = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS_PEAK);
++    ok(peak >= gdi2, "got peak %lu, count %lu\n", peak, gdi2);
++    peak = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS_PEAK);
++    ok(peak >= user2, "got peak %lu, count %lu\n", peak, user2);
++    for (i = 0; i < ARRAY_SIZE(brushes); i++) DeleteObject(brushes[i]);
++    DestroyWindow(hwnd);
++    ok(GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) < user2, "USER objects did not go\n");
++
++    SetLastError(0xdeadbeef);
++    ok(!GetGuiResources(GetCurrentProcess(), 3), "got a count\n");
++    ok(GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError());
++    SetLastError(0xdeadbeef);
++    ok(!GetGuiResources(NULL, GR_GDIOBJECTS), "got a count\n");
++    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError());
++}
++
+ static void test_RegisterTouchHitTestingWindow(void)
+ {
+     BOOL (WINAPI *pRegisterTouchHitTestingWindow)(HWND, ULONG);
+@@ -15043,6 +15074,7 @@ START_TEST(win)
+     test_PrintWindow();
+     test_RegisterTouchHitTestingWindow();
+     test_ChangeWindowMessageFilterEx();
++    test_GetGuiResources();
+     test_window_without_child_style();
+     test_smresult();
+     test_GetMessagePos();
+diff --git a/dlls/win32u/gdiobj.c b/dlls/win32u/gdiobj.c
+index e861dee167d..b228019168d 100644
+--- a/dlls/win32u/gdiobj.c
++++ b/dlls/win32u/gdiobj.c
+@@ -73,6 +73,21 @@ static inline struct gdi_obj_header *entry_obj( GDI_HANDLE_ENTRY *entry )
+     return (struct gdi_obj_header *)(ULONG_PTR)entry->Object;
+ }
+ 
++static pthread_mutex_t gdi_lock;
++
++/* the GDI objects this process has, stock objects not counted, as GetGuiResources counts them */
++DWORD get_gdi_object_count(void)
++{
++    GDI_HANDLE_ENTRY *entry;
++    DWORD count = 0;
++
++    pthread_mutex_lock( &gdi_lock );
++    for (entry = gdi_shared->Handles + FIRST_GDI_HANDLE; entry < next_unused; entry++)
++        if (entry->Type && !entry->StockFlag) count++;
++    pthread_mutex_unlock( &gdi_lock );
++    return count;
++}
++
+ /***********************************************************************
+  *          GDI stock objects
+  */
+@@ -87,7 +102,6 @@ static const LOGBRUSH DkGrayBrush = { BS_SOLID, RGB(64,64,64), 0 };
+ 
+ static const LOGBRUSH DCBrush = { BS_SOLID, RGB(255,255,255), 0 };
+ 
+-static pthread_mutex_t gdi_lock;
+ 
+ 
+ /****************************************************************************
+diff --git a/dlls/win32u/win32syscalls.h b/dlls/win32u/win32syscalls.h
+index 0763648af4a..89b0668fa32 100644
+--- a/dlls/win32u/win32syscalls.h
++++ b/dlls/win32u/win32syscalls.h
+@@ -1024,7 +1024,7 @@
+     SYSCALL_ENTRY( 0x13fc, NtUserGetGestureConfig, 0 ) \
+     SYSCALL_ENTRY( 0x13fd, NtUserGetGestureExtArgs, 0 ) \
+     SYSCALL_ENTRY( 0x13fe, NtUserGetGestureInfo, 0 ) \
+-    SYSCALL_ENTRY( 0x13ff, NtUserGetGuiResources, 0 ) \
++    SYSCALL_ENTRY( 0x13ff, NtUserGetGuiResources, 8 ) \
+     SYSCALL_ENTRY( 0x1400, NtUserGetHDevName, 0 ) \
+     SYSCALL_ENTRY( 0x1401, NtUserGetHimetricScaleFactorFromPixelLocation, 0 ) \
+     SYSCALL_ENTRY( 0x1402, NtUserGetIMEShowStatus, 0 ) \
+@@ -2566,7 +2566,7 @@
+     SYSCALL_ENTRY( 0x13fc, NtUserGetGestureConfig, 0 ) \
+     SYSCALL_ENTRY( 0x13fd, NtUserGetGestureExtArgs, 0 ) \
+     SYSCALL_ENTRY( 0x13fe, NtUserGetGestureInfo, 0 ) \
+-    SYSCALL_ENTRY( 0x13ff, NtUserGetGuiResources, 0 ) \
++    SYSCALL_ENTRY( 0x13ff, NtUserGetGuiResources, 16 ) \
+     SYSCALL_ENTRY( 0x1400, NtUserGetHDevName, 0 ) \
+     SYSCALL_ENTRY( 0x1401, NtUserGetHimetricScaleFactorFromPixelLocation, 0 ) \
+     SYSCALL_ENTRY( 0x1402, NtUserGetIMEShowStatus, 0 ) \
+@@ -3803,7 +3803,6 @@
+     SYSCALL_STUB( NtUserGetGestureConfig ) \
+     SYSCALL_STUB( NtUserGetGestureExtArgs ) \
+     SYSCALL_STUB( NtUserGetGestureInfo ) \
+-    SYSCALL_STUB( NtUserGetGuiResources ) \
+     SYSCALL_STUB( NtUserGetHDevName ) \
+     SYSCALL_STUB( NtUserGetHimetricScaleFactorFromPixelLocation ) \
+     SYSCALL_STUB( NtUserGetIMEShowStatus ) \
+diff --git a/dlls/win32u/win32u.spec b/dlls/win32u/win32u.spec
+index 081ba140121..887ce46c6d1 100644
+--- a/dlls/win32u/win32u.spec
++++ b/dlls/win32u/win32u.spec
+@@ -1022,7 +1022,7 @@
+ @ stub -syscall NtUserGetGestureConfig
+ @ stub -syscall NtUserGetGestureExtArgs
+ @ stub -syscall NtUserGetGestureInfo
+-@ stub -syscall NtUserGetGuiResources
++@ stdcall -syscall NtUserGetGuiResources(long long)
+ @ stub -syscall NtUserGetHDevName
+ @ stub -syscall NtUserGetHimetricScaleFactorFromPixelLocation
+ @ stub -syscall NtUserGetIMEShowStatus
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 9305cc942e2..11d640e9247 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -269,6 +269,7 @@ extern BOOL shared_object_release_seqlock( const shared_object_t *object, UINT64
+  * on it, within the loop, or after, unless the function has returned STATUS_SUCCESS.
+  */
+ extern const session_shm_t *shared_session;
++extern DWORD get_gdi_object_count(void);
+ extern NTSTATUS get_shared_desktop( struct object_lock *lock, const desktop_shm_t **desktop_shm );
+ extern NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_shm );
+ extern NTSTATUS get_shared_input( UINT tid, struct object_lock *lock, const input_shm_t **input_shm );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index fc6d86fc8b8..72856bff38d 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -6046,6 +6046,56 @@ static void map_dpi_create_struct( CREATESTRUCTW *cs, struct ratio dpi_to )
+     cs->cy = rect.bottom - rect.top;
+ }
+ 
++/***********************************************************************
++ *           NtUserGetGuiResources (win32u.@)
++ *
++ * The GDI and USER objects a process has, and the most it has been seen to have.  The USER objects of every
++ * process are in the session's table; the GDI objects of another process are not to be seen from here.
++ */
++DWORD WINAPI NtUserGetGuiResources( HANDLE process, DWORD flags )
++{
++    static DWORD gdi_peak, user_peak;
++    PROCESS_BASIC_INFORMATION pbi;
++    DWORD count = 0, pid;
++    unsigned int i;
++
++    TRACE( "process %p, flags %#x\n", process, (int)flags );
++
++    /* GR_GLOBAL counts the whole session's */
++    if (process == GR_GLOBAL) pid = 0;
++    else if (!process || NtQueryInformationProcess( process, ProcessBasicInformation, &pbi, sizeof(pbi), NULL ))
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return 0;
++    }
++    else pid = pbi.UniqueProcessId;
++
++    switch (flags)
++    {
++    case GR_GDIOBJECTS:
++    case GR_GDIOBJECTS_PEAK:
++        if (pid != GetCurrentProcessId())
++        {
++            FIXME( "the GDI objects of process %04x are not known\n", (int)pid );
++            return 0;
++        }
++        count = get_gdi_object_count();
++        if (count > gdi_peak) gdi_peak = count;
++        return flags == GR_GDIOBJECTS ? count : gdi_peak;
++
++    case GR_USEROBJECTS:
++    case GR_USEROBJECTS_PEAK:
++        for (i = 0; i < MAX_USER_HANDLES; i++)
++            if (shared_session->user_entries[i].type && (!pid || shared_session->user_entries[i].pid == pid)) count++;
++        if (pid != GetCurrentProcessId()) return flags == GR_USEROBJECTS ? count : 0;
++        if (count > user_peak) user_peak = count;
++        return flags == GR_USEROBJECTS ? count : user_peak;
++
++    default:
++        return 0;
++    }
++}
++
+ /***********************************************************************
+  *           NtUserCreateWindowEx (win32u.@)
+  */
+diff --git a/dlls/wow64win/user.c b/dlls/wow64win/user.c
+index eb617c88ca7..682924446de 100644
+--- a/dlls/wow64win/user.c
++++ b/dlls/wow64win/user.c
+@@ -2585,6 +2585,14 @@ NTSTATUS WINAPI wow64_NtUserGetForegroundWindow( UINT *args )
+     return HandleToUlong( NtUserGetForegroundWindow() );
+ }
+ 
++NTSTATUS WINAPI wow64_NtUserGetGuiResources( UINT *args )
++{
++    HANDLE process = get_handle( &args );
++    DWORD flags = get_ulong( &args );
++
++    return NtUserGetGuiResources( process, flags );
++}
++
+ NTSTATUS WINAPI wow64_NtUserGetGUIThreadInfo( UINT *args )
+ {
+     DWORD id = get_ulong( &args );
+diff --git a/include/ntuser.h b/include/ntuser.h
+index a761b378560..c6470315157 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -863,6 +863,7 @@ W32KAPI LONG    WINAPI NtUserGetDisplayConfigBufferSizes( UINT32 flags, UINT32 *
+ W32KAPI UINT    WINAPI NtUserGetDoubleClickTime(void);
+ W32KAPI BOOL    WINAPI NtUserGetDpiForMonitor( HMONITOR monitor, UINT type, UINT *x, UINT *y );
+ W32KAPI HWND    WINAPI NtUserGetForegroundWindow(void);
++W32KAPI DWORD   WINAPI NtUserGetGuiResources( HANDLE process, DWORD flags );
+ W32KAPI BOOL    WINAPI NtUserGetGUIThreadInfo( DWORD id, GUITHREADINFO *info );
+ W32KAPI BOOL    WINAPI NtUserGetIconInfo( HICON icon, ICONINFO *info, UNICODE_STRING *module,
+                                           UNICODE_STRING *res_name, DWORD *bpp, LONG unk );

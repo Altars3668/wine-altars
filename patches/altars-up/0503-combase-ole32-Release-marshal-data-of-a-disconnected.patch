@@ -1,0 +1,481 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 22:07:15 -0400
+Subject: [PATCH] combase, ole32: Release marshal data of a disconnected object
+ quietly, and drop its running object table entry.
+
+Word disconnects its objects at exit and then revokes their running
+object table entries and global interface table cookies: the marshal
+data then has no stub manager, CoReleaseMarshalData failed with
+RPC_E_INVALID_OBJREF after two ERRs.  Windows 11 answers S_OK for data
+of an object that was disconnected, of an apartment that has gone and
+for table data released already.  Its running object table takes such
+a registration for gone: IsRunning answers S_FALSE, GetObject and
+GetTimeOfLastChange MK_E_UNAVAILABLE, EnumRunning leaves it out, and
+only Revoke still knows its cookie (tools/startupgapsprobe comrel).
+ole32 asks combase whether the object of an entry made in this process
+is still connected, without unmarshaling it, and retires the ones that
+are not.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
+index b976b8b27cf..0b21bb70265 100644
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -265,6 +265,7 @@
+ @ stdcall InternalIrotNoteChangeTime(long ptr)
+ @ stdcall InternalIrotRegister(ptr ptr ptr ptr long ptr ptr)
+ @ stdcall InternalIrotRevoke(long ptr ptr ptr)
++@ stdcall InternalIrotObjectConnected(ptr long)
+ @ stub InternalIsApartmentInitialized
+ @ stdcall InternalIsProcessInitialized()
+ @ stub InternalMarshalObjRef
+diff --git a/dlls/combase/marshal.c b/dlls/combase/marshal.c
+index 5ff9058737b..ba86acf5a55 100644
+--- a/dlls/combase/marshal.c
++++ b/dlls/combase/marshal.c
+@@ -636,19 +636,21 @@ static HRESULT std_release_marshal_data(IStream *stream)
+     TRACE("oxid = %s, oid = %s, ipid = %s\n", wine_dbgstr_longlong(obj.std.oxid),
+             wine_dbgstr_longlong(obj.std.oid), wine_dbgstr_guid(&obj.std.ipid));
+ 
++    /* Data of an apartment that has gone, of an object disconnected or released already: there is nothing left
++     * to release, and Windows 11 answers S_OK. */
+     if (!(apt = apartment_findfromoxid(obj.std.oxid)))
+     {
+         WARN("Could not map OXID %s to apartment object\n",
+             wine_dbgstr_longlong(obj.std.oxid));
+-        return RPC_E_INVALID_OBJREF;
++        return S_OK;
+     }
+ 
+     if (!(stubmgr = get_stub_manager(apt, obj.std.oid)))
+     {
+         apartment_release(apt);
+-        ERR("could not map object ID to stub manager, oxid=%s, oid=%s\n",
++        WARN("could not map object ID to stub manager, oxid=%s, oid=%s\n",
+             wine_dbgstr_longlong(obj.std.oxid), wine_dbgstr_longlong(obj.std.oid));
+-        return RPC_E_INVALID_OBJREF;
++        return S_OK;
+     }
+ 
+     stub_manager_release_marshal_data(stubmgr, obj.std.cPublicRefs, &obj.std.ipid, obj.std.flags & SORFP_TABLEWEAK);
+@@ -2264,6 +2266,35 @@ static HRESULT StdMarshalImpl_Construct(REFIID riid, DWORD dest_context, void *d
+     return hr;
+ }
+ 
++/***********************************************************************
++ *           InternalIrotObjectConnected (combase.@)
++ *
++ * For ole32's running object table: whether the object of standard marshal data made in this process is still
++ * there and not disconnected.  Windows' table hides the registrations of objects that are not.
++ */
++BOOL WINAPI InternalIrotObjectConnected(const void *data, ULONG size)
++{
++    const OBJREF *objref = data;
++    struct stub_manager *stubmgr;
++    struct apartment *apt;
++    BOOL ret = FALSE;
++
++    if (size < FIELD_OFFSET(OBJREF, u_objref.u_standard.saResAddr) || objref->signature != OBJREF_SIGNATURE ||
++            !(objref->flags & OBJREF_STANDARD))
++        return TRUE;
++
++    if ((apt = apartment_findfromoxid(objref->u_objref.u_standard.std.oxid)))
++    {
++        if ((stubmgr = get_stub_manager(apt, objref->u_objref.u_standard.std.oid)))
++        {
++            ret = !stubmgr->disconnected;
++            stub_manager_int_release(stubmgr);
++        }
++        apartment_release(apt);
++    }
++    return ret;
++}
++
+ HRESULT WINAPI InternalCoStdMarshalObject(REFIID riid, DWORD dest_context, void *dest_context_data, void **ppvObject)
+ {
+     return StdMarshalImpl_Construct(riid, dest_context, dest_context_data, ppvObject);
+diff --git a/dlls/ole32/moniker.c b/dlls/ole32/moniker.c
+index b81033c6c4e..e8f591b4dac 100644
+--- a/dlls/ole32/moniker.c
++++ b/dlls/ole32/moniker.c
+@@ -49,6 +49,7 @@ HRESULT WINAPI InternalIrotGetTimeOfLastChange(const MonikerComparisonData *moni
+ HRESULT WINAPI InternalIrotEnumRunning(PInterfaceList *list);
+ HRESULT WINAPI InternalIrotRevoke(IrotCookie cookie, IrotContextHandle *ctxt_handle, PInterfaceData *object,
+         PInterfaceData *moniker);
++BOOL WINAPI InternalIrotObjectConnected(const void *data, ULONG size);
+ 
+ /* define the structure of the running object table elements */
+ struct rot_entry
+@@ -59,6 +60,7 @@ struct rot_entry
+     DWORD              cookie; /* cookie identifying this object */
+     FILETIME           last_modified;
+     IrotContextHandle  ctxt_handle;
++    BOOL               retired; /* the object was disconnected: gone from the table but for Revoke */
+ };
+ 
+ /* define the RunningObjectTableImpl structure */
+@@ -102,14 +104,15 @@ static HRESULT create_stream_on_mip_ro(const InterfaceData *mip, IStream **strea
+     return CreateStreamOnHGlobal(hglobal, TRUE, stream);
+ }
+ 
+-static void rot_entry_delete(struct rot_entry *rot_entry)
++/* takes a registration out of the system's table and releases what it held */
++static void unregister(DWORD cookie, IrotContextHandle *ctxt_handle, InterfaceData *registered)
+ {
+-    if (rot_entry->cookie)
++    if (cookie)
+     {
+         InterfaceData *object = NULL;
+         InterfaceData *moniker = NULL;
+ 
+-        InternalIrotRevoke(rot_entry->cookie, &rot_entry->ctxt_handle, &object, &moniker);
++        InternalIrotRevoke(cookie, ctxt_handle, &object, &moniker);
+         MIDL_user_free(object);
+         if (moniker)
+         {
+@@ -124,22 +127,56 @@ static void rot_entry_delete(struct rot_entry *rot_entry)
+         }
+         MIDL_user_free(moniker);
+     }
+-    if (rot_entry->object)
++    if (registered)
+     {
+         IStream *stream;
+         HRESULT hr;
+-        hr = create_stream_on_mip_ro(rot_entry->object, &stream);
++        hr = create_stream_on_mip_ro(registered, &stream);
+         if (hr == S_OK)
+         {
+             CoReleaseMarshalData(stream);
+             IStream_Release(stream);
+         }
+     }
+-    HeapFree(GetProcessHeap(), 0, rot_entry->object);
++    HeapFree(GetProcessHeap(), 0, registered);
++}
++
++static void rot_entry_delete(struct rot_entry *rot_entry)
++{
++    if (!rot_entry->retired) unregister(rot_entry->cookie, &rot_entry->ctxt_handle, rot_entry->object);
+     HeapFree(GetProcessHeap(), 0, rot_entry->moniker_data);
+     HeapFree(GetProcessHeap(), 0, rot_entry);
+ }
+ 
++/* As Windows does, the registration of an object that was disconnected is not running any more: it leaves the
++ * system's table, and only Revoke still knows its cookie. */
++static void retire_disconnected(struct list *rot, CRITICAL_SECTION *lock)
++{
++    struct { DWORD cookie; IrotContextHandle ctxt_handle; InterfaceData *object; } retired[16];
++    struct rot_entry *rot_entry;
++    unsigned int i, count;
++
++    do
++    {
++        count = 0;
++        EnterCriticalSection(lock);
++        LIST_FOR_EACH_ENTRY(rot_entry, rot, struct rot_entry, entry)
++        {
++            if (rot_entry->retired || !rot_entry->object ||
++                    InternalIrotObjectConnected(rot_entry->object->abData, rot_entry->object->ulCntData))
++                continue;
++            retired[count].cookie = rot_entry->cookie;
++            retired[count].ctxt_handle = rot_entry->ctxt_handle;
++            retired[count].object = rot_entry->object;
++            rot_entry->object = NULL;
++            rot_entry->retired = TRUE;
++            if (++count == ARRAY_SIZE(retired)) break;
++        }
++        LeaveCriticalSection(lock);
++        for (i = 0; i < count; i++) unregister(retired[i].cookie, &retired[i].ctxt_handle, retired[i].object);
++    } while (count == ARRAY_SIZE(retired));
++}
++
+ /* moniker_data must be freed with HeapFree when no longer in use */
+ static HRESULT get_moniker_comparison_data(IMoniker *pMoniker, MonikerComparisonData **moniker_data)
+ {
+@@ -479,11 +516,13 @@ RunningObjectTableImpl_IsRunning( IRunningObjectTable* iface, IMoniker *pmkObjec
+     if (hr != S_OK)
+         return hr;
+ 
++    retire_disconnected(&This->rot, &This->lock);
++
+     hr = S_FALSE;
+     EnterCriticalSection(&This->lock);
+     LIST_FOR_EACH_ENTRY(rot_entry, &This->rot, const struct rot_entry, entry)
+     {
+-        if ((rot_entry->moniker_data->ulCntData == moniker_data->ulCntData) &&
++        if (!rot_entry->retired && (rot_entry->moniker_data->ulCntData == moniker_data->ulCntData) &&
+             !memcmp(moniker_data->abData, rot_entry->moniker_data->abData, moniker_data->ulCntData))
+         {
+             hr = S_OK;
+@@ -533,10 +572,12 @@ RunningObjectTableImpl_GetObject( IRunningObjectTable* iface,
+     if (hr != S_OK)
+         return hr;
+ 
++    retire_disconnected(&This->rot, &This->lock);
++
+     EnterCriticalSection(&This->lock);
+     LIST_FOR_EACH_ENTRY(rot_entry, &This->rot, struct rot_entry, entry)
+     {
+-        if ((rot_entry->moniker_data->ulCntData == moniker_data->ulCntData) &&
++        if (!rot_entry->retired && (rot_entry->moniker_data->ulCntData == moniker_data->ulCntData) &&
+             !memcmp(moniker_data->abData, rot_entry->moniker_data->abData, moniker_data->ulCntData))
+         {
+             IStream *pStream;
+@@ -599,10 +640,12 @@ RunningObjectTableImpl_NoteChangeTime(IRunningObjectTable* iface,
+     {
+         if (rot_entry->cookie == dwRegister)
+         {
++            BOOL retired = rot_entry->retired;
++
+             rot_entry->last_modified = *pfiletime;
+             LeaveCriticalSection(&This->lock);
+ 
+-            hr = InternalIrotNoteChangeTime(dwRegister, pfiletime);
++            hr = retired ? S_OK : InternalIrotNoteChangeTime(dwRegister, pfiletime);
+ 
+             goto done;
+         }
+@@ -645,10 +688,12 @@ RunningObjectTableImpl_GetTimeOfLastChange(IRunningObjectTable* iface,
+ 
+     hr = MK_E_UNAVAILABLE;
+ 
++    retire_disconnected(&This->rot, &This->lock);
++
+     EnterCriticalSection(&This->lock);
+     LIST_FOR_EACH_ENTRY(rot_entry, &This->rot, const struct rot_entry, entry)
+     {
+-        if ((rot_entry->moniker_data->ulCntData == moniker_data->ulCntData) &&
++        if (!rot_entry->retired && (rot_entry->moniker_data->ulCntData == moniker_data->ulCntData) &&
+             !memcmp(moniker_data->abData, rot_entry->moniker_data->abData, moniker_data->ulCntData))
+         {
+             *pfiletime = rot_entry->last_modified;
+@@ -685,6 +730,8 @@ RunningObjectTableImpl_EnumRunning(IRunningObjectTable* iface,
+ 
+     *ppenumMoniker = NULL;
+ 
++    retire_disconnected(&This->rot, &This->lock);
++
+     hr = InternalIrotEnumRunning(&interface_list);
+     if (SUCCEEDED(hr))
+         hr = EnumMonikerImpl_CreateEnumROTMoniker(interface_list, 0, ppenumMoniker);
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index 581eb145077..76668b2420e 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -2604,6 +2604,130 @@ static void test_disconnect_stub(void)
+     ok( hr == E_INVALIDARG, "wrong status %lx\n", hr );
+ }
+ 
++/* an object that counts its references, and nothing else */
++struct ref_object
++{
++    IDropTarget IDropTarget_iface;
++    LONG refs;
++};
++
++static inline struct ref_object *impl_from_ref_object(IDropTarget *iface)
++{
++    return CONTAINING_RECORD(iface, struct ref_object, IDropTarget_iface);
++}
++
++static HRESULT WINAPI ref_object_QueryInterface(IDropTarget *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDropTarget))
++    {
++        *obj = iface;
++        IDropTarget_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ref_object_AddRef(IDropTarget *iface)
++{
++    return InterlockedIncrement(&impl_from_ref_object(iface)->refs);
++}
++
++static ULONG WINAPI ref_object_Release(IDropTarget *iface)
++{
++    return InterlockedDecrement(&impl_from_ref_object(iface)->refs);
++}
++
++static HRESULT WINAPI ref_object_DragEnter(IDropTarget *iface, IDataObject *data, DWORD keys, POINTL pt, DWORD *effect)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ref_object_DragOver(IDropTarget *iface, DWORD keys, POINTL pt, DWORD *effect)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ref_object_DragLeave(IDropTarget *iface)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI ref_object_Drop(IDropTarget *iface, IDataObject *data, DWORD keys, POINTL pt, DWORD *effect)
++{
++    return E_NOTIMPL;
++}
++
++static const IDropTargetVtbl ref_object_vtbl =
++{
++    ref_object_QueryInterface,
++    ref_object_AddRef,
++    ref_object_Release,
++    ref_object_DragEnter,
++    ref_object_DragOver,
++    ref_object_DragLeave,
++    ref_object_Drop,
++};
++
++static void init_ref_object(struct ref_object *obj)
++{
++    obj->IDropTarget_iface.lpVtbl = &ref_object_vtbl;
++    obj->refs = 1;
++}
++
++/* releases marshal data of an object that was disconnected, or released already */
++static void test_release_marshal_data_disconnected(void)
++{
++    static const MSHLFLAGS flags[] = { MSHLFLAGS_NORMAL, MSHLFLAGS_TABLESTRONG, MSHLFLAGS_TABLEWEAK };
++    LARGE_INTEGER zero = {{0}};
++    struct ref_object obj;
++    IStream *stream;
++    unsigned int i;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(flags); i++)
++    {
++        winetest_push_context("flags %#x", flags[i]);
++        init_ref_object(&obj);
++        CreateStreamOnHGlobal(NULL, TRUE, &stream);
++        hr = CoMarshalInterface(stream, &IID_IUnknown, (IUnknown *)&obj.IDropTarget_iface, MSHCTX_INPROC, NULL, flags[i]);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        /* the IUnknown is the stub manager's, with no reference of its own */
++        ok(obj.refs == 2, "got %ld references\n", obj.refs);
++        hr = CoDisconnectObject((IUnknown *)&obj.IDropTarget_iface, 0);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        ok(obj.refs == 1, "got %ld references\n", obj.refs);
++
++        /* nothing is left to release, and that is no error */
++        IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++        hr = CoReleaseMarshalData(stream);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++        hr = CoReleaseMarshalData(stream);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        ok(obj.refs == 1, "got %ld references\n", obj.refs);
++        IStream_Release(stream);
++        winetest_pop_context();
++    }
++
++    /* nor is table data released twice */
++    init_ref_object(&obj);
++    CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    hr = CoMarshalInterface(stream, &IID_IDropTarget, (IUnknown *)&obj.IDropTarget_iface, MSHCTX_INPROC, NULL,
++                            MSHLFLAGS_TABLESTRONG);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(obj.refs == 4, "got %ld references\n", obj.refs);
++    IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++    hr = CoReleaseMarshalData(stream);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(obj.refs == 1, "got %ld references\n", obj.refs);
++    IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++    hr = CoReleaseMarshalData(stream);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(obj.refs == 1, "got %ld references\n", obj.refs);
++    IStream_Release(stream);
++}
++
+ /* tests failure case of a same-thread marshal and unmarshal twice */
+ static void test_normal_marshal_and_unmarshal_twice(void)
+ {
+@@ -5827,6 +5951,8 @@ START_TEST(marshal)
+         with_external_conn = !with_external_conn;
+     } while (with_external_conn);
+ 
++    test_release_marshal_data_disconnected();
++
+     test_marshal_channel_buffer();
+     test_StdMarshal_custom_marshaling();
+     test_DfMarshal_custom_marshaling();
+diff --git a/dlls/ole32/tests/moniker.c b/dlls/ole32/tests/moniker.c
+index 098b014d7f1..5210022d206 100644
+--- a/dlls/ole32/tests/moniker.c
++++ b/dlls/ole32/tests/moniker.c
+@@ -1091,6 +1091,61 @@ static void test_ROT_multiple_entries(void)
+     IRunningObjectTable_Release(pROT);
+ }
+ 
++/* the registration of an object that was disconnected is not running any more, but Revoke still knows it */
++static void test_ROT_disconnected(void)
++{
++    struct test_factory factory;
++    IEnumMoniker *enum_moniker;
++    IRunningObjectTable *rot;
++    IMoniker *moniker, *found;
++    IUnknown *object;
++    FILETIME time;
++    BOOL listed;
++    DWORD cookie;
++    HRESULT hr;
++
++    test_factory_init(&factory);
++    hr = GetRunningObjectTable(0, &rot);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = CreateItemMoniker(L"!", L"wine-rot-disconnected", &moniker);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = IRunningObjectTable_Register(rot, ROTFLAGS_REGISTRATIONKEEPSALIVE, (IUnknown *)&factory.IClassFactory_iface,
++                                      moniker, &cookie);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = IRunningObjectTable_IsRunning(rot, moniker);
++    ok(hr == S_OK, "got %#lx\n", hr);
++
++    hr = CoDisconnectObject((IUnknown *)&factory.IClassFactory_iface, 0);
++    ok(hr == S_OK, "got %#lx\n", hr);
++
++    hr = IRunningObjectTable_IsRunning(rot, moniker);
++    ok(hr == S_FALSE, "got %#lx\n", hr);
++    object = NULL;
++    hr = IRunningObjectTable_GetObject(rot, moniker, &object);
++    ok(hr == MK_E_UNAVAILABLE, "got %#lx\n", hr);
++    ok(!object, "got %p\n", object);
++    hr = IRunningObjectTable_GetTimeOfLastChange(rot, moniker, &time);
++    ok(hr == MK_E_UNAVAILABLE, "got %#lx\n", hr);
++    listed = FALSE;
++    hr = IRunningObjectTable_EnumRunning(rot, &enum_moniker);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    while (IEnumMoniker_Next(enum_moniker, 1, &found, NULL) == S_OK)
++    {
++        if (IMoniker_IsEqual(found, moniker) == S_OK) listed = TRUE;
++        IMoniker_Release(found);
++    }
++    IEnumMoniker_Release(enum_moniker);
++    ok(!listed, "the moniker is listed\n");
++
++    hr = IRunningObjectTable_Revoke(rot, cookie);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = IRunningObjectTable_Revoke(rot, cookie);
++    ok(hr == E_INVALIDARG, "got %#lx\n", hr);
++
++    IMoniker_Release(moniker);
++    IRunningObjectTable_Release(rot);
++}
++
+ static HRESULT WINAPI ParseDisplayName_QueryInterface(IParseDisplayName *iface, REFIID riid, void **ppv)
+ {
+     if (IsEqualIID(riid, &IID_IUnknown) ||
+@@ -4622,6 +4677,7 @@ START_TEST(moniker)
+ 
+     test_ROT();
+     test_ROT_multiple_entries();
++    test_ROT_disconnected();
+     test_MkParseDisplayName();
+     test_class_moniker();
+     test_file_monikers();

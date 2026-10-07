@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 12:22:02 -0400
+Subject: [PATCH] ole32: do not flush an ILockBytes that a storage has not
+ written to.
+
+Word asks StgOpenStorageOnILockBytes of every document it opens whether it
+is a compound file.  For a document on OneDrive the ILockBytes is a stream on
+Office's local copy, which commits itself when flushed and is no longer
+usable afterwards.  The storage code flushed it on the way out of a failed
+open, and on every successful one, so Word went on to ask the size of a dead
+stream and crashed: every AutoSave document crashed Word when it was opened
+again, and at the next start as well when Word reopened it by itself.
+
+On Windows a storage that fails to open, or is opened for reading or in
+transacted mode, does not flush its ILockBytes; one open for writing in
+direct mode does, when it is released.  The ILockBytes is now flushed only
+after something was written to it, or on the release of such a direct
+writer, and data that is not a storage is reported as STG_E_FILEALREADYEXISTS
+here too, as StgOpenStorage already did and Windows does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 47edbea463e3d68babc58acd12709f33ef55d0a8)
+
+diff --git a/dlls/ole32/storage32.c b/dlls/ole32/storage32.c
+index 9397e96524b..8f68c13015f 100644
+--- a/dlls/ole32/storage32.c
++++ b/dlls/ole32/storage32.c
+@@ -2933,6 +2933,7 @@ static HRESULT StorageImpl_WriteAt(StorageImpl* This,
+   const ULONG    size,
+   ULONG*         bytesWritten)
+ {
++    This->lockBytesDirty = TRUE;
+     return ILockBytes_WriteAt(This->lockBytes,offset,buffer,size,bytesWritten);
+ }
+ 
+@@ -4324,7 +4325,10 @@ static ULONG StorageImpl_GetNextFreeBigBlock(
+   ILockBytes_Stat(This->lockBytes, &statstg, STATFLAG_NONAME);
+ 
+   if (neededSize.QuadPart > statstg.cbSize.QuadPart)
++  {
++    This->lockBytesDirty = TRUE;
+     ILockBytes_SetSize(This->lockBytes, neededSize);
++  }
+ 
+   This->prevFreeBlock = freeBlock;
+ 
+@@ -4659,6 +4663,7 @@ static HRESULT StorageImpl_Refresh(StorageImpl *This, BOOL new_object, BOOL crea
+ 
+     /* Discard any existing data. */
+     size.QuadPart = 0;
++    This->lockBytesDirty = TRUE;
+     ILockBytes_SetSize(This->lockBytes, size);
+ 
+     /*
+@@ -4691,6 +4696,7 @@ static HRESULT StorageImpl_Refresh(StorageImpl *This, BOOL new_object, BOOL crea
+      */
+     size.HighPart = 0;
+     size.LowPart  = This->bigBlockSize * 3;
++    This->lockBytesDirty = TRUE;
+     ILockBytes_SetSize(This->lockBytes, size);
+ 
+     /*
+@@ -5194,8 +5200,13 @@ static HRESULT StorageImpl_Flush(StorageBaseImpl *storage)
+     if (This->blockChainCache[i])
+       hr = BlockChainStream_Flush(This->blockChainCache[i]);
+ 
+-  if (SUCCEEDED(hr))
++  /* A storage that wrote nothing leaves its ILockBytes alone, as on Windows: some of them
++   * commit themselves on Flush. */
++  if (SUCCEEDED(hr) && This->lockBytesDirty)
++  {
+     hr = ILockBytes_Flush(This->lockBytes);
++    if (SUCCEEDED(hr)) This->lockBytesDirty = FALSE;
++  }
+ 
+   return hr;
+ }
+@@ -5340,6 +5351,7 @@ static HRESULT StorageImpl_Construct(
+    */
+   This->bigBlockSize   = sector_size;
+   This->smallBlockSize = DEF_SMALL_BLOCK_SIZE;
++  This->lockBytesDirty = FALSE;
+   if (hFile)
+     hr = FileLockBytesImpl_Construct(hFile, openFlags, pwcsName, &This->lockBytes);
+   else
+@@ -5372,6 +5384,10 @@ static HRESULT StorageImpl_Construct(
+   else
+   {
+     StorageImpl_Flush(&This->base);
++    /* Opened for writing in direct mode, it flushes its ILockBytes when released, whether or
++     * not it wrote anything. */
++    if (STGM_ACCESS_MODE(openFlags) != STGM_READ && !(openFlags & STGM_TRANSACTED))
++      This->lockBytesDirty = TRUE;
+     *result = This;
+   }
+ 
+@@ -9025,6 +9041,9 @@ HRESULT WINAPI StgOpenStorageOnILockBytes(
+ 
+   if (FAILED(hr))
+   {
++    /* As for a file, data that is not a storage is reported as such. */
++    if (hr == STG_E_INVALIDHEADER)
++      hr = STG_E_FILEALREADYEXISTS;
+     return hr;
+   }
+ 
+diff --git a/dlls/ole32/storage32.h b/dlls/ole32/storage32.h
+index dd4b89aceec..203df1a8181 100644
+--- a/dlls/ole32/storage32.h
++++ b/dlls/ole32/storage32.h
+@@ -414,6 +414,7 @@ struct StorageImpl
+   ULONG locks_supported;
+ 
+   ILockBytes* lockBytes;
++  BOOL lockBytesDirty; /* written to since it was last flushed */
+ 
+   ULONG locked_bytes[8];
+ };
+diff --git a/dlls/ole32/tests/storage32.c b/dlls/ole32/tests/storage32.c
+index 7adb129962e..31548cea2e7 100644
+--- a/dlls/ole32/tests/storage32.c
++++ b/dlls/ole32/tests/storage32.c
+@@ -63,6 +63,7 @@ typedef struct TestLockBytes {
+     HRESULT lock_hr;
+     ULONG locks_supported;
+     ULONG lock_called;
++    ULONG flush_called;
+ } TestLockBytes;
+ 
+ static inline TestLockBytes *impl_from_ILockBytes(ILockBytes *iface)
+@@ -152,6 +153,8 @@ static HRESULT WINAPI TestLockBytes_WriteAt(ILockBytes *iface,
+ 
+ static HRESULT WINAPI TestLockBytes_Flush(ILockBytes *iface)
+ {
++    TestLockBytes *This = impl_from_ILockBytes(iface);
++    This->flush_called++;
+     return S_OK;
+ }
+ 
+@@ -4050,6 +4053,72 @@ static void test_MoveElementTo(void)
+     DeleteFileW(dst_name);
+ }
+ 
++static void test_lockbytes_flush(void)
++{
++    static const struct
++    {
++        DWORD mode;
++        ULONG flushes;
++    }
++    open_tests[] =
++    {
++        { STGM_READ | STGM_SHARE_DENY_WRITE, 0 },
++        { STGM_READ | STGM_SHARE_EXCLUSIVE, 0 },
++        { STGM_READ | STGM_SHARE_DENY_NONE | STGM_TRANSACTED, 0 },
++        { STGM_READWRITE | STGM_SHARE_EXCLUSIVE | STGM_TRANSACTED, 0 },
++        { STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 1 },
++    };
++    static const WCHAR stmname[] = L"CONTENTS";
++    TestLockBytes *lockbytes;
++    ULARGE_INTEGER offset = {{0}}, size;
++    IStorage *stg;
++    IStream *stm;
++    unsigned int i;
++    HRESULT hr;
++
++    /* Data that is not a storage is refused without flushing the ILockBytes. */
++    CreateTestLockBytes(&lockbytes);
++    size.QuadPart = 4096;
++    ILockBytes_SetSize(&lockbytes->ILockBytes_iface, size);
++    hr = ILockBytes_WriteAt(&lockbytes->ILockBytes_iface, offset, "PK\3\4", 4, NULL);
++    ok(hr == S_OK, "WriteAt failed: %#lx\n", hr);
++
++    for (i = 0; i < ARRAY_SIZE(open_tests); i++)
++    {
++        lockbytes->flush_called = 0;
++        stg = NULL;
++        hr = StgOpenStorageOnILockBytes(&lockbytes->ILockBytes_iface, NULL, open_tests[i].mode, NULL, 0, &stg);
++        ok(hr == STG_E_FILEALREADYEXISTS, "%u: got %#lx\n", i, hr);
++        ok(!stg, "%u: got storage %p\n", i, stg);
++        ok(!lockbytes->flush_called, "%u: Flush called %lu times\n", i, lockbytes->flush_called);
++    }
++    DeleteTestLockBytes(lockbytes);
++
++    /* A storage that is only read leaves the ILockBytes alone; one open for writing in direct
++     * mode flushes it when released. */
++    CreateTestLockBytes(&lockbytes);
++    hr = StgCreateDocfileOnILockBytes(&lockbytes->ILockBytes_iface, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, &stg);
++    ok(hr == S_OK, "StgCreateDocfileOnILockBytes failed: %#lx\n", hr);
++    hr = IStorage_CreateStream(stg, stmname, STGM_SHARE_EXCLUSIVE | STGM_READWRITE, 0, 0, &stm);
++    ok(hr == S_OK, "CreateStream failed: %#lx\n", hr);
++    IStream_Write(stm, "data", 4, NULL);
++    IStream_Release(stm);
++    IStorage_Commit(stg, STGC_DEFAULT);
++    IStorage_Release(stg);
++
++    for (i = 0; i < ARRAY_SIZE(open_tests); i++)
++    {
++        lockbytes->flush_called = 0;
++        hr = StgOpenStorageOnILockBytes(&lockbytes->ILockBytes_iface, NULL, open_tests[i].mode, NULL, 0, &stg);
++        ok(hr == S_OK, "%u: got %#lx\n", i, hr);
++        if (FAILED(hr)) continue;
++        ok(!lockbytes->flush_called, "%u: Flush called %lu times while opening\n", i, lockbytes->flush_called);
++        IStorage_Release(stg);
++        ok(lockbytes->flush_called == open_tests[i].flushes, "%u: Flush called %lu times\n", i, lockbytes->flush_called);
++    }
++    DeleteTestLockBytes(lockbytes);
++}
++
+ START_TEST(storage32)
+ {
+     CHAR temp[MAX_PATH];
+@@ -4100,4 +4169,5 @@ START_TEST(storage32)
+     test_overwrite();
+     test_custom_lockbytes();
+     test_MoveElementTo();
++    test_lockbytes_flush();
+ }

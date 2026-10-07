@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 19:52:27 -0400
+Subject: [PATCH] wininet: keep the cookies a response sets where Windows keeps
+ them.
+
+A cookie a response sets without a Path of its own was kept for the
+request's whole path, so "Set-Cookie: a=1" in the answer to /dup was
+sent back to /dup alone.  It belongs to the directory of the request,
+as a cookie InternetSetCookie is given a URL for already does and as
+Windows does: back with /echo, and with /dir/other for /dir/page.
+
+A cookie set again went to the end of its container, so "a=1; b=2"
+became "b=2; a=1" when a was set again.  It takes the old one's place
+and creation time instead, as RFC 6265 has it and Windows does.
+
+Both measured through Windows.Web.Http on Windows, which sends WinINet's
+cookies; the test runs on Windows too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 486197e3c7e79e7b6c93cc914edd417d5cc3464e)
+
+diff --git a/dlls/wininet/cookie.c b/dlls/wininet/cookie.c
+index dd43485658b..b729bc00072 100644
+--- a/dlls/wininet/cookie.c
++++ b/dlls/wininet/cookie.c
+@@ -1037,7 +1037,6 @@ DWORD set_cookie(substr_t domain, substr_t path, substr_t name, substr_t data, D
+ 
+         if (!(thisCookie->flags & INTERNET_COOKIE_IS_SESSION))
+             update_persistent = TRUE;
+-        delete_cookie(thisCookie);
+     }
+ 
+     TRACE("setting cookie %s=%s for domain %s path %s\n", debugstr_wn(name.str, name.len),
+@@ -1047,14 +1046,23 @@ DWORD set_cookie(substr_t domain, substr_t path, substr_t name, substr_t data, D
+     if (!expired) {
+         cookie_t *new_cookie;
+ 
+-        new_cookie = alloc_cookie(name, value, expiry, create, cookie_flags);
++        /* A cookie that replaces one takes its creation time and its place,
++         * as RFC 6265 has it and Windows does: "Cookie: a=1; b=2" stays in
++         * that order when a is set again. */
++        new_cookie = alloc_cookie(name, value, expiry, thisCookie ? thisCookie->create : create, cookie_flags);
+         if(!new_cookie) {
+             LeaveCriticalSection(&cookie_cs);
+             return COOKIE_STATE_UNKNOWN;
+         }
+ 
+-        add_cookie(container, new_cookie);
++        if (thisCookie) {
++            list_add_before(&thisCookie->entry, &new_cookie->entry);
++            new_cookie->container = container;
++        }
++        else add_cookie(container, new_cookie);
+     }
++    if (thisCookie)
++        delete_cookie(thisCookie);
+ 
+     if (!update_persistent || save_persistent_cookie(container))
+     {
+diff --git a/dlls/wininet/http.c b/dlls/wininet/http.c
+index ae746db955f..5b80b71cc6d 100644
+--- a/dlls/wininet/http.c
++++ b/dlls/wininet/http.c
+@@ -649,10 +649,22 @@ static void HTTP_ProcessCookies( http_request_t *request )
+     int HeaderIndex;
+     int numCookies = 0;
+     LPHTTPHEADERW setCookieHeader;
++    substr_t path = substrz(request->path);
++    const WCHAR *query;
+ 
+     if(request->hdr.dwFlags & INTERNET_FLAG_NO_COOKIES)
+         return;
+ 
++    /* A cookie without a path of its own belongs to the directory of the
++     * request, as one InternetSetCookie is given a URL for does: one set by
++     * "/dir/page?x" goes back with "/dir/other". */
++    for(query = path.str; query < path.str + path.len && *query != '?'; query++);
++    path.len = query - path.str;
++    while(path.len && path.str[path.len-1] != '/')
++        path.len--;
++    if(!path.len)
++        path = substr(L"/", 1);
++
+     EnterCriticalSection( &request->headers_section );
+ 
+     while((HeaderIndex = HTTP_GetCustomHeaderIndex(request, L"Set-Cookie", numCookies++, FALSE)) != -1)
+@@ -671,7 +683,7 @@ static void HTTP_ProcessCookies( http_request_t *request )
+ 
+         name = substr(setCookieHeader->lpszValue, data - setCookieHeader->lpszValue);
+         data++;
+-        set_cookie(substrz(request->server->name), substrz(request->path), name, substrz(data), INTERNET_COOKIE_HTTPONLY);
++        set_cookie(substrz(request->server->name), path, name, substrz(data), INTERNET_COOKIE_HTTPONLY);
+     }
+ 
+     LeaveCriticalSection( &request->headers_section );
+diff --git a/dlls/wininet/tests/http.c b/dlls/wininet/tests/http.c
+index 2b99acf40bf..8dcec0b0ef6 100644
+--- a/dlls/wininet/tests/http.c
++++ b/dlls/wininet/tests/http.c
+@@ -2708,6 +2708,17 @@ static DWORD CALLBACK server_thread(LPVOID param)
+             else
+                 send(c, notokmsg, sizeof notokmsg-1, 0);
+         }
++        if (strstr(buffer, "GET /cookie_dir/page "))
++        {
++            static const char msg[] = "HTTP/1.1 200 OK\r\nSet-Cookie: c1=1\r\nSet-Cookie: c2=2\r\n"
++                                      "Content-Length: 0\r\n\r\n";
++            send(c, msg, sizeof msg-1, 0);
++        }
++        if (strstr(buffer, "GET /cookie_dir/again "))
++        {
++            static const char msg[] = "HTTP/1.1 200 OK\r\nSet-Cookie: c1=3\r\nContent-Length: 0\r\n\r\n";
++            send(c, msg, sizeof msg-1, 0);
++        }
+         if (strstr(buffer, "/testC"))
+         {
+             if (strstr(buffer, "Cookie: cookie=biscuit"))
+@@ -4482,6 +4493,42 @@ static void test_cookie_header(int port)
+     InternetCloseHandle(ses);
+ }
+ 
++/* What WinINet does with the cookies a response sets. */
++static void test_response_cookies(int port)
++{
++    test_request_t req;
++    char buffer[1024];
++    DWORD size;
++    BOOL ret;
++
++    /* a cookie without a path of its own belongs to the directory of the request */
++    open_simple_request(&req, "localhost", port, "GET", "/cookie_dir/page");
++    ret = HttpSendRequestA(req.request, NULL, 0, NULL, 0);
++    ok(ret, "HttpSendRequest failed: %lu\n", GetLastError());
++    test_status_code(req.request, 200);
++    close_request(&req);
++
++    size = sizeof(buffer);
++    ret = InternetGetCookieA("http://localhost/cookie_dir/other", NULL, buffer, &size);
++    ok(ret, "InternetGetCookie failed: %lu\n", GetLastError());
++    ok(ret && strstr(buffer, "c1=1; c2=2") != NULL, "got %s\n", ret ? buffer : "nothing");
++    size = sizeof(buffer);
++    ret = InternetGetCookieA("http://localhost/elsewhere", NULL, buffer, &size);
++    ok(!ret || !strstr(buffer, "c1="), "got %s\n", buffer);
++
++    /* one set again keeps its place */
++    open_simple_request(&req, "localhost", port, "GET", "/cookie_dir/again");
++    ret = HttpSendRequestA(req.request, NULL, 0, NULL, 0);
++    ok(ret, "HttpSendRequest failed: %lu\n", GetLastError());
++    test_status_code(req.request, 200);
++    close_request(&req);
++
++    size = sizeof(buffer);
++    ret = InternetGetCookieA("http://localhost/cookie_dir/other", NULL, buffer, &size);
++    ok(ret, "InternetGetCookie failed: %lu\n", GetLastError());
++    ok(ret && strstr(buffer, "c1=3; c2=2") != NULL, "got %s\n", ret ? buffer : "nothing");
++}
++
+ static void test_basic_authentication(int port)
+ {
+     HINTERNET session, connect, request;
+@@ -6917,6 +6964,7 @@ static void test_http_connection(void)
+     test_connection_header(si.port);
+     test_header_override(si.port);
+     test_cookie_header(si.port);
++    test_response_cookies(si.port);
+     test_basic_authentication(si.port);
+     test_invalid_response_headers(si.port);
+     test_response_without_headers(si.port);

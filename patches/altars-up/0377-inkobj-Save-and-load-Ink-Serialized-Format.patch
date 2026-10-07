@@ -1,0 +1,3286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 12:56:24 -0400
+Subject: [PATCH] inkobj: Save and load Ink Serialized Format.
+
+Office asks whether the ink platform is there, and when it is, it loads an
+ISF stream into a new InkDisp before it creates any other ink object; a
+failing Load leaves it with no ink objects at all, so the slide show pen
+draws nothing.  With the platform absent it takes a path where new ink
+keeps no InkML, and a kept slide show annotation saves as an empty
+ppt/ink/ink1.xml.
+
+Load takes raw ISF, "base64:" text and the comment extension of a GIF;
+Save writes raw ISF and base64 with each compression mode (GIF output is
+not done).  The decoder handles the GUID table, the ink space rectangle,
+drawing attributes (the mantissa of pen sizes, custom attributes), stroke
+descriptors with buttons and stroke property lists, metrics, the float and
+double transform tables, packet data compressed with the default Huffman
+tables or bit packing with and without delta-delta, property data
+compressed by bit packing or LZ with embedded variant types, point
+property blocks and unknown tags with sizes.  The format follows
+Microsoft's published ISF specification; tag values, the default Huffman
+tables and the drawing flags follow WPF's MIT-licensed implementation.
+
+Not measured on Windows yet (tools/isfprobe): loading into ink that has
+strokes (refused, as WPF does), the dirty flag after Load, the error codes
+for bad arguments, and the "base64:" header on Save.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/inkobj/Makefile.in b/dlls/inkobj/Makefile.in
+index 5219c126be8..6052bd5fd06 100644
+--- a/dlls/inkobj/Makefile.in
++++ b/dlls/inkobj/Makefile.in
+@@ -7,6 +7,7 @@ VER_OLESELFREGISTER     = 1
+ SOURCES = \
+ 	attributes.c \
+ 	ink.c \
++	isf.c \
+ 	inkobj_reg.idl \
+ 	inkobj_tlb.idl \
+ 	main.c \
+diff --git a/dlls/inkobj/ink.c b/dlls/inkobj/ink.c
+index a727bc680bd..0d13c2100ea 100644
+--- a/dlls/inkobj/ink.c
++++ b/dlls/inkobj/ink.c
+@@ -80,7 +80,7 @@ void stroke_data_release(struct stroke_data *data)
+     free(data);
+ }
+ 
+-static HRESULT stroke_data_create(unsigned int packet_size, const GUID *description, unsigned int packet_count,
++HRESULT stroke_data_create(unsigned int packet_size, const GUID *description, unsigned int packet_count,
+         const LONG *packets, IInkDrawingAttributes *attributes, struct stroke_data **out)
+ {
+     struct stroke_data *data;
+@@ -101,7 +101,7 @@ static HRESULT stroke_data_create(unsigned int packet_size, const GUID *descript
+     memcpy(data->description, description, packet_size * sizeof(*description));
+     for (unsigned int i = 0; i < packet_size; ++i)
+         default_metrics(&description[i], &data->metrics[i]);
+-    memcpy(data->packets, packets, packet_count * packet_size * sizeof(*packets));
++    if (packet_count) memcpy(data->packets, packets, packet_count * packet_size * sizeof(*packets));
+ 
+     if (attributes) hr = drawing_attributes_clone(attributes, &data->attributes);
+     else hr = drawing_attributes_create(&data->attributes);
+@@ -2927,17 +2927,310 @@ static HRESULT WINAPI ink_AddStrokesAtRectangle(IInkDisp *iface, IInkStrokes *st
+     return hr;
+ }
+ 
++/* 将 Base64 字符转换为数值。 */
++static int isf_base64_digit(BYTE c)
++{
++    if (c >= 'A' && c <= 'Z')
++        return c - 'A';
++    if (c >= 'a' && c <= 'z')
++        return c - 'a' + 26;
++    if (c >= '0' && c <= '9')
++        return c - '0' + 52;
++    if (c == '+')
++        return 62;
++    if (c == '/')
++        return 63;
++    return -1;
++}
++
++/* 解码 Base64 包装的墨迹数据。 */
++static HRESULT ink_decode_base64(const BYTE *input, SIZE_T length, BYTE **out, SIZE_T *size)
++{
++    BYTE *bytes;
++    unsigned int bits = 0;
++    unsigned int value = 0;
++    unsigned int padding = 0;
++    SIZE_T i;
++    SIZE_T n = 0;
++    int digit;
++
++    if (length && !input[length - 1])
++        --length;
++    if (!(bytes = malloc(max((SIZE_T)1, length))))
++        return E_OUTOFMEMORY;
++    for (i = 0; i < length; ++i)
++    {
++        if (input[i] == '=')
++        {
++            ++padding;
++            continue;
++        }
++        if ((digit = isf_base64_digit(input[i])) < 0 || padding)
++        {
++            free(bytes);
++            return E_INVALIDARG;
++        }
++        value = value << 6 | digit;
++        bits += 6;
++        if (bits >= 8)
++        {
++            bits -= 8;
++            bytes[n++] = value >> bits;
++            value &= (1u << bits) - 1;
++        }
++    }
++    if (padding > 2 || (padding && (length & 3)) || bits != (padding ? (padding == 1 ? 2 : 4) : 0) || value)
++    {
++        free(bytes);
++        return E_INVALIDARG;
++    }
++    *out = bytes;
++    *size = n;
++    return S_OK;
++}
++
++/* 读取 GIF 注释中的墨迹数据。 */
++static HRESULT ink_gif_comment(const BYTE *gif, SIZE_T length, BYTE **out, SIZE_T *size)
++{
++    BYTE *result = NULL;
++    BYTE *p;
++    SIZE_T pos = 13;
++    SIZE_T total = 0;
++    SIZE_T table, n;
++    BYTE flags;
++    BOOL finished = FALSE;
++
++    if (length < pos || (memcmp(gif, "GIF87a", 6) && memcmp(gif, "GIF89a", 6)))
++        return E_INVALIDARG;
++    flags = gif[10];
++    if (flags & 0x80)
++    {
++        table = 3u << ((flags & 7) + 1);
++        if (table > length - pos)
++            return E_INVALIDARG;
++        pos += table;
++    }
++    while (pos < length)
++    {
++        flags = gif[pos++];
++        if (flags == 0x3b)
++        {
++            finished = TRUE;
++            break;
++        }
++        if (flags == 0x2c)
++        {
++            if (length - pos < 9)
++                break;
++            flags = gif[pos + 8];
++            pos += 9;
++            if (flags & 0x80)
++            {
++                table = 3u << ((flags & 7) + 1);
++                if (table > length - pos)
++                    break;
++                pos += table;
++            }
++            if (pos == length)
++                break;
++            ++pos;
++            flags = 0;
++        }
++        else if (flags == 0x21)
++        {
++            if (pos == length)
++                break;
++            flags = gif[pos++];
++        }
++        else
++            break;
++        do
++        {
++            if (pos == length)
++                goto invalid;
++            n = gif[pos++];
++            if (n > length - pos || n > SIZE_MAX - total)
++                goto invalid;
++            if (flags == 0xfe && n)
++            {
++                if (!(p = realloc(result, total + n)))
++                {
++                    free(result);
++                    return E_OUTOFMEMORY;
++                }
++                result = p;
++                memcpy(result + total, gif + pos, n);
++                total += n;
++            }
++            pos += n;
++        }
++        while (n);
++    }
++    if (!finished || !total)
++        goto invalid;
++    *out = result;
++    *size = total;
++    return S_OK;
++invalid:
++    free(result);
++    return E_INVALIDARG;
++}
++
++/* 将墨迹保存到字节数组。 */
+ static HRESULT WINAPI ink_Save(IInkDisp *iface, InkPersistenceFormat format, InkPersistenceCompressionMode compression,
+         VARIANT *data)
+ {
+-    FIXME("iface %p, format %d, compression %d, data %p, not implemented.\n", iface, format, compression, data);
+-    return E_NOTIMPL;
++    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    struct ink *ink = impl_from_IInkDisp(iface);
++    struct stroke_data **strokes;
++    unsigned int count;
++    SIZE_T size, encoded_size, i, j;
++    BYTE *bytes, *dest;
++    SAFEARRAY *array;
++    HRESULT hr;
++
++    TRACE("iface %p, format %d, compression %d, data %p.\n", iface, format, compression, data);
++    if (!data)
++        return E_POINTER;
++    VariantInit(data);
++    if (compression < IPCM_Default || compression > IPCM_NoCompression ||
++            format < IPF_InkSerializeFormat || format > IPF_Base64GIF) return E_INVALIDARG;
++    if (format == IPF_GIF || format == IPF_Base64GIF)
++    {
++        FIXME("GIF persistence is not implemented.\n");
++        return E_NOTIMPL;
++    }
++    if (FAILED(hr = ink_get_data(ink, &strokes, &count)))
++        return hr;
++    hr = isf_encode(strokes, count, ink->properties, compression, &bytes, &size);
++    strokes_free_data(strokes, count);
++    if (FAILED(hr))
++        return hr;
++    if (format == IPF_Base64InkSerializedFormat)
++    {
++        if (size > (SIZE_MAX - 8) / 4 * 3)
++        {
++            free(bytes);
++            return E_OUTOFMEMORY;
++        }
++        encoded_size = 7 + 4 * ((size + 2) / 3) + 1;
++    }
++    else
++        encoded_size = size;
++    if (encoded_size > UINT_MAX || !(array = SafeArrayCreateVector(VT_UI1, 0, encoded_size)))
++    {
++        free(bytes);
++        return E_OUTOFMEMORY;
++    }
++    if (FAILED(hr = SafeArrayAccessData(array, (void **)&dest)))
++    {
++        SafeArrayDestroy(array);
++        free(bytes);
++        return hr;
++    }
++    if (format == IPF_Base64InkSerializedFormat)
++    {
++        memcpy(dest, "base64:", 7);
++        j = 7;
++        for (i = 0; i < size; i += 3)
++        {
++            unsigned int value = bytes[i] << 16 | (i + 1 < size ? bytes[i + 1] << 8 : 0) |
++                    (i + 2 < size ? bytes[i + 2] : 0);
++            dest[j++] = alphabet[(value >> 18) & 63];
++            dest[j++] = alphabet[(value >> 12) & 63];
++            dest[j++] = i + 1 < size ? alphabet[(value >> 6) & 63] : '=';
++            dest[j++] = i + 2 < size ? alphabet[value & 63] : '=';
++        }
++        dest[j] = 0;
++    }
++    else
++        memcpy(dest, bytes, size);
++    SafeArrayUnaccessData(array);
++    free(bytes);
++    V_VT(data) = VT_ARRAY | VT_UI1;
++    V_ARRAY(data) = array;
++    return S_OK;
+ }
+ 
++/* 从字节数组加载墨迹。 */
+ static HRESULT WINAPI ink_Load(IInkDisp *iface, VARIANT data)
+ {
+-    FIXME("iface %p, data %s, not implemented.\n", iface, debugstr_variant(&data));
+-    return E_NOTIMPL;
++    struct ink *ink = impl_from_IInkDisp(iface);
++    struct stroke_data **strokes = NULL;
++    IInkExtendedProperties *properties = NULL;
++    SAFEARRAY *array;
++    const BYTE *raw, *input;
++    BYTE *allocated = NULL;
++    SIZE_T size;
++    unsigned int count = 0;
++    unsigned int i;
++    LONG lower, upper;
++    HRESULT hr;
++
++    TRACE("iface %p, data %s.\n", iface, debugstr_variant(&data));
++
++    /* UNMEASURED: WPF refuses to load into ink that has strokes */
++    EnterCriticalSection(&ink->cs);
++    hr = list_empty(&ink->strokes) ? S_OK : E_UNEXPECTED;
++    LeaveCriticalSection(&ink->cs);
++    if (FAILED(hr))
++        return hr;
++    if (V_VT(&data) == (VT_ARRAY | VT_UI1))
++        array = V_ARRAY(&data);
++    else if (V_VT(&data) == (VT_BYREF | VT_ARRAY | VT_UI1) && V_ARRAYREF(&data))
++        array = *V_ARRAYREF(&data);
++    else
++        return E_INVALIDARG;
++    if (!array || SafeArrayGetDim(array) != 1 || FAILED(SafeArrayGetLBound(array, 1, &lower)) ||
++            FAILED(SafeArrayGetUBound(array, 1, &upper)) || upper < lower) return E_INVALIDARG;
++    size = (SIZE_T)((INT64)upper - lower + 1);
++    if (FAILED(hr = SafeArrayAccessData(array, (void **)&raw)))
++        return hr;
++    input = raw;
++    if (size >= 7 && !memcmp(raw, "base64:", 7))
++        hr = ink_decode_base64(raw + 7, size - 7, &allocated, &size);
++    else if (size >= 3 && !memcmp(raw, "GIF", 3))
++        hr = ink_gif_comment(raw, size, &allocated, &size);
++    else
++        hr = S_OK;
++    if (SUCCEEDED(hr) && allocated && size >= 3 && !memcmp(allocated, "GIF", 3))
++    {
++        BYTE *comment;
++        SIZE_T comment_size;
++        hr = ink_gif_comment(allocated, size, &comment, &comment_size);
++        free(allocated);
++        allocated = SUCCEEDED(hr) ? comment : NULL;
++        if (SUCCEEDED(hr))
++            size = comment_size;
++    }
++    if (SUCCEEDED(hr))
++    {
++        if (allocated)
++            input = allocated;
++        if (SUCCEEDED(hr = extended_properties_create(&properties)))
++            hr = isf_decode(input, size, properties, &strokes, &count);
++    }
++    SafeArrayUnaccessData(array);
++    free(allocated);
++    if (SUCCEEDED(hr))
++    {
++        EnterCriticalSection(&ink->cs);
++        if (!list_empty(&ink->strokes))
++            hr = E_UNEXPECTED;
++        /* the ink keeps its properties object, so one taken before Load sees the loaded properties */
++        else if (SUCCEEDED(hr = IInkExtendedProperties_Clear(ink->properties))
++                && SUCCEEDED(hr = extended_properties_copy(ink->properties, properties)))
++        {
++            for (i = 0; i < count; i++)
++                ink_add_stroke(ink, strokes[i]);
++            ink->dirty = VARIANT_FALSE; /* UNMEASURED */
++        }
++        LeaveCriticalSection(&ink->cs);
++    }
++    strokes_free_data(strokes, count);
++    if (properties)
++        IInkExtendedProperties_Release(properties);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI ink_CreateStroke(IInkDisp *iface, VARIANT packet_data, VARIANT packet_description,
+diff --git a/dlls/inkobj/inkobj_private.h b/dlls/inkobj/inkobj_private.h
+index 4e8f2f6c731..2f33fc9621a 100644
+--- a/dlls/inkobj/inkobj_private.h
++++ b/dlls/inkobj/inkobj_private.h
+@@ -153,6 +153,12 @@ struct stroke_data
+ };
+ 
+ HRESULT ink_create(IInkDisp **out);
++HRESULT stroke_data_create(unsigned int packet_size, const GUID *description, unsigned int packet_count,
++        const LONG *packets, IInkDrawingAttributes *attributes, struct stroke_data **out);
++HRESULT isf_decode(const BYTE *data, SIZE_T size, IInkExtendedProperties *ink_properties,
++        struct stroke_data ***strokes, unsigned int *count);
++HRESULT isf_encode(struct stroke_data **strokes, unsigned int count, IInkExtendedProperties *ink_properties,
++        InkPersistenceCompressionMode compression, BYTE **data, SIZE_T *size);
+ struct stroke_data *stroke_data_from_IInkStrokeDisp(IInkStrokeDisp *iface);
+ HRESULT strokes_get_data(IInkStrokes *iface, struct stroke_data ***data, unsigned int *count);
+ void strokes_free_data(struct stroke_data **data, unsigned int count);
+diff --git a/dlls/inkobj/isf.c b/dlls/inkobj/isf.c
+new file mode 100644
+index 00000000000..6f183fe3955
+--- /dev/null
++++ b/dlls/inkobj/isf.c
+@@ -0,0 +1,2140 @@
++/*
++ * Ink Serialized Format (ISF). The format follows Microsoft's ISF specification;
++ * tag values and default tables follow dotnet/wpf's MIT-licensed implementation.
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <limits.h>
++#include <math.h>
++#include <stdint.h>
++
++#include "inkobj_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(inkobj);
++
++enum isf_tag
++{
++    TAG_INK_RECT = 0,
++    TAG_GUID_TABLE = 1,
++    TAG_DA_TABLE = 2,
++    TAG_DA_BLOCK = 3,
++    TAG_DESC_TABLE = 4,
++    TAG_DESC_BLOCK = 5,
++    TAG_BUTTONS = 6,
++    TAG_NO_X = 7,
++    TAG_NO_Y = 8,
++    TAG_DIDX = 9,
++    TAG_STROKE = 10,
++    TAG_STROKE_PROPERTIES = 11,
++    TAG_POINT_PROPERTIES = 12,
++    TAG_SIDX = 13,
++    TAG_COMPRESSION_HEADER = 14,
++    TAG_TRANSFORM_TABLE = 15,
++    TAG_TRANSFORM = 16,
++    TAG_ISO_SCALE = 17,
++    TAG_ANISO_SCALE = 18,
++    TAG_ROTATE = 19,
++    TAG_TRANSLATE = 20,
++    TAG_SCALE_TRANSLATE = 21,
++    TAG_QUAD = 22,
++    TAG_TIDX = 23,
++    TAG_METRIC_TABLE = 24,
++    TAG_METRIC_BLOCK = 25,
++    TAG_MIDX = 26,
++    TAG_MANTISSA = 27,
++    TAG_PERSISTENCE = 28,
++    TAG_HIMETRIC_SIZE = 29,
++    TAG_STROKE_IDS = 30,
++    TAG_EXT_TRANSFORM_TABLE = 31,
++    TAG_GUID_X = 50,
++    TAG_GUID_Y = 51,
++    TAG_GUID_Z = 52,
++    TAG_GUID_PACKET_STATUS = 53,
++    TAG_GUID_TIMER_TICK = 54,
++    TAG_GUID_SERIAL_NUMBER = 55,
++    TAG_GUID_NORMAL_PRESSURE = 56,
++    TAG_GUID_TANGENT_PRESSURE = 57,
++    TAG_GUID_BUTTON_PRESSURE = 58,
++    TAG_GUID_X_TILT_ORIENTATION = 59,
++    TAG_GUID_Y_TILT_ORIENTATION = 60,
++    TAG_GUID_AZIMUTH_ORIENTATION = 61,
++    TAG_GUID_ALTITUDE_ORIENTATION = 62,
++    TAG_GUID_TWIST_ORIENTATION = 63,
++    TAG_GUID_PITCH_ROTATION = 64,
++    TAG_GUID_ROLL_ROTATION = 65,
++    TAG_GUID_YAW_ROTATION = 66,
++    TAG_GUID_PEN_STYLE = 67,
++    TAG_GUID_COLORREF = 68,
++    TAG_GUID_PEN_WIDTH = 69,
++    TAG_GUID_PEN_HEIGHT = 70,
++    TAG_GUID_PEN_TIP = 71,
++    TAG_GUID_DRAWING_FLAGS = 72,
++    TAG_GUID_CURSOR_ID = 73,
++    TAG_GUID_WORD_ALTERNATES = 74,
++    TAG_GUID_CHAR_ALTERNATES = 75,
++    TAG_GUID_INKMETRICS = 76,
++    TAG_GUID_GUIDE_STRUCTURE = 77,
++    TAG_GUID_TIME_STAMP = 78,
++    TAG_GUID_LANGUAGE = 79,
++    TAG_GUID_TRANSPARENCY = 80,
++    TAG_GUID_CURVE_FITTING_ERROR = 81,
++    TAG_GUID_RECO_LATTICE = 82,
++    TAG_GUID_CURSOR_DOWN = 83,
++    TAG_GUID_SECONDARY_TIP_SWITCH = 84,
++    TAG_GUID_BARREL_DOWN = 85,
++    TAG_GUID_TABLET_PICK = 86,
++    TAG_GUID_RASTER_OPERATION = 87,
++    TAG_KNOWN_GUID_LIMIT = 88,
++    TAG_CUSTOM_GUID_BASE = 100
++};
++
++/* bits of the drawing flags attribute */
++#define DRAWING_FLAG_FIT_TO_CURVE     0x01
++#define DRAWING_FLAG_IGNORE_PRESSURE  0x04
++#define DRAWING_FLAG_ANTIALIASED      0x10
++
++static const GUID known_guids[] =
++{
++    {0x598a6a8f, 0x52c0, 0x4ba0, {0x93, 0xaf, 0xaf, 0x35, 0x74, 0x11, 0xa5, 0x61}},
++    {0xb53f9f75, 0x04e0, 0x4498, {0xa7, 0xee, 0xc3, 0x0d, 0xbb, 0x5a, 0x90, 0x11}},
++    {0x735adb30, 0x0ebb, 0x4788, {0xa0, 0xe4, 0x0f, 0x31, 0x64, 0x90, 0x05, 0x5d}},
++    {0x6e0e07bf, 0xafe7, 0x4cf7, {0x87, 0xd1, 0xaf, 0x64, 0x46, 0x20, 0x84, 0x18}},
++    {0x436510c5, 0xfed3, 0x45d1, {0x8b, 0x76, 0x71, 0xd3, 0xea, 0x7a, 0x82, 0x9d}},
++    {0x78a81b56, 0x0935, 0x4493, {0xba, 0xae, 0x00, 0x54, 0x1a, 0x8a, 0x16, 0xc4}},
++    {0x7307502d, 0xf9f4, 0x4e18, {0xb3, 0xf2, 0x2c, 0xe1, 0xb1, 0xa3, 0x61, 0x0c}},
++    {0x6da4488b, 0x5244, 0x41ec, {0x90, 0x5b, 0x32, 0xd8, 0x9a, 0xb8, 0x08, 0x09}},
++    {0x8b7fefc4, 0x96aa, 0x4bfe, {0xac, 0x26, 0x8a, 0x5f, 0x0b, 0xe0, 0x7b, 0xf5}},
++    {0xa8d07b3a, 0x8bf0, 0x40b0, {0x95, 0xa9, 0xb8, 0x0a, 0x6b, 0xb7, 0x87, 0xbf}},
++    {0x0e932389, 0x1d77, 0x43af, {0xac, 0x00, 0x5b, 0x95, 0x0d, 0x6d, 0x4b, 0x2d}},
++    {0x029123b4, 0x8828, 0x410b, {0xb2, 0x50, 0xa0, 0x53, 0x65, 0x95, 0xe5, 0xdc}},
++    {0x82dec5c7, 0xf6ba, 0x4906, {0x89, 0x4f, 0x66, 0xd6, 0x8d, 0xfc, 0x45, 0x6c}},
++    {0x0d324960, 0x13b2, 0x41e4, {0xac, 0xe6, 0x7a, 0xe9, 0xd4, 0x3d, 0x2d, 0x3b}},
++    {0x7f7e57b7, 0xbe37, 0x4be1, {0xa3, 0x56, 0x7a, 0x84, 0x16, 0x0e, 0x18, 0x93}},
++    {0x5d5d5e56, 0x6ba9, 0x4c5b, {0x9f, 0xb0, 0x85, 0x1c, 0x91, 0x71, 0x4e, 0x56}},
++    {0x6a849980, 0x7c3a, 0x45b7, {0xaa, 0x82, 0x90, 0xa2, 0x62, 0x95, 0x0e, 0x89}},
++    {0x33c1df83, 0xecdb, 0x44f0, {0xb9, 0x23, 0xdb, 0xd1, 0xa5, 0xb2, 0x13, 0x6e}},
++    {0x5329cda5, 0xfa5b, 0x4ed2, {0xbb, 0x32, 0x83, 0x46, 0x01, 0x72, 0x44, 0x28}},
++    {0x002df9af, 0xdd8c, 0x4949, {0xba, 0x46, 0xd6, 0x5e, 0x10, 0x7d, 0x1a, 0x8a}},
++    {0x9d32b7ca, 0x1213, 0x4f54, {0xb7, 0xe4, 0xc9, 0x05, 0x0e, 0xe1, 0x7a, 0x38}},
++    {0xe71caab9, 0x8059, 0x4c0d, {0xa2, 0xdb, 0x7c, 0x79, 0x54, 0x47, 0x8d, 0x82}},
++    {0x5c0b730a, 0xf394, 0x4961, {0xa9, 0x33, 0x37, 0xc4, 0x34, 0xf4, 0xb7, 0xeb}},
++    {0x2812210f, 0x871e, 0x4d91, {0x86, 0x07, 0x49, 0x32, 0x7d, 0xdf, 0x0a, 0x9f}},
++    {0x8359a0fa, 0x2f44, 0x4de6, {0x92, 0x81, 0xce, 0x5a, 0x89, 0x9c, 0xf5, 0x8f}},
++    {0x4c4642dd, 0x479e, 0x4c66, {0xb4, 0x40, 0x1f, 0xcd, 0x83, 0x95, 0x8f, 0x00}},
++    {0xce2d9a8a, 0xe58e, 0x40ba, {0x93, 0xfa, 0x18, 0x9b, 0xb3, 0x90, 0x00, 0xae}},
++    {0xc3c7480f, 0x5839, 0x46ef, {0xa5, 0x66, 0xd8, 0x48, 0x1c, 0x7a, 0xfe, 0xc1}},
++    {0xea2278af, 0xc59d, 0x4ef4, {0x98, 0x5b, 0xd4, 0xbe, 0x12, 0xdf, 0x22, 0x34}},
++    {0xb8630dc9, 0xcc5c, 0x4c33, {0x8d, 0xad, 0xb4, 0x7f, 0x62, 0x2b, 0x8c, 0x79}},
++    {0x15e2f8e6, 0x6381, 0x4e8b, {0xa9, 0x65, 0x01, 0x1f, 0x7d, 0x7f, 0xca, 0x38}},
++    {0x7066fbe4, 0x473e, 0x4675, {0x9c, 0x25, 0x00, 0x26, 0x82, 0x9b, 0x40, 0x1f}},
++    {0xbbc85b9a, 0xade6, 0x4093, {0xb3, 0xbb, 0x64, 0x1f, 0xa1, 0xd3, 0x7a, 0x1a}},
++    {0x039143d3, 0x78cb, 0x449c, {0xa8, 0xe7, 0x67, 0xd1, 0x88, 0x64, 0xc3, 0x32}},
++    {0x67743782, 0x0ee5, 0x419a, {0xa1, 0x2b, 0x27, 0x3a, 0x9e, 0xc0, 0x8f, 0x3d}},
++    {0xf0720328, 0x663b, 0x418f, {0x85, 0xa6, 0x95, 0x31, 0xae, 0x3e, 0xcd, 0xfa}},
++    {0xa1718cdd, 0x0dac, 0x4095, {0xa1, 0x81, 0x7b, 0x59, 0xcb, 0x10, 0x6b, 0xfb}},
++    {0x810a74d2, 0x6ee2, 0x4e39, {0x82, 0x5e, 0x6d, 0xef, 0x82, 0x6a, 0xff, 0xc5}}
++};
++
++static const BYTE fixed_sizes[] =
++{
++    4, 4, 4, 4, 8, 4, 2, 2, 2, 4,
++    4, 4, 4, 4, 2, 2, 2, 2, 4, 4,
++    4, 1, 4, 4, 0, 0, 20, 12, 16, 2,
++    1, 4, 0, 4, 4, 4, 4, 4
++};
++
++static const BYTE huff_bits[8][10] =
++{
++    {0, 1, 2, 4, 6, 8, 12, 16, 24, 32},
++    {0, 1, 1, 2, 4, 8, 12, 16, 24, 32},
++    {0, 1, 1, 1, 2, 4, 8, 14, 22, 32},
++    {0, 2, 2, 3, 5, 8, 12, 16, 24, 32},
++    {0, 3, 4, 5, 8, 12, 16, 24, 32},
++    {0, 4, 6, 8, 12, 16, 24, 32},
++    {0, 6, 8, 12, 16, 24, 32},
++    {0, 7, 8, 12, 16, 24, 32}
++};
++static const BYTE huff_count[8] = {10, 10, 10, 10, 9, 8, 7, 7};
++static const BYTE prop_bits[24] = {
++    8, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2,
++    2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7
++};
++static const BYTE prop_pads[24] = {
++    0, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2,
++    3, 0, 1, 2, 0, 1, 0, 1, 0, 1, 0, 1
++};
++
++struct isf_reader
++{
++    const BYTE *ptr, *end;
++};
++struct isf_writer
++{
++    BYTE *data;
++    SIZE_T size, capacity;
++    HRESULT hr;
++};
++struct isf_blob
++{
++    const BYTE *data;
++    SIZE_T size;
++};
++struct isf_transform
++{
++    double m11, m12, m21, m22, dx, dy;
++};
++struct isf_state
++{
++    GUID *guids;
++    unsigned int guid_count;
++    struct isf_blob *desc, *metric;
++    unsigned int desc_count, metric_count, didx, sidx, midx, tidx;
++    IInkDrawingAttributes **attrs;
++    unsigned int attr_count;
++    struct isf_transform *transforms;
++    unsigned int transform_count;
++    struct stroke_data **strokes;
++    unsigned int count;
++    IInkExtendedProperties *properties;
++};
++
++/* 读取定长字节。 */
++static BOOL isf_bytes(struct isf_reader *r, SIZE_T n, const BYTE **out)
++{
++    if (n > (SIZE_T)(r->end - r->ptr))
++        return FALSE;
++    *out = r->ptr;
++    r->ptr += n;
++    return TRUE;
++}
++
++/* 读取多字节无符号整数。 */
++static BOOL isf_uint(struct isf_reader *r, UINT64 *value)
++{
++    UINT64 v = 0;
++    unsigned int i;
++    BYTE b;
++
++    for (i = 0; i < 10; ++i)
++    {
++        if (r->ptr == r->end)
++            return FALSE;
++        b = *r->ptr++;
++        if (i == 9 && (b & 0xfe))
++            return FALSE;
++        v |= (UINT64)(b & 0x7f) << (7 * i);
++        if (!(b & 0x80))
++        {
++            *value = v;
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++/* 读取多字节有符号整数。 */
++static BOOL isf_signed(struct isf_reader *r, LONG *value)
++{
++    UINT64 n;
++    if (!isf_uint(r, &n) || (n >> 1) > (UINT64)INT_MAX + (n & 1))
++        return FALSE;
++    *value = (n & 1) ? -(INT64)(n >> 1) : n >> 1;
++    return TRUE;
++}
++
++/* 读取带长度的块。 */
++static BOOL isf_block(struct isf_reader *r, struct isf_reader *block)
++{
++    UINT64 n;
++    const BYTE *data;
++    if (!isf_uint(r, &n) || n > (SIZE_T)(r->end - r->ptr) || !isf_bytes(r, n, &data))
++        return FALSE;
++    block->ptr = data;
++    block->end = data + (SIZE_T)n;
++    return TRUE;
++}
++
++/* 追加字节到输出缓冲区。 */
++static void isf_write(struct isf_writer *w, const void *data, SIZE_T n)
++{
++    BYTE *p;
++    SIZE_T capacity;
++    if (FAILED(w->hr) || n > ~(SIZE_T)0 - w->size)
++    {
++        w->hr = E_OUTOFMEMORY;
++        return;
++    }
++    if (w->size + n > w->capacity)
++    {
++        capacity = max(w->size + n, max((SIZE_T)64, w->capacity * 2));
++        if (capacity < w->size + n || !(p = realloc(w->data, capacity)))
++        {
++            w->hr = E_OUTOFMEMORY;
++            return;
++        }
++        w->data = p;
++        w->capacity = capacity;
++    }
++    if (n)
++        memcpy(w->data + w->size, data, n);
++    w->size += n;
++}
++
++/* 写入单个字节。 */
++static void isf_byte(struct isf_writer *w, BYTE b)
++{
++    isf_write(w, &b, 1);
++}
++
++/* 写入多字节无符号整数。 */
++static void isf_number(struct isf_writer *w, UINT64 n)
++{
++    while (n >= 128)
++    {
++        isf_byte(w, (n & 0x7f) | 0x80);
++        n >>= 7;
++    }
++    isf_byte(w, n);
++}
++
++/* 写入多字节有符号整数。 */
++static void isf_sign_number(struct isf_writer *w, LONG n)
++{
++    isf_number(w, ((UINT64)(n < 0 ? -(INT64)n : n) << 1) | (n < 0));
++}
++
++/* 写入带标签和长度的块。 */
++static void isf_section(struct isf_writer *w, UINT64 tag, const struct isf_writer *block)
++{
++    isf_number(w, tag);
++    isf_number(w, block->size);
++    isf_write(w, block->data, block->size);
++    if (FAILED(block->hr))
++        w->hr = block->hr;
++}
++
++/* 释放输出缓冲区。 */
++static void isf_drop(struct isf_writer *w)
++{
++    free(w->data);
++    w->data = NULL;
++}
++
++/* 按标签查找 GUID。 */
++static const GUID *isf_guid(const struct isf_state *s, UINT64 tag)
++{
++    if (tag >= TAG_GUID_X && tag < TAG_GUID_X + ARRAY_SIZE(known_guids))
++        return &known_guids[tag - TAG_GUID_X];
++    if (tag >= TAG_CUSTOM_GUID_BASE && tag - TAG_CUSTOM_GUID_BASE < s->guid_count)
++        return &s->guids[tag - TAG_CUSTOM_GUID_BASE];
++    return NULL;
++}
++
++/* 按 GUID 查找标签。 */
++static UINT64 isf_tag_for_guid(const struct isf_state *s, const GUID *guid)
++{
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(known_guids); i++)
++        if (IsEqualGUID(guid, &known_guids[i]))
++            return i + TAG_GUID_X;
++    for (i = 0; i < s->guid_count; i++)
++        if (IsEqualGUID(guid, &s->guids[i]))
++            return i + TAG_CUSTOM_GUID_BASE;
++    return 0;
++}
++
++/* 收集自定义 GUID。 */
++static HRESULT isf_add_guid(struct isf_state *s, const GUID *guid)
++{
++    GUID *list;
++    if (isf_tag_for_guid(s, guid))
++        return S_OK;
++    if (s->guid_count == UINT_MAX || !(list = realloc(s->guids, (s->guid_count + 1) * sizeof(*list))))
++        return E_OUTOFMEMORY;
++    s->guids = list;
++    list[s->guid_count++] = *guid;
++    return S_OK;
++}
++
++/* 收集描述符或度量块。 */
++static HRESULT isf_add_blob(struct isf_blob **blobs, unsigned int *count, struct isf_reader *block)
++{
++    struct isf_blob *p;
++    if (*count == UINT_MAX || !(p = realloc(*blobs, (*count + 1) * sizeof(*p))))
++        return E_OUTOFMEMORY;
++    *blobs = p;
++    p[*count].data = block->ptr;
++    p[*count].size = block->end - block->ptr;
++    ++*count;
++    return S_OK;
++}
++
++/* 加入扩展属性。 */
++static HRESULT isf_add_property(IInkExtendedProperties *props, const GUID *guid, VARIANT *data)
++{
++    IInkExtendedProperty *property;
++    WCHAR name[39];
++    BSTR bstr;
++    HRESULT hr;
++
++    StringFromGUID2(guid, name, ARRAY_SIZE(name));
++    if (!(bstr = SysAllocString(name)))
++        return E_OUTOFMEMORY;
++    hr = IInkExtendedProperties_Add(props, bstr, *data, &property);
++    SysFreeString(bstr);
++    if (SUCCEEDED(hr) && property)
++        IInkExtendedProperty_Release(property);
++    return hr;
++}
++
++/* 读取扩展属性。 */
++static HRESULT isf_get_property(IInkExtendedProperties *props, unsigned int index, GUID *guid, VARIANT *v)
++{
++    IInkExtendedProperty *prop;
++    VARIANT n;
++    BSTR str;
++    HRESULT hr;
++
++    V_VT(&n) = VT_I4;
++    V_I4(&n) = index;
++    if (FAILED(hr = IInkExtendedProperties_Item(props, n, &prop)))
++        return hr;
++    if (SUCCEEDED(hr = IInkExtendedProperty_get_Guid(prop, &str)))
++    {
++        hr = IIDFromString(str, guid);
++        SysFreeString(str);
++    }
++    if (SUCCEEDED(hr))
++        hr = IInkExtendedProperty_get_Data(prop, v);
++    IInkExtendedProperty_Release(prop);
++    return hr;
++}
++
++/* 返回标量类型的字节数。 */
++static unsigned int isf_scalar_size(VARTYPE vt)
++{
++    switch (vt)
++    {
++    case VT_I1: case VT_UI1:
++        return 1;
++    case VT_I2: case VT_UI2: case VT_BOOL:
++        return 2;
++    case VT_I4: case VT_UI4: case VT_R4:
++        return 4;
++    case VT_I8: case VT_UI8: case VT_R8: case VT_DATE:
++        return 8;
++    default:
++        return 0;
++    }
++}
++
++/* 将属性字节还原为 VARIANT。 */
++static HRESULT isf_decode_variant(const GUID *guid, struct isf_reader bytes, VARIANT *v)
++{
++    const BYTE *raw;
++    VARTYPE vt, base;
++    SIZE_T n;
++    UINT i, count;
++    BYTE *dest;
++    SAFEARRAY *array;
++    unsigned int item_size;
++
++    VariantInit(v);
++    if (isf_tag_for_guid(&(struct isf_state){0}, guid) >= TAG_GUID_X &&
++            isf_tag_for_guid(&(struct isf_state){0}, guid) < TAG_KNOWN_GUID_LIMIT)
++        vt = VT_ARRAY | VT_UI1;
++    else
++    {
++        if (!isf_bytes(&bytes, 2, &raw))
++            return E_INVALIDARG;
++        vt = raw[0] | (raw[1] << 8);
++    }
++    n = bytes.end - bytes.ptr;
++    base = vt & ~VT_ARRAY;
++    if (vt == VT_BSTR)
++    {
++        if (n & 1 || n > UINT_MAX || !(V_BSTR(v) = SysAllocStringLen((const WCHAR *)bytes.ptr, n / 2)))
++            return n ? E_INVALIDARG : E_OUTOFMEMORY;
++        V_VT(v) = VT_BSTR;
++        return S_OK;
++    }
++    item_size = isf_scalar_size(base);
++    if (!item_size && base != VT_BSTR)
++        return E_INVALIDARG;
++    if (vt & VT_ARRAY)
++    {
++        if (base == VT_BSTR)
++        {
++            /* Strings in a SAFEARRAY have explicit byte lengths; WPF does not emit this type. */
++            struct isf_reader strings = bytes;
++            UINT64 length;
++            if (!isf_uint(&strings, &length) || length > UINT_MAX)
++                return E_INVALIDARG;
++            count = length;
++            if (!(array = SafeArrayCreateVector(VT_BSTR, 0, count)))
++                return E_OUTOFMEMORY;
++            for (i = 0; i < count; ++i)
++            {
++                BSTR str;
++                HRESULT hr;
++                LONG index = i;
++                if (!isf_uint(&strings, &length) || length > (SIZE_T)(strings.end - strings.ptr) || (length & 1))
++                    break;
++                if (!(str = SysAllocStringLen((const WCHAR *)strings.ptr, length / 2)))
++                {
++                    SafeArrayDestroy(array);
++                    return E_OUTOFMEMORY;
++                }
++                hr = SafeArrayPutElement(array, &index, str);
++                SysFreeString(str);
++                if (FAILED(hr))
++                {
++                    SafeArrayDestroy(array);
++                    return hr;
++                }
++                strings.ptr += length;
++            }
++            if (i != count || strings.ptr != strings.end)
++            {
++                SafeArrayDestroy(array);
++                return E_INVALIDARG;
++            }
++        }
++        else
++        {
++            if (n % item_size || n / item_size > UINT_MAX)
++                return E_INVALIDARG;
++            count = n / item_size;
++            if (!(array = SafeArrayCreateVector(base, 0, count)))
++                return E_OUTOFMEMORY;
++            if (FAILED(SafeArrayAccessData(array, (void **)&dest)))
++            {
++                SafeArrayDestroy(array);
++                return E_INVALIDARG;
++            }
++            memcpy(dest, bytes.ptr, n);
++            SafeArrayUnaccessData(array);
++        }
++        V_VT(v) = vt;
++        V_ARRAY(v) = array;
++        return S_OK;
++    }
++    if (n != item_size)
++        return E_INVALIDARG;
++    V_VT(v) = vt;
++    memcpy(&V_I8(v), bytes.ptr, n);
++    return S_OK;
++}
++
++/* 将 VARIANT 写成属性字节。 */
++static void isf_encode_variant(struct isf_writer *w, const GUID *guid, const VARIANT *v)
++{
++    VARTYPE vt = V_VT(v);
++    VARTYPE base = vt & ~VT_ARRAY;
++    BYTE *bytes;
++    UINT count;
++    BSTR str;
++    unsigned int elem_size;
++
++    if (isf_tag_for_guid(&(struct isf_state){0}, guid) < TAG_GUID_X)
++    {
++        isf_byte(w, vt);
++        isf_byte(w, vt >> 8);
++    }
++    if (vt == VT_BSTR)
++    {
++        isf_write(w, V_BSTR(v), SysStringLen(V_BSTR(v)) * sizeof(WCHAR));
++        return;
++    }
++    elem_size = isf_scalar_size(base);
++    if (vt & VT_ARRAY)
++    {
++        if (!V_ARRAY(v) || SafeArrayGetDim(V_ARRAY(v)) != 1)
++        {
++            w->hr = E_INVALIDARG;
++            return;
++        }
++        if (base == VT_BSTR)
++        {
++            LONG lower, upper, index;
++            SafeArrayGetLBound(V_ARRAY(v), 1, &lower);
++            SafeArrayGetUBound(V_ARRAY(v), 1, &upper);
++            isf_number(w, upper - lower + 1);
++            for (index = lower; index <= upper; ++index)
++            {
++                if (FAILED(SafeArrayGetElement(V_ARRAY(v), &index, &str)))
++                {
++                    w->hr = E_INVALIDARG;
++                    return;
++                }
++                isf_number(w, SysStringLen(str) * sizeof(WCHAR));
++                isf_write(w, str, SysStringLen(str) * sizeof(WCHAR));
++                SysFreeString(str);
++            }
++            return;
++        }
++        if (!elem_size || SafeArrayGetVartype(V_ARRAY(v), &base) != S_OK || base != (vt & ~VT_ARRAY))
++        {
++            w->hr = E_INVALIDARG;
++            return;
++        }
++        count = V_ARRAY(v)->rgsabound[0].cElements;
++        if (FAILED(SafeArrayAccessData(V_ARRAY(v), (void **)&bytes)))
++        {
++            w->hr = E_INVALIDARG;
++            return;
++        }
++        isf_write(w, bytes, (SIZE_T)count * elem_size);
++        SafeArrayUnaccessData(V_ARRAY(v));
++        return;
++    }
++    if (!elem_size)
++    {
++        w->hr = E_INVALIDARG;
++        return;
++    }
++    isf_write(w, &V_I8(v), elem_size);
++}
++
++struct isf_bits
++{
++    struct isf_reader *reader;
++    struct isf_writer *writer;
++    BYTE current;
++    unsigned int used;
++};
++
++/* 从位流读取整数。 */
++static BOOL isf_read_bits(struct isf_bits *bits, unsigned int n, UINT64 *out)
++{
++    UINT64 result = 0;
++    unsigned int i;
++    for (i = 0; i < n; ++i)
++    {
++        if (!bits->used)
++        {
++            if (bits->reader->ptr == bits->reader->end)
++                return FALSE;
++            bits->current = *bits->reader->ptr++;
++            bits->used = 8;
++        }
++        result = (result << 1) | ((bits->current >> --bits->used) & 1);
++    }
++    *out = result;
++    return TRUE;
++}
++
++/* 向位流写入整数。 */
++static void isf_write_bits(struct isf_bits *bits, UINT64 v, unsigned int n)
++{
++    unsigned int i;
++    for (i = n; i; --i)
++    {
++        bits->current = (bits->current << 1) | ((v >> (i - 1)) & 1);
++        if (++bits->used == 8)
++        {
++            isf_byte(bits->writer, bits->current);
++            bits->used = 0;
++            bits->current = 0;
++        }
++    }
++}
++
++/* 写出位流中的末尾字节。 */
++static void isf_flush_bits(struct isf_bits *bits)
++{
++    if (bits->used)
++        isf_byte(bits->writer, bits->current << (8 - bits->used));
++}
++
++/* 解开属性的位打包数据。 */
++static BOOL isf_unpack_property(struct isf_reader data, BYTE algo, struct isf_writer *out)
++{
++    struct isf_bits bits = {.reader = &data};
++    unsigned int unit = (algo & 0x40) ? 4 : ((algo & 0x20) ? 2 : 1);
++    unsigned int index = algo & ((algo & 0x40) ? 63 : 31);
++    unsigned int nbits = index < 24 ? prop_bits[index] : index - 16;
++    unsigned int pads = index < 24 ? prop_pads[index] : 0;
++    SIZE_T count, i;
++    UINT64 v;
++    BYTE b;
++
++    if (algo & 0x80 || !nbits || nbits > 8 * unit || (data.end - data.ptr) > SIZE_MAX / 8)
++        return FALSE;
++    count = ((SIZE_T)(data.end - data.ptr) * 8) / nbits;
++    if (count < pads)
++        return FALSE;
++    count -= pads;
++    if (count > SIZE_MAX / unit)
++        return FALSE;
++    for (i = 0; i < count; ++i)
++    {
++        if (!isf_read_bits(&bits, nbits, &v))
++            return FALSE;
++        if (unit == 4 && nbits < 32 && (v & (1u << (nbits - 1))))
++            v |= ~((1ull << nbits) - 1);
++        for (unsigned int j = 0; j < unit; j++)
++        {
++            b = v >> (8 * j);
++            isf_byte(out, b);
++        }
++    }
++    return SUCCEEDED(out->hr);
++}
++
++/* 解开 LZ 压缩属性。 */
++static BOOL isf_unpack_lz(struct isf_reader data, struct isf_writer *out)
++{
++    BYTE ring[4069] = {0};
++    BYTE first, second;
++    unsigned int flags = 0;
++    unsigned int position = ARRAY_SIZE(ring) - 16;
++    unsigned int offset, count, i;
++
++    while (data.ptr < data.end)
++    {
++        if (((flags >>= 1) & 0x100) == 0)
++            flags = *data.ptr++ | 0xff00;
++        if (data.ptr == data.end)
++            return FALSE;
++        first = *data.ptr++;
++        if (flags & 1)
++        {
++            isf_byte(out, first);
++            ring[position++] = first;
++            position &= ARRAY_SIZE(ring) - 1;
++        }
++        else
++        {
++            if (data.ptr == data.end)
++                return FALSE;
++            second = *data.ptr++;
++            offset = ((second & 0xf0) << 4) | first;
++            count = (second & 0x0f) + 3;
++            for (i = 0; i < count; i++)
++            {
++                first = ring[(offset + i) & (ARRAY_SIZE(ring) - 1)];
++                isf_byte(out, first);
++                ring[position++] = first;
++                position &= ARRAY_SIZE(ring) - 1;
++            }
++        }
++        if (FAILED(out->hr))
++            return FALSE;
++    }
++    return TRUE;
++}
++
++/* 计算整数的最小位宽。 */
++static unsigned int isf_bits_for(UINT64 maximum, BOOL signed_value)
++{
++    unsigned int bits = 0;
++    do
++    {
++        ++bits;
++        maximum >>= 1;
++    }
++    while (maximum)
++        ;
++    return min(bits + !!signed_value, signed_value ? 32u : 16u);
++}
++
++/* 压缩属性数据。 */
++static void isf_pack_property(struct isf_writer *out, const BYTE *data, SIZE_T n,
++        InkPersistenceCompressionMode compression)
++{
++    static const BYTE offsets[] = {0,1,9,13,16,18,20,22};
++    struct isf_bits bits = {.writer = out};
++    unsigned int nbits = 8;
++    unsigned int unit = 1;
++    unsigned int index = 0;
++    unsigned int other;
++    UINT64 maximum = 0;
++    UINT64 v, magnitude;
++    INT64 signed_value;
++    SIZE_T i;
++
++    if (compression != IPCM_NoCompression && n)
++    {
++        for (i = 0; i < n; i++)
++            maximum = max(maximum, data[i]);
++        nbits = isf_bits_for(maximum, FALSE);
++        if (!(n & 1))
++        {
++            maximum = 0;
++            for (i = 0; i < n; i += 2)
++                maximum = max(maximum, data[i] | (unsigned int)data[i + 1] << 8);
++            other = isf_bits_for(maximum, FALSE);
++            if (other < nbits * 2)
++            {
++                nbits = other;
++                unit = 2;
++            }
++        }
++        if (!(n & 3))
++        {
++            maximum = 0;
++            for (i = 0; i < n; i += 4)
++            {
++                INT32 number = (UINT32)data[i] | (UINT32)data[i + 1] << 8 |
++                        (UINT32)data[i + 2] << 16 | (UINT32)data[i + 3] << 24;
++                signed_value = number;
++                magnitude = signed_value < 0 ? -signed_value : signed_value;
++                maximum = max(maximum, magnitude);
++            }
++            other = isf_bits_for(maximum, TRUE);
++            if (other < nbits * (unit == 2 ? 2 : 4))
++            {
++                nbits = other;
++                unit = 4;
++            }
++        }
++        if (unit == 1 && nbits == 8)
++            index = 0;
++        else if (nbits > 7)
++            index = 16 + nbits;
++        else
++            index = offsets[nbits] + ((8 - (n / unit * nbits) % 8) % 8) / nbits;
++        index |= unit == 4 ? 0x40 : (unit == 2 ? 0x20 : 0);
++    }
++    isf_byte(out, index);
++    for (i = 0; i < n; i += unit)
++    {
++        v = data[i];
++        if (unit > 1)
++            v |= (UINT64)data[i + 1] << 8;
++        if (unit > 2)
++            v |= (UINT64)data[i + 2] << 16 | (UINT64)data[i + 3] << 24;
++        isf_write_bits(&bits, v, nbits);
++    }
++    isf_flush_bits(&bits);
++}
++
++/* 读取单项扩展属性。 */
++static HRESULT isf_decode_property(struct isf_reader *r, const struct isf_state *s, UINT64 tag,
++        IInkExtendedProperties *properties)
++{
++    const GUID *guid = isf_guid(s, tag);
++    struct isf_reader compressed, raw;
++    struct isf_writer uncompressed = {0};
++    const BYTE *p;
++    UINT64 n;
++    VARIANT v;
++    HRESULT hr;
++
++    if (!guid)
++        return E_INVALIDARG;
++    if (tag >= TAG_GUID_X && tag < TAG_KNOWN_GUID_LIMIT && fixed_sizes[tag - TAG_GUID_X])
++    {
++        if (!isf_bytes(r, fixed_sizes[tag - TAG_GUID_X], &p))
++            return E_INVALIDARG;
++        raw.ptr = p;
++        raw.end = p + fixed_sizes[tag - TAG_GUID_X];
++    }
++    else
++    {
++        if (!isf_uint(r, &n) || n >= (SIZE_T)(r->end - r->ptr) || !isf_bytes(r, n + 1, &p))
++            return E_INVALIDARG;
++        compressed.ptr = p + 1;
++        compressed.end = p + n + 1;
++        if (!(*p == 0x80 ? isf_unpack_lz(compressed, &uncompressed) :
++                isf_unpack_property(compressed, *p, &uncompressed)))
++        {
++            hr = FAILED(uncompressed.hr) ? uncompressed.hr : E_INVALIDARG;
++            isf_drop(&uncompressed);
++            return hr;
++        }
++        raw.ptr = uncompressed.data ? uncompressed.data : (const BYTE *)"";
++        raw.end = raw.ptr + uncompressed.size;
++    }
++    hr = isf_decode_variant(guid, raw, &v);
++    if (SUCCEEDED(hr))
++    {
++        hr = isf_add_property(properties, guid, &v);
++        VariantClear(&v);
++    }
++    isf_drop(&uncompressed);
++    return hr;
++}
++
++/* 写入单项扩展属性。 */
++static HRESULT isf_encode_property(struct isf_writer *w, struct isf_state *s, const GUID *guid,
++        const VARIANT *v, InkPersistenceCompressionMode mode, BOOL tagged)
++{
++    struct isf_writer data = {0};
++    struct isf_writer compressed = {0};
++    UINT64 tag = isf_tag_for_guid(s, guid);
++    if (!tag)
++        return E_INVALIDARG;
++    if (tagged)
++        isf_number(w, tag);
++    isf_encode_variant(&data, guid, v);
++    if (FAILED(data.hr))
++    {
++        isf_drop(&data);
++        return data.hr;
++    }
++    if (tag >= TAG_GUID_X && tag < TAG_KNOWN_GUID_LIMIT && fixed_sizes[tag - TAG_GUID_X])
++    {
++        if (data.size != fixed_sizes[tag - TAG_GUID_X])
++            w->hr = E_INVALIDARG;
++        else
++            isf_write(w, data.data, data.size);
++    }
++    else
++    {
++        isf_pack_property(&compressed, data.data, data.size, mode);
++        if (!compressed.size)
++            w->hr = E_INVALIDARG;
++        else
++        {
++            isf_number(w, compressed.size - 1);
++            isf_write(w, compressed.data, compressed.size);
++        }
++        if (FAILED(compressed.hr))
++            w->hr = compressed.hr;
++    }
++    isf_drop(&data);
++    isf_drop(&compressed);
++    return w->hr;
++}
++
++/* 跳过已知的非公开属性。 */
++static HRESULT isf_skip_property(struct isf_reader *r, UINT64 tag)
++{
++    UINT64 n;
++    const BYTE *raw;
++    if (tag < TAG_GUID_X || tag >= TAG_KNOWN_GUID_LIMIT)
++        return E_INVALIDARG;
++    if (fixed_sizes[tag - TAG_GUID_X])
++        return isf_bytes(r, fixed_sizes[tag - TAG_GUID_X], &raw) ? S_OK : E_INVALIDARG;
++    if (!isf_uint(r, &n) || n >= (SIZE_T)(r->end - r->ptr) || !isf_bytes(r, n + 1, &raw))
++        return E_INVALIDARG;
++    return S_OK;
++}
++
++/* 读取绘图属性块。 */
++static HRESULT isf_decode_attrs(struct isf_state *s, struct isf_reader r)
++{
++    IInkDrawingAttributes *attributes, **list;
++    IInkExtendedProperties *props;
++    UINT64 tag, value, len;
++    const BYTE *raw;
++    float width;
++    HRESULT hr = S_OK;
++
++    if (FAILED(hr = drawing_attributes_create(&attributes)))
++        return hr;
++    if (FAILED(hr = IInkDrawingAttributes_get_ExtendedProperties(attributes, &props)))
++    {
++        IInkDrawingAttributes_Release(attributes);
++        return hr;
++    }
++    while (r.ptr < r.end)
++    {
++        if (!isf_uint(&r, &tag))
++        {
++            hr = E_INVALIDARG;
++            break;
++        }
++        TRACE("drawing tag %I64u, remaining %Iu.\n", tag, (SIZE_T)(r.end - r.ptr));
++        switch (tag)
++        {
++        case TAG_GUID_PEN_STYLE: /* pen style */
++        case TAG_GUID_CURVE_FITTING_ERROR: /* fitting error */
++            if (!isf_uint(&r, &value))
++                hr = E_INVALIDARG;
++            break;
++        case TAG_GUID_CURSOR_ID: /* cursor ID */
++            if (!isf_bytes(&r, fixed_sizes[TAG_GUID_CURSOR_ID - TAG_GUID_X], &raw))
++                hr = E_INVALIDARG;
++            break;
++        case TAG_GUID_COLORREF:
++            if (!isf_uint(&r, &value) || value > 0xffffff)
++            {
++                hr = E_INVALIDARG;
++                break;
++            }
++            hr = IInkDrawingAttributes_put_Color(attributes, value);
++            break;
++        case TAG_GUID_PEN_WIDTH: case TAG_GUID_PEN_HEIGHT:
++            if (!isf_uint(&r, &value) || value > INT_MAX)
++            {
++                hr = E_INVALIDARG;
++                break;
++            }
++            width = value;
++            if (r.ptr < r.end)
++            {
++                struct isf_reader saved = r;
++                UINT64 next;
++                if (!isf_uint(&r, &next))
++                {
++                    hr = E_INVALIDARG;
++                    break;
++                }
++                if (next == TAG_MANTISSA)
++                {
++                    struct isf_writer fraction = {0};
++                    struct isf_reader compressed;
++                    if (!isf_uint(&r, &len) || len >= (SIZE_T)(r.end - r.ptr) ||
++                            !isf_bytes(&r, len + 1, &raw))
++                    {
++                        hr = E_INVALIDARG;
++                        break;
++                    }
++                    compressed.ptr = raw + 1;
++                    compressed.end = raw + len + 1;
++                    if (!(*raw == 0x80 ? isf_unpack_lz(compressed, &fraction) :
++                            isf_unpack_property(compressed, *raw, &fraction)) || fraction.size != 2)
++                    {
++                        hr = FAILED(fraction.hr) ? fraction.hr : E_INVALIDARG;
++                        isf_drop(&fraction);
++                        break;
++                    }
++                    width += (SHORT)(fraction.data[0] | fraction.data[1] << 8) / 1000.0f;
++                    isf_drop(&fraction);
++                }
++                else
++                    r = saved;
++            }
++            hr = tag == TAG_GUID_PEN_WIDTH ? IInkDrawingAttributes_put_Width(attributes, width) :
++                    IInkDrawingAttributes_put_Height(attributes, width);
++            break;
++        case TAG_GUID_PEN_TIP:
++            if (!isf_uint(&r, &value) || value > 1)
++            {
++                hr = E_INVALIDARG;
++                break;
++            }
++            hr = IInkDrawingAttributes_put_PenTip(attributes, value);
++            break;
++        case TAG_GUID_DRAWING_FLAGS: /* drawing flags */
++            if (!isf_uint(&r, &value))
++            {
++                hr = E_INVALIDARG;
++                break;
++            }
++            IInkDrawingAttributes_put_FitToCurve(attributes,
++                    (value & DRAWING_FLAG_FIT_TO_CURVE) ? VARIANT_TRUE : VARIANT_FALSE);
++            IInkDrawingAttributes_put_IgnorePressure(attributes,
++                    (value & DRAWING_FLAG_IGNORE_PRESSURE) ? VARIANT_TRUE : VARIANT_FALSE);
++            hr = IInkDrawingAttributes_put_AntiAliased(attributes,
++                    (value & DRAWING_FLAG_ANTIALIASED) ? VARIANT_TRUE : VARIANT_FALSE);
++            break;
++        case TAG_GUID_TRANSPARENCY:
++            if (!isf_uint(&r, &value) || value > 255)
++            {
++                hr = E_INVALIDARG;
++                break;
++            }
++            hr = IInkDrawingAttributes_put_Transparency(attributes, value);
++            break;
++        case TAG_GUID_RASTER_OPERATION:
++            if (!isf_bytes(&r, fixed_sizes[TAG_GUID_RASTER_OPERATION - TAG_GUID_X], &raw) ||
++                    raw[0] < IRO_Black || raw[0] > IRO_White)
++            {
++                hr = E_INVALIDARG;
++                break;
++            }
++            hr = IInkDrawingAttributes_put_RasterOperation(attributes, raw[0]);
++            break;
++        default:
++            if (tag >= TAG_GUID_X && tag < TAG_KNOWN_GUID_LIMIT)
++                hr = isf_skip_property(&r, tag);
++            else if (isf_guid(s, tag))
++                hr = isf_decode_property(&r, s, tag, props);
++            else
++                hr = E_INVALIDARG;
++            break;
++        }
++        if (FAILED(hr))
++            break;
++    }
++    IInkExtendedProperties_Release(props);
++    if (SUCCEEDED(hr))
++    {
++        if (s->attr_count == UINT_MAX || !(list = realloc(s->attrs, (s->attr_count + 1) * sizeof(*list))))
++            hr = E_OUTOFMEMORY;
++        else
++        {
++            s->attrs = list;
++            list[s->attr_count++] = attributes;
++        }
++    }
++    if (FAILED(hr))
++        IInkDrawingAttributes_Release(attributes);
++    return hr;
++}
++
++/* 读取并收集变换。 */
++static HRESULT isf_add_transform(struct isf_state *s, struct isf_reader *r, UINT64 tag, BOOL extended,
++        unsigned int index)
++{
++    struct isf_transform *list;
++    const BYTE *raw;
++    UINT64 angle;
++    double values[6] = {0};
++    unsigned int count, i;
++    struct isf_transform xform = {1,0,0,1,0,0};
++
++    if (tag < TAG_TRANSFORM || tag > TAG_QUAD)
++        return E_INVALIDARG;
++    if (tag == TAG_ROTATE)
++    {
++        if (!isf_uint(r, &angle) || angle > 36000)
++            return E_INVALIDARG;
++        values[0] = angle;
++    }
++    else
++    {
++        count = tag == TAG_ISO_SCALE ? 1 : (tag == TAG_ANISO_SCALE || tag == TAG_TRANSLATE ? 2 :
++                (tag == TAG_SCALE_TRANSLATE ? 4 : 6));
++        if (!isf_bytes(r, count * (extended ? sizeof(double) : sizeof(float)), &raw))
++            return E_INVALIDARG;
++        for (i = 0; i < count; i++)
++        {
++            if (extended)
++                memcpy(&values[i], raw + i * sizeof(double), sizeof(double));
++            else
++            {
++                float f;
++                memcpy(&f, raw + i * sizeof(float), sizeof(float));
++                values[i] = f;
++            }
++            if (!isfinite(values[i]))
++                return E_INVALIDARG;
++        }
++    }
++    switch (tag)
++    {
++    case TAG_ISO_SCALE:
++        xform.m11 = xform.m22 = values[0];
++        break;
++    case TAG_ANISO_SCALE:
++        xform.m11 = values[0];
++        xform.m22 = values[1];
++        break;
++    case TAG_ROTATE:
++        xform.m11 = xform.m22 = cos(values[0] * 0.01 * M_PI / 180);
++        xform.m12 = sin(values[0] * 0.01 * M_PI / 180);
++        xform.m21 = -xform.m12;
++        break;
++    case TAG_TRANSLATE:
++        xform.dx = values[0];
++        xform.dy = values[1];
++        break;
++    case TAG_SCALE_TRANSLATE:
++        xform.m11 = values[0];
++        xform.m22 = values[1];
++        xform.dx = values[2];
++        xform.dy = values[3];
++        break;
++    default:
++        xform.m11 = values[0];
++        xform.m12 = values[1];
++        xform.m21 = values[2];
++        xform.m22 = values[3];
++        xform.dx = values[4];
++        xform.dy = values[5];
++    }
++    if (extended)
++    {
++        if (index >= s->transform_count)
++            return E_INVALIDARG;
++        s->transforms[index] = xform;
++    }
++    else
++    {
++        if (s->transform_count == UINT_MAX || !(list = realloc(s->transforms,
++                (s->transform_count + 1) * sizeof(*list)))) return E_OUTOFMEMORY;
++        s->transforms = list;
++        list[s->transform_count++] = xform;
++    }
++    return S_OK;
++}
++
++/* 设置属性的默认度量。 */
++static void isf_default_metric(UINT64 tag, struct property_metrics *m)
++{
++    m->minimum = tag >= TAG_CUSTOM_GUID_BASE ? INT_MIN : 0;
++    m->maximum = INT_MAX;
++    m->units = TPMU_Default;
++    m->resolution = 1;
++    if (tag == TAG_GUID_X || tag == TAG_GUID_Y)
++    {
++        m->maximum = tag == TAG_GUID_X ? 12699 : 9649;
++        m->units = TPMU_Centimeters;
++        m->resolution = 1000;
++    }
++    else if (tag == TAG_GUID_Z)
++    {
++        m->minimum = -1023;
++        m->maximum = 1023;
++        m->units = TPMU_Centimeters;
++        m->resolution = 1000;
++    }
++    else if (tag == TAG_GUID_NORMAL_PRESSURE || tag == TAG_GUID_TANGENT_PRESSURE || tag == TAG_GUID_BUTTON_PRESSURE)
++        m->maximum = 1023;
++    else if (tag >= TAG_GUID_X_TILT_ORIENTATION && tag <= TAG_GUID_TWIST_ORIENTATION)
++    {
++        m->minimum = tag == TAG_GUID_ALTITUDE_ORIENTATION ? -900 : 0;
++        m->maximum = tag == TAG_GUID_ALTITUDE_ORIENTATION ? 900 : 3600;
++        m->units = TPMU_Degrees;
++        m->resolution = 10;
++    }
++}
++
++/* 将度量块应用到笔画。 */
++static HRESULT isf_apply_metrics(const struct isf_blob *block, const struct isf_state *s,
++        struct stroke_data *stroke)
++{
++    struct isf_reader r = {block->data, block->data + block->size};
++    struct isf_reader entry;
++    UINT64 tag;
++    LONG n;
++    const BYTE *p;
++    unsigned int i;
++    float f;
++
++    while (r.ptr < r.end)
++    {
++        if (!isf_uint(&r, &tag) || !isf_block(&r, &entry))
++            return E_INVALIDARG;
++        if (!isf_guid(s, tag))
++            continue;
++        for (i = 0; i < stroke->packet_size; i++)
++            if (IsEqualGUID(&stroke->description[i], isf_guid(s, tag)))
++                break;
++        if (i == stroke->packet_size)
++            continue;
++        if (entry.ptr < entry.end)
++        {
++            if (!isf_signed(&entry, &n))
++                return E_INVALIDARG;
++            stroke->metrics[i].minimum = n;
++        }
++        if (entry.ptr < entry.end)
++        {
++            if (!isf_signed(&entry, &n))
++                return E_INVALIDARG;
++            stroke->metrics[i].maximum = n;
++        }
++        if (entry.ptr < entry.end)
++        {
++            if (!isf_uint(&entry, &tag) || tag > TPMU_Grams)
++                return E_INVALIDARG;
++            stroke->metrics[i].units = tag;
++        }
++        if (entry.ptr < entry.end)
++        {
++            if (!isf_bytes(&entry, sizeof(f), &p))
++                return E_INVALIDARG;
++            memcpy(&f, p, sizeof(f));
++            stroke->metrics[i].resolution = f;
++        }
++    }
++    return S_OK;
++}
++
++/* 读取一个 Huffman 符号。 */
++static BOOL isf_huff_value(struct isf_bits *bits, BYTE codec, LONG *value, UINT64 *extra,
++        unsigned int depth)
++{
++    UINT64 v;
++    UINT64 min = 0;
++    unsigned int pref = 0;
++    unsigned int i;
++    if (depth > 1 || codec >= ARRAY_SIZE(huff_bits))
++        return FALSE;
++    do
++    {
++        if (!isf_read_bits(bits, 1, &v))
++            return FALSE;
++        if (v && ++pref > huff_count[codec])
++            return FALSE;
++    }
++    while (v);
++    *extra = 0;
++    if (!pref)
++    {
++        *value = 0;
++        return TRUE;
++    }
++    if (pref == huff_count[codec])
++    {
++        LONG high;
++        UINT64 unused;
++        if (!isf_huff_value(bits, codec, &high, &unused, depth + 1) || unused ||
++                !isf_huff_value(bits, codec, value, &unused, depth + 1) || unused) return FALSE;
++        *extra = (UINT32)high;
++        return TRUE;
++    }
++    min = 1;
++    for (i = 1; i < pref; i++)
++        min += (UINT64)1 << (huff_bits[codec][i] - 1);
++    if (!isf_read_bits(bits, huff_bits[codec][pref], &v))
++        return FALSE;
++    if ((v >> 1) + min > (UINT64)INT_MAX + (v & 1))
++        return FALSE;
++    *value = (v & 1) ? -(INT64)((v >> 1) + min) : (v >> 1) + min;
++    return TRUE;
++}
++
++/* 写入一个 Huffman 符号。 */
++static void isf_huff_encode(struct isf_bits *bits, BYTE codec, LONG value, UINT64 extra)
++{
++    UINT64 n = value < 0 ? -(INT64)value : value;
++    UINT64 min[10] = {0};
++    unsigned int pref = 1;
++    unsigned int i;
++    if (!value && !extra)
++    {
++        isf_write_bits(bits, 0, 1);
++        return;
++    }
++    if (extra)
++    {
++        isf_write_bits(bits, ((1u << (huff_count[codec] + 1)) - 2), huff_count[codec] + 1);
++        isf_huff_encode(bits, codec, extra, 0);
++        isf_huff_encode(bits, codec, value, 0);
++        return;
++    }
++    min[1] = 1;
++    for (i = 2; i < huff_count[codec]; ++i)
++        min[i] = min[i - 1] + ((UINT64)1 << (huff_bits[codec][i - 1] - 1));
++    while (pref < huff_count[codec] && n >= min[pref])
++        ++pref;
++    isf_write_bits(bits, (1u << pref) - 2, pref);
++    isf_write_bits(bits, ((n - min[pref - 1]) << 1) | (value < 0), huff_bits[codec][pref - 1]);
++}
++
++/* 解压一个笔画数据数组。 */
++static BOOL isf_packet(struct isf_reader *r, LONG *points, unsigned int count, unsigned int stride)
++{
++    struct isf_bits bits = {.reader = r};
++    BYTE algo;
++    UINT64 v, extra, magnitude;
++    INT64 previous = 0;
++    INT64 before = 0;
++    INT64 delta, original;
++    LONG value;
++    unsigned int width, i;
++
++    if (!count)
++        return TRUE;
++    if (r->ptr == r->end)
++        return FALSE;
++    algo = *r->ptr++;
++    if ((algo & 0xc0) == 0x80)
++    {
++        if ((algo & 31) >= ARRAY_SIZE(huff_bits))
++            return FALSE;
++        for (i = 0; i < count; ++i)
++        {
++            if (!isf_huff_value(&bits, algo & 31, &value, &extra, 0))
++                return FALSE;
++            magnitude = (UINT32)value;
++            delta = extra ? ((extra & 1) ? -1 : 1) * (INT64)((extra >> 1) << 32 | magnitude) : value;
++            original = delta + 2 * previous - before;
++            if (original < INT_MIN || original > INT_MAX)
++                return FALSE;
++            points[i * stride] = original;
++            before = previous;
++            previous = original;
++        }
++        return TRUE;
++    }
++    if (algo & 0xc0)
++        return FALSE;
++    width = algo & 31;
++    if (!width)
++        width = 32;
++    if (algo & 0x20)
++    {
++        for (i = 0; i < min(count, 2u); i++)
++        {
++            if (!isf_signed(r, &value))
++                return FALSE;
++            original = value + 2 * previous - before;
++            if (original < INT_MIN || original > INT_MAX)
++                return FALSE;
++            points[i * stride] = original;
++            before = previous;
++            previous = original;
++        }
++    }
++    for (i = (algo & 0x20) ? min(count, 2u) : 0; i < count; ++i)
++    {
++        if (!isf_read_bits(&bits, width, &v))
++            return FALSE;
++        value = width == 32 ? v : ((v & (1u << (width - 1))) ? v | ~((1ull << width) - 1) : v);
++        original = (algo & 0x20) ? (INT64)value + 2 * previous - before : value;
++        if (original < INT_MIN || original > INT_MAX)
++            return FALSE;
++        points[i * stride] = original;
++        before = previous;
++        previous = original;
++    }
++    return TRUE;
++}
++
++/* 压缩一个笔画数据数组。 */
++static void isf_encode_packet(struct isf_writer *w, const struct stroke_data *stroke, unsigned int property,
++        InkPersistenceCompressionMode compression)
++{
++    struct isf_bits bits = {.writer = w};
++    INT64 previous = 0;
++    INT64 before = 0;
++    INT64 delta;
++    UINT64 magnitude, extra;
++    unsigned int i;
++    unsigned int width = 1;
++    LONG value;
++
++    if (compression != IPCM_NoCompression)
++    {
++        for (i = 0; i < stroke->packet_count; i++)
++        {
++            value = stroke->packets[i * stroke->packet_size + property];
++            delta = (INT64)value + before - 2 * previous;
++            if (delta > INT_MAX && delta < (1ll << 32))
++                compression = IPCM_NoCompression;
++            before = previous;
++            previous = value;
++        }
++        before = previous = 0;
++    }
++    if (compression != IPCM_NoCompression)
++    {
++        isf_byte(w, 0x83);
++        for (i = 0; i < stroke->packet_count; i++)
++        {
++            value = stroke->packets[i * stroke->packet_size + property];
++            delta = (INT64)value + before - 2 * previous;
++            if (delta > INT_MAX || delta < INT_MIN)
++            {
++                magnitude = delta < 0 ? -delta : delta;
++                extra = ((magnitude >> 32) << 1) | (delta < 0);
++                isf_huff_encode(&bits, 3, (UINT32)magnitude, extra);
++            }
++            else
++                isf_huff_encode(&bits, 3, delta, 0);
++            before = previous;
++            previous = value;
++        }
++    }
++    else
++    {
++        for (i = 0; i < stroke->packet_count; i++)
++        {
++            value = stroke->packets[i * stroke->packet_size + property];
++            while (width < 32 && ((INT64)value < -(1ll << (width - 1)) ||
++                    (INT64)value >= (1ll << (width - 1)))) ++width;
++        }
++        isf_byte(w, width == 32 ? 0 : width);
++        for (i = 0; i < stroke->packet_count; i++)
++            isf_write_bits(&bits, (UINT32)stroke->packets[i * stroke->packet_size + property], width);
++    }
++    isf_flush_bits(&bits);
++}
++
++/* 读取笔画及其属性。 */
++static HRESULT isf_decode_stroke(struct isf_state *s, struct isf_reader r)
++{
++    struct isf_reader desc = {0};
++    GUID *guids = NULL;
++    LONG *packets = NULL;
++    IInkDrawingAttributes *attr = NULL;
++    struct stroke_data *stroke = NULL;
++    struct stroke_data **list;
++    UINT64 tag, n;
++    UINT64 button_count = 0;
++    unsigned int count = 2;
++    unsigned int values = 2;
++    unsigned int i, j, stride;
++    unsigned int property_count = 0;
++    BOOL no_x = FALSE;
++    BOOL no_y = FALSE;
++    struct isf_bits button_bits;
++    HRESULT hr = E_INVALIDARG;
++
++    if (s->desc_count && s->sidx >= s->desc_count)
++        return E_INVALIDARG;
++    if (s->metric_count && s->midx >= s->metric_count)
++        return E_INVALIDARG;
++    if (s->attr_count && s->didx >= s->attr_count)
++        return E_INVALIDARG;
++    if (s->transform_count && s->tidx >= s->transform_count)
++        return E_INVALIDARG;
++    if (s->desc_count)
++    {
++        desc.ptr = s->desc[s->sidx].data;
++        desc.end = desc.ptr + s->desc[s->sidx].size;
++    }
++    else
++        desc.ptr = desc.end = (const BYTE *)"";
++    if (!isf_uint(&r, &n) || n > UINT_MAX ||
++            (r.end - r.ptr < SIZE_MAX / 8 && n > (SIZE_T)(r.end - r.ptr) * 8)) return E_INVALIDARG;
++    if (!(guids = malloc((2 + (desc.end - desc.ptr)) * sizeof(*guids))))
++        return E_OUTOFMEMORY;
++    guids[0] = known_guids[0];
++    guids[1] = known_guids[1];
++    while (desc.ptr < desc.end)
++    {
++        if (!isf_uint(&desc, &tag))
++            goto done;
++        if (tag == TAG_NO_X)
++        {
++            no_x = TRUE;
++            continue;
++        }
++        if (tag == TAG_NO_Y)
++        {
++            no_y = TRUE;
++            continue;
++        }
++        if (tag == TAG_BUTTONS)
++        {
++            if (!isf_uint(&desc, &button_count) || button_count > desc.end - desc.ptr)
++                goto done;
++            for (i = 0; i < button_count; i++)
++            {
++                if (!isf_uint(&desc, &tag) || !isf_guid(s, tag))
++                    goto done;
++                guids[count++] = *isf_guid(s, tag);
++            }
++            continue;
++        }
++        if (tag == TAG_STROKE_PROPERTIES)
++            break;
++        if (!isf_guid(s, tag))
++            goto done;
++        guids[count++] = *isf_guid(s, tag);
++        ++property_count;
++    }
++    stride = count;
++    values += property_count;
++    if (n > SIZE_MAX / stride / sizeof(*packets))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    if (!(packets = calloc(max((SIZE_T)1, n * stride), sizeof(*packets))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    for (i = 0; i < values; ++i)
++    {
++        if ((i == 0 && no_x) || (i == 1 && no_y))
++            continue;
++        if (!isf_packet(&r, packets + i, n, stride))
++            goto done;
++    }
++    if (button_count)
++    {
++        button_bits = (struct isf_bits){.reader = &r};
++        for (i = 0; i < n; i++)
++            for (j = 0; j < button_count; j++)
++            {
++                if (!isf_read_bits(&button_bits, 1, &tag))
++                    goto done;
++                packets[i * stride + values + j] = tag;
++            }
++    }
++    if (s->attr_count)
++        attr = s->attrs[s->didx];
++    if (FAILED(hr = stroke_data_create(stride, guids, n, packets, attr, &stroke)))
++        goto done;
++    for (i = 0; i < stride; i++)
++        isf_default_metric(isf_tag_for_guid(s, &guids[i]), &stroke->metrics[i]);
++    if (s->metric_count && FAILED(hr = isf_apply_metrics(&s->metric[s->midx], s, stroke)))
++        goto done;
++    if (s->transform_count)
++    {
++        const struct isf_transform *xf = &s->transforms[s->tidx];
++        for (i = 0; i < n; i++)
++        {
++            double x = packets[i * stride];
++            double y = packets[i * stride + 1];
++            double tx = x * xf->m11 + y * xf->m21 + xf->dx;
++            double ty = x * xf->m12 + y * xf->m22 + xf->dy;
++            if (!isfinite(tx) || !isfinite(ty) || tx < INT_MIN || tx > INT_MAX || ty < INT_MIN || ty > INT_MAX)
++            {
++                hr = E_INVALIDARG;
++                goto done;
++            }
++            stroke->packets[i * stride] = lround(tx);
++            stroke->packets[i * stride + 1] = lround(ty);
++        }
++    }
++    while (desc.ptr < desc.end)
++    {
++        if (!isf_uint(&desc, &tag))
++        {
++            hr = E_INVALIDARG;
++            goto done;
++        }
++        if (FAILED(hr = isf_decode_property(&r, s, tag, stroke->properties)))
++            goto done;
++    }
++    while (r.ptr < r.end)
++    {
++        if (!isf_uint(&r, &tag))
++        {
++            hr = E_INVALIDARG;
++            goto done;
++        }
++        if (tag == TAG_POINT_PROPERTIES)
++        {
++            struct isf_reader skip;
++            if (!isf_block(&r, &skip))
++            {
++                hr = E_INVALIDARG;
++                goto done;
++            }
++        }
++        else if (FAILED(hr = isf_decode_property(&r, s, tag, stroke->properties)))
++            goto done;
++    }
++    if (s->count == UINT_MAX || !(list = realloc(s->strokes, (s->count + 1) * sizeof(*list))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    s->strokes = list;
++    list[s->count++] = stroke;
++    stroke = NULL;
++    hr = S_OK;
++done:
++    if (stroke)
++        stroke_data_release(stroke);
++    free(guids);
++    free(packets);
++    return hr;
++}
++
++/* 读取绘图、描述符或度量表。 */
++static HRESULT isf_decode_blocks(struct isf_state *s, struct isf_reader table, UINT64 type, BOOL single)
++{
++    struct isf_reader block;
++    HRESULT hr;
++
++    while (table.ptr < table.end || (single && table.ptr == table.end))
++    {
++        if (single)
++        {
++            block = table;
++            table.ptr = table.end;
++        }
++        else if (!isf_block(&table, &block))
++            return E_INVALIDARG;
++        if (type == TAG_DA_BLOCK)
++            hr = isf_decode_attrs(s, block);
++        else if (type == TAG_DESC_BLOCK)
++            hr = isf_add_blob(&s->desc, &s->desc_count, &block);
++        else
++            hr = isf_add_blob(&s->metric, &s->metric_count, &block);
++        if (FAILED(hr))
++            return hr;
++        if (single)
++            break;
++    }
++    return S_OK;
++}
++
++/* 读取变换表。 */
++static HRESULT isf_decode_transforms(struct isf_state *s, struct isf_reader block, BOOL extended)
++{
++    UINT64 tag;
++    unsigned int i = 0;
++    HRESULT hr;
++
++    if (extended && !s->transform_count)
++        return E_INVALIDARG;
++    while (block.ptr < block.end)
++    {
++        if (!isf_uint(&block, &tag))
++            return E_INVALIDARG;
++        if (FAILED(hr = isf_add_transform(s, &block, tag, extended, i++)))
++            return hr;
++    }
++    if (extended && i != s->transform_count)
++        return E_INVALIDARG;
++    return S_OK;
++}
++
++/* 释放解码状态。 */
++static void isf_free_state(struct isf_state *s)
++{
++    unsigned int i;
++    free(s->guids);
++    free(s->desc);
++    free(s->metric);
++    for (i = 0; i < s->attr_count; i++)
++        IInkDrawingAttributes_Release(s->attrs[i]);
++    free(s->attrs);
++    free(s->transforms);
++    strokes_free_data(s->strokes, s->count);
++}
++
++/* 将 ISF 字节流加载为笔画。 */
++HRESULT isf_decode(const BYTE *data, SIZE_T size, IInkExtendedProperties *ink_properties,
++        struct stroke_data ***strokes, unsigned int *count)
++{
++    struct isf_state state = {.properties = ink_properties};
++    struct isf_reader r = {data, data + size};
++    struct isf_reader block;
++    UINT64 tag, n, version;
++    LONG signed_value;
++    HRESULT hr = E_INVALIDARG;
++    unsigned int i;
++
++    TRACE("data %p, size %Iu, properties %p.\n", data, size, ink_properties);
++    *strokes = NULL;
++    *count = 0;
++    if (!data || !isf_uint(&r, &version) || version != 0 ||
++            !isf_uint(&r, &n) || n != (UINT64)(r.end - r.ptr)) goto done;
++    while (r.ptr < r.end)
++    {
++        hr = E_INVALIDARG;
++        if (!isf_uint(&r, &tag))
++            goto done;
++        TRACE("tag %I64u, offset %Iu.\n", tag, (SIZE_T)(r.ptr - data));
++        switch (tag)
++        {
++        case TAG_GUID_TABLE:
++            if (!isf_block(&r, &block) || (block.end - block.ptr) % sizeof(GUID))
++                goto done;
++            free(state.guids);
++            state.guid_count = (block.end - block.ptr) / sizeof(GUID);
++            if (!(state.guids = malloc(max(1u, state.guid_count) * sizeof(GUID))))
++            {
++                hr = E_OUTOFMEMORY;
++                goto done;
++            }
++            memcpy(state.guids, block.ptr, state.guid_count * sizeof(GUID));
++            break;
++        case TAG_INK_RECT:
++            for (i = 0; i < 4; i++)
++                if (!isf_signed(&r, &signed_value))
++                    goto done;
++            break;
++        case TAG_DA_TABLE: case TAG_DA_BLOCK: case TAG_DESC_TABLE: case TAG_DESC_BLOCK:
++        case TAG_METRIC_TABLE: case TAG_METRIC_BLOCK:
++            if (!isf_block(&r, &block))
++                goto done;
++            hr = isf_decode_blocks(&state, block, tag == TAG_DA_TABLE ? TAG_DA_BLOCK :
++                    (tag == TAG_DESC_TABLE ? TAG_DESC_BLOCK : (tag == TAG_METRIC_TABLE ? TAG_METRIC_BLOCK : tag)),
++                    tag == TAG_DA_BLOCK || tag == TAG_DESC_BLOCK || tag == TAG_METRIC_BLOCK);
++            if (FAILED(hr))
++                goto done;
++            break;
++        case TAG_TRANSFORM_TABLE: case TAG_EXT_TRANSFORM_TABLE:
++            if (!isf_block(&r, &block) || FAILED(hr = isf_decode_transforms(&state, block,
++                    tag == TAG_EXT_TRANSFORM_TABLE))) goto done;
++            break;
++        case TAG_TRANSFORM: case TAG_ISO_SCALE: case TAG_ANISO_SCALE: case TAG_ROTATE:
++        case TAG_TRANSLATE: case TAG_SCALE_TRANSLATE: case TAG_QUAD:
++            if (FAILED(hr = isf_add_transform(&state, &r, tag, FALSE, 0)))
++                goto done;
++            break;
++        case TAG_DIDX: case TAG_SIDX: case TAG_MIDX: case TAG_TIDX:
++            if (!isf_uint(&r, &n) || n > UINT_MAX)
++            {
++                hr = E_INVALIDARG;
++                goto done;
++            }
++            if (tag == TAG_DIDX)
++                state.didx = n;
++            else if (tag == TAG_SIDX)
++                state.sidx = n;
++            else if (tag == TAG_MIDX)
++                state.midx = n;
++            else
++                state.tidx = n;
++            break;
++        case TAG_STROKE:
++            if (!isf_block(&r, &block) || FAILED(hr = isf_decode_stroke(&state, block)))
++                goto done;
++            break;
++        case TAG_HIMETRIC_SIZE:
++            if (!isf_block(&r, &block) || !isf_signed(&block, &signed_value) ||
++                    !isf_signed(&block, &signed_value) || block.ptr != block.end) goto done;
++            break;
++        case TAG_PERSISTENCE:
++            if (!isf_block(&r, &block) || !isf_uint(&block, &n) || block.ptr != block.end)
++                goto done;
++            break;
++        case TAG_COMPRESSION_HEADER: case TAG_STROKE_IDS:
++            if (!isf_block(&r, &block))
++                goto done;
++            break;
++        default:
++            if (isf_guid(&state, tag))
++            {
++                if (FAILED(hr = isf_decode_property(&r, &state, tag, ink_properties)))
++                    goto done;
++            }
++            else if (!isf_block(&r, &block))
++                goto done;
++            break;
++        }
++    }
++    *strokes = state.strokes;
++    *count = state.count;
++    state.strokes = NULL;
++    state.count = 0;
++    hr = S_OK;
++done:
++    isf_free_state(&state);
++    return hr;
++}
++
++/* 收集扩展属性使用的 GUID。 */
++static HRESULT isf_collect_properties(struct isf_state *s, IInkExtendedProperties *properties)
++{
++    GUID guid;
++    VARIANT v;
++    LONG count, i;
++    HRESULT hr;
++
++    if (FAILED(hr = IInkExtendedProperties_get_Count(properties, &count)))
++        return hr;
++    for (i = 0; i < count; ++i)
++    {
++        if (FAILED(hr = isf_get_property(properties, i, &guid, &v)))
++            return hr;
++        hr = isf_add_guid(s, &guid);
++        VariantClear(&v);
++        if (FAILED(hr))
++            return hr;
++    }
++    return S_OK;
++}
++
++/* 写入扩展属性集合。 */
++static void isf_encode_properties(struct isf_writer *w, struct isf_state *s,
++        IInkExtendedProperties *props, InkPersistenceCompressionMode mode, BOOL tagged)
++{
++    LONG count, i;
++    GUID guid;
++    VARIANT v;
++    HRESULT hr;
++
++    if (FAILED(hr = IInkExtendedProperties_get_Count(props, &count)))
++    {
++        w->hr = hr;
++        return;
++    }
++    for (i = 0; i < count && SUCCEEDED(w->hr); ++i)
++    {
++        if (FAILED(hr = isf_get_property(props, i, &guid, &v)))
++        {
++            w->hr = hr;
++            return;
++        }
++        w->hr = isf_encode_property(w, s, &guid, &v, mode, tagged);
++        VariantClear(&v);
++    }
++}
++
++/* 写入绘图属性块。 */
++static void isf_encode_attrs(struct isf_writer *w, struct isf_state *s, IInkDrawingAttributes *attrs,
++        InkPersistenceCompressionMode mode)
++{
++    IInkExtendedProperties *props;
++    InkRasterOperation rop;
++    InkPenTip tip;
++    VARIANT_BOOL fit, ignore, aa;
++    float sizes[2], rounded;
++    SHORT fraction;
++    LONG color, transparency;
++    unsigned int i;
++    HRESULT hr;
++
++    if (FAILED(hr = IInkDrawingAttributes_get_Color(attrs, &color)) ||
++            FAILED(hr = IInkDrawingAttributes_get_Width(attrs, &sizes[0])) ||
++            FAILED(hr = IInkDrawingAttributes_get_Height(attrs, &sizes[1])) ||
++            FAILED(hr = IInkDrawingAttributes_get_FitToCurve(attrs, &fit)) ||
++            FAILED(hr = IInkDrawingAttributes_get_IgnorePressure(attrs, &ignore)) ||
++            FAILED(hr = IInkDrawingAttributes_get_AntiAliased(attrs, &aa)) ||
++            FAILED(hr = IInkDrawingAttributes_get_Transparency(attrs, &transparency)) ||
++            FAILED(hr = IInkDrawingAttributes_get_RasterOperation(attrs, &rop)) ||
++            FAILED(hr = IInkDrawingAttributes_get_PenTip(attrs, &tip)))
++    {
++        w->hr = hr;
++        return;
++    }
++    isf_number(w, TAG_GUID_DRAWING_FLAGS);
++    isf_number(w, (fit ? DRAWING_FLAG_FIT_TO_CURVE : 0) | (ignore ? DRAWING_FLAG_IGNORE_PRESSURE : 0) |
++            (aa ? DRAWING_FLAG_ANTIALIASED : 0));
++    if (color)
++    {
++        isf_number(w, TAG_GUID_COLORREF);
++        isf_number(w, color & 0xffffff);
++    }
++    if (transparency)
++    {
++        isf_number(w, TAG_GUID_TRANSPARENCY);
++        isf_number(w, transparency);
++    }
++    if (rop != IRO_CopyPen)
++    {
++        static const BYTE zeros[3] = {0};
++        isf_number(w, TAG_GUID_RASTER_OPERATION);
++        isf_byte(w, rop);
++        isf_write(w, zeros, sizeof(zeros));
++    }
++    for (i = 0; i < 2; ++i)
++    {
++        if (sizes[i] == (i ? 1.0f : 53.0f))
++            continue;
++        if (!isfinite(sizes[i]) || sizes[i] < 0 || sizes[i] > INT_MAX - 1)
++        {
++            w->hr = E_INVALIDARG;
++            return;
++        }
++        rounded = floorf(sizes[i] + 0.5f);
++        fraction = lroundf((sizes[i] - rounded) * 1000.0f);
++        isf_number(w, TAG_GUID_PEN_WIDTH + i);
++        isf_number(w, rounded);
++        if (fraction)
++        {
++            isf_number(w, TAG_MANTISSA);
++            isf_number(w, 2);
++            isf_byte(w, 0);
++            isf_write(w, &fraction, sizeof(fraction));
++        }
++    }
++    if (tip != IPT_Ball)
++    {
++        isf_number(w, TAG_GUID_PEN_TIP);
++        isf_number(w, tip);
++    }
++    if (FAILED(hr = IInkDrawingAttributes_get_ExtendedProperties(attrs, &props)))
++    {
++        w->hr = hr;
++        return;
++    }
++    isf_encode_properties(w, s, props, mode, TRUE);
++    IInkExtendedProperties_Release(props);
++}
++
++/* 写入非默认属性度量。 */
++static void isf_encode_metric(struct isf_writer *w, struct isf_state *s,
++        const struct stroke_data *stroke)
++{
++    struct property_metrics def, *m;
++    struct isf_writer entry;
++    UINT64 tag;
++    unsigned int i;
++
++    for (i = 0; i < stroke->packet_size; i++)
++    {
++        tag = isf_tag_for_guid(s, &stroke->description[i]);
++        isf_default_metric(tag, &def);
++        m = &stroke->metrics[i];
++        if (m->minimum == def.minimum && m->maximum == def.maximum && m->units == def.units &&
++                m->resolution == def.resolution) continue;
++        entry = (struct isf_writer){0};
++        isf_sign_number(&entry, m->minimum);
++        if (m->maximum != def.maximum || m->units != def.units || m->resolution != def.resolution)
++            isf_sign_number(&entry, m->maximum);
++        if (m->units != def.units || m->resolution != def.resolution)
++            isf_number(&entry, m->units);
++        if (m->resolution != def.resolution)
++            isf_write(&entry, &m->resolution, sizeof(m->resolution));
++        isf_number(w, tag);
++        isf_number(w, entry.size);
++        isf_write(w, entry.data, entry.size);
++        if (FAILED(entry.hr))
++            w->hr = entry.hr;
++        isf_drop(&entry);
++    }
++}
++
++/* 写入笔画描述符。 */
++static void isf_encode_desc(struct isf_writer *w, struct isf_state *s, struct stroke_data *stroke)
++{
++    LONG count, i;
++    GUID guid;
++    VARIANT v;
++    HRESULT hr;
++    unsigned int j;
++
++    for (j = 2; j < stroke->packet_size; j++)
++        isf_number(w, isf_tag_for_guid(s, &stroke->description[j]));
++    if (FAILED(hr = IInkExtendedProperties_get_Count(stroke->properties, &count)))
++    {
++        w->hr = hr;
++        return;
++    }
++    if (count)
++        isf_number(w, TAG_STROKE_PROPERTIES);
++    for (i = 0; i < count; ++i)
++    {
++        if (FAILED(hr = isf_get_property(stroke->properties, i, &guid, &v)))
++        {
++            w->hr = hr;
++            return;
++        }
++        isf_number(w, isf_tag_for_guid(s, &guid));
++        VariantClear(&v);
++    }
++}
++
++/* 将笔画保存为 ISF 字节流。 */
++HRESULT isf_encode(struct stroke_data **strokes, unsigned int count, IInkExtendedProperties *ink_properties,
++        InkPersistenceCompressionMode compression, BYTE **data, SIZE_T *size)
++{
++    struct isf_state s = {0};
++    struct isf_writer content = {0};
++    struct isf_writer block = {0};
++    struct isf_writer table = {0};
++    struct isf_writer stream = {0};
++    IInkExtendedProperties *props;
++    unsigned int i, j;
++    HRESULT hr = S_OK;
++
++    *data = NULL;
++    *size = 0;
++    if (FAILED(hr = isf_collect_properties(&s, ink_properties)))
++        goto done;
++    for (i = 0; i < count; i++)
++    {
++        for (j = 0; j < strokes[i]->packet_size; j++)
++            if (FAILED(hr = isf_add_guid(&s, &strokes[i]->description[j])))
++                goto done;
++        if (FAILED(hr = isf_collect_properties(&s, strokes[i]->properties)) ||
++                FAILED(hr = IInkDrawingAttributes_get_ExtendedProperties(strokes[i]->attributes, &props))) goto done;
++        hr = isf_collect_properties(&s, props);
++        IInkExtendedProperties_Release(props);
++        if (FAILED(hr))
++            goto done;
++    }
++    if (s.guid_count)
++    {
++        isf_number(&content, TAG_GUID_TABLE);
++        isf_number(&content, s.guid_count * sizeof(GUID));
++        isf_write(&content, s.guids, s.guid_count * sizeof(GUID));
++    }
++    if (count)
++    {
++        for (i = 0; i < count; i++)
++        {
++            block = (struct isf_writer){0};
++            isf_encode_attrs(&block, &s, strokes[i]->attributes, compression);
++            if (count == 1)
++                isf_section(&content, TAG_DA_BLOCK, &block);
++            else
++            {
++                isf_number(&table, block.size);
++                isf_write(&table, block.data, block.size);
++                if (FAILED(block.hr))
++                    table.hr = block.hr;
++            }
++            isf_drop(&block);
++        }
++        if (count > 1)
++        {
++            isf_section(&content, TAG_DA_TABLE, &table);
++            isf_drop(&table);
++            table = (struct isf_writer){0};
++        }
++        for (i = 0; i < count; i++)
++        {
++            block = (struct isf_writer){0};
++            isf_encode_desc(&block, &s, strokes[i]);
++            if (count == 1)
++                isf_section(&content, TAG_DESC_BLOCK, &block);
++            else
++            {
++                isf_number(&table, block.size);
++                isf_write(&table, block.data, block.size);
++                if (FAILED(block.hr))
++                    table.hr = block.hr;
++            }
++            isf_drop(&block);
++        }
++        if (count > 1)
++        {
++            isf_section(&content, TAG_DESC_TABLE, &table);
++            isf_drop(&table);
++            table = (struct isf_writer){0};
++        }
++        for (i = 0; i < count; i++)
++        {
++            block = (struct isf_writer){0};
++            isf_encode_metric(&block, &s, strokes[i]);
++            if (count == 1)
++                isf_section(&content, TAG_METRIC_BLOCK, &block);
++            else
++            {
++                isf_number(&table, block.size);
++                isf_write(&table, block.data, block.size);
++                if (FAILED(block.hr))
++                    table.hr = block.hr;
++            }
++            isf_drop(&block);
++        }
++        if (count > 1)
++        {
++            isf_section(&content, TAG_METRIC_TABLE, &table);
++            isf_drop(&table);
++            table = (struct isf_writer){0};
++        }
++    }
++    isf_encode_properties(&content, &s, ink_properties, compression, TRUE);
++    for (i = 0; i < count && SUCCEEDED(content.hr); i++)
++    {
++        struct stroke_data *stroke = strokes[i];
++        if (count > 1)
++        {
++            isf_number(&content, TAG_DIDX);
++            isf_number(&content, i);
++            isf_number(&content, TAG_SIDX);
++            isf_number(&content, i);
++            isf_number(&content, TAG_MIDX);
++            isf_number(&content, i);
++        }
++        block = (struct isf_writer){0};
++        isf_number(&block, stroke->packet_count);
++        /* a stroke without points has no packet arrays at all */
++        for (j = 0; stroke->packet_count && j < stroke->packet_size && SUCCEEDED(block.hr); j++)
++            isf_encode_packet(&block, stroke, j, compression);
++        isf_encode_properties(&block, &s, stroke->properties, compression, FALSE);
++        isf_section(&content, TAG_STROKE, &block);
++        isf_drop(&block);
++    }
++    if (SUCCEEDED(content.hr))
++    {
++        isf_byte(&stream, 0);
++        isf_number(&stream, content.size);
++        isf_write(&stream, content.data, content.size);
++        if (SUCCEEDED(stream.hr))
++        {
++            *data = stream.data;
++            *size = stream.size;
++            stream.data = NULL;
++        }
++        else
++            hr = stream.hr;
++    }
++    else
++        hr = content.hr;
++done:
++    isf_drop(&stream);
++    isf_drop(&content);
++    isf_drop(&block);
++    isf_drop(&table);
++    free(s.guids);
++    return hr;
++}
+diff --git a/dlls/inkobj/tests/inkobj.c b/dlls/inkobj/tests/inkobj.c
+index 27e2095a2c6..e0dd7e506ef 100644
+--- a/dlls/inkobj/tests/inkobj.c
++++ b/dlls/inkobj/tests/inkobj.c
+@@ -30,6 +30,7 @@
+ #include "ocidl.h"
+ #include "initguid.h"
+ #include "msinkaut.h"
++#include "wine/inkobj.h"
+ 
+ #include "wine/test.h"
+ 
+@@ -345,6 +346,722 @@ static void test_ink(void)
+     IInkDisp_Release(ink);
+ }
+ 
++static VARIANT byte_array(const BYTE *values, unsigned int count)
++{
++    SAFEARRAY *array = SafeArrayCreateVector(VT_UI1, 0, count);
++    BYTE *bytes;
++    VARIANT v;
++
++    SafeArrayAccessData(array, (void **)&bytes);
++    memcpy(bytes, values, count);
++    SafeArrayUnaccessData(array);
++    V_VT(&v) = VT_ARRAY | VT_UI1;
++    V_ARRAY(&v) = array;
++    return v;
++}
++
++static void add_property(IInkExtendedProperties *props, const WCHAR *guid, VARIANT value)
++{
++    IInkExtendedProperty *property;
++    BSTR str = SysAllocString(guid);
++    HRESULT hr = IInkExtendedProperties_Add(props, str, value, &property);
++    ok(hr == S_OK, "Add property returned %#lx.\n", hr);
++    if (hr == S_OK) IInkExtendedProperty_Release(property);
++    SysFreeString(str);
++}
++
++static void check_property(IInkExtendedProperties *props, const WCHAR *guid, const VARIANT *expected)
++{
++    VARIANT id, value;
++    IInkExtendedProperty *property;
++    BYTE *a, *b;
++    LONG count;
++    HRESULT hr;
++
++    V_VT(&id) = VT_BSTR;
++    V_BSTR(&id) = SysAllocString(guid);
++    hr = IInkExtendedProperties_Item(props, id, &property);
++    ok(hr == S_OK, "Property %s: %#lx.\n", wine_dbgstr_w(guid), hr);
++    VariantClear(&id);
++    if (FAILED(hr)) return;
++    hr = IInkExtendedProperty_get_Data(property, &value);
++    ok(hr == S_OK && V_VT(&value) == V_VT(expected), "Property type %#x, hr %#lx.\n", V_VT(&value), hr);
++    if (SUCCEEDED(hr))
++    {
++        if (V_VT(expected) == VT_I4)
++            ok(V_I4(&value) == V_I4(expected), "Got %ld.\n", V_I4(&value));
++        else if (V_VT(expected) == VT_R8)
++            ok(V_R8(&value) == V_R8(expected), "Got %f.\n", V_R8(&value));
++        else if (V_VT(expected) == VT_BSTR)
++            ok(!wcscmp(V_BSTR(&value), V_BSTR(expected)), "Got %s.\n", wine_dbgstr_w(V_BSTR(&value)));
++        else if (V_VT(expected) == (VT_ARRAY | VT_UI1))
++        {
++            count = V_ARRAY(expected)->rgsabound[0].cElements;
++            ok(V_ARRAY(&value)->rgsabound[0].cElements == count, "Got %lu bytes.\n",
++                    V_ARRAY(&value)->rgsabound[0].cElements);
++            SafeArrayAccessData(V_ARRAY(&value), (void **)&a);
++            SafeArrayAccessData(V_ARRAY(expected), (void **)&b);
++            ok(!memcmp(a, b, count), "Byte property changed.\n");
++            SafeArrayUnaccessData(V_ARRAY(expected));
++            SafeArrayUnaccessData(V_ARRAY(&value));
++        }
++        VariantClear(&value);
++    }
++    IInkExtendedProperty_Release(property);
++}
++
++static void test_save_load(void)
++{
++    static const WCHAR ink_guid[] = L"{0C17FA69-A143-4565-ACDE-6B2824B4470A}";
++    static const WCHAR attr_guid[] = L"{0C17FA69-A143-4565-ACDE-6B2824B4470B}";
++    static const WCHAR stroke_guid[] = L"{0C17FA69-A143-4565-ACDE-6B2824B4470C}";
++    static const WCHAR double_guid[] = L"{0C17FA69-A143-4565-ACDE-6B2824B4470D}";
++    static const WCHAR pressure_guid[] = L"{7307502D-F9F4-4E18-B3F2-2CE1B1A3610C}";
++    static const WCHAR x_guid[] = L"{598A6A8F-52C0-4BA0-93AF-AF357411A561}";
++    static const WCHAR y_guid[] = L"{B53F9F75-04E0-4498-A7EE-C30DBB5A9011}";
++    static const BYTE empty[] = {0, 0}, wrong[] = {1, 0}, truncated[] = {0, 4, 10, 4, 1};
++    static const BYTE unknown_isf[] = {0,5,32,3,0xaa,0xbb,0xcc};
++    static const BYTE large_size[] = {0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,2};
++    static const BYTE packed[] = {0, 8, 10, 6, 1, 4, 0xd0, 11, 0x57, 0x80};
++    static const BYTE metric_isf[] = {0,21,25,11,50,9,0,0xc0,0xb8,2,2,0,0x80,0xbb,0x44,
++            10,6,1,4,0xd0,11,0x57,0x80};
++    static const BYTE delta_isf[] = {0,10,10,8,3,0x23,0x14,0,0,3,0x29,0x80};
++    static const BYTE no_x_isf[] = {0,9,5,1,7,10,4,1,11,0x57,0x80};
++    static const BYTE no_y_isf[] = {0,8,5,1,8,10,3,1,4,0xd0};
++    static const BYTE buttons_isf[] = {0,13,5,3,6,1,83,10,6,2,2,0x40,2,0x10,0x80};
++    static const BYTE point_skip_isf[] = {0,13,10,11,1,4,0xd0,11,0x57,0x80,12,3,0,0,0};
++    static const BYTE tagged_isf[] = {0,35,1,16,0x69,0xfa,0x17,0x0c,0x43,0xa1,0x65,0x45,
++            0xac,0xde,0x6b,0x28,0x24,0xb4,0x47,0x0a,10,15,1,4,0xd0,11,0x57,0x80,
++            100,6,0,3,0,42,0,0,0};
++    static const BYTE extended_xform[] = {0,38,15,9,20,0,0,0xc0,0x3f,0,0,0x10,0x40,
++            31,17,20,0,0,0,0,0,0,4,0x40,0,0,0,0,0,0,12,0x40,
++            10,6,1,4,0xd0,11,0x57,0x80};
++    static const BYTE mantissa_isf[] = {0,17,3,7,69,27,27,2,22,0xee,4,
++            10,6,1,4,0xd0,11,0x57,0x80};
++    static const BYTE gif[] = {'G','I','F','8','9','a', 1,0,1,0,0,0,0,
++            0x21,0xfe,2,0,0,0,0x3b};
++    static const BYTE wrapped_gif[] = "base64:R0lGODlhAQABAAAAACH+AgAAADs=";
++    static const BYTE lz_isf[] = {0,28,1,16,0x69,0xfa,0x17,0x0c,0x43,0xa1,0x65,0x45,
++            0xac,0xde,0x6b,0x28,0x24,0xb4,0x47,0x0a,100,7,0x80,0xff,3,0,42,0,0,0};
++    static const BYTE property_bytes[] = {0, 0x7f, 0xff, 0x92};
++    static const LONG one[] = {-2000000000, 2000000000};
++    static const LONG packet[] = {
++        -2000000000, 2000000000, 100, -100, 123, 150,
++        2000000000, -2000000000, 750, 345, -785, 0,
++        347, 438, 800, 322, 999, 1000,
++        -201, 100, 1023, 2, 3, 4
++    };
++    IInkDisp *ink, *loaded, *simple;
++    IInkStrokes *strokes;
++    IInkStrokeDisp *stroke, *second, *item;
++    IInkDrawingAttributes *attrs, *check_attrs;
++    IInkExtendedProperties *properties;
++    IWineInkStroke *wstroke;
++    PACKET_PROPERTY metric;
++    VARIANT bytes, v, desc, props_v[4];
++    BSTR *guids, name;
++    LONG values[64], count, minimum, maximum;
++    TabletPropertyMetricUnit units;
++    float width, resolution;
++    VARIANT_BOOL flag;
++    InkPenTip tip;
++    InkRasterOperation rop;
++    LONG color;
++    HRESULT hr;
++    unsigned int mode, format, n;
++
++    if (!(simple = create(&CLSID_InkDisp, &IID_IInkDisp))) return;
++    bytes = byte_array(empty, sizeof(empty));
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == S_OK, "Empty ISF: %#lx.\n", hr);
++    VariantClear(&bytes);
++    hr = IInkDisp_Save(simple, IPF_InkSerializeFormat, IPCM_Default, &bytes);
++    ok(hr == S_OK && V_VT(&bytes) == (VT_ARRAY | VT_UI1), "Empty Save: %#lx.\n", hr);
++    if (SUCCEEDED(hr)) VariantClear(&bytes);
++    hr = IInkDisp_Save(simple, IPF_InkSerializeFormat, IPCM_Default, NULL);
++    ok(hr == E_POINTER, "Null Save output: %#lx.\n", hr); /* UNMEASURED */
++    hr = IInkDisp_Save(simple, (InkPersistenceFormat)9, IPCM_Default, &bytes);
++    ok(hr == E_INVALIDARG, "Unknown format: %#lx.\n", hr); /* UNMEASURED */
++    hr = IInkDisp_Save(simple, IPF_InkSerializeFormat, (InkPersistenceCompressionMode)9, &bytes);
++    ok(hr == E_INVALIDARG, "Unknown compression: %#lx.\n", hr); /* UNMEASURED */
++    hr = IInkDisp_Save(simple, IPF_GIF, IPCM_Default, &bytes);
++    ok(hr == E_NOTIMPL, "GIF Save: %#lx.\n", hr); /* UNMEASURED */
++    bytes = byte_array(wrong, sizeof(wrong));
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == E_INVALIDARG, "Wrong version: %#lx.\n", hr);
++    VariantClear(&bytes);
++    bytes = byte_array(truncated, sizeof(truncated));
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == E_INVALIDARG, "Truncated ISF: %#lx.\n", hr);
++    VariantClear(&bytes);
++    bytes = byte_array(large_size, sizeof(large_size));
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == E_INVALIDARG, "Overflowed 64-bit size: %#lx.\n", hr);
++    VariantClear(&bytes);
++    bytes = byte_array(unknown_isf, sizeof(unknown_isf));
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == S_OK, "Unknown sized tag: %#lx.\n", hr);
++    VariantClear(&bytes);
++    V_VT(&bytes) = VT_ARRAY | VT_UI1;
++    V_ARRAY(&bytes) = SafeArrayCreateVector(VT_UI1, 0, 0);
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == E_INVALIDARG, "Zero-length array: %#lx.\n", hr); /* UNMEASURED */
++    VariantClear(&bytes);
++    bytes = byte_array(packed, sizeof(packed));
++    hr = IInkDisp_Load(simple, bytes);
++    ok(hr == S_OK, "Bit-packed sample: %#lx.\n", hr);
++    VariantClear(&bytes);
++    if (SUCCEEDED(hr))
++    {
++        IInkDisp_get_Strokes(simple, &strokes);
++        IInkStrokes_get_Count(strokes, &count);
++        ok(count == 1, "Got %ld strokes.\n", count);
++        IInkStrokes_Item(strokes, 0, &item);
++        IInkStrokeDisp_GetPoints(item, 0, -1, &v);
++        n = read_longs(&v, values, ARRAY_SIZE(values));
++        ok(n == 2 && values[0] == -3 && values[1] == 700, "Bit-packed point %ld, %ld.\n", values[0], values[1]);
++        IInkStrokeDisp_Release(item);
++        IInkStrokes_Release(strokes);
++        hr = IInkDisp_Load(simple, (VARIANT){.vt = VT_EMPTY});
++        ok(hr == E_UNEXPECTED, "Nonempty Load: %#lx.\n", hr); /* UNMEASURED */
++    }
++    IInkDisp_Release(simple);
++    {
++        static const struct
++        {
++            const BYTE *bytes;
++            unsigned int size, length;
++            LONG expected[6];
++        } cases[] =
++        {
++            {metric_isf, sizeof(metric_isf), 2, {-3, 700}},
++            {delta_isf, sizeof(delta_isf), 6, {10, 1, 20, 2, 30, 3}},
++            {no_x_isf, sizeof(no_x_isf), 2, {0, 700}},
++            {no_y_isf, sizeof(no_y_isf), 2, {-3, 0}},
++            {point_skip_isf, sizeof(point_skip_isf), 2, {-3, 700}},
++            {extended_xform, sizeof(extended_xform), 2, {-1, 704}},
++            {mantissa_isf, sizeof(mantissa_isf), 2, {-3, 700}},
++        };
++        unsigned int j;
++
++        for (j = 0; j < ARRAY_SIZE(cases); j++)
++        {
++            if (!(simple = create(&CLSID_InkDisp, &IID_IInkDisp))) break;
++            bytes = byte_array(cases[j].bytes, cases[j].size);
++            hr = IInkDisp_Load(simple, bytes);
++            ok(hr == S_OK, "Spec stream %u: %#lx.\n", j, hr);
++            VariantClear(&bytes);
++            if (SUCCEEDED(hr))
++            {
++                IInkDisp_get_Strokes(simple, &strokes);
++                IInkStrokes_Item(strokes, 0, &item);
++                hr = IInkStrokeDisp_GetPoints(item, 0, -1, &v);
++                ok(hr == S_OK, "Spec points %u: %#lx.\n", j, hr);
++                if (SUCCEEDED(hr))
++                {
++                    n = read_longs(&v, values, ARRAY_SIZE(values));
++                    ok(n == cases[j].length && !memcmp(values, cases[j].expected, n * sizeof(LONG)),
++                            "Spec points %u differ.\n", j);
++                }
++                if (j == ARRAY_SIZE(cases) - 1)
++                {
++                    IInkStrokeDisp_get_DrawingAttributes(item, &check_attrs);
++                    IInkDrawingAttributes_get_Width(check_attrs, &width);
++                    ok(width == 27.375f, "Compressed mantissa width %f.\n", width);
++                    IInkDrawingAttributes_Release(check_attrs);
++                }
++                if (j == 0)
++                {
++                    name = SysAllocString(x_guid);
++                    hr = IInkStrokeDisp_GetPacketDescriptionPropertyMetrics(item, name, &minimum, &maximum,
++                            &units, &resolution);
++                    ok(hr == S_OK && minimum == 0 && maximum == 20000 && units == TPMU_Centimeters &&
++                            resolution == 1500, "Spec metric: %#lx, %ld..%ld, %d, %f.\n",
++                            hr, minimum, maximum, units, resolution);
++                    SysFreeString(name);
++                }
++                IInkStrokeDisp_Release(item);
++                IInkStrokes_Release(strokes);
++            }
++            IInkDisp_Release(simple);
++        }
++    }
++    /* a stroke without points saves without packet arrays and loads back */
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        static const BYTE empty_stroke[] = {0, 3, 10, 1, 0};
++
++        bytes = byte_array(empty_stroke, sizeof(empty_stroke));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "Stroke without points: %#lx.\n", hr);
++        VariantClear(&bytes);
++        hr = IInkDisp_Save(simple, IPF_InkSerializeFormat, IPCM_Default, &bytes);
++        ok(hr == S_OK, "Save of a stroke without points: %#lx.\n", hr);
++        IInkDisp_Release(simple);
++        if (SUCCEEDED(hr) && (simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++        {
++            hr = IInkDisp_Load(simple, bytes);
++            ok(hr == S_OK, "Reload of a stroke without points: %#lx.\n", hr);
++            IInkDisp_get_Strokes(simple, &strokes);
++            count = -1;
++            IInkStrokes_get_Count(strokes, &count);
++            ok(count == 1, "Got %ld strokes.\n", count);
++            if (count == 1)
++            {
++                IInkStrokes_Item(strokes, 0, &item);
++                count = -1;
++                IInkStrokeDisp_get_PacketCount(item, &count);
++                ok(!count, "Got %ld packets.\n", count);
++                IInkStrokeDisp_Release(item);
++            }
++            IInkStrokes_Release(strokes);
++            IInkDisp_Release(simple);
++        }
++        VariantClear(&bytes);
++    }
++
++    /* the drawing flags: fit to curve 0x1, ignore pressure 0x4, antialiased 0x10 */
++    {
++        static const BYTE flags_isf[][9] =
++        {
++            {0, 7, 3, 2, 72, 0x11, 10, 1, 0},
++            {0, 7, 3, 2, 72, 0x04, 10, 1, 0},
++        };
++        static const VARIANT_BOOL expected_flags[][3] =
++        {
++            {VARIANT_TRUE, VARIANT_FALSE, VARIANT_TRUE},
++            {VARIANT_FALSE, VARIANT_TRUE, VARIANT_FALSE},
++        };
++        VARIANT_BOOL fit, ignore, antialiased;
++        unsigned int j, pass;
++
++        for (j = 0; j < ARRAY_SIZE(flags_isf); j++)
++        {
++            bytes = byte_array(flags_isf[j], sizeof(flags_isf[j]));
++            for (pass = 0; pass < 2; pass++)
++            {
++                if (!(simple = create(&CLSID_InkDisp, &IID_IInkDisp))) break;
++                hr = IInkDisp_Load(simple, bytes);
++                ok(hr == S_OK, "Flags %u, pass %u: %#lx.\n", j, pass, hr);
++                VariantClear(&bytes);
++                IInkDisp_get_Strokes(simple, &strokes);
++                IInkStrokes_Item(strokes, 0, &item);
++                IInkStrokeDisp_get_DrawingAttributes(item, &check_attrs);
++                IInkDrawingAttributes_get_FitToCurve(check_attrs, &fit);
++                IInkDrawingAttributes_get_IgnorePressure(check_attrs, &ignore);
++                IInkDrawingAttributes_get_AntiAliased(check_attrs, &antialiased);
++                ok(fit == expected_flags[j][0] && ignore == expected_flags[j][1] &&
++                        antialiased == expected_flags[j][2], "Flags %u, pass %u: fit %d, ignore %d, antialiased %d.\n",
++                        j, pass, fit, ignore, antialiased);
++                IInkDrawingAttributes_Release(check_attrs);
++                IInkStrokeDisp_Release(item);
++                IInkStrokes_Release(strokes);
++                /* the second pass loads what the first saved */
++                hr = IInkDisp_Save(simple, IPF_InkSerializeFormat, IPCM_Default, &bytes);
++                ok(hr == S_OK, "Save of flags %u: %#lx.\n", j, hr);
++                IInkDisp_Release(simple);
++            }
++            VariantClear(&bytes);
++        }
++    }
++
++    /* the ink keeps its properties object across Load */
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        /* a global property: VT_I4 42 under the GUID of the table */
++        static const BYTE global_isf[] = {0,27,1,16,0x69,0xfa,0x17,0x0c,0x43,0xa1,0x65,0x45,
++                0xac,0xde,0x6b,0x28,0x24,0xb4,0x47,0x0a,100,6,0,3,0,42,0,0,0};
++
++        hr = IInkDisp_get_ExtendedProperties(simple, &properties);
++        ok(hr == S_OK, "Ink properties: %#lx.\n", hr);
++        bytes = byte_array(global_isf, sizeof(global_isf));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "Global property: %#lx.\n", hr);
++        VariantClear(&bytes);
++        count = -1;
++        IInkExtendedProperties_get_Count(properties, &count);
++        ok(count == 1, "Properties taken before Load have %ld entries.\n", count);
++        IInkExtendedProperties_Release(properties);
++        IInkDisp_Release(simple);
++    }
++
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        static const LONG expected[] = {1, 0, 1, 0, 1, 0};
++        bytes = byte_array(buttons_isf, sizeof(buttons_isf));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "Button bits: %#lx.\n", hr);
++        VariantClear(&bytes);
++        if (SUCCEEDED(hr))
++        {
++            IInkDisp_get_Strokes(simple, &strokes);
++            IInkStrokes_Item(strokes, 0, &item);
++            IInkStrokeDisp_GetPacketData(item, 0, -1, &v);
++            n = read_longs(&v, values, ARRAY_SIZE(values));
++            ok(n == ARRAY_SIZE(expected) && !memcmp(values, expected, sizeof(expected)),
++                    "Button bits changed.\n");
++            IInkStrokeDisp_Release(item);
++            IInkStrokes_Release(strokes);
++        }
++        IInkDisp_Release(simple);
++    }
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        bytes = byte_array(tagged_isf, sizeof(tagged_isf));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "Tagged stroke property: %#lx.\n", hr);
++        VariantClear(&bytes);
++        if (SUCCEEDED(hr))
++        {
++            IInkDisp_get_Strokes(simple, &strokes);
++            IInkStrokes_Item(strokes, 0, &item);
++            IInkStrokeDisp_get_ExtendedProperties(item, &properties);
++            V_VT(&v) = VT_I4;
++            V_I4(&v) = 42;
++            check_property(properties, ink_guid, &v);
++            IInkExtendedProperties_Release(properties);
++            IInkStrokeDisp_Release(item);
++            IInkStrokes_Release(strokes);
++        }
++        IInkDisp_Release(simple);
++    }
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        bytes = byte_array(gif, sizeof(gif));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "GIF comment: %#lx.\n", hr); /* UNMEASURED */
++        VariantClear(&bytes);
++        IInkDisp_Release(simple);
++    }
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        bytes = byte_array(wrapped_gif, sizeof(wrapped_gif));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "Base64 GIF comment: %#lx.\n", hr); /* UNMEASURED */
++        VariantClear(&bytes);
++        IInkDisp_Release(simple);
++    }
++
++    if ((simple = create(&CLSID_InkDisp, &IID_IInkDisp)))
++    {
++        bytes = byte_array(lz_isf, sizeof(lz_isf));
++        hr = IInkDisp_Load(simple, bytes);
++        ok(hr == S_OK, "LZ property: %#lx.\n", hr);
++        VariantClear(&bytes);
++        if (SUCCEEDED(hr))
++        {
++            IInkDisp_get_ExtendedProperties(simple, &properties);
++            V_VT(&v) = VT_I4;
++            V_I4(&v) = 42;
++            check_property(properties, ink_guid, &v);
++            IInkExtendedProperties_Release(properties);
++        }
++        IInkDisp_Release(simple);
++    }
++
++    if (!(ink = create(&CLSID_InkDisp, &IID_IInkDisp))) return;
++    v = long_array(one, ARRAY_SIZE(one));
++    V_VT(&desc) = VT_EMPTY;
++    hr = IInkDisp_CreateStroke(ink, v, desc, &stroke);
++    ok(hr == S_OK, "CreateStroke (one): %#lx.\n", hr);
++    VariantClear(&v);
++    if (FAILED(hr)) { IInkDisp_Release(ink); return; }
++    v = long_array(packet, ARRAY_SIZE(packet));
++    V_VT(&desc) = VT_ARRAY | VT_BSTR;
++    V_ARRAY(&desc) = SafeArrayCreateVector(VT_BSTR, 0, 3);
++    SafeArrayAccessData(V_ARRAY(&desc), (void **)&guids);
++    guids[0] = SysAllocString(x_guid);
++    guids[1] = SysAllocString(y_guid);
++    guids[2] = SysAllocString(pressure_guid);
++    SafeArrayUnaccessData(V_ARRAY(&desc));
++    hr = IInkDisp_CreateStroke(ink, v, desc, &second);
++    ok(hr == S_OK, "CreateStroke (pressure): %#lx.\n", hr);
++    VariantClear(&v);
++    VariantClear(&desc);
++    if (FAILED(hr)) { IInkStrokeDisp_Release(stroke); IInkDisp_Release(ink); return; }
++
++    hr = IInkStrokeDisp_QueryInterface(second, &IID_IWineInkStroke, (void **)&wstroke);
++    ok(hr == S_OK, "Property metrics interface: %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        IIDFromString(pressure_guid, &metric.guid);
++        metric.PropertyMetrics.nLogicalMin = -40;
++        metric.PropertyMetrics.nLogicalMax = 4095;
++        metric.PropertyMetrics.Units = (PROPERTY_UNITS)TPMU_Grams;
++        metric.PropertyMetrics.fResolution = 12.5f;
++        hr = IWineInkStroke_SetPropertyMetrics(wstroke, 1, &metric);
++        ok(hr == S_OK, "Set metrics: %#lx.\n", hr);
++        IWineInkStroke_Release(wstroke);
++    }
++    V_VT(&props_v[0]) = VT_I4; V_I4(&props_v[0]) = -12345;
++    V_VT(&props_v[1]) = VT_BSTR; V_BSTR(&props_v[1]) = SysAllocString(L"ISF notes");
++    props_v[2] = byte_array(property_bytes, sizeof(property_bytes));
++    V_VT(&props_v[3]) = VT_R8; V_R8(&props_v[3]) = 271.625;
++    IInkDisp_get_ExtendedProperties(ink, &properties);
++    add_property(properties, ink_guid, props_v[0]);
++    IInkExtendedProperties_Release(properties);
++    IInkStrokeDisp_get_DrawingAttributes(second, &attrs);
++    IInkDrawingAttributes_put_Color(attrs, RGB(23, 45, 67));
++    IInkDrawingAttributes_put_Width(attrs, 27.375f);
++    IInkDrawingAttributes_put_Height(attrs, 13.125f);
++    IInkDrawingAttributes_put_PenTip(attrs, IPT_Rectangle);
++    IInkDrawingAttributes_put_FitToCurve(attrs, VARIANT_TRUE);
++    IInkDrawingAttributes_put_IgnorePressure(attrs, VARIANT_TRUE);
++    IInkDrawingAttributes_put_AntiAliased(attrs, VARIANT_FALSE);
++    IInkDrawingAttributes_put_Transparency(attrs, 120);
++    IInkDrawingAttributes_put_RasterOperation(attrs, IRO_MaskPen);
++    IInkDrawingAttributes_get_ExtendedProperties(attrs, &properties);
++    add_property(properties, attr_guid, props_v[1]);
++    IInkExtendedProperties_Release(properties);
++    IInkDrawingAttributes_Release(attrs);
++    IInkStrokeDisp_get_ExtendedProperties(second, &properties);
++    add_property(properties, stroke_guid, props_v[2]);
++    add_property(properties, double_guid, props_v[3]);
++    IInkExtendedProperties_Release(properties);
++
++    for (mode = IPCM_Default; mode <= IPCM_NoCompression; ++mode)
++        for (format = IPF_InkSerializeFormat; format <= IPF_Base64InkSerializedFormat; ++format)
++        {
++            hr = IInkDisp_Save(ink, format, mode, &bytes);
++            ok(hr == S_OK && V_VT(&bytes) == (VT_ARRAY | VT_UI1), "Save mode %u format %u: %#lx.\n", mode, format, hr);
++            if (FAILED(hr)) continue;
++            if (!(loaded = create(&CLSID_InkDisp, &IID_IInkDisp))) { VariantClear(&bytes); continue; }
++            hr = IInkDisp_Load(loaded, bytes);
++            ok(hr == S_OK, "Load mode %u format %u: %#lx.\n", mode, format, hr);
++            VariantClear(&bytes);
++            if (SUCCEEDED(hr))
++            {
++                IInkDisp_get_Dirty(loaded, &flag);
++                ok(flag == VARIANT_FALSE, "Load dirty flag %d.\n", flag); /* UNMEASURED */
++                IInkDisp_get_Strokes(loaded, &strokes);
++                IInkStrokes_get_Count(strokes, &count);
++                ok(count == 2, "Got %ld strokes.\n", count);
++                if (count == 2)
++                {
++                    IInkStrokes_Item(strokes, 0, &item);
++                    IInkStrokeDisp_GetPacketData(item, 0, -1, &v);
++                    n = read_longs(&v, values, ARRAY_SIZE(values));
++                    ok(n == ARRAY_SIZE(one) && !memcmp(values, one, sizeof(one)), "One-point stroke changed.\n");
++                    IInkStrokeDisp_Release(item);
++                    IInkStrokes_Item(strokes, 1, &item);
++                    IInkStrokeDisp_GetPacketData(item, 0, -1, &v);
++                    n = read_longs(&v, values, ARRAY_SIZE(values));
++                    ok(n == ARRAY_SIZE(packet) && !memcmp(values, packet, sizeof(packet)), "Pressure packets changed.\n");
++                    name = SysAllocString(pressure_guid);
++                    hr = IInkStrokeDisp_GetPacketDescriptionPropertyMetrics(item, name, &minimum, &maximum,
++                            &units, &resolution);
++                    ok(hr == S_OK && minimum == -40 && maximum == 4095 && units == TPMU_Grams &&
++                            resolution == 12.5f, "Metrics: hr %#lx, %ld..%ld, unit %d, resolution %f.\n",
++                            hr, minimum, maximum, units, resolution);
++                    SysFreeString(name);
++                    IInkStrokeDisp_get_DrawingAttributes(item, &check_attrs);
++                    IInkDrawingAttributes_get_Color(check_attrs, &color);
++                    ok(color == RGB(23, 45, 67), "Color %#lx.\n", color);
++                    IInkDrawingAttributes_get_Width(check_attrs, &width);
++                    ok(width == 27.375f, "Width %f.\n", width);
++                    IInkDrawingAttributes_get_Height(check_attrs, &width);
++                    ok(width == 13.125f, "Height %f.\n", width);
++                    IInkDrawingAttributes_get_PenTip(check_attrs, &tip);
++                    ok(tip == IPT_Rectangle, "Tip %d.\n", tip);
++                    IInkDrawingAttributes_get_FitToCurve(check_attrs, &flag);
++                    ok(flag == VARIANT_TRUE, "Fit %d.\n", flag);
++                    IInkDrawingAttributes_get_IgnorePressure(check_attrs, &flag);
++                    ok(flag == VARIANT_TRUE, "Ignore %d.\n", flag);
++                    IInkDrawingAttributes_get_AntiAliased(check_attrs, &flag);
++                    ok(flag == VARIANT_FALSE, "Antialias %d.\n", flag);
++                    IInkDrawingAttributes_get_Transparency(check_attrs, &color);
++                    ok(color == 120, "Transparency %ld.\n", color);
++                    IInkDrawingAttributes_get_RasterOperation(check_attrs, &rop);
++                    ok(rop == IRO_MaskPen, "Raster op %d.\n", rop);
++                    IInkDrawingAttributes_get_ExtendedProperties(check_attrs, &properties);
++                    check_property(properties, attr_guid, &props_v[1]);
++                    IInkExtendedProperties_Release(properties);
++                    IInkDrawingAttributes_Release(check_attrs);
++                    IInkStrokeDisp_get_ExtendedProperties(item, &properties);
++                    check_property(properties, stroke_guid, &props_v[2]);
++                    check_property(properties, double_guid, &props_v[3]);
++                    IInkExtendedProperties_Release(properties);
++                    IInkStrokeDisp_Release(item);
++                }
++                IInkStrokes_Release(strokes);
++                IInkDisp_get_ExtendedProperties(loaded, &properties);
++                check_property(properties, ink_guid, &props_v[0]);
++                IInkExtendedProperties_Release(properties);
++            }
++            IInkDisp_Release(loaded);
++        }
++    {
++        LONG long_points[400], *read_back;
++        IInkStrokeDisp *long_stroke;
++        unsigned int j;
++
++        for (j = 0; j < 200; j++)
++        {
++            long_points[j * 2] = j * 2;
++            long_points[j * 2 + 1] = j * 2 + 1;
++        }
++        v = long_array(long_points, ARRAY_SIZE(long_points));
++        V_VT(&desc) = VT_EMPTY;
++        hr = IInkDisp_CreateStroke(ink, v, desc, &long_stroke);
++        ok(hr == S_OK, "Create long stroke: %#lx.\n", hr);
++        VariantClear(&v);
++        if (SUCCEEDED(hr))
++        {
++            for (mode = IPCM_Default; mode <= IPCM_NoCompression; mode++)
++            {
++                hr = IInkDisp_Save(ink, IPF_InkSerializeFormat, mode, &bytes);
++                ok(hr == S_OK, "Save long stroke mode %u: %#lx.\n", mode, hr);
++                if (FAILED(hr)) continue;
++                if ((loaded = create(&CLSID_InkDisp, &IID_IInkDisp)))
++                {
++                    hr = IInkDisp_Load(loaded, bytes);
++                    ok(hr == S_OK, "Load long stroke mode %u: %#lx.\n", mode, hr);
++                    if (SUCCEEDED(hr))
++                    {
++                        IInkDisp_get_Strokes(loaded, &strokes);
++                        IInkStrokes_Item(strokes, 2, &item);
++                        hr = IInkStrokeDisp_GetPacketData(item, 0, -1, &v);
++                        ok(hr == S_OK, "Read long stroke: %#lx.\n", hr);
++                        if (SUCCEEDED(hr))
++                        {
++                            ok(V_ARRAY(&v)->rgsabound[0].cElements == ARRAY_SIZE(long_points),
++                                    "Got %lu coordinates.\n", V_ARRAY(&v)->rgsabound[0].cElements);
++                            SafeArrayAccessData(V_ARRAY(&v), (void **)&read_back);
++                            ok(!memcmp(read_back, long_points, sizeof(long_points)), "Long stroke packets changed.\n");
++                            SafeArrayUnaccessData(V_ARRAY(&v));
++                            VariantClear(&v);
++                        }
++                        IInkStrokeDisp_Release(item);
++                        IInkStrokes_Release(strokes);
++                    }
++                    IInkDisp_Release(loaded);
++                }
++                VariantClear(&bytes);
++            }
++            IInkStrokeDisp_Release(long_stroke);
++        }
++    }
++    for (mode = 1; mode < ARRAY_SIZE(props_v); mode++) VariantClear(&props_v[mode]);
++    IInkStrokeDisp_Release(second);
++    IInkStrokeDisp_Release(stroke);
++    IInkDisp_Release(ink);
++}
++
++static void test_isf_types(void)
++{
++    static const VARTYPE types[] = {VT_I1, VT_UI1, VT_I2, VT_UI2, VT_I4, VT_UI4, VT_I8, VT_UI8,
++            VT_R4, VT_R8, VT_DATE, VT_BOOL, VT_BSTR};
++    static const BYTE raw[] = {0x91,0x02,0x03,0x04,0x05,0x06,0x07,0x08};
++    IInkDisp *ink, *loaded;
++    IInkExtendedProperties *properties;
++    IInkExtendedProperty *property;
++    VARIANT input, output, saved, key;
++    WCHAR guid[39];
++    BSTR name, *strings, first, second;
++    BYTE *items;
++    ULONG length;
++    HRESULT hr;
++    unsigned int i, array_type;
++
++    for (i = 0; i < ARRAY_SIZE(types); i++)
++        for (array_type = 0; array_type < 2; array_type++)
++        {
++            if (!(ink = create(&CLSID_InkDisp, &IID_IInkDisp))) return;
++            if (!(loaded = create(&CLSID_InkDisp, &IID_IInkDisp))) { IInkDisp_Release(ink); return; }
++            swprintf(guid, ARRAY_SIZE(guid), L"{0C17FA69-A143-4565-ACDE-6B2824B4%04X}", i * 2 + array_type);
++            name = SysAllocString(guid);
++            VariantInit(&input);
++            V_VT(&input) = types[i] | (array_type ? VT_ARRAY : 0);
++            length = types[i] == VT_I1 || types[i] == VT_UI1 ? 1 :
++                    (types[i] == VT_I2 || types[i] == VT_UI2 || types[i] == VT_BOOL ? 2 :
++                    (types[i] == VT_I4 || types[i] == VT_UI4 || types[i] == VT_R4 ? 4 : 8));
++            if (types[i] == VT_BSTR)
++            {
++                if (array_type)
++                {
++                    V_ARRAY(&input) = SafeArrayCreateVector(VT_BSTR, 0, 2);
++                    SafeArrayAccessData(V_ARRAY(&input), (void **)&strings);
++                    strings[0] = SysAllocString(L"first");
++                    strings[1] = SysAllocString(L"second");
++                    SafeArrayUnaccessData(V_ARRAY(&input));
++                }
++                else V_BSTR(&input) = SysAllocString(L"one value");
++            }
++            else if (array_type)
++            {
++                V_ARRAY(&input) = SafeArrayCreateVector(types[i], 0, 2);
++                SafeArrayAccessData(V_ARRAY(&input), (void **)&items);
++                memcpy(items, raw, length);
++                memcpy(items + length, raw, length);
++                SafeArrayUnaccessData(V_ARRAY(&input));
++            }
++            else memcpy(&V_I8(&input), raw, length);
++            IInkDisp_get_ExtendedProperties(ink, &properties);
++            hr = IInkExtendedProperties_Add(properties, name, input, &property);
++            ok(hr == S_OK, "Type %#x Add: %#lx.\n", V_VT(&input), hr);
++            if (SUCCEEDED(hr)) IInkExtendedProperty_Release(property);
++            IInkExtendedProperties_Release(properties);
++            hr = IInkDisp_Save(ink, IPF_InkSerializeFormat, IPCM_Default, &saved);
++            ok(hr == S_OK, "Type %#x Save: %#lx.\n", V_VT(&input), hr);
++            if (SUCCEEDED(hr))
++            {
++                hr = IInkDisp_Load(loaded, saved);
++                ok(hr == S_OK, "Type %#x Load: %#lx.\n", V_VT(&input), hr);
++                VariantClear(&saved);
++                if (SUCCEEDED(hr))
++                {
++                    IInkDisp_get_ExtendedProperties(loaded, &properties);
++                    V_VT(&key) = VT_BSTR;
++                    V_BSTR(&key) = name;
++                    hr = IInkExtendedProperties_Item(properties, key, &property);
++                    ok(hr == S_OK, "Type %#x Item: %#lx.\n", V_VT(&input), hr);
++                    if (SUCCEEDED(hr))
++                    {
++                        hr = IInkExtendedProperty_get_Data(property, &output);
++                        ok(hr == S_OK && V_VT(&output) == V_VT(&input), "Type %#x roundtrip type %#x.\n",
++                                V_VT(&input), V_VT(&output));
++                        if (SUCCEEDED(hr) && V_VT(&output) == V_VT(&input))
++                        {
++                            if (types[i] == VT_BSTR)
++                            {
++                                if (array_type)
++                                {
++                                    LONG zero = 0, one = 1;
++                                    SafeArrayGetElement(V_ARRAY(&output), &zero, &first);
++                                    SafeArrayGetElement(V_ARRAY(&output), &one, &second);
++                                    ok(!wcscmp(first, L"first") && !wcscmp(second, L"second"),
++                                            "BSTR array values changed.\n");
++                                    SysFreeString(first);
++                                    SysFreeString(second);
++                                }
++                                else ok(!wcscmp(V_BSTR(&output), V_BSTR(&input)), "BSTR changed.\n");
++                            }
++                            else if (array_type)
++                            {
++                                BYTE *got, *want;
++                                SafeArrayAccessData(V_ARRAY(&output), (void **)&got);
++                                SafeArrayAccessData(V_ARRAY(&input), (void **)&want);
++                                ok(V_ARRAY(&output)->rgsabound[0].cElements == 2 &&
++                                        !memcmp(got, want, length * 2), "Type %#x array changed.\n", types[i]);
++                                SafeArrayUnaccessData(V_ARRAY(&input));
++                                SafeArrayUnaccessData(V_ARRAY(&output));
++                            }
++                            else ok(!memcmp(&V_I8(&output), &V_I8(&input), length),
++                                    "Type %#x scalar changed.\n", types[i]);
++                        }
++                        if (SUCCEEDED(hr)) VariantClear(&output);
++                        IInkExtendedProperty_Release(property);
++                    }
++                    IInkExtendedProperties_Release(properties);
++                }
++            }
++            VariantClear(&input);
++            SysFreeString(name);
++            IInkDisp_Release(loaded);
++            IInkDisp_Release(ink);
++        }
++}
++
+ static void test_renderer(void)
+ {
+     static const LONG points[] = {2540, 2540, 5080, 2540};
+@@ -420,6 +1137,8 @@ START_TEST(inkobj)
+     test_transform();
+     test_rectangle();
+     test_ink();
++    test_save_load();
++    test_isf_types();
+     test_renderer();
+ 
+     CoUninitialize();

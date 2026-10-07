@@ -1,0 +1,1690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 16:08:32 -0400
+Subject: [PATCH] ntdll: Implement the AVL generic tables and
+ RtlIsNameInExpression.
+
+Office's App-V subsystem (AppvIsvSubsystems64.dll, loaded into Word
+and the other applications) keeps its tables in AVL generic tables and
+matches names with RtlIsNameInExpression.  The AVL functions Wine had
+did nothing: the table was not initialized, an insert neither
+allocated nor returned the element, a lookup found nothing; the
+enumeration, the delete and RtlIsNameInExpression it also imports
+were missing or raised.
+
+The tables now follow what Windows was measured doing
+(tools/avlprobe): the element's data follows its links, the tree
+hangs off the right of BalancedRoot, whose balance stops the
+rebalancing walks, a node with two children gives its place to the
+next or the previous one from its deeper side, a delete moves a
+restart key it removes to the previous element, inserts and deletes
+drop the element cursor, and RtlEnumerateGenericTableLikeADirectory
+continues from its restart key only while nothing was deleted.  The
+compare routine gets the caller's buffer first.
+
+RtlIsNameInExpression keeps the set of states of the expression that
+match the name so far, as the NT file systems do, which matches all
+2160 combinations of wildcard expressions and names the probe tried on
+Windows.  ntoskrnl's FsRtlIsNameInExpression, a stub returning FALSE,
+uses it.  The new tests pass on Windows 11 build 29671.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit c92e5b9cdacc9525c31689d9612c39484cb9916e)
+
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index bc3fea41572..f79bc7fd40e 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -627,7 +627,8 @@
+ @ stdcall RtlDeleteCriticalSection(ptr)
+ @ stdcall -arch=!i386 RtlDeleteGrowableFunctionTable(ptr)
+ @ stdcall RtlDeleteElementGenericTable(ptr ptr)
+-@ stub RtlDeleteElementGenericTableAvl
++@ stdcall RtlDeleteElementGenericTableAvl(ptr ptr)
++@ stdcall RtlDeleteElementGenericTableAvlEx(ptr ptr)
+ @ cdecl -arch=!i386 RtlDeleteFunctionTable(ptr)
+ @ stdcall RtlDeleteNoSplay(ptr ptr)
+ @ stub RtlDeleteOwnersRanges
+@@ -672,8 +673,8 @@
+ @ stdcall RtlEnterCriticalSection(ptr)
+ @ stub RtlEnumProcessHeaps
+ @ stdcall RtlEnumerateGenericTable(ptr long)
+-# @ stub RtlEnumerateGenericTableAvl
+-# @ stub RtlEnumerateGenericTableLikeADirectory
++@ stdcall RtlEnumerateGenericTableAvl(ptr long)
++@ stdcall RtlEnumerateGenericTableLikeADirectory(ptr ptr ptr long ptr ptr ptr)
+ @ stdcall RtlEnumerateGenericTableWithoutSplaying(ptr ptr)
+ @ stdcall RtlEnumerateGenericTableWithoutSplayingAvl(ptr ptr)
+ @ stub RtlEnumerateProperties
+@@ -751,7 +752,7 @@
+ @ stdcall RtlGetCurrentTransaction()
+ @ stdcall RtlGetDaclSecurityDescriptor(ptr ptr ptr ptr)
+ @ stdcall RtlGetElementGenericTable(ptr long)
+-# @ stub RtlGetElementGenericTableAvl
++@ stdcall RtlGetElementGenericTableAvl(ptr long)
+ @ stdcall RtlGetEnabledExtendedFeatures(int64)
+ @ stdcall RtlGetExePath(wstr ptr)
+ @ stdcall RtlGetExtendedContextLength(long ptr)
+@@ -835,6 +836,7 @@
+ # @ stub RtlInitializeStackTraceDataBase
+ @ stdcall RtlInsertElementGenericTable(ptr ptr long ptr)
+ @ stdcall RtlInsertElementGenericTableAvl(ptr ptr long ptr)
++@ stdcall RtlInsertElementGenericTableFullAvl(ptr ptr long ptr ptr long)
+ @ cdecl -arch=!i386 RtlInstallFunctionTableCallback(long long long ptr ptr wstr)
+ @ stdcall RtlInt64ToUnicodeString(int64 long ptr)
+ @ stdcall RtlIntegerToChar(long long long ptr)
+@@ -870,7 +872,8 @@
+ @ stdcall RtlIsDosDeviceName_U(wstr)
+ @ stdcall -arch=x86_64 -norelay RtlIsEcCode(ptr)
+ @ stdcall RtlIsGenericTableEmpty(ptr)
+-# @ stub RtlIsGenericTableEmptyAvl
++@ stdcall RtlIsGenericTableEmptyAvl(ptr)
++@ stdcall RtlIsNameInExpression(ptr ptr long ptr)
+ @ stdcall RtlIsNameLegalDOS8Dot3(ptr ptr ptr)
+ @ stdcall RtlIsNormalizedString(long wstr long ptr)
+ @ stdcall RtlIsProcessorFeaturePresent(long)
+@@ -905,6 +908,8 @@
+ @ stdcall RtlLookupAtomInAtomTable(ptr wstr ptr)
+ @ stdcall RtlLookupElementGenericTable(ptr ptr)
+ @ stdcall RtlLookupElementGenericTableAvl(ptr ptr)
++@ stdcall RtlLookupElementGenericTableFullAvl(ptr ptr ptr ptr)
++@ stdcall RtlLookupFirstMatchingElementGenericTableAvl(ptr ptr ptr)
+ @ stdcall -arch=!i386 RtlLookupFunctionEntry(long ptr ptr)
+ @ stdcall -arch=!i386 RtlLookupFunctionTable(long ptr ptr)
+ @ stdcall RtlMakeSelfRelativeSD(ptr ptr ptr)
+diff --git a/dlls/ntdll/path.c b/dlls/ntdll/path.c
+index aaa1585bd13..a098b165add 100644
+--- a/dlls/ntdll/path.c
++++ b/dlls/ntdll/path.c
+@@ -869,6 +869,178 @@ BOOLEAN WINAPI RtlDoesFileExists_U(LPCWSTR file_name)
+ }
+ 
+ 
++/* whether a name has a wildcard in its last component */
++static BOOL has_wildcards( const WCHAR *name, USHORT length )
++{
++    const WCHAR *p;
++
++    for (p = name + length / sizeof(WCHAR); p-- > name && *p != '\\';)
++        if (*p == '*' || *p == '?' || *p == '<' || *p == '>' || *p == '"') return TRUE;
++    return FALSE;
++}
++
++static inline WCHAR upcase_name_char( WCHAR ch, const WCHAR *table )
++{
++    return table ? table[ch] : RtlUpcaseUnicodeChar( ch );
++}
++
++/******************************************************************
++ *             RtlIsNameInExpression   (NTDLL.@)
++ *
++ * Matches a name against an expression with the wildcards of NtQueryDirectoryFile: * and ?, and the DOS ones,
++ * < for anything up to the last period, > for any character except that a period or the end of the name also ends
++ * a run of them, and " for a period or the end of the name.  To ignore case the expression has to be in upper
++ * case; the name is upcased with the table, or RtlUpcaseUnicodeChar() without one.
++ *
++ * This keeps the set of places in the expression that match the name so far, each place a state: the byte
++ * offset times two, plus three past a * or < that is done matching.  A set is in increasing order and never holds
++ * more than two states for each character of the expression and the final one.
++ */
++BOOLEAN WINAPI RtlIsNameInExpression( UNICODE_STRING *expression, UNICODE_STRING *name, BOOLEAN ignore_case,
++                                      WCHAR *upcase_table )
++{
++    USHORT local[2][34], *prev = local[0], *next = local[1], *buffer = NULL, *tmp;
++    USHORT name_offset = 0, expr_offset, step, state, max_state, offset;
++    ULONG count, dest, src, prev_dest, size;
++    BOOLEAN name_finished = FALSE, ret;
++    WCHAR ch = 0, expr_ch;
++
++    TRACE( "%s %s %d %p\n", debugstr_us(expression), debugstr_us(name), ignore_case, upcase_table );
++
++    if (!name->Length || !expression->Length) return !name->Length && !expression->Length;
++    if (expression->Length == sizeof(WCHAR) && expression->Buffer[0] == '*') return TRUE;
++
++    /* *X, with no other wildcard, needs no states: the name ends with X */
++    if (expression->Buffer[0] == '*' && !has_wildcards( expression->Buffer + 1, expression->Length - sizeof(WCHAR) ))
++    {
++        USHORT tail = expression->Length - sizeof(WCHAR), start, i;
++
++        if (name->Length < tail) return FALSE;
++        start = (name->Length - tail) / sizeof(WCHAR);
++        if (!ignore_case) return !memcmp( expression->Buffer + 1, name->Buffer + start, tail );
++        for (i = 0; i < tail / sizeof(WCHAR); i++)
++            if (upcase_name_char( name->Buffer[start + i], upcase_table ) != expression->Buffer[1 + i]) return FALSE;
++        return TRUE;
++    }
++
++    size = expression->Length / sizeof(WCHAR) * 2 + 4;
++    if (size > ARRAY_SIZE(local[0]))
++    {
++        if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, 2 * size * sizeof(*buffer) ))) return FALSE;
++        prev = buffer;
++        next = buffer + size;
++    }
++
++    max_state = expression->Length * 2;
++    prev[0] = 0;
++    count = 1;
++
++    while (!name_finished)
++    {
++        if (name_offset < name->Length)
++        {
++            ch = name->Buffer[name_offset / sizeof(WCHAR)];
++            name_offset += sizeof(WCHAR);
++        }
++        else
++        {
++            /* one more round after the name, for what can match nothing at its end */
++            name_finished = TRUE;
++            if (prev[count - 1] == max_state) break;
++        }
++
++        src = dest = prev_dest = 0;
++        while (src < count)
++        {
++            expr_offset = (prev[src++] + 1) / 2;
++            step = 0;
++
++            /* what can match nothing continues, what needs this character stops */
++            for (;;)
++            {
++                if (expr_offset >= expression->Length) break;
++                expr_offset += step;
++                step = sizeof(WCHAR);
++                state = expr_offset * 2;
++                if (expr_offset >= expression->Length)
++                {
++                    if (expr_offset == expression->Length) next[dest++] = max_state;
++                    break;
++                }
++                expr_ch = expression->Buffer[expr_offset / sizeof(WCHAR)];
++
++                if (expr_ch == '*')
++                {
++                    next[dest++] = state;
++                    next[dest++] = state + 3;
++                    continue;
++                }
++                if (expr_ch == '<')
++                {
++                    BOOL eat_dot = FALSE;
++
++                    /* a period is taken unless it is the last one */
++                    if (!name_finished && ch == '.')
++                    {
++                        for (offset = name_offset; offset < name->Length; offset += sizeof(WCHAR))
++                            if (name->Buffer[offset / sizeof(WCHAR)] == '.')
++                            {
++                                eat_dot = TRUE;
++                                break;
++                            }
++                    }
++                    if (name_finished || ch != '.' || eat_dot) next[dest++] = state;
++                    next[dest++] = state + 3;
++                    continue;
++                }
++
++                state += 2 * sizeof(WCHAR);
++                if (expr_ch == '>')
++                {
++                    if (name_finished || ch == '.') continue;
++                    next[dest++] = state;
++                    break;
++                }
++                if (expr_ch == '"')
++                {
++                    if (name_finished) continue;
++                    if (ch == '.')
++                    {
++                        next[dest++] = state;
++                        break;
++                    }
++                }
++                if (name_finished) break;
++                if (expr_ch == '?' || expr_ch == (ignore_case ? upcase_name_char( ch, upcase_table ) : ch))
++                    next[dest++] = state;
++                break;
++            }
++
++            /* skip the states just reached from an earlier one */
++            if (src < count && prev_dest < dest)
++            {
++                for (; prev_dest < dest; prev_dest++)
++                    while (src < count && prev[src] < next[prev_dest]) src++;
++            }
++        }
++
++        if (!dest)
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, buffer );
++            return FALSE;
++        }
++        tmp = prev;
++        prev = next;
++        next = tmp;
++        count = dest;
++    }
++
++    ret = prev[count - 1] == max_state;
++    RtlFreeHeap( GetProcessHeap(), 0, buffer );
++    return ret;
++}
++
++
+ /******************************************************************
+  *             RtlIsNameLegalDOS8Dot3   (NTDLL.@)
+  *
+diff --git a/dlls/ntdll/rtl.c b/dlls/ntdll/rtl.c
+index 04231658c1e..6fe65fa78aa 100644
+--- a/dlls/ntdll/rtl.c
++++ b/dlls/ntdll/rtl.c
+@@ -1573,53 +1573,493 @@ void WINAPI RtlRbRemoveNode( RTL_RB_TREE *tree, RTL_BALANCED_NODE *node )
+     if (tree->root) tree->root->Red = 0;
+ }
+ 
++/* An AVL table hangs its tree off the right of BalancedRoot, whose Parent points to itself and whose Balance stops
++ * the rebalancing walks at the top.  Each element is its RTL_BALANCED_LINKS followed by the caller's data. */
++
++static inline void *avl_data( RTL_BALANCED_LINKS *links )
++{
++    return links + 1;
++}
++
++static RTL_BALANCED_LINKS *avl_successor( RTL_BALANCED_LINKS *links )
++{
++    RTL_BALANCED_LINKS *child;
++
++    if ((child = links->RightChild))
++    {
++        while (child->LeftChild) child = child->LeftChild;
++        return child;
++    }
++    while (links == links->Parent->RightChild) links = links->Parent;
++    /* the root is the right child of BalancedRoot, where this stops */
++    if (links == links->Parent->LeftChild) return links->Parent;
++    return NULL;
++}
++
++static RTL_BALANCED_LINKS *avl_predecessor( RTL_BALANCED_LINKS *links )
++{
++    RTL_BALANCED_LINKS *child;
++
++    if ((child = links->LeftChild))
++    {
++        while (child->RightChild) child = child->RightChild;
++        return child;
++    }
++    while (links == links->Parent->LeftChild) links = links->Parent;
++    /* a right child comes after its parent, unless that is BalancedRoot */
++    if (links->Parent != links->Parent->Parent) return links->Parent;
++    return NULL;
++}
++
++/* finds the element comparing equal to the buffer, or the one it would be inserted under */
++static TABLE_SEARCH_RESULT avl_find( RTL_AVL_TABLE *table, void *buffer, RTL_BALANCED_LINKS **node_or_parent )
++{
++    RTL_BALANCED_LINKS *links = table->BalancedRoot.RightChild, *child;
++
++    if (!links) return TableEmptyTree;
++    for (;;)
++    {
++        switch (table->CompareRoutine( table, buffer, avl_data( links ) ))
++        {
++        case GenericLessThan:
++            if (!(child = links->LeftChild))
++            {
++                *node_or_parent = links;
++                return TableInsertAsLeft;
++            }
++            break;
++        case GenericGreaterThan:
++            if (!(child = links->RightChild))
++            {
++                *node_or_parent = links;
++                return TableInsertAsRight;
++            }
++            break;
++        default:
++            *node_or_parent = links;
++            return TableFoundNode;
++        }
++        links = child;
++    }
++}
++
++/* puts a node where its parent was, the parent becoming its child */
++static void avl_promote( RTL_BALANCED_LINKS *links )
++{
++    RTL_BALANCED_LINKS *parent = links->Parent, *grandparent = parent->Parent;
++
++    if (links == parent->LeftChild)
++    {
++        if ((parent->LeftChild = links->RightChild)) parent->LeftChild->Parent = parent;
++        links->RightChild = parent;
++    }
++    else
++    {
++        if ((parent->RightChild = links->LeftChild)) parent->RightChild->Parent = parent;
++        links->LeftChild = parent;
++    }
++    parent->Parent = links;
++    links->Parent = grandparent;
++    if (parent == grandparent->LeftChild) grandparent->LeftChild = links;
++    else grandparent->RightChild = links;
++}
++
++/* rotates a subtree two levels deeper on the side of its balance; returns whether it kept its height, which only
++ * happens after a delete, when the child on that side is balanced */
++static BOOL avl_rebalance( RTL_BALANCED_LINKS *links )
++{
++    CHAR side = links->Balance;
++    RTL_BALANCED_LINKS *child = side < 0 ? links->LeftChild : links->RightChild, *grandchild;
++
++    if (child->Balance == side)
++    {
++        avl_promote( child );
++        links->Balance = child->Balance = 0;
++        return FALSE;
++    }
++    if (!child->Balance)
++    {
++        avl_promote( child );
++        child->Balance = -side;
++        return TRUE;
++    }
++    grandchild = side < 0 ? child->RightChild : child->LeftChild;
++    avl_promote( grandchild );
++    avl_promote( grandchild );
++    links->Balance = grandchild->Balance == side ? -side : 0;
++    child->Balance = grandchild->Balance == -side ? side : 0;
++    grandchild->Balance = 0;
++    return FALSE;
++}
++
++static void avl_insert( RTL_AVL_TABLE *table, RTL_BALANCED_LINKS *links, RTL_BALANCED_LINKS *parent,
++                        TABLE_SEARCH_RESULT result )
++{
++    CHAR side;
++
++    table->NumberGenericTableElements++;
++    if (result == TableEmptyTree)
++    {
++        table->BalancedRoot.RightChild = links;
++        links->Parent = &table->BalancedRoot;
++        table->DepthOfTree = 1;
++        return;
++    }
++    if (result == TableInsertAsLeft) parent->LeftChild = links;
++    else parent->RightChild = links;
++    links->Parent = parent;
++
++    /* up while the subtrees grow; BalancedRoot, reached from the right, stops this with the tree one deeper */
++    table->BalancedRoot.Balance = -1;
++    for (;;)
++    {
++        side = links == links->Parent->LeftChild ? -1 : 1;
++        links = links->Parent;
++        if (!links->Balance) links->Balance = side;
++        else if (links->Balance != side)
++        {
++            links->Balance = 0;
++            if (links == &table->BalancedRoot) table->DepthOfTree++;
++            return;
++        }
++        else
++        {
++            avl_rebalance( links );
++            return;
++        }
++    }
++}
++
++static void avl_delete( RTL_AVL_TABLE *table, RTL_BALANCED_LINKS *links )
++{
++    RTL_BALANCED_LINKS *victim, *parent, *child;
++    CHAR side;
++
++    /* a node with two children gives its place to the next or the previous one, from its deeper side */
++    if (!links->LeftChild || !links->RightChild) victim = links;
++    else if (links->Balance >= 0) for (victim = links->RightChild; victim->LeftChild; victim = victim->LeftChild) ;
++    else for (victim = links->LeftChild; victim->RightChild; victim = victim->RightChild) ;
++
++    parent = victim->Parent;
++    child = victim->LeftChild ? victim->LeftChild : victim->RightChild;
++    if (victim == parent->LeftChild)
++    {
++        parent->LeftChild = child;
++        side = -1;
++    }
++    else
++    {
++        parent->RightChild = child;
++        side = 1;
++    }
++    if (child) child->Parent = parent;
++
++    /* up while the subtrees shrink; BalancedRoot, reached from the right, stops this with the tree one shallower */
++    table->BalancedRoot.Balance = 0;
++    for (;;)
++    {
++        if (parent->Balance == side) parent->Balance = 0;
++        else if (!parent->Balance)
++        {
++            parent->Balance = -side;
++            if (parent == &table->BalancedRoot) table->DepthOfTree--;
++            break;
++        }
++        else
++        {
++            if (avl_rebalance( parent )) break;
++            parent = parent->Parent;
++        }
++        side = parent == parent->Parent->LeftChild ? -1 : 1;
++        parent = parent->Parent;
++    }
++
++    if (victim != links)
++    {
++        *victim = *links;
++        if (links == links->Parent->LeftChild) links->Parent->LeftChild = victim;
++        else links->Parent->RightChild = victim;
++        if (victim->LeftChild) victim->LeftChild->Parent = victim;
++        if (victim->RightChild) victim->RightChild->Parent = victim;
++    }
++    table->NumberGenericTableElements--;
++}
++
+ /***********************************************************************
+  *           RtlInitializeGenericTableAvl  (NTDLL.@)
+  */
+-void WINAPI RtlInitializeGenericTableAvl(PRTL_AVL_TABLE table, PRTL_AVL_COMPARE_ROUTINE compare,
+-                                         PRTL_AVL_ALLOCATE_ROUTINE allocate, PRTL_AVL_FREE_ROUTINE free, void *context)
++void WINAPI RtlInitializeGenericTableAvl( RTL_AVL_TABLE *table, PRTL_AVL_COMPARE_ROUTINE compare,
++                                          PRTL_AVL_ALLOCATE_ROUTINE allocate, PRTL_AVL_FREE_ROUTINE free, void *context )
+ {
+-    FIXME("%p %p %p %p %p: stub\n", table, compare, allocate, free, context);
++    TRACE( "%p %p %p %p %p\n", table, compare, allocate, free, context );
++
++    memset( table, 0, sizeof(*table) );
++    table->BalancedRoot.Parent = &table->BalancedRoot;
++    table->CompareRoutine = compare;
++    table->AllocateRoutine = allocate;
++    table->FreeRoutine = free;
++    table->TableContext = context;
++}
++
++/***********************************************************************
++ *           RtlIsGenericTableEmptyAvl  (NTDLL.@)
++ */
++BOOLEAN WINAPI RtlIsGenericTableEmptyAvl( RTL_AVL_TABLE *table )
++{
++    TRACE( "%p\n", table );
++    return !table->NumberGenericTableElements;
+ }
+ 
+ /******************************************************************************
+- *           RtlEnumerateGenericTableWithoutSplayingAvl  (NTDLL.@)
++ *           RtlNumberGenericTableElementsAvl  (NTDLL.@)
+  */
+-void * WINAPI RtlEnumerateGenericTableWithoutSplayingAvl(RTL_AVL_TABLE *table, PVOID *previous)
++ULONG WINAPI RtlNumberGenericTableElementsAvl( RTL_AVL_TABLE *table )
+ {
+-    static int warn_once;
++    TRACE( "%p\n", table );
++    return table->NumberGenericTableElements;
++}
+ 
+-    if (!warn_once++)
+-        FIXME("(%p, %p) stub!\n", table, previous);
+-    return NULL;
++/***********************************************************************
++ *           RtlLookupElementGenericTableFullAvl  (NTDLL.@)
++ */
++void * WINAPI RtlLookupElementGenericTableFullAvl( RTL_AVL_TABLE *table, void *buffer, void **node_or_parent,
++                                                   TABLE_SEARCH_RESULT *result )
++{
++    TRACE( "%p %p %p %p\n", table, buffer, node_or_parent, result );
++
++    *result = avl_find( table, buffer, (RTL_BALANCED_LINKS **)node_or_parent );
++    return *result == TableFoundNode ? avl_data( *node_or_parent ) : NULL;
+ }
+ 
+ /******************************************************************************
+- *  RtlNumberGenericTableElementsAvl  (NTDLL.@)
++ *           RtlLookupElementGenericTableAvl  (NTDLL.@)
++ */
++void * WINAPI RtlLookupElementGenericTableAvl( RTL_AVL_TABLE *table, void *buffer )
++{
++    RTL_BALANCED_LINKS *links;
++
++    TRACE( "%p %p\n", table, buffer );
++
++    if (avl_find( table, buffer, &links ) != TableFoundNode) return NULL;
++    return avl_data( links );
++}
++
++/***********************************************************************
++ *           RtlLookupFirstMatchingElementGenericTableAvl  (NTDLL.@)
++ *
++ * The first element in order of those the compare routine finds equal to the buffer.
+  */
+-ULONG WINAPI RtlNumberGenericTableElementsAvl(RTL_AVL_TABLE *table)
++void * WINAPI RtlLookupFirstMatchingElementGenericTableAvl( RTL_AVL_TABLE *table, void *buffer, void **restart_key )
+ {
+-    FIXME("(%p) stub!\n", table);
+-    return 0;
++    RTL_BALANCED_LINKS *links, *prev;
++
++    TRACE( "%p %p %p\n", table, buffer, restart_key );
++
++    *restart_key = NULL;
++    if (avl_find( table, buffer, &links ) != TableFoundNode) return NULL;
++    while ((prev = avl_predecessor( links )) &&
++           table->CompareRoutine( table, buffer, avl_data( prev ) ) == GenericEqual)
++        links = prev;
++    *restart_key = links;
++    return avl_data( links );
++}
++
++/***********************************************************************
++ *           RtlInsertElementGenericTableFullAvl  (NTDLL.@)
++ */
++void * WINAPI RtlInsertElementGenericTableFullAvl( RTL_AVL_TABLE *table, void *buffer, ULONG size,
++                                                   BOOLEAN *new_element, void *node_or_parent,
++                                                   TABLE_SEARCH_RESULT result )
++{
++    RTL_BALANCED_LINKS *links = node_or_parent;
++
++    TRACE( "%p %p %lu %p %p %d\n", table, buffer, size, new_element, node_or_parent, result );
++
++    if (result != TableFoundNode)
++    {
++        if (!(links = table->AllocateRoutine( table, size + sizeof(*links) )))
++        {
++            if (new_element) *new_element = FALSE;
++            return NULL;
++        }
++        memset( links, 0, sizeof(*links) );
++        memcpy( avl_data( links ), buffer, size );
++        avl_insert( table, links, node_or_parent, result );
++    }
++    table->OrderedPointer = NULL;
++    table->WhichOrderedElement = 0;
++    if (new_element) *new_element = result != TableFoundNode;
++    return avl_data( links );
+ }
+ 
+ /***********************************************************************
+  *           RtlInsertElementGenericTableAvl  (NTDLL.@)
+  */
+-void WINAPI RtlInsertElementGenericTableAvl(PRTL_AVL_TABLE table, void *buffer, ULONG size, BOOL *element)
++void * WINAPI RtlInsertElementGenericTableAvl( RTL_AVL_TABLE *table, void *buffer, ULONG size, BOOLEAN *new_element )
++{
++    RTL_BALANCED_LINKS *links = NULL;
++    TABLE_SEARCH_RESULT result;
++
++    TRACE( "%p %p %lu %p\n", table, buffer, size, new_element );
++
++    result = avl_find( table, buffer, &links );
++    return RtlInsertElementGenericTableFullAvl( table, buffer, size, new_element, links, result );
++}
++
++/***********************************************************************
++ *           RtlDeleteElementGenericTableAvlEx  (NTDLL.@)
++ */
++void WINAPI RtlDeleteElementGenericTableAvlEx( RTL_AVL_TABLE *table, void *node )
+ {
+-    FIXME("%p %p %lu %p: stub\n", table, buffer, size, element);
++    RTL_BALANCED_LINKS *links = node;
++
++    TRACE( "%p %p\n", table, node );
++
++    if (links == table->RestartKey) table->RestartKey = avl_predecessor( links );
++    table->OrderedPointer = NULL;
++    table->WhichOrderedElement = 0;
++    table->DeleteCount++;
++    avl_delete( table, links );
++    table->FreeRoutine( table, links );
++}
++
++/***********************************************************************
++ *           RtlDeleteElementGenericTableAvl  (NTDLL.@)
++ */
++BOOLEAN WINAPI RtlDeleteElementGenericTableAvl( RTL_AVL_TABLE *table, void *buffer )
++{
++    RTL_BALANCED_LINKS *links;
++
++    TRACE( "%p %p\n", table, buffer );
++
++    if (avl_find( table, buffer, &links ) != TableFoundNode) return FALSE;
++    RtlDeleteElementGenericTableAvlEx( table, links );
++    return TRUE;
+ }
+ 
+ /******************************************************************************
+- *           RtlLookupElementGenericTableAvl  (NTDLL.@)
++ *           RtlEnumerateGenericTableWithoutSplayingAvl  (NTDLL.@)
+  */
+-void * WINAPI RtlLookupElementGenericTableAvl(PRTL_AVL_TABLE table, void *buffer)
++void * WINAPI RtlEnumerateGenericTableWithoutSplayingAvl( RTL_AVL_TABLE *table, void **restart_key )
+ {
+-    FIXME("(%p, %p) stub!\n", table, buffer);
++    RTL_BALANCED_LINKS *links;
++
++    TRACE( "%p %p\n", table, restart_key );
++
++    if (!table->NumberGenericTableElements) return NULL;
++    if (!*restart_key)
++        for (links = table->BalancedRoot.RightChild; links->LeftChild; links = links->LeftChild) ;
++    else if (!(links = avl_successor( *restart_key ))) return NULL;
++    *restart_key = links;
++    return avl_data( links );
++}
++
++/******************************************************************************
++ *           RtlEnumerateGenericTableAvl  (NTDLL.@)
++ */
++void * WINAPI RtlEnumerateGenericTableAvl( RTL_AVL_TABLE *table, BOOLEAN restart )
++{
++    TRACE( "%p %d\n", table, restart );
++
++    if (restart) table->RestartKey = NULL;
++    return RtlEnumerateGenericTableWithoutSplayingAvl( table, (void **)&table->RestartKey );
++}
++
++/******************************************************************************
++ *           RtlEnumerateGenericTableLikeADirectory  (NTDLL.@)
++ *
++ * Continues from the restart key unless an element was deleted since, and otherwise from the buffer's place: its
++ * element, or the next one after it with next set, or the first one after where it would be.  The first element the
++ * match function takes is returned; any status but STATUS_NO_MATCH from it ends the enumeration there.
++ */
++void * WINAPI RtlEnumerateGenericTableLikeADirectory( RTL_AVL_TABLE *table, PRTL_AVL_MATCH_FUNCTION match,
++                                                      void *match_data, ULONG next, void **restart_key,
++                                                      ULONG *delete_count, void *buffer )
++{
++    RTL_BALANCED_LINKS *links;
++    NTSTATUS status;
++
++    TRACE( "%p %p %p %lu %p %p %p\n", table, match, match_data, next, restart_key, delete_count, buffer );
++
++    if (!table->NumberGenericTableElements)
++    {
++        *restart_key = NULL;
++        return NULL;
++    }
++    if ((links = *restart_key) && *delete_count == table->DeleteCount)
++    {
++        if (next) links = avl_successor( links );
++    }
++    else
++    {
++        switch (avl_find( table, buffer, &links ))
++        {
++        case TableFoundNode:
++            if (next) links = avl_successor( links );
++            break;
++        case TableInsertAsRight:
++            links = avl_successor( links );
++            break;
++        default:
++            break;
++        }
++    }
++
++    for (; links; links = avl_successor( links ))
++    {
++        status = match ? match( table, avl_data( links ), match_data ) : STATUS_SUCCESS;
++        if (status == STATUS_NO_MATCH) continue;
++        *restart_key = links;
++        *delete_count = table->DeleteCount;
++        return status == STATUS_SUCCESS ? avl_data( links ) : NULL;
++    }
+     return NULL;
+ }
+ 
++/******************************************************************************
++ *           RtlGetElementGenericTableAvl  (NTDLL.@)
++ *
++ * The element with that index in order, found from whichever is nearest of the first element, the last one and the
++ * last one found this way.
++ */
++void * WINAPI RtlGetElementGenericTableAvl( RTL_AVL_TABLE *table, ULONG index )
++{
++    ULONG count = table->NumberGenericTableElements, current, distance;
++    RTL_BALANCED_LINKS *links;
++
++    TRACE( "%p %lu\n", table, index );
++
++    if (index >= count) return NULL;
++
++    if (index <= count - 1 - index)
++    {
++        for (links = table->BalancedRoot.RightChild; links->LeftChild; links = links->LeftChild) ;
++        current = 0;
++        distance = index;
++    }
++    else
++    {
++        for (links = table->BalancedRoot.RightChild; links->RightChild; links = links->RightChild) ;
++        current = count - 1;
++        distance = count - 1 - index;
++    }
++    if (table->OrderedPointer)
++    {
++        ULONG ordered = table->WhichOrderedElement;
++        if ((ordered > index ? ordered - index : index - ordered) < distance)
++        {
++            links = table->OrderedPointer;
++            current = ordered;
++        }
++    }
++    for (; current < index; current++) links = avl_successor( links );
++    for (; current > index; current--) links = avl_predecessor( links );
++
++    table->OrderedPointer = links;
++    table->WhichOrderedElement = index;
++    return avl_data( links );
++}
++
+ /*********************************************************************
+  *           RtlQueryPackageIdentity [NTDLL.@]
+  */
+diff --git a/dlls/ntdll/tests/rtl.c b/dlls/ntdll/tests/rtl.c
+index c9f5303336b..b7931ee5063 100644
+--- a/dlls/ntdll/tests/rtl.c
++++ b/dlls/ntdll/tests/rtl.c
+@@ -122,6 +122,24 @@ static void      (WINAPI *pRtlInitializeGenericTable)(RTL_GENERIC_TABLE *, PRTL_
+                                                       void *);
+ static void *    (WINAPI *pRtlFindExportedRoutineByName)(HMODULE,const char *);
+ static void *    (WINAPI *pRtlLookupElementGenericTable)(PRTL_GENERIC_TABLE, void *);
++static void      (WINAPI *pRtlInitializeGenericTableAvl)(RTL_AVL_TABLE *, PRTL_AVL_COMPARE_ROUTINE,
++                                                         PRTL_AVL_ALLOCATE_ROUTINE, PRTL_AVL_FREE_ROUTINE, void *);
++static void *    (WINAPI *pRtlInsertElementGenericTableAvl)(RTL_AVL_TABLE *, void *, ULONG, BOOLEAN *);
++static void *    (WINAPI *pRtlInsertElementGenericTableFullAvl)(RTL_AVL_TABLE *, void *, ULONG, BOOLEAN *, void *,
++                                                                TABLE_SEARCH_RESULT);
++static void *    (WINAPI *pRtlLookupElementGenericTableAvl)(RTL_AVL_TABLE *, void *);
++static void *    (WINAPI *pRtlLookupElementGenericTableFullAvl)(RTL_AVL_TABLE *, void *, void **, TABLE_SEARCH_RESULT *);
++static void *    (WINAPI *pRtlLookupFirstMatchingElementGenericTableAvl)(RTL_AVL_TABLE *, void *, void **);
++static BOOLEAN   (WINAPI *pRtlDeleteElementGenericTableAvl)(RTL_AVL_TABLE *, void *);
++static void      (WINAPI *pRtlDeleteElementGenericTableAvlEx)(RTL_AVL_TABLE *, void *);
++static void *    (WINAPI *pRtlEnumerateGenericTableAvl)(RTL_AVL_TABLE *, BOOLEAN);
++static void *    (WINAPI *pRtlEnumerateGenericTableWithoutSplayingAvl)(RTL_AVL_TABLE *, void **);
++static void *    (WINAPI *pRtlEnumerateGenericTableLikeADirectory)(RTL_AVL_TABLE *, PRTL_AVL_MATCH_FUNCTION, void *,
++                                                                  ULONG, void **, ULONG *, void *);
++static void *    (WINAPI *pRtlGetElementGenericTableAvl)(RTL_AVL_TABLE *, ULONG);
++static ULONG     (WINAPI *pRtlNumberGenericTableElementsAvl)(RTL_AVL_TABLE *);
++static BOOLEAN   (WINAPI *pRtlIsGenericTableEmptyAvl)(RTL_AVL_TABLE *);
++static BOOLEAN   (WINAPI *pRtlIsNameInExpression)(UNICODE_STRING *, UNICODE_STRING *, BOOLEAN, WCHAR *);
+ static ULONG     (WINAPI *pRtlNumberGenericTableElements)(PRTL_GENERIC_TABLE);
+ static NTSTATUS  (WINAPI *pLdrEnumerateLoadedModules)(void *, void *, void *);
+ static NTSTATUS  (WINAPI *pLdrRegisterDllNotification)(ULONG, PLDR_DLL_NOTIFICATION_FUNCTION, void *, void **);
+@@ -214,6 +232,21 @@ static void InitFunctionPtrs(void)
+         pRtlSubtreePredecessor = (void *)GetProcAddress(hntdll, "RtlSubtreePredecessor");
+         pRtlSubtreeSuccessor = (void *)GetProcAddress(hntdll, "RtlSubtreeSuccessor");
+         pRtlSplay = (void *)GetProcAddress(hntdll, "RtlSplay");
++        pRtlInitializeGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlInitializeGenericTableAvl");
++        pRtlInsertElementGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlInsertElementGenericTableAvl");
++        pRtlInsertElementGenericTableFullAvl = (void *)GetProcAddress(hntdll, "RtlInsertElementGenericTableFullAvl");
++        pRtlLookupElementGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlLookupElementGenericTableAvl");
++        pRtlLookupElementGenericTableFullAvl = (void *)GetProcAddress(hntdll, "RtlLookupElementGenericTableFullAvl");
++        pRtlLookupFirstMatchingElementGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlLookupFirstMatchingElementGenericTableAvl");
++        pRtlDeleteElementGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlDeleteElementGenericTableAvl");
++        pRtlDeleteElementGenericTableAvlEx = (void *)GetProcAddress(hntdll, "RtlDeleteElementGenericTableAvlEx");
++        pRtlEnumerateGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlEnumerateGenericTableAvl");
++        pRtlEnumerateGenericTableWithoutSplayingAvl = (void *)GetProcAddress(hntdll, "RtlEnumerateGenericTableWithoutSplayingAvl");
++        pRtlEnumerateGenericTableLikeADirectory = (void *)GetProcAddress(hntdll, "RtlEnumerateGenericTableLikeADirectory");
++        pRtlGetElementGenericTableAvl = (void *)GetProcAddress(hntdll, "RtlGetElementGenericTableAvl");
++        pRtlNumberGenericTableElementsAvl = (void *)GetProcAddress(hntdll, "RtlNumberGenericTableElementsAvl");
++        pRtlIsGenericTableEmptyAvl = (void *)GetProcAddress(hntdll, "RtlIsGenericTableEmptyAvl");
++        pRtlIsNameInExpression = (void *)GetProcAddress(hntdll, "RtlIsNameInExpression");
+     }
+     hkernel32 = LoadLibraryA("kernel32.dll");
+     ok(hkernel32 != 0, "LoadLibrary failed\n");
+@@ -5414,6 +5447,680 @@ static void test_RtlGetElementGenericTable(void)
+     }
+ }
+ 
++/* what the AVL table asked its routines for */
++static int avl_compare_calls, avl_compare_by_tens, avl_compare_misordered, avl_allocations, avl_frees, avl_refuse;
++static LONG avl_last_size;
++static void *avl_buffer, *avl_last_allocation, *avl_last_free;
++
++static RTL_GENERIC_COMPARE_RESULTS WINAPI avl_compare( RTL_AVL_TABLE *table, void *first, void *second )
++{
++    int a = *(int *)first, b = *(int *)second;
++
++    avl_compare_calls++;
++    if (avl_buffer && first != avl_buffer) avl_compare_misordered++;
++    if (avl_compare_by_tens)
++    {
++        a /= 10;
++        b /= 10;
++    }
++    if (a < b) return GenericLessThan;
++    if (a > b) return GenericGreaterThan;
++    return GenericEqual;
++}
++
++static void * WINAPI avl_allocate( RTL_AVL_TABLE *table, LONG size )
++{
++    if (avl_refuse) return NULL;
++    avl_allocations++;
++    avl_last_size = size;
++    return avl_last_allocation = malloc( size );
++}
++
++static void WINAPI avl_free( RTL_AVL_TABLE *table, void *ptr )
++{
++    avl_frees++;
++    avl_last_free = ptr;
++    free( ptr );
++}
++
++static int avl_value( RTL_BALANCED_LINKS *links )
++{
++    return *(int *)(links + 1);
++}
++
++/* the tree as value, a ! for a wrong parent, balance, and the children in brackets, a dot for none */
++static void avl_shape( RTL_BALANCED_LINKS *links, RTL_BALANCED_LINKS *parent, char *out )
++{
++    if (!links)
++    {
++        strcat( out, "." );
++        return;
++    }
++    sprintf( out + strlen( out ), "%d%s%+d", avl_value( links ), links->Parent == parent ? "" : "!", links->Balance );
++    if (!links->LeftChild && !links->RightChild) return;
++    strcat( out, "(" );
++    avl_shape( links->LeftChild, links, out );
++    strcat( out, " " );
++    avl_shape( links->RightChild, links, out );
++    strcat( out, ")" );
++}
++
++static const char *avl_tree( RTL_AVL_TABLE *table )
++{
++    static char buffer[1024];
++
++    buffer[0] = 0;
++    avl_shape( table->BalancedRoot.RightChild, &table->BalancedRoot, buffer );
++    return buffer;
++}
++
++static RTL_BALANCED_LINKS *avl_links( void *data )
++{
++    return (RTL_BALANCED_LINKS *)data - 1;
++}
++
++static void avl_init( RTL_AVL_TABLE *table )
++{
++    memset( table, 0xcc, sizeof(*table) );
++    pRtlInitializeGenericTableAvl( table, avl_compare, avl_allocate, avl_free, (void *)0xdeadbeef );
++}
++
++static void *avl_insert( RTL_AVL_TABLE *table, int value )
++{
++    BOOLEAN new_element;
++    void *data;
++
++    avl_buffer = &value;
++    data = pRtlInsertElementGenericTableAvl( table, &value, sizeof(value), &new_element );
++    avl_buffer = NULL;
++    ok( new_element, "%d was there\n", value );
++    return data;
++}
++
++static void test_RtlGenericTableAvl(void)
++{
++    static const struct
++    {
++        int value;
++        const char *tree;
++        ULONG depth;
++        CHAR root_balance;
++        int compares;
++    }
++    inserts[] =
++    {
++        { 50, "50+0", 1, 0, 0 },
++        { 30, "50-1(30+0 .)", 2, 0, 1 },
++        { 70, "50+0(30+0 70+0)", 2, -1, 1 },
++        { 20, "50-1(30-1(20+0 .) 70+0)", 3, 0, 2 },
++        { 40, "50-1(30+0(20+0 40+0) 70+0)", 3, -1, 2 },
++        { 60, "50+0(30+0(20+0 40+0) 70-1(60+0 .))", 3, -1, 2 },
++        { 80, "50+0(30+0(20+0 40+0) 70+0(60+0 80+0))", 3, -1, 2 },
++        { 10, "50-1(30-1(20-1(10+0 .) 40+0) 70+0(60+0 80+0))", 4, 0, 3 },
++        { 25, "50-1(30-1(20+0(10+0 25+0) 40+0) 70+0(60+0 80+0))", 4, -1, 3 },
++        { 35, "50-1(30+0(20+0(10+0 25+0) 40-1(35+0 .)) 70+0(60+0 80+0))", 4, -1, 3 },
++        { 45, "50-1(30+0(20+0(10+0 25+0) 40+0(35+0 45+0)) 70+0(60+0 80+0))", 4, -1, 3 },
++        { 5, "30+0(20-1(10-1(5+0 .) 25+0) 50+0(40+0(35+0 45+0) 70+0(60+0 80+0)))", 4, -1, 4 },
++        { 1, "30+0(20-1(5+0(1+0 10+0) 25+0) 50+0(40+0(35+0 45+0) 70+0(60+0 80+0)))", 4, -1, 4 },
++        { 90, "30+1(20-1(5+0(1+0 10+0) 25+0) 50+1(40+0(35+0 45+0) 70+1(60+0 80+1(. 90+0))))", 5, 0, 4 },
++        { 95, "30+1(20-1(5+0(1+0 10+0) 25+0) 50+1(40+0(35+0 45+0) 70+1(60+0 90+0(80+0 95+0))))", 5, -1, 5 },
++        { 99, "30+1(20-1(5+0(1+0 10+0) 25+0) 50+1(40+0(35+0 45+0) 90+0(70+0(60+0 80+0) 95+1(. 99+0))))", 5, -1, 5 },
++        { 42, "30+1(20-1(5+0(1+0 10+0) 25+0) 50+0(40+1(35+0 45-1(42+0 .)) 90+0(70+0(60+0 80+0) 95+1(. 99+0))))",
++          5, -1, 4 },
++        { 43, "30+1(20-1(5+0(1+0 10+0) 25+0) 50+0(40+1(35+0 43+0(42+0 45+0)) 90+0(70+0(60+0 80+0) 95+1(. 99+0))))",
++          5, -1, 5 },
++        { 44, "30+1(20-1(5+0(1+0 10+0) 25+0) 50+0(43+0(40+0(35+0 42+0) 45-1(44+0 .)) 90+0(70+0(60+0 80+0) "
++          "95+1(. 99+0))))", 5, -1, 5 },
++        { 41, "43+0(30+0(20-1(5+0(1+0 10+0) 25+0) 40+1(35+0 42-1(41+0 .))) 50+1(45-1(44+0 .) 90+0(70+0(60+0 "
++          "80+0) 95+1(. 99+0))))", 5, -1, 5 },
++    };
++    static const struct
++    {
++        int value;
++        BOOLEAN found;
++        const char *tree;
++        ULONG depth;
++        CHAR root_balance;
++    }
++    deletes[] =
++    {
++        { 99, TRUE, "43+0(30+0(20-1(5+0(1+0 10+0) 25+0) 40+1(35+0 42-1(41+0 .))) 50+1(45-1(44+0 .) 90-1(70+0(60+0 "
++          "80+0) 95+0)))", 5, 0 },
++        { 95, TRUE, "43+0(30+0(20-1(5+0(1+0 10+0) 25+0) 40+1(35+0 42-1(41+0 .))) 50+1(45-1(44+0 .) 70+1(60+0 "
++          "90-1(80+0 .))))", 5, 0 },
++        { 30, TRUE, "43+0(35-1(20-1(5+0(1+0 10+0) 25+0) 41+0(40+0 42+0)) 50+1(45-1(44+0 .) 70+1(60+0 90-1(80+0 .))))",
++          5, 0 },
++        { 50, TRUE, "43-1(35-1(20-1(5+0(1+0 10+0) 25+0) 41+0(40+0 42+0)) 60+0(45-1(44+0 .) 80+0(70+0 90+0)))", 5, 0 },
++        { 12, FALSE, "43-1(35-1(20-1(5+0(1+0 10+0) 25+0) 41+0(40+0 42+0)) 60+0(45-1(44+0 .) 80+0(70+0 90+0)))", 5, 0 },
++        { 1, TRUE, "43-1(35-1(20-1(5+1(. 10+0) 25+0) 41+0(40+0 42+0)) 60+0(45-1(44+0 .) 80+0(70+0 90+0)))", 5, 0 },
++        { 44, TRUE, "43-1(35-1(20-1(5+1(. 10+0) 25+0) 41+0(40+0 42+0)) 60+1(45+0 80+0(70+0 90+0)))", 5, 0 },
++        { 45, TRUE, "43-1(35-1(20-1(5+1(. 10+0) 25+0) 41+0(40+0 42+0)) 80-1(60+1(. 70+0) 90+0))", 5, 0 },
++        { 5, TRUE, "43+0(35+0(20+0(10+0 25+0) 41+0(40+0 42+0)) 80-1(60+1(. 70+0) 90+0))", 4, -1 },
++        { 10, TRUE, "43+0(35+0(20+1(. 25+0) 41+0(40+0 42+0)) 80-1(60+1(. 70+0) 90+0))", 4, 0 },
++        { 40, TRUE, "43+0(35+0(20+1(. 25+0) 41+1(. 42+0)) 80-1(60+1(. 70+0) 90+0))", 4, 0 },
++    };
++    static const int sorted[] = { 1, 5, 10, 20, 25, 30, 35, 40, 41, 42, 43, 44, 45, 50, 60, 70, 80, 90, 95, 99 };
++    RTL_BALANCED_LINKS *node;
++    TABLE_SEARCH_RESULT result;
++    RTL_AVL_TABLE table;
++    BOOLEAN new_element;
++    void *data, *restart;
++    unsigned int i;
++    int value;
++
++    if (!pRtlInitializeGenericTableAvl || !pRtlEnumerateGenericTableAvl || !pRtlIsGenericTableEmptyAvl)
++    {
++        win_skip( "AVL tables are not supported\n" );
++        return;
++    }
++
++    avl_init( &table );
++    ok( table.BalancedRoot.Parent == &table.BalancedRoot, "got parent %p\n", table.BalancedRoot.Parent );
++    ok( !table.BalancedRoot.LeftChild && !table.BalancedRoot.RightChild, "got children\n" );
++    ok( !table.BalancedRoot.Balance && !table.BalancedRoot.Reserved[0] && !table.BalancedRoot.Reserved[1]
++        && !table.BalancedRoot.Reserved[2], "got balance %d\n", table.BalancedRoot.Balance );
++    ok( !table.OrderedPointer && !table.WhichOrderedElement && !table.NumberGenericTableElements && !table.DepthOfTree
++        && !table.RestartKey && !table.DeleteCount, "got fields\n" );
++    ok( table.CompareRoutine == avl_compare && table.AllocateRoutine == avl_allocate && table.FreeRoutine == avl_free
++        && table.TableContext == (void *)0xdeadbeef, "got routines\n" );
++    ok( pRtlIsGenericTableEmptyAvl( &table ), "not empty\n" );
++    ok( !pRtlNumberGenericTableElementsAvl( &table ), "got elements\n" );
++    value = 1;
++    ok( !pRtlLookupElementGenericTableAvl( &table, &value ), "found something\n" );
++    ok( !pRtlEnumerateGenericTableAvl( &table, TRUE ), "enumerated something\n" );
++    restart = NULL;
++    ok( !pRtlEnumerateGenericTableWithoutSplayingAvl( &table, &restart ), "enumerated something\n" );
++    ok( !pRtlGetElementGenericTableAvl( &table, 0 ), "got an element\n" );
++    ok( !pRtlDeleteElementGenericTableAvl( &table, &value ), "deleted something\n" );
++
++    /* each element is the links followed by the data; the root sentinel's balance is left at -1 unless the
++     * tree got deeper */
++    for (i = 0; i < ARRAY_SIZE(inserts); i++)
++    {
++        winetest_push_context( "insert %d", inserts[i].value );
++        avl_compare_calls = avl_compare_misordered = 0;
++        data = avl_insert( &table, inserts[i].value );
++        ok( data == (RTL_BALANCED_LINKS *)avl_last_allocation + 1, "got %p, allocated %p\n", data, avl_last_allocation );
++        ok( avl_last_size == sizeof(int) + sizeof(RTL_BALANCED_LINKS), "allocated %ld\n", avl_last_size );
++        ok( *(int *)data == inserts[i].value, "got %d\n", *(int *)data );
++        ok( avl_compare_calls == inserts[i].compares, "got %d compares\n", avl_compare_calls );
++        ok( !avl_compare_misordered, "the buffer was not the first to compare\n" );
++        ok( !strcmp( avl_tree( &table ), inserts[i].tree ), "got %s\n", avl_tree( &table ) );
++        ok( table.DepthOfTree == inserts[i].depth, "got depth %lu\n", table.DepthOfTree );
++        ok( table.BalancedRoot.Balance == inserts[i].root_balance, "got balance %d\n", table.BalancedRoot.Balance );
++        ok( table.BalancedRoot.Parent == &table.BalancedRoot && !table.BalancedRoot.LeftChild, "got root links\n" );
++        ok( table.NumberGenericTableElements == i + 1, "got %lu elements\n", table.NumberGenericTableElements );
++        winetest_pop_context();
++    }
++    value = 40;
++    avl_compare_calls = 0;
++    new_element = 0xcc;
++    data = pRtlInsertElementGenericTableAvl( &table, &value, sizeof(value), &new_element );
++    ok( !new_element, "40 was not there\n" );
++    ok( avl_compare_calls == 3, "got %d compares\n", avl_compare_calls );
++    ok( *(int *)data == 40 && avl_links( data )->Parent->RightChild == avl_links( data ), "got %p\n", data );
++    ok( !pRtlIsGenericTableEmptyAvl( &table ), "empty\n" );
++    ok( pRtlNumberGenericTableElementsAvl( &table ) == 20, "got %lu\n", pRtlNumberGenericTableElementsAvl( &table ) );
++
++    for (value = 0; value <= 100; value++)
++    {
++        data = pRtlLookupElementGenericTableAvl( &table, &value );
++        if (data) ok( *(int *)data == value, "looked up %d, got %d\n", value, *(int *)data );
++        else ok( value % 5 || value == 0 || value == 15 || value == 55 || value == 65 || value == 75 || value == 85
++                 || value == 100, "%d not found\n", value );
++    }
++    ok( !table.OrderedPointer && !table.RestartKey, "lookups moved the cursors\n" );
++
++    /* enumerating keeps its place in RestartKey, and stays at the last element */
++    data = pRtlEnumerateGenericTableAvl( &table, FALSE );
++    ok( data && *(int *)data == 1, "without a key, got %p\n", data );
++    for (i = 0, data = pRtlEnumerateGenericTableAvl( &table, TRUE ); data;
++         data = pRtlEnumerateGenericTableAvl( &table, FALSE ), i++)
++    {
++        ok( i < ARRAY_SIZE(sorted) && *(int *)data == sorted[i], "%u: got %d\n", i, *(int *)data );
++        ok( table.RestartKey == avl_links( data ), "%u: got restart key %p\n", i, table.RestartKey );
++    }
++    ok( i == ARRAY_SIZE(sorted), "got %u elements\n", i );
++    ok( avl_value( table.RestartKey ) == 99, "got restart key %d\n", avl_value( table.RestartKey ) );
++    ok( !pRtlEnumerateGenericTableAvl( &table, FALSE ), "enumerated past the end\n" );
++    for (i = 0, restart = NULL; (data = pRtlEnumerateGenericTableWithoutSplayingAvl( &table, &restart )); i++)
++    {
++        ok( i < ARRAY_SIZE(sorted) && *(int *)data == sorted[i], "%u: got %d\n", i, *(int *)data );
++        ok( restart == avl_links( data ), "%u: got restart key %p\n", i, restart );
++    }
++    ok( i == ARRAY_SIZE(sorted), "got %u elements\n", i );
++    ok( avl_value( restart ) == 99, "got restart key %d\n", avl_value( restart ) );
++
++    /* elements by index, in order, remembering the last one */
++    for (i = 0; i < ARRAY_SIZE(sorted); i++)
++    {
++        data = pRtlGetElementGenericTableAvl( &table, i );
++        ok( data && *(int *)data == sorted[i], "%u: got %p\n", i, data );
++        ok( table.OrderedPointer == avl_links( data ) && table.WhichOrderedElement == i, "%u: got %p %lu\n", i,
++            table.OrderedPointer, table.WhichOrderedElement );
++    }
++    ok( !pRtlGetElementGenericTableAvl( &table, 20 ), "got element 20\n" );
++    ok( !pRtlGetElementGenericTableAvl( &table, ~0u ), "got element ~0\n" );
++    ok( table.WhichOrderedElement == 19, "got %lu\n", table.WhichOrderedElement );
++    data = pRtlGetElementGenericTableAvl( &table, 5 );
++    ok( *(int *)data == 30 && table.WhichOrderedElement == 5, "got %d %lu\n", *(int *)data, table.WhichOrderedElement );
++    data = pRtlGetElementGenericTableAvl( &table, 16 );
++    ok( *(int *)data == 80 && table.WhichOrderedElement == 16, "got %d %lu\n", *(int *)data, table.WhichOrderedElement );
++
++    /* the next or the previous element takes a deleted one's place, from the deeper side; a deleted restart key
++     * becomes the previous element, and the element cursor goes */
++    for (i = 0; i < ARRAY_SIZE(deletes); i++)
++    {
++        BOOLEAN ret;
++
++        winetest_push_context( "delete %d", deletes[i].value );
++        pRtlGetElementGenericTableAvl( &table, 3 );
++        avl_frees = 0;
++        value = deletes[i].value;
++        avl_buffer = &value;
++        avl_compare_misordered = 0;
++        ret = pRtlDeleteElementGenericTableAvl( &table, &value );
++        avl_buffer = NULL;
++        ok( ret == deletes[i].found, "got %d\n", ret );
++        ok( !avl_compare_misordered, "the buffer was not the first to compare\n" );
++        ok( avl_frees == ret, "got %d frees\n", avl_frees );
++        ok( !strcmp( avl_tree( &table ), deletes[i].tree ), "got %s\n", avl_tree( &table ) );
++        ok( table.DepthOfTree == deletes[i].depth, "got depth %lu\n", table.DepthOfTree );
++        ok( table.BalancedRoot.Balance == deletes[i].root_balance, "got balance %d\n", table.BalancedRoot.Balance );
++        ok( ret ? !table.OrderedPointer && !table.WhichOrderedElement : table.WhichOrderedElement == 3,
++            "got cursor %p %lu\n", table.OrderedPointer, table.WhichOrderedElement );
++        winetest_pop_context();
++    }
++    ok( table.DeleteCount == 10, "got %lu deletes\n", table.DeleteCount );
++    ok( avl_value( table.RestartKey ) == 90, "got restart key %d\n", avl_value( table.RestartKey ) );
++    while ((data = pRtlGetElementGenericTableAvl( &table, 0 )))
++    {
++        value = *(int *)data;
++        ok( pRtlDeleteElementGenericTableAvl( &table, &value ), "%d not deleted\n", value );
++    }
++    ok( !table.BalancedRoot.RightChild && !table.DepthOfTree && table.BalancedRoot.Balance == -1, "got %p %lu %d\n",
++        table.BalancedRoot.RightChild, table.DepthOfTree, table.BalancedRoot.Balance );
++    ok( !table.RestartKey && table.DeleteCount == 20, "got %p %lu\n", table.RestartKey, table.DeleteCount );
++    ok( pRtlIsGenericTableEmptyAvl( &table ), "not empty\n" );
++
++    /* an insert, even of a value that is there, loses the cursor, unless the allocation fails */
++    avl_init( &table );
++    for (i = 1; i <= 9; i++) avl_insert( &table, i * 10 );
++    pRtlGetElementGenericTableAvl( &table, 3 );
++    value = 30;
++    pRtlInsertElementGenericTableAvl( &table, &value, sizeof(value), NULL );
++    ok( !table.OrderedPointer && !table.WhichOrderedElement, "got cursor %lu\n", table.WhichOrderedElement );
++    pRtlGetElementGenericTableAvl( &table, 3 );
++    avl_refuse = 1;
++    value = 35;
++    new_element = 0xcc;
++    data = pRtlInsertElementGenericTableAvl( &table, &value, sizeof(value), &new_element );
++    avl_refuse = 0;
++    ok( !data && !new_element, "got %p %d\n", data, new_element );
++    ok( table.WhichOrderedElement == 3, "got cursor %lu\n", table.WhichOrderedElement );
++    ok( table.NumberGenericTableElements == 9, "got %lu elements\n", table.NumberGenericTableElements );
++    value = 5;
++    data = pRtlInsertElementGenericTableAvl( &table, &value, 100, &new_element );
++    ok( new_element && avl_last_size == 100 + sizeof(RTL_BALANCED_LINKS), "allocated %ld\n", avl_last_size );
++    ok( !table.OrderedPointer && !table.WhichOrderedElement, "got cursor %lu\n", table.WhichOrderedElement );
++
++    /* deleting the restart key of an enumeration */
++    pRtlEnumerateGenericTableAvl( &table, TRUE );
++    pRtlEnumerateGenericTableAvl( &table, FALSE );
++    data = pRtlEnumerateGenericTableAvl( &table, FALSE );
++    ok( *(int *)data == 20, "got %d\n", *(int *)data );
++    value = 20;
++    pRtlDeleteElementGenericTableAvl( &table, &value );
++    ok( avl_value( table.RestartKey ) == 10, "got restart key %d\n", avl_value( table.RestartKey ) );
++    data = pRtlEnumerateGenericTableAvl( &table, FALSE );
++    ok( *(int *)data == 30, "got %d\n", *(int *)data );
++    value = 5;
++    pRtlDeleteElementGenericTableAvl( &table, &value );
++    value = 10;
++    pRtlDeleteElementGenericTableAvl( &table, &value );
++    ok( avl_value( table.RestartKey ) == 30, "got restart key %d\n", avl_value( table.RestartKey ) );
++    pRtlEnumerateGenericTableAvl( &table, TRUE );
++    value = 30;
++    pRtlDeleteElementGenericTableAvl( &table, &value );
++    ok( !table.RestartKey, "got restart key %d\n", avl_value( table.RestartKey ) );
++    while ((data = pRtlEnumerateGenericTableAvl( &table, TRUE ))) pRtlDeleteElementGenericTableAvl( &table, data );
++
++    /* the full lookup gives the node or the parent to insert under */
++    if (pRtlLookupElementGenericTableFullAvl && pRtlInsertElementGenericTableFullAvl)
++    {
++        static const struct { int value; int node; TABLE_SEARCH_RESULT result; } lookups[] =
++        {
++            { 5, 10, TableInsertAsLeft }, { 10, 10, TableFoundNode }, { 15, 10, TableInsertAsRight },
++            { 40, 40, TableFoundNode }, { 45, 50, TableInsertAsLeft }, { 75, 70, TableInsertAsRight },
++        };
++
++        avl_init( &table );
++        value = 5;
++        restart = (void *)0xdeadbeef;
++        result = 0xcc;
++        data = pRtlLookupElementGenericTableFullAvl( &table, &value, &restart, &result );
++        ok( !data && result == TableEmptyTree && restart == (void *)0xdeadbeef, "got %p %d %p\n", data, result, restart );
++        new_element = FALSE;
++        data = pRtlInsertElementGenericTableFullAvl( &table, &value, sizeof(value), &new_element, restart, result );
++        ok( new_element && *(int *)data == 5, "got %d\n", new_element );
++        ok( !strcmp( avl_tree( &table ), "5+0" ) && table.DepthOfTree == 1, "got %s\n", avl_tree( &table ) );
++        pRtlDeleteElementGenericTableAvl( &table, &value );
++
++        for (i = 0; i < 7; i++) avl_insert( &table, (int[]){ 40, 20, 60, 10, 30, 50, 70 }[i] );
++        for (i = 0; i < ARRAY_SIZE(lookups); i++)
++        {
++            value = lookups[i].value;
++            avl_buffer = &value;
++            avl_compare_misordered = 0;
++            data = pRtlLookupElementGenericTableFullAvl( &table, &value, (void **)&node, &result );
++            avl_buffer = NULL;
++            ok( result == lookups[i].result, "%d: got %d\n", value, result );
++            ok( avl_value( node ) == lookups[i].node, "%d: got %d\n", value, avl_value( node ) );
++            ok( result == TableFoundNode ? data == node + 1 : !data, "%d: got %p\n", value, data );
++            ok( !avl_compare_misordered, "the buffer was not the first to compare\n" );
++        }
++        value = 45;
++        pRtlLookupElementGenericTableFullAvl( &table, &value, (void **)&node, &result );
++        avl_compare_calls = 0;
++        data = pRtlInsertElementGenericTableFullAvl( &table, &value, sizeof(value), &new_element, node, result );
++        ok( new_element && *(int *)data == 45 && !avl_compare_calls, "got %d %d\n", new_element, avl_compare_calls );
++        ok( !strcmp( avl_tree( &table ), "40+1(20+0(10+0 30+0) 60-1(50-1(45+0 .) 70+0))" ), "got %s\n",
++            avl_tree( &table ) );
++        ok( table.DepthOfTree == 4 && !table.BalancedRoot.Balance, "got %lu %d\n", table.DepthOfTree,
++            table.BalancedRoot.Balance );
++        value = 20;
++        pRtlLookupElementGenericTableFullAvl( &table, &value, (void **)&node, &result );
++        pRtlGetElementGenericTableAvl( &table, 3 );
++        avl_allocations = 0;
++        data = pRtlInsertElementGenericTableFullAvl( &table, &value, sizeof(value), &new_element, node, result );
++        ok( !new_element && data == node + 1 && !avl_allocations, "got %d %d\n", new_element, avl_allocations );
++        ok( !table.OrderedPointer, "kept the cursor\n" );
++
++        if (pRtlDeleteElementGenericTableAvlEx)
++        {
++            value = 40;
++            pRtlLookupElementGenericTableFullAvl( &table, &value, (void **)&node, &result );
++            avl_compare_calls = avl_frees = 0;
++            pRtlDeleteElementGenericTableAvlEx( &table, node );
++            ok( !avl_compare_calls && avl_frees == 1 && avl_last_free == node, "got %d %d\n", avl_compare_calls,
++                avl_frees );
++            ok( !strcmp( avl_tree( &table ), "45+0(20+0(10+0 30+0) 60+0(50+0 70+0))" ), "got %s\n",
++                avl_tree( &table ) );
++            ok( table.DeleteCount == 2 && table.DepthOfTree == 3, "got %lu %lu\n", table.DeleteCount,
++                table.DepthOfTree );
++        }
++        else win_skip( "RtlDeleteElementGenericTableAvlEx is not available\n" );
++        while ((data = pRtlEnumerateGenericTableAvl( &table, TRUE ))) pRtlDeleteElementGenericTableAvl( &table, data );
++    }
++    else win_skip( "the full AVL functions are not available\n" );
++
++    /* the first of the elements the compare routine finds equal */
++    if (pRtlLookupFirstMatchingElementGenericTableAvl)
++    {
++        static const struct { int value, first, compares; } matches[] =
++        {
++            { 0, 5, 4 }, { 10, 11, 4 }, { 20, 21, 5 }, { 30, 31, 4 }, { 40, 40, 5 }, { 50, 0, 4 },
++        };
++
++        avl_init( &table );
++        for (i = 0; i < 10; i++) avl_insert( &table, (int[]){ 11, 25, 21, 29, 23, 31, 5, 27, 22, 40 }[i] );
++        ok( !strcmp( avl_tree( &table ), "25+0(21+0(11-1(5+0 .) 23-1(22+0 .)) 29+1(27+0 31+1(. 40+0)))" ),
++            "got %s\n", avl_tree( &table ) );
++        avl_compare_by_tens = 1;
++        for (i = 0; i < ARRAY_SIZE(matches); i++)
++        {
++            value = matches[i].value;
++            restart = (void *)0xdeadbeef;
++            avl_compare_calls = 0;
++            data = pRtlLookupFirstMatchingElementGenericTableAvl( &table, &value, &restart );
++            if (matches[i].first)
++            {
++                ok( data && *(int *)data == matches[i].first, "%d: got %p\n", value, data );
++                ok( restart == avl_links( data ), "%d: got restart key %p\n", value, restart );
++            }
++            else ok( !data && !restart, "%d: got %p %p\n", value, data, restart );
++            ok( avl_compare_calls == matches[i].compares, "%d: got %d compares\n", value, avl_compare_calls );
++        }
++        value = 20;
++        restart = NULL;
++        pRtlLookupFirstMatchingElementGenericTableAvl( &table, &value, &restart );
++        data = pRtlEnumerateGenericTableWithoutSplayingAvl( &table, &restart );
++        ok( *(int *)data == 22, "got %d\n", *(int *)data );
++        avl_compare_by_tens = 0;
++        while ((data = pRtlEnumerateGenericTableAvl( &table, TRUE ))) pRtlDeleteElementGenericTableAvl( &table, data );
++    }
++    else win_skip( "RtlLookupFirstMatchingElementGenericTableAvl is not available\n" );
++}
++
++static NTSTATUS WINAPI avl_match( RTL_AVL_TABLE *table, void *data, void *match_data )
++{
++    int value = *(int *)data;
++
++    switch ((ULONG_PTR)match_data)
++    {
++    case 1: return value % 20 ? STATUS_NO_MATCH : STATUS_SUCCESS;
++    case 2: return value == 50 ? STATUS_NO_MORE_MATCHES : STATUS_NO_MATCH;
++    case 3: return value == 30 ? STATUS_INVALID_PARAMETER : STATUS_SUCCESS;
++    case 4: return value == 30 ? STATUS_MORE_ENTRIES : STATUS_NO_MATCH;
++    default: return value == 30 ? STATUS_BUFFER_OVERFLOW : STATUS_NO_MATCH;
++    }
++}
++
++static void test_RtlEnumerateGenericTableLikeADirectory(void)
++{
++    static const struct
++    {
++        int value;
++        ULONG next;
++        int restart;   /* -1 for none */
++        ULONG deletes;
++        ULONG_PTR match;
++        int ret, restart_after;
++        ULONG deletes_after;
++    }
++    tests[] =
++    {
++        /* from the buffer: its element, or the next one with next set, or the first one after it */
++        { 0, 0, -1, 0, 0, 10, 10, 0 },
++        { 0, 1, -1, 0, 0, 10, 10, 0 },
++        { 25, 0, -1, 0, 0, 30, 30, 0 },
++        { 25, 1, -1, 0, 0, 30, 30, 0 },
++        { 50, 0, -1, 0, 0, 50, 50, 0 },
++        { 50, 1, -1, 0, 0, 60, 60, 0 },
++        { 75, 1, -1, 0, 0, 80, 80, 0 },
++        { 100, 0, -1, 0, 0, 0, -1, 0 },
++        /* from the restart key, whatever the buffer, if nothing was deleted since */
++        { 30, 1, 30, 0, 0, 40, 40, 0 },
++        { 30, 0, 50, 0, 0, 50, 50, 0 },
++        { 99, 1, 60, 0, 0, 70, 70, 0 },
++        { 99, 1, 90, 0, 0, 0, 90, 0 },
++        { 40, 1, 60, 5, 0, 50, 50, 0 },
++        { 1000, 0, 90, 5, 0, 0, 90, 5 },
++        /* the match function passes, skips or ends */
++        { 10, 0, -1, 0, 1, 20, 20, 0 },
++        { 10, 1, 20, 0, 1, 40, 40, 0 },
++        { 10, 1, 80, 0, 1, 0, 80, 0 },
++        { 10, 0, -1, 7, 2, 0, 50, 0 },
++        { 10, 0, -1, 7, 3, 10, 10, 0 },
++        { 10, 1, 20, 0, 3, 0, 30, 0 },
++        { 10, 0, -1, 7, 4, 0, 30, 0 },
++        { 10, 0, -1, 7, 5, 0, 30, 0 },
++    };
++    RTL_BALANCED_LINKS *nodes[10] = { 0 };
++    RTL_AVL_TABLE table;
++    void *data, *restart;
++    ULONG deletes;
++    unsigned int i;
++    int value;
++
++    if (!pRtlEnumerateGenericTableLikeADirectory || !pRtlInitializeGenericTableAvl)
++    {
++        win_skip( "RtlEnumerateGenericTableLikeADirectory is not available\n" );
++        return;
++    }
++
++    avl_init( &table );
++    value = 0;
++    restart = &table;
++    deletes = 0;
++    data = pRtlEnumerateGenericTableLikeADirectory( &table, NULL, NULL, FALSE, &restart, &deletes, &value );
++    ok( !data && !restart && !deletes, "got %p %p %lu\n", data, restart, deletes );
++    for (i = 1; i <= 9; i++) nodes[i] = avl_links( avl_insert( &table, i * 10 ) );
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context( "%u", i );
++        value = tests[i].value;
++        restart = tests[i].restart == -1 ? NULL : nodes[tests[i].restart / 10];
++        deletes = tests[i].deletes;
++        data = pRtlEnumerateGenericTableLikeADirectory( &table, tests[i].match ? avl_match : NULL,
++                                                        (void *)tests[i].match, tests[i].next, &restart, &deletes,
++                                                        &value );
++        if (tests[i].ret) ok( data && *(int *)data == tests[i].ret, "got %p\n", data );
++        else ok( !data, "got %d\n", *(int *)data );
++        if (tests[i].restart_after == -1) ok( !restart, "got restart key %p\n", restart );
++        else ok( restart == nodes[tests[i].restart_after / 10], "got restart key %p\n", restart );
++        ok( deletes == tests[i].deletes_after, "got %lu deletes\n", deletes );
++        winetest_pop_context();
++    }
++
++    /* after a delete, the restart key is not used */
++    value = 70;
++    pRtlDeleteElementGenericTableAvl( &table, &value );
++    value = 40;
++    restart = nodes[4];
++    deletes = 0;
++    avl_compare_calls = 0;
++    data = pRtlEnumerateGenericTableLikeADirectory( &table, NULL, NULL, TRUE, &restart, &deletes, &value );
++    ok( data && *(int *)data == 50, "got %p\n", data );
++    ok( restart == nodes[5] && deletes == 1 && avl_compare_calls, "got %p %lu %d\n", restart, deletes,
++        avl_compare_calls );
++    avl_compare_calls = 0;
++    data = pRtlEnumerateGenericTableLikeADirectory( &table, NULL, NULL, TRUE, &restart, &deletes, &value );
++    ok( data && *(int *)data == 60 && !avl_compare_calls, "got %p %d\n", data, avl_compare_calls );
++    ok( !table.OrderedPointer && table.RestartKey != nodes[6], "moved the table's cursors\n" );
++
++    while ((data = pRtlEnumerateGenericTableAvl( &table, TRUE ))) pRtlDeleteElementGenericTableAvl( &table, data );
++    value = 0;
++    restart = &table;
++    deletes = 0;
++    data = pRtlEnumerateGenericTableLikeADirectory( &table, NULL, NULL, FALSE, &restart, &deletes, &value );
++    ok( !data && !restart && !deletes, "got %p %p %lu\n", data, restart, deletes );
++}
++
++static void test_RtlIsNameInExpression(void)
++{
++    static const WCHAR *names[] =
++    {
++        L"", L"a", L"ab", L"abc", L"ABC", L"aBc", L"a.b", L"a.b.c", L"abc.txt", L"abc.TXT", L".txt", L"a.", L"a..",
++        L"..", L".", L"file.tar.gz", L"aXc", L"a.bc", L"ab.c", L"b",
++    };
++    static const struct
++    {
++        const WCHAR *expression;
++        const char *matches, *matches_ignoring_case;
++    }
++    tests[] =
++    {
++        { L"", "10000000000000000000", "10000000000000000000" },
++        { L"*", "01111111111111111111", "01111111111111111111" },
++        { L"?", "01000000000000100001", "01000000000000100001" },
++        { L"??", "00100000000101000000", "00100000000101000000" },
++        { L"*.*", "00000011111111110110", "00000011111111110110" },
++        { L"*.", "00000000000111100000", "00000000000111100000" },
++        { L".*", "00000000001001100000", "00000000001001100000" },
++        { L"a*", "01110111110110001110", "00000000000000000000" },
++        { L"a?c", "00010100000000001000", "00000000000000000000" },
++        { L"A*B*", "00001000000000000000", "00111111110000000110" },
++        { L"*B", "00000000000000000000", "00100010000000000001" },
++        { L"<", "01111100000111101001", "01111100000111101001" },
++        { L"<.TXT", "00000000010000000000", "00000000111000000000" },
++        { L"*.txt", "00000000101000000000", "00000000000000000000" },
++        { L">", "01000000000000100001", "01000000000000100001" },
++        { L">>>", "01111100000100101001", "01111100000100101001" },
++        { L"a>", "01100000000100000000", "00000000000000000000" },
++        { L"a>>", "01110100000100001000", "00000000000000000000" },
++        { L"a\"", "01000000000100000000", "00000000000000000000" },
++        { L"a\"*", "01000011000110000100", "00000000000000000000" },
++        { L"\"", "00000000000000100000", "00000000000000100000" },
++        { L"<\"*", "01111111111111111111", "01111111111111111111" },
++        { L"a.\"", "00000000000110000000", "00000000000000000000" },
++        { L"ab.<", "00000000000000000010", "00000000000000000000" },
++        { L"?*?", "00111111111111011110", "00111111111111011110" },
++        { L"a*.b", "00000010000000000000", "00000000000000000000" },
++        { L"<a", "01000000000000000000", "00000000000000000000" },
++        { L"<.gz", "00000000000000010000", "00000000000000000000" },
++        { L"<.tar.gz", "00000000000000010000", "00000000000000000000" },
++        { L"f<", "00000000000000000000", "00000000000000000000" },
++        { L"?\"", "01000000000101100001", "01000000000101100001" },
++        { L"*.?", "00000011000011000010", "00000011000011000010" },
++        { L"a.>>", "00000010000110000100", "00000000000000000000" },
++        { L">.>", "00000010000111100000", "00000010000111100000" },
++    };
++    UNICODE_STRING expression, name;
++    WCHAR table[65536], expr_buffer[] = L"a*bXYZ", name_buffer[] = L"axxbQQQ";
++    unsigned int i, j;
++    BOOLEAN ret;
++
++    if (!pRtlIsNameInExpression)
++    {
++        win_skip( "RtlIsNameInExpression is not available\n" );
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        RtlInitUnicodeString( &expression, tests[i].expression );
++        for (j = 0; j < ARRAY_SIZE(names); j++)
++        {
++            RtlInitUnicodeString( &name, names[j] );
++            ret = pRtlIsNameInExpression( &expression, &name, FALSE, NULL );
++            ok( ret == tests[i].matches[j] - '0', "%s %s: got %d\n", debugstr_w(tests[i].expression),
++                debugstr_w(names[j]), ret );
++            ret = pRtlIsNameInExpression( &expression, &name, TRUE, NULL );
++            ok( ret == tests[i].matches_ignoring_case[j] - '0', "%s %s ignoring case: got %d\n",
++                debugstr_w(tests[i].expression), debugstr_w(names[j]), ret );
++        }
++    }
++
++    /* only the name goes through the table */
++    for (i = 0; i < ARRAY_SIZE(table); i++) table[i] = i;
++    table['x'] = 'Y';
++    table['a'] = 'A';
++    RtlInitUnicodeString( &name, L"ax" );
++    RtlInitUnicodeString( &expression, L"AY" );
++    ok( pRtlIsNameInExpression( &expression, &name, TRUE, table ), "no match\n" );
++    ok( !pRtlIsNameInExpression( &expression, &name, FALSE, table ), "matched\n" );
++    RtlInitUnicodeString( &expression, L"ay" );
++    ok( !pRtlIsNameInExpression( &expression, &name, TRUE, table ), "matched\n" );
++    RtlInitUnicodeString( &expression, L"AX" );
++    ok( !pRtlIsNameInExpression( &expression, &name, TRUE, table ), "matched\n" );
++    RtlInitUnicodeString( &name, L"a\x00e9" );
++    RtlInitUnicodeString( &expression, L"A\x00c9" );
++    ok( !pRtlIsNameInExpression( &expression, &name, TRUE, table ), "matched\n" );
++    ok( pRtlIsNameInExpression( &expression, &name, TRUE, NULL ), "no match\n" );
++    RtlInitUnicodeString( &expression, L"A*" );
++    ok( pRtlIsNameInExpression( &expression, &name, TRUE, table ), "no match\n" );
++
++    /* the lengths count, not the terminators */
++    expression.Buffer = expr_buffer;
++    expression.Length = expression.MaximumLength = 3 * sizeof(WCHAR);
++    name.Buffer = name_buffer;
++    name.Length = name.MaximumLength = 4 * sizeof(WCHAR);
++    ok( pRtlIsNameInExpression( &expression, &name, FALSE, NULL ), "no match\n" );
++    name.Length = 7;
++    ok( pRtlIsNameInExpression( &expression, &name, FALSE, NULL ), "no match\n" );
++    name.Length = 5 * sizeof(WCHAR);
++    ok( !pRtlIsNameInExpression( &expression, &name, FALSE, NULL ), "matched\n" );
++
++    /* long expressions */
++    RtlInitUnicodeString( &expression, L"*a*b*c*d*e*f*g*h*i*j*k*l*m*n*o*p*q*r*s*t*u*v*w*x*y*z*<.>" );
++    RtlInitUnicodeString( &name, L"0a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6.7" );
++    ok( pRtlIsNameInExpression( &expression, &name, FALSE, NULL ), "no match\n" );
++    RtlInitUnicodeString( &name, L"0a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5y6.7" );
++    ok( !pRtlIsNameInExpression( &expression, &name, FALSE, NULL ), "matched\n" );
++}
++
+ static void test_RtlCreateServiceSid(void)
+ {
+     UNICODE_STRING service_name;
+@@ -5631,6 +6338,9 @@ START_TEST(rtl)
+     test_RtlEnumerateGenericTableWithoutSplaying();
+     test_RtlEnumerateGenericTable();
+     test_RtlGetElementGenericTable();
++    test_RtlGenericTableAvl();
++    test_RtlEnumerateGenericTableLikeADirectory();
++    test_RtlIsNameInExpression();
+     test_RtlCreateServiceSid();
+     test_RtlDeriveCapabilitySidsFromName();
+     test_pointer_encoding();
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index 6738027e757..096bd6ffed1 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -2490,16 +2490,6 @@ NTSTATUS WINAPI FsRtlGetFileSize( PFILE_OBJECT file_obj, PLARGE_INTEGER file_siz
+     return status;
+ }
+ 
+-/***********************************************************************
+-*           FsRtlIsNameInExpression   (NTOSKRNL.EXE.@)
+-*/
+-BOOLEAN WINAPI FsRtlIsNameInExpression(PUNICODE_STRING expression, PUNICODE_STRING name,
+-                                       BOOLEAN ignore, PWCH upcase)
+-{
+-    FIXME("stub: %p %p %d %p\n", expression, name, ignore, upcase);
+-    return FALSE;
+-}
+-
+ /***********************************************************************
+ *           FsRtlRegisterUncProvider   (NTOSKRNL.EXE.@)
+ */
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index d06f73253a0..85896a8b242 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -255,7 +255,7 @@
+ @ stub FsRtlIsDbcsInExpression
+ @ stub FsRtlIsFatDbcsLegal
+ @ stub FsRtlIsHpfsDbcsLegal
+-@ stdcall FsRtlIsNameInExpression(ptr ptr long ptr)
++@ stdcall FsRtlIsNameInExpression(ptr ptr long ptr) RtlIsNameInExpression
+ @ stub FsRtlIsNtstatusExpected
+ @ stub FsRtlIsPagingFile
+ @ stub FsRtlIsTotalDeviceFailure
+@@ -1064,7 +1064,8 @@
+ @ stdcall RtlDeleteAce(ptr long)
+ @ stdcall RtlDeleteAtomFromAtomTable(ptr long)
+ @ stdcall RtlDeleteElementGenericTable(ptr ptr)
+-@ stub RtlDeleteElementGenericTableAvl
++@ stdcall RtlDeleteElementGenericTableAvl(ptr ptr)
++@ stdcall RtlDeleteElementGenericTableAvlEx(ptr ptr)
+ @ stdcall RtlDeleteNoSplay(ptr ptr)
+ @ stub RtlDeleteOwnersRanges
+ @ stub RtlDeleteRange
+@@ -1080,8 +1081,8 @@
+ @ stdcall -arch=win32 RtlEnlargedUnsignedDivide(int64 long ptr)
+ @ stdcall -arch=win32 -ret64 RtlEnlargedUnsignedMultiply(long long)
+ @ stdcall RtlEnumerateGenericTable(ptr long)
+-@ stub RtlEnumerateGenericTableAvl
+-@ stub RtlEnumerateGenericTableLikeADirectory
++@ stdcall RtlEnumerateGenericTableAvl(ptr long)
++@ stdcall RtlEnumerateGenericTableLikeADirectory(ptr ptr ptr long ptr ptr ptr)
+ @ stdcall RtlEnumerateGenericTableWithoutSplaying(ptr ptr)
+ @ stdcall RtlEnumerateGenericTableWithoutSplayingAvl(ptr ptr)
+ @ stdcall RtlEqualLuid(ptr ptr)
+@@ -1125,7 +1126,7 @@
+ @ stdcall RtlGetDaclSecurityDescriptor(ptr ptr ptr ptr)
+ @ stub RtlGetDefaultCodePage
+ @ stdcall RtlGetElementGenericTable(ptr long)
+-@ stub RtlGetElementGenericTableAvl
++@ stdcall RtlGetElementGenericTableAvl(ptr long)
+ @ stdcall RtlGetExtendedContextLength(long ptr)
+ @ stdcall RtlGetExtendedContextLength2(long ptr int64)
+ @ stub RtlGetFirstRange
+@@ -1162,7 +1163,7 @@
+ @ stdcall RtlInsertElementGenericTable(ptr ptr long ptr)
+ @ stdcall RtlInsertElementGenericTableAvl(ptr ptr long ptr)
+ @ stub RtlInsertElementGenericTableFull
+-@ stub RtlInsertElementGenericTableFullAvl
++@ stdcall RtlInsertElementGenericTableFullAvl(ptr ptr long ptr ptr long)
+ @ stub RtlInsertUnicodePrefix
+ @ stdcall RtlInt64ToUnicodeString(int64 long ptr)
+ @ stdcall RtlIntegerToChar(long long long ptr)
+@@ -1186,7 +1187,7 @@
+ @ stdcall RtlIpv6StringToAddressExW(wstr ptr ptr ptr)
+ @ stdcall RtlIpv6StringToAddressW(wstr ptr ptr)
+ @ stdcall RtlIsGenericTableEmpty(ptr)
+-@ stub RtlIsGenericTableEmptyAvl
++@ stdcall RtlIsGenericTableEmptyAvl(ptr)
+ @ stdcall RtlIsNameLegalDOS8Dot3(ptr ptr ptr)
+ @ stdcall RtlIsNormalizedString(long wstr long ptr)
+ @ stdcall RtlIsNtDdiVersionAvailable(long)
+@@ -1212,7 +1213,8 @@
+ @ stdcall RtlLookupElementGenericTable(ptr ptr)
+ @ stdcall RtlLookupElementGenericTableAvl(ptr ptr)
+ @ stub RtlLookupElementGenericTableFull
+-@ stub RtlLookupElementGenericTableFullAvl
++@ stdcall RtlLookupElementGenericTableFullAvl(ptr ptr ptr ptr)
++@ stdcall RtlLookupFirstMatchingElementGenericTableAvl(ptr ptr ptr)
+ @ stdcall -arch=!i386 RtlLookupFunctionEntry(long ptr ptr)
+ @ stdcall RtlMapGenericMask(ptr ptr)
+ @ stub RtlMapSecurityErrorToNtStatus
+diff --git a/include/ddk/ntddk.h b/include/ddk/ntddk.h
+index 898b0a4f8bd..ecb02377318 100644
+--- a/include/ddk/ntddk.h
++++ b/include/ddk/ntddk.h
+@@ -249,6 +249,16 @@ typedef struct _RTL_AVL_TABLE {
+     void *TableContext;
+ } RTL_AVL_TABLE, *PRTL_AVL_TABLE;
+ 
++typedef NTSTATUS (WINAPI *PRTL_AVL_MATCH_FUNCTION)(struct _RTL_AVL_TABLE *, void *, void *);
++
++typedef enum _TABLE_SEARCH_RESULT
++{
++    TableEmptyTree,
++    TableFoundNode,
++    TableInsertAsLeft,
++    TableInsertAsRight
++} TABLE_SEARCH_RESULT;
++
+ typedef struct _PS_CREATE_NOTIFY_INFO {
+     SIZE_T Size;
+     union {
+@@ -315,19 +325,28 @@ LONG      WINAPI RtlCompareString(const STRING*,const STRING*,BOOLEAN);
+ void      WINAPI RtlCopyString(STRING*,const STRING*);
+ PRTL_SPLAY_LINKS WINAPI RtlDelete(PRTL_SPLAY_LINKS);
+ BOOLEAN   WINAPI RtlDeleteElementGenericTable(PRTL_GENERIC_TABLE,PVOID);
++BOOLEAN   WINAPI RtlDeleteElementGenericTableAvl(PRTL_AVL_TABLE,void *);
++void      WINAPI RtlDeleteElementGenericTableAvlEx(PRTL_AVL_TABLE,void *);
+ void      WINAPI RtlDeleteNoSplay(PRTL_SPLAY_LINKS,PRTL_SPLAY_LINKS *);
+ void *    WINAPI RtlEnumerateGenericTable(PRTL_GENERIC_TABLE,BOOLEAN);
++void *    WINAPI RtlEnumerateGenericTableAvl(PRTL_AVL_TABLE,BOOLEAN);
++void *    WINAPI RtlEnumerateGenericTableLikeADirectory(PRTL_AVL_TABLE,PRTL_AVL_MATCH_FUNCTION,void *,ULONG,void **,ULONG *,void *);
+ void *    WINAPI RtlEnumerateGenericTableWithoutSplaying(PRTL_GENERIC_TABLE,PVOID*);
+ void *    WINAPI RtlEnumerateGenericTableWithoutSplayingAvl(PRTL_AVL_TABLE,PVOID*);
+ BOOLEAN   WINAPI RtlEqualString(const STRING*,const STRING*,BOOLEAN);
+ void *    WINAPI RtlGetElementGenericTable(PRTL_GENERIC_TABLE,ULONG);
++void *    WINAPI RtlGetElementGenericTableAvl(PRTL_AVL_TABLE,ULONG);
+ void      WINAPI RtlInitializeGenericTable(PRTL_GENERIC_TABLE,PRTL_GENERIC_COMPARE_ROUTINE,PRTL_GENERIC_ALLOCATE_ROUTINE,PRTL_GENERIC_FREE_ROUTINE,void *);
+ void      WINAPI RtlInitializeGenericTableAvl(PRTL_AVL_TABLE,PRTL_AVL_COMPARE_ROUTINE,PRTL_AVL_ALLOCATE_ROUTINE, PRTL_AVL_FREE_ROUTINE,void *);
+ PVOID     WINAPI RtlInsertElementGenericTable(PRTL_GENERIC_TABLE,PVOID,CLONG,PBOOLEAN);
+-void      WINAPI RtlInsertElementGenericTableAvl(PRTL_AVL_TABLE,void *,ULONG,BOOL*);
++void *    WINAPI RtlInsertElementGenericTableAvl(PRTL_AVL_TABLE,void *,ULONG,BOOLEAN*);
++void *    WINAPI RtlInsertElementGenericTableFullAvl(PRTL_AVL_TABLE,void *,ULONG,BOOLEAN*,void *,TABLE_SEARCH_RESULT);
+ BOOLEAN   WINAPI RtlIsGenericTableEmpty(PRTL_GENERIC_TABLE);
++BOOLEAN   WINAPI RtlIsGenericTableEmptyAvl(PRTL_AVL_TABLE);
+ void *    WINAPI RtlLookupElementGenericTable(PRTL_GENERIC_TABLE,void *);
+ void *    WINAPI RtlLookupElementGenericTableAvl(PRTL_AVL_TABLE,void *);
++void *    WINAPI RtlLookupElementGenericTableFullAvl(PRTL_AVL_TABLE,void *,void **,TABLE_SEARCH_RESULT*);
++void *    WINAPI RtlLookupFirstMatchingElementGenericTableAvl(PRTL_AVL_TABLE,void *,void **);
+ void      WINAPI RtlMapGenericMask(ACCESS_MASK*,const GENERIC_MAPPING*);
+ ULONG     WINAPI RtlNumberGenericTableElements(PRTL_GENERIC_TABLE);
+ ULONG     WINAPI RtlNumberGenericTableElementsAvl(PRTL_AVL_TABLE);
+diff --git a/include/winternl.h b/include/winternl.h
+index e23ca79be5e..0f6d5112370 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -5317,6 +5317,7 @@ NTSYSAPI BOOL      WINAPI RtlIsCriticalSectionLockedByThread(RTL_CRITICAL_SECTIO
+ NTSYSAPI BOOLEAN   WINAPI RtlIsCurrentProcess(HANDLE);
+ NTSYSAPI BOOLEAN   WINAPI RtlIsCurrentThread(HANDLE);
+ NTSYSAPI ULONG     WINAPI RtlIsDosDeviceName_U(PCWSTR);
++NTSYSAPI BOOLEAN   WINAPI RtlIsNameInExpression(UNICODE_STRING*,UNICODE_STRING*,BOOLEAN,WCHAR*);
+ NTSYSAPI BOOLEAN   WINAPI RtlIsNameLegalDOS8Dot3(const UNICODE_STRING*,POEM_STRING,PBOOLEAN);
+ NTSYSAPI NTSTATUS  WINAPI RtlIsNormalizedString(ULONG,const WCHAR*,INT,BOOLEAN*);
+ NTSYSAPI BOOLEAN   WINAPI RtlIsProcessorFeaturePresent(UINT);

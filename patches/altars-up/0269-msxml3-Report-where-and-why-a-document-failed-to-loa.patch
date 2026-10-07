@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 10:40:29 -0400
+Subject: [PATCH] msxml3: Report where and why a document failed to load.
+
+get_parseError() gave the error code alone, with "error" for a reason
+and no position.  The document's parser now keeps the first error with
+the reader's position and message, and leaves the depth limit to the
+reader, which stops at the name of the element that is too deep.
+Measured with tools/msxmlpropprobe on Windows 11, a prohibited document
+type and an element beyond MaxElementDepth are both reported on line 1
+at column 11, in MSXML 3 and 6 alike, as they are here now.  The reason
+is the English text of msxml3's message table, where Windows gives its
+localized one.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index 320eab03203..590f3f6de08 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -112,6 +112,7 @@ struct domdoc
+     VARIANT_BOOL async;
+     VARIANT_BOOL resolving;
+     HRESULT error;
++    struct parse_error parse_error;
+ 
+     struct domnode *node;
+ 
+@@ -269,8 +270,15 @@ static HRESULT WINAPI PersistStreamInit_IsDirty(IPersistStreamInit *iface)
+     return S_FALSE;
+ }
+ 
++static void domdoc_set_parse_error(domdoc *doc, struct parse_error *error)
++{
++    SysFreeString(doc->parse_error.reason);
++    doc->parse_error = *error;
++}
++
+ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+ {
++    struct parse_error error;
+     LARGE_INTEGER zero = {{0}};
+     struct domnode *node;
+     DWORD read, written;
+@@ -297,7 +305,8 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+     }
+ 
+     hr = IStream_Seek(hstream, zero, STREAM_SEEK_SET, NULL);
+-    hr = parse_stream((ISequentialStream *)hstream, false, doc->node->properties, &node);
++    hr = parse_stream((ISequentialStream *)hstream, false, doc->node->properties, &node, &error);
++    domdoc_set_parse_error(doc, &error);
+     IStream_Release(hstream);
+ 
+     if (!node)
+@@ -460,6 +469,7 @@ static ULONG WINAPI domdoc_Release( IXMLDOMDocument3 *iface )
+             if (doc->events[eid]) IDispatch_Release(doc->events[eid]);
+ 
+         release_namespaces(doc);
++        SysFreeString(doc->parse_error.reason);
+         free(doc);
+     }
+ 
+@@ -1183,13 +1193,15 @@ static HRESULT WINAPI domdoc_nodeFromID(IXMLDOMDocument3 *iface, BSTR id, IXMLDO
+ 
+ static HRESULT domdoc_onDataAvailable(void *obj, char *ptr, DWORD len)
+ {
++    struct parse_error error;
+     struct domnode *node = NULL;
+     ISequentialStream *stream;
+     domdoc *doc = obj;
+     HRESULT hr;
+ 
+     stream_wrapper_create(ptr, len, &stream);
+-    hr = parse_stream(stream, false, doc->node->properties, &node);
++    hr = parse_stream(stream, false, doc->node->properties, &node, &error);
++    domdoc_set_parse_error(doc, &error);
+     ISequentialStream_Release(stream);
+ 
+     if (hr == S_OK)
+@@ -1393,14 +1405,30 @@ static HRESULT WINAPI domdoc_get_readyState(IXMLDOMDocument3 *iface, LONG *value
+ static HRESULT WINAPI domdoc_get_parseError(IXMLDOMDocument3 *iface, IXMLDOMParseError **obj)
+ {
+     domdoc *doc = impl_from_IXMLDOMDocument3(iface);
++    const struct parse_error *error = &doc->parse_error;
+     BSTR error_string = NULL;
++    LONG line = 0, linepos = 0;
++    WCHAR message[1024];
+ 
+-    FIXME("%p, %p semi-stub\n", iface, obj);
++    TRACE("%p, %p.\n", iface, obj);
+ 
+     if (doc->error)
+-        error_string = SysAllocString(L"error");
++    {
++        /* where the parser stopped, and why, when this error is the parser's */
++        if (error->code == doc->error)
++        {
++            line = error->line;
++            linepos = error->linepos;
++            if (error->reason) error_string = SysAllocString(error->reason);
++        }
++        if (!error_string && FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_FROM_HMODULE,
++                MSXML_hInstance, doc->error, 0, message, ARRAY_SIZE(message), NULL))
++            error_string = SysAllocString(message);
++        if (!error_string)
++            error_string = SysAllocString(L"error");
++    }
+ 
+-    *obj = create_parseError(doc->error, NULL, error_string, NULL, 0, 0, 0);
++    *obj = create_parseError(doc->error, NULL, error_string, NULL, line, linepos, 0);
+     if (!*obj) return E_OUTOFMEMORY;
+     return S_OK;
+ }
+@@ -1450,6 +1478,7 @@ static HRESULT WINAPI domdoc_abort(IXMLDOMDocument3 *iface)
+ /* Don't rely on data to be in BSTR format, treat it as WCHAR string. */
+ static HRESULT WINAPI domdoc_loadXML(IXMLDOMDocument3 *iface, BSTR data, VARIANT_BOOL *result)
+ {
++    struct parse_error error;
+     domdoc *doc = impl_from_IXMLDOMDocument3(iface);
+     struct domnode *node;
+     HRESULT hr = E_FAIL;
+@@ -1474,7 +1503,8 @@ static HRESULT WINAPI domdoc_loadXML(IXMLDOMDocument3 *iface, BSTR data, VARIANT
+ 
+         if (SUCCEEDED(hr = stream_wrapper_create(ptr, lstrlenW(ptr) * sizeof(WCHAR), &stream)))
+         {
+-            hr = parse_stream(stream, true, doc->node->properties, &node);
++            hr = parse_stream(stream, true, doc->node->properties, &node, &error);
++            domdoc_set_parse_error(doc, &error);
+             ISequentialStream_Release(stream);
+         }
+ 
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index 58db231674c..20089260d1f 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -266,6 +266,15 @@ extern HRESULT domnode_create(DOMNodeType type, const WCHAR *name, int name_len,
+ extern void domnode_append_child(struct domnode *parent, struct domnode *node);
+ extern void domnode_insert_attribute(struct domnode *parent, struct domnode *node, struct domnode *ref_node);
+ extern void domnode_destroy_tree(struct domnode *tree);
++
++/* where and why a document failed to load */
++struct parse_error
++{
++    HRESULT code;
++    LONG line;
++    LONG linepos;
++    BSTR reason;
++};
+ extern struct domnode *domnode_addref(struct domnode *node);
+ extern void domnode_release(struct domnode *node);
+ extern struct domnode *domnode_get_root_element(struct domnode *doc);
+@@ -279,7 +288,7 @@ extern HRESULT domnode_get_attribute(const struct domnode *node, const WCHAR *na
+ extern bool domnode_is_namespace_declaration(const struct domnode *node);
+ extern HRESULT node_clone_domnode(struct domnode *, bool, struct domnode **);
+ extern HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_properties *properties,
+-        struct domnode **tree);
++        struct domnode **tree, struct parse_error *error);
+ extern void dump_doc_refcounts(struct domnode *node);
+ 
+ struct parsed_name
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index dcf962a6b98..e1487030224 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -3845,6 +3845,7 @@ struct parse_context
+ {
+     ISAXExtensionHandler extension_handler;
+     ISAXContentHandler content_handler;
++    ISAXErrorHandler error_handler;
+     ISAXLexicalHandler lexical_handler;
+     ISAXDTDHandler dtd_handler;
+     ISAXDeclHandler decl_handler;
+@@ -3860,10 +3861,31 @@ struct parse_context
+ 
+     MSXML_VERSION version;
+     HRESULT status;
+-    int max_depth;
+-    int depth;
++
++    ISAXLocator *locator;
++    struct parse_error error;
+ };
+ 
++/* the first error is the one a document reports, with the position the reader had reached */
++static void parse_context_set_error(struct parse_context *c, ISAXLocator *locator, HRESULT code, const WCHAR *message)
++{
++    if (c->error.code)
++        return;
++
++    c->error.code = code;
++    if (locator)
++    {
++        int line = 0, column = 0;
++
++        ISAXLocator_getLineNumber(locator, &line);
++        ISAXLocator_getColumnNumber(locator, &column);
++        c->error.line = line;
++        c->error.linepos = column;
++    }
++    if (message && *message)
++        c->error.reason = SysAllocString(message);
++}
++
+ static void parse_context_node_create(struct parse_context *context, DOMNodeType type,
+         const WCHAR *name, int name_len, const WCHAR *uri, int uri_len, struct domnode *owner,
+         struct domnode **node)
+@@ -4016,6 +4038,9 @@ static ULONG WINAPI parse_content_handler_Release(ISAXContentHandler *iface)
+ 
+ static HRESULT WINAPI parse_content_handler_putDocumentLocator(ISAXContentHandler *iface, ISAXLocator *locator)
+ {
++    struct parse_context *c = CONTAINING_RECORD(iface, struct parse_context, content_handler);
++
++    c->locator = locator;
+     return S_OK;
+ }
+ 
+@@ -4046,14 +4071,9 @@ static HRESULT WINAPI parse_content_handler_startElement(ISAXContentHandler *ifa
+ {
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+     struct domnode *element, *attr;
+-    int max_depth = c->max_depth;
+     int count, length;
+     const WCHAR *str;
+ 
+-    ++c->depth;
+-    if (max_depth && c->depth > max_depth)
+-        return c->version < MSXML6 ? E_ABORT : E_DOM_MAX_ELEMENT_DEPTH;
+-
+     parse_context_create_text_node(c, NODE_TEXT);
+     parse_context_node_create(c, NODE_ELEMENT, qname, qname_len, uri, uri_len, c->root, &element);
+     parse_context_append_child(c, c->node, element);
+@@ -4093,7 +4113,6 @@ static HRESULT WINAPI parse_content_handler_endElement(ISAXContentHandler *iface
+ {
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+ 
+-    --c->depth;
+     parse_context_create_text_node(c, NODE_TEXT);
+     c->node = c->node->parent;
+ 
+@@ -4317,6 +4336,64 @@ static const ISAXDeclHandlerVtbl parse_decl_handler_vtbl =
+     parse_decl_handler_externalEntityDecl,
+ };
+ 
++static HRESULT WINAPI parse_error_handler_QueryInterface(ISAXErrorHandler *iface, REFIID riid, void **obj)
++{
++    if (IsEqualGUID(riid, &IID_ISAXErrorHandler)
++            || IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        ISAXErrorHandler_AddRef(iface);
++        return S_OK;
++    }
++
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI parse_error_handler_AddRef(ISAXErrorHandler *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI parse_error_handler_Release(ISAXErrorHandler *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI parse_error_handler_error(ISAXErrorHandler *iface, ISAXLocator *locator,
++        const WCHAR *message, HRESULT code)
++{
++    struct parse_context *c = CONTAINING_RECORD(iface, struct parse_context, error_handler);
++
++    parse_context_set_error(c, locator, code, message);
++    return S_OK;
++}
++
++static HRESULT WINAPI parse_error_handler_fatalError(ISAXErrorHandler *iface, ISAXLocator *locator,
++        const WCHAR *message, HRESULT code)
++{
++    struct parse_context *c = CONTAINING_RECORD(iface, struct parse_context, error_handler);
++
++    parse_context_set_error(c, locator, code, message);
++    return S_OK;
++}
++
++static HRESULT WINAPI parse_error_handler_ignorableWarning(ISAXErrorHandler *iface, ISAXLocator *locator,
++        const WCHAR *message, HRESULT code)
++{
++    return S_OK;
++}
++
++static const ISAXErrorHandlerVtbl parse_error_handler_vtbl =
++{
++    parse_error_handler_QueryInterface,
++    parse_error_handler_AddRef,
++    parse_error_handler_Release,
++    parse_error_handler_error,
++    parse_error_handler_fatalError,
++    parse_error_handler_ignorableWarning,
++};
++
+ static HRESULT WINAPI parse_extension_handler_QueryInterface(ISAXExtensionHandler *iface, REFIID riid, void **obj)
+ {
+     if (IsEqualGUID(riid, &IID_ISAXExtensionHandler)
+@@ -4514,8 +4591,8 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+     c->lexical_handler.lpVtbl = &parse_lexical_handler_vtbl;
+     c->dtd_handler.lpVtbl = &parse_dtd_handler_vtbl;
+     c->decl_handler.lpVtbl = &parse_decl_handler_vtbl;
++    c->error_handler.lpVtbl = &parse_error_handler_vtbl;
+     c->buffer.status = &c->status;
+-    c->max_depth = properties->max_element_depth;
+     c->version = properties->version;
+ 
+     if (FAILED(hr = SAXXMLReader_create(MSXML3, (void **)&unk)))
+@@ -4527,6 +4604,7 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+ 
+     ISAXXMLReader_putContentHandler(c->reader, &c->content_handler);
+     ISAXXMLReader_putDTDHandler(c->reader, &c->dtd_handler);
++    ISAXXMLReader_putErrorHandler(c->reader, &c->error_handler);
+ 
+     V_VT(&v) = VT_UNKNOWN;
+     V_UNKNOWN(&v) = (IUnknown *)&c->lexical_handler;
+@@ -4540,8 +4618,9 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+     V_UNKNOWN(&v) = (IUnknown *)&c->extension_handler;
+     ISAXXMLReader_putProperty(c->reader, L"http://winehq.org/sax/properties/extension-handler", v);
+ 
++    /* the reader stops at the element too deep, where MSXML reports it */
+     V_VT(&v) = VT_I4;
+-    V_I4(&v) = 0;
++    V_I4(&v) = properties->max_element_depth;
+     ISAXXMLReader_putProperty(c->reader, L"max-element-depth", v);
+     ISAXXMLReader_putFeature(c->reader, L"prohibit-dtd", properties->prohibit_dtd ? VARIANT_TRUE : VARIANT_FALSE);
+     if (properties->version == MSXML6)
+@@ -4558,6 +4637,7 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+ 
+ static void parse_context_cleanup(struct parse_context *c)
+ {
++    SysFreeString(c->error.reason);
+     free(c->buffer.data);
+     if (c->reader)
+         ISAXXMLReader_Release(c->reader);
+@@ -4565,13 +4645,16 @@ static void parse_context_cleanup(struct parse_context *c)
+         ISAXXMLReaderExtension_Release(c->reader_extension);
+ }
+ 
+-HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_properties *properties, struct domnode **tree)
++HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_properties *properties,
++        struct domnode **tree, struct parse_error *error)
+ {
+     struct parse_context context;
+     HRESULT hr;
+     VARIANT v;
+ 
+     *tree = NULL;
++    if (error)
++        memset(error, 0, sizeof(*error));
+ 
+     if (FAILED(hr = parse_context_init(&context, properties)))
+         return hr;
+@@ -4592,6 +4675,12 @@ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_
+         *tree = context.root;
+         context.root = NULL;
+     }
++    else if (error)
++    {
++        *error = context.error;
++        context.error.reason = NULL;
++        if (!error->code) error->code = hr;
++    }
+ 
+     parse_context_cleanup(&context);
+ 
+diff --git a/dlls/msxml3/saxreader.c b/dlls/msxml3/saxreader.c
+index b87cca5006b..6ad94267b9e 100644
+--- a/dlls/msxml3/saxreader.c
++++ b/dlls/msxml3/saxreader.c
+@@ -4417,7 +4417,10 @@ static void saxreader_parse_starttag(struct saxlocator *locator)
+         if (locator->saxreader->version >= MSXML6)
+             locator->column += SysStringLen(name.qname);
+         locator->limit_name = L"MaxElementDepth";
+-        saxreader_set_error(locator, locator->saxreader->version < MSXML6 ? E_ABORT : E_SAX_MAX_ELEMENT_DEPTH);
++        if (locator->saxreader->features & DOMVersion6)
++            saxreader_set_error(locator, E_DOM_MAX_ELEMENT_DEPTH);
++        else
++            saxreader_set_error(locator, locator->saxreader->version < MSXML6 ? E_ABORT : E_SAX_MAX_ELEMENT_DEPTH);
+         saxreader_free_name(&name);
+         return;
+     }
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index e3553f97e58..c3306e5a054 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -15183,11 +15183,12 @@ static void test_undeclared_prefix(void)
+     free_bstrs();
+ }
+ 
+-static void check_load_error(IXMLDOMDocument2 *doc, const char *xml, LONG expect, int line)
++/* an error is reported on the first line, at the column given */
++static void check_load_error(IXMLDOMDocument2 *doc, const char *xml, LONG expect, LONG linepos, int line)
+ {
+     IXMLDOMParseError *error;
+     VARIANT_BOOL b = VARIANT_TRUE;
+-    LONG code = 0;
++    LONG code = 0, error_line = -1, error_linepos = -1;
+     HRESULT hr;
+ 
+     hr = IXMLDOMDocument2_loadXML(doc, _bstr_(xml), &b);
+@@ -15197,6 +15198,13 @@ static void check_load_error(IXMLDOMDocument2 *doc, const char *xml, LONG expect
+     ok_(__FILE__, line)(hr == S_OK, "got hr %#lx\n", hr);
+     IXMLDOMParseError_get_errorCode(error, &code);
+     ok_(__FILE__, line)(code == expect, "got error %#lx\n", code);
++    if (expect)
++    {
++        IXMLDOMParseError_get_line(error, &error_line);
++        IXMLDOMParseError_get_linepos(error, &error_linepos);
++        ok_(__FILE__, line)(error_line == 1 && error_linepos == linepos, "got position %ld:%ld\n",
++                error_line, error_linepos);
++    }
+     IXMLDOMParseError_Release(error);
+ }
+ 
+@@ -15263,15 +15271,15 @@ static void test_parser_properties(void)
+         hr = IXMLDOMDocument2_getProperty(doc, _bstr_("ProhibitDTD"), &var);
+         ok(hr == S_OK, "got hr %#lx\n", hr);
+         ok(V_VT(&var) == VT_BOOL && V_BOOL(&var) == VARIANT_TRUE, "got vt %d value %d\n", V_VT(&var), V_BOOL(&var));
+-        check_load_error(doc, "<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>", version == 3 ? 0xc00ce556 : 0xc00ce584,
++        check_load_error(doc, "<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>", version == 3 ? 0xc00ce556 : 0xc00ce584, 11,
+                          __LINE__);
+-        check_load_error(doc, "<!DOCTYPE a><a>x</a>", version == 3 ? 0xc00ce556 : 0xc00ce584, __LINE__);
+-        check_load_error(doc, "<a>x</a>", 0, __LINE__);
++        check_load_error(doc, "<!DOCTYPE a><a>x</a>", version == 3 ? 0xc00ce556 : 0xc00ce584, 11, __LINE__);
++        check_load_error(doc, "<a>x</a>", 0, 0, __LINE__);
+         V_VT(&var) = VT_BOOL;
+         V_BOOL(&var) = VARIANT_FALSE;
+         hr = IXMLDOMDocument2_setProperty(doc, _bstr_("ProhibitDTD"), var);
+         ok(hr == S_OK, "got hr %#lx\n", hr);
+-        check_load_error(doc, "<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>", 0, __LINE__);
++        check_load_error(doc, "<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>", 0, 0, __LINE__);
+ 
+         /* elements nested deeper than allowed */
+         V_VT(&var) = VT_BSTR;
+@@ -15282,8 +15290,8 @@ static void test_parser_properties(void)
+         hr = IXMLDOMDocument2_getProperty(doc, _bstr_("MaxElementDepth"), &var);
+         ok(hr == S_OK, "got hr %#lx\n", hr);
+         ok(V_VT(&var) == VT_I4 && V_I4(&var) == 3, "got vt %d value %ld\n", V_VT(&var), V_I4(&var));
+-        check_load_error(doc, "<a><b><c/></b></a>", 0, __LINE__);
+-        check_load_error(doc, "<a><b><c><d/></c></b></a>", version == 3 ? E_ABORT : 0xc00ce586, __LINE__);
++        check_load_error(doc, "<a><b><c/></b></a>", 0, 0, __LINE__);
++        check_load_error(doc, "<a><b><c><d/></c></b></a>", version == 3 ? E_ABORT : 0xc00ce586, 11, __LINE__);
+         V_VT(&var) = VT_I4;
+         V_I4(&var) = -1;
+         hr = IXMLDOMDocument2_setProperty(doc, _bstr_("MaxElementDepth"), var);
+@@ -15291,7 +15299,7 @@ static void test_parser_properties(void)
+         V_I4(&var) = 0;
+         hr = IXMLDOMDocument2_setProperty(doc, _bstr_("MaxElementDepth"), var);
+         ok(hr == S_OK, "got hr %#lx\n", hr);
+-        check_load_error(doc, "<a><b><c><d/></c></b></a>", 0, __LINE__);
++        check_load_error(doc, "<a><b><c><d/></c></b></a>", 0, 0, __LINE__);
+ 
+         /* MSXML 3 cannot set what it does not answer; last, as NewParser changes the parse errors */
+         for (i = 0; i < ARRAY_SIZE(properties); i++)

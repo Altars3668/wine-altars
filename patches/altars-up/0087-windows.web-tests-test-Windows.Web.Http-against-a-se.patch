@@ -1,0 +1,806 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 19:59:59 -0400
+Subject: [PATCH] windows.web/tests: test Windows.Web.Http against a server in
+ the process.
+
+The order the header collections list headers in, Location and Host
+kept as a Uri and a HostName, how a body reads as text by its
+Content-Type, the buffer a content hands out, and what HttpClient sends:
+cookies a response set, the order of the headers on the wire, HEAD with
+no length, and a POST a 303 turned into a GET.  Every expectation was
+checked on Windows first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit a0a15c6aec5ec7b46736302f2d1ed4bef8c20e90)
+
+diff --git a/dlls/windows.web/tests/Makefile.in b/dlls/windows.web/tests/Makefile.in
+index 9329346e3c2..03088e750a0 100644
+--- a/dlls/windows.web/tests/Makefile.in
++++ b/dlls/windows.web/tests/Makefile.in
+@@ -1,5 +1,6 @@
+ TESTDLL = windows.web.dll
+-IMPORTS = combase
++IMPORTS = combase ws2_32
+ 
+ SOURCES = \
++	http.c \
+ 	web.c
+diff --git a/dlls/windows.web/tests/http.c b/dlls/windows.web/tests/http.c
+new file mode 100644
+index 00000000000..44c98921af9
+--- /dev/null
++++ b/dlls/windows.web/tests/http.c
+@@ -0,0 +1,772 @@
++/*
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++#define COBJMACROS
++#include <stdarg.h>
++#include <stdio.h>
++
++#include "winsock2.h"
++#include "windef.h"
++#include "winbase.h"
++#include "winstring.h"
++
++#include "roapi.h"
++
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Foundation_Collections
++#define WIDL_using_Windows_Storage_Streams
++#define WIDL_using_Windows_Networking
++#define WIDL_using_Windows_Web_Http
++#define WIDL_using_Windows_Web_Http_Headers
++#define WIDL_using_Windows_Web_Http_Filters
++#include "windows.foundation.h"
++/* web.c defines the Windows.Foundation GUIDs */
++#include "initguid.h"
++#include "windows.storage.streams.h"
++#include "windows.networking.h"
++#include "windows.web.http.h"
++#include "robuffer.h"
++
++#include "wine/test.h"
++
++static HSTRING hstr( const WCHAR *str )
++{
++    HSTRING ret = NULL;
++    if (str) WindowsCreateString( str, wcslen( str ), &ret );
++    return ret;
++}
++
++static void *get_factory( const WCHAR *name, const IID *iid )
++{
++    HSTRING str = hstr( name );
++    void *factory = NULL;
++    HRESULT hr;
++
++    hr = RoGetActivationFactory( str, iid, &factory );
++    ok( hr == S_OK, "RoGetActivationFactory %s got hr %#lx.\n", debugstr_w( name ), hr );
++    WindowsDeleteString( str );
++    return factory;
++}
++
++static void *activate( const WCHAR *name, const IID *iid )
++{
++    HSTRING str = hstr( name );
++    IInspectable *inspectable;
++    void *ret = NULL;
++    HRESULT hr;
++
++    hr = RoActivateInstance( str, &inspectable );
++    ok( hr == S_OK, "RoActivateInstance %s got hr %#lx.\n", debugstr_w( name ), hr );
++    WindowsDeleteString( str );
++    if (FAILED(hr)) return NULL;
++    IInspectable_QueryInterface( inspectable, iid, &ret );
++    IInspectable_Release( inspectable );
++    return ret;
++}
++
++static AsyncStatus wait_op( void *op, HRESULT *error )
++{
++    AsyncStatus status = Started;
++    IAsyncInfo *info;
++    int i;
++
++    *error = E_FAIL;
++    if (FAILED(IUnknown_QueryInterface( (IUnknown *)op, &IID_IAsyncInfo, (void **)&info ))) return Error;
++    for (i = 0; i < 1000 && status == Started; i++)
++    {
++        IAsyncInfo_get_Status( info, &status );
++        if (status == Started) Sleep( 10 );
++    }
++    IAsyncInfo_get_ErrorCode( info, error );
++    IAsyncInfo_Release( info );
++    return status;
++}
++
++static IMap_HSTRING_HSTRING *map_of( void *collection )
++{
++    IMap_HSTRING_HSTRING *map = NULL;
++    IUnknown_QueryInterface( (IUnknown *)collection, &IID_IMap_HSTRING_HSTRING, (void **)&map );
++    return map;
++}
++
++static HRESULT insert( void *collection, const WCHAR *name, const WCHAR *value )
++{
++    IMap_HSTRING_HSTRING *map = map_of( collection );
++    HSTRING key = hstr( name ), str = hstr( value );
++    boolean replaced;
++    HRESULT hr;
++
++    hr = IMap_HSTRING_HSTRING_Insert( map, key, str, &replaced );
++    WindowsDeleteString( key );
++    WindowsDeleteString( str );
++    IMap_HSTRING_HSTRING_Release( map );
++    return hr;
++}
++
++#define check_lookup( a, b, c ) check_lookup_( __LINE__, a, b, c )
++static void check_lookup_( unsigned int line, void *collection, const WCHAR *name, const WCHAR *expect )
++{
++    IMap_HSTRING_HSTRING *map = map_of( collection );
++    HSTRING key = hstr( name ), value = NULL;
++    HRESULT hr;
++
++    hr = IMap_HSTRING_HSTRING_Lookup( map, key, &value );
++    if (!expect) ok_(__FILE__, line)( hr == E_BOUNDS, "%s: got hr %#lx.\n", debugstr_w( name ), hr );
++    else
++    {
++        ok_(__FILE__, line)( hr == S_OK, "%s: got hr %#lx.\n", debugstr_w( name ), hr );
++        ok_(__FILE__, line)( !wcscmp( WindowsGetStringRawBuffer( value, NULL ), expect ), "%s: got %s, expected %s.\n",
++                             debugstr_w( name ), debugstr_hstring( value ), debugstr_w( expect ) );
++    }
++    WindowsDeleteString( value );
++    WindowsDeleteString( key );
++    IMap_HSTRING_HSTRING_Release( map );
++}
++
++/* the names, in the order the collection lists them in, separated by spaces */
++#define check_order( a, b ) check_order_( __LINE__, a, b )
++static void check_order_( unsigned int line, void *collection, const char *expect )
++{
++    IIterable_IKeyValuePair_HSTRING_HSTRING *iterable;
++    IIterator_IKeyValuePair_HSTRING_HSTRING *iterator;
++    IKeyValuePair_HSTRING_HSTRING *pair;
++    char buffer[2048] = {0};
++    boolean has = FALSE;
++    HSTRING key;
++
++    IUnknown_QueryInterface( (IUnknown *)collection, &IID_IIterable_IKeyValuePair_HSTRING_HSTRING, (void **)&iterable );
++    IIterable_IKeyValuePair_HSTRING_HSTRING_First( iterable, &iterator );
++    IIterable_IKeyValuePair_HSTRING_HSTRING_Release( iterable );
++    IIterator_IKeyValuePair_HSTRING_HSTRING_get_HasCurrent( iterator, &has );
++    while (has)
++    {
++        IIterator_IKeyValuePair_HSTRING_HSTRING_get_Current( iterator, &pair );
++        IKeyValuePair_HSTRING_HSTRING_get_Key( pair, &key );
++        if (*buffer) strcat( buffer, " " );
++        WideCharToMultiByte( CP_ACP, 0, WindowsGetStringRawBuffer( key, NULL ), -1, buffer + strlen( buffer ),
++                             sizeof(buffer) - strlen( buffer ), NULL, NULL );
++        WindowsDeleteString( key );
++        IKeyValuePair_HSTRING_HSTRING_Release( pair );
++        IIterator_IKeyValuePair_HSTRING_HSTRING_MoveNext( iterator, &has );
++    }
++    IIterator_IKeyValuePair_HSTRING_HSTRING_Release( iterator );
++    ok_(__FILE__, line)( !strcmp( buffer, expect ), "got \"%s\", expected \"%s\".\n", buffer, expect );
++}
++
++static IHttpResponseHeaderCollection *response_headers(void)
++{
++    IHttpResponseMessage *response = activate( L"Windows.Web.Http.HttpResponseMessage", &IID_IHttpResponseMessage );
++    IHttpResponseHeaderCollection *headers = NULL;
++    IHttpResponseMessage_get_Headers( response, &headers );
++    IHttpResponseMessage_Release( response );
++    return headers;
++}
++
++static IHttpRequestHeaderCollection *request_headers(void)
++{
++    IHttpRequestMessage *request = activate( L"Windows.Web.Http.HttpRequestMessage", &IID_IHttpRequestMessage );
++    IHttpRequestHeaderCollection *headers = NULL;
++    IHttpRequestMessage_get_Headers( request, &headers );
++    IHttpRequestMessage_Release( request );
++    return headers;
++}
++
++static IUriRuntimeClass *create_uri( const WCHAR *text )
++{
++    IUriRuntimeClassFactory *factory = get_factory( L"Windows.Foundation.Uri", &IID_IUriRuntimeClassFactory );
++    IUriRuntimeClass *uri = NULL;
++    HSTRING str = hstr( text );
++
++    IUriRuntimeClassFactory_CreateUri( factory, str, &uri );
++    WindowsDeleteString( str );
++    IUriRuntimeClassFactory_Release( factory );
++    return uri;
++}
++
++/* The headers are listed the way ATL's CAtlMap keeps them: 17 bins by the
++ * FNV-1a hash of the name in upper case, each new header at the head of its
++ * bin, and a rehash into 53 bins past 38 headers. */
++static void test_header_order(void)
++{
++    IHttpMethodHeaderValueCollection *allow;
++    IHttpResponseHeaderCollection *headers;
++    IReference_TimeSpan *age;
++    IVector_HttpMethod *vector;
++    IPropertyValueStatics *statics;
++    IPropertyValue *value;
++    TimeSpan span;
++    HSTRING name, str;
++    WCHAR buffer[16];
++    HRESULT hr;
++    int i;
++
++    headers = response_headers();
++    insert( headers, L"A", L"1" );
++    insert( headers, L"B", L"2" );
++    insert( headers, L"C", L"3" );
++    check_order( headers, "C A B" );
++    IHttpResponseHeaderCollection_Release( headers );
++
++    headers = response_headers();
++    insert( headers, L"c", L"1" );
++    insert( headers, L"x", L"2" );
++    check_order( headers, "x c" );
++    /* Insert puts the header it replaces at the head of its bin, with the name it is given */
++    insert( headers, L"C", L"3" );
++    check_order( headers, "C x" );
++    check_lookup( headers, L"c", L"3" );
++    /* Append leaves it where it is */
++    name = hstr( L"x" );
++    str = hstr( L"4" );
++    hr = IHttpResponseHeaderCollection_Append( headers, name, str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    WindowsDeleteString( name );
++    WindowsDeleteString( str );
++    check_order( headers, "C x" );
++    check_lookup( headers, L"x", L"2, 4" );
++
++    /* a typed collection takes its place when it has a value, and gives it up when it has none */
++    hr = IHttpResponseHeaderCollection_get_Allow( headers, &allow );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_order( headers, "C x" );
++    insert( headers, L"X-1", L"v" );
++    str = hstr( L"GET" );
++    hr = IHttpMethodHeaderValueCollection_ParseAdd( allow, str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    WindowsDeleteString( str );
++    check_order( headers, "C x Allow X-1" );
++    IHttpMethodHeaderValueCollection_QueryInterface( allow, &IID_IVector_HttpMethod, (void **)&vector );
++    IVector_HttpMethod_Clear( vector );
++    IVector_HttpMethod_Release( vector );
++    check_order( headers, "C x X-1" );
++    check_lookup( headers, L"Allow", NULL );
++    IHttpMethodHeaderValueCollection_Release( allow );
++
++    /* a typed property leaves it where it is */
++    insert( headers, L"Age", L"1" );
++    insert( headers, L"X-0", L"v" );
++    check_order( headers, "C x X-1 X-0 Age" );
++    statics = get_factory( L"Windows.Foundation.PropertyValue", &IID_IPropertyValueStatics );
++    span.Duration = 20000000;
++    IPropertyValueStatics_CreateTimeSpan( statics, span, (IInspectable **)&value );
++    IPropertyValue_QueryInterface( value, &IID_IReference_TimeSpan, (void **)&age );
++    hr = IHttpResponseHeaderCollection_put_Age( headers, age );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IReference_TimeSpan_Release( age );
++    IPropertyValue_Release( value );
++    IPropertyValueStatics_Release( statics );
++    check_order( headers, "C x X-1 X-0 Age" );
++    check_lookup( headers, L"Age", L"2" );
++    IHttpResponseHeaderCollection_Release( headers );
++
++    /* past 38 headers they are spread over 53 bins */
++    headers = response_headers();
++    for (i = 0; i < 38; i++)
++    {
++        swprintf( buffer, ARRAY_SIZE(buffer), L"X-%d", i );
++        insert( headers, buffer, L"v" );
++    }
++    check_order( headers, "X-14 X-23 X-19 X-9 X-3 X-31 X-6 X-28 X-26 X-10 X-36 X-25 X-15 X-16 X-2 X-22 X-8 "
++                 "X-32 X-21 X-11 X-5 X-37 X-24 X-12 X-34 X-17 X-1 X-33 X-20 X-18 X-4 X-30 X-7 X-29 X-27 "
++                 "X-13 X-35 X-0" );
++    insert( headers, L"X-38", L"v" );
++    check_order( headers, "X-17 X-33 X-35 X-27 X-14 X-3 X-30 X-20 X-13 X-0 X-19 X-6 X-25 X-5 X-36 X-26 X-29 "
++                 "X-15 X-2 X-38 X-9 X-31 X-23 X-10 X-16 X-8 X-32 X-22 X-34 X-24 X-4 X-37 X-21 X-12 X-28 "
++                 "X-1 X-18 X-7 X-11" );
++    IHttpResponseHeaderCollection_Release( headers );
++}
++
++/* Location and Host are kept as a Uri and a HostName, which they read as. */
++static void test_header_objects(void)
++{
++    IHttpResponseHeaderCollection *headers;
++    IHttpRequestHeaderCollection *request;
++    IUriRuntimeClass *uri, *uri2;
++    IHostName *host;
++    HSTRING name, str;
++    boolean result;
++    HRESULT hr;
++
++    headers = response_headers();
++    hr = insert( headers, L"Location", L"http://example.com/a b?x=1#f" );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_lookup( headers, L"Location", L"http://example.com/a%20b?x=1#f" );
++    uri = uri2 = NULL;
++    hr = IHttpResponseHeaderCollection_get_Location( headers, &uri );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IHttpResponseHeaderCollection_get_Location( headers, &uri2 );
++    ok( uri == uri2, "got %p and %p.\n", uri, uri2 );
++    IUriRuntimeClass_get_RawUri( uri, &str );
++    ok( !wcscmp( WindowsGetStringRawBuffer( str, NULL ), L"http://example.com/a b?x=1#f" ), "got %s.\n",
++        debugstr_hstring( str ) );
++    WindowsDeleteString( str );
++    IUriRuntimeClass_Release( uri );
++    IUriRuntimeClass_Release( uri2 );
++
++    hr = insert( headers, L"Location", L"/relative" );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++
++    /* a Uri reads as its AbsoluteCanonicalUri */
++    uri = create_uri( L"http://example.com/p q?\x00e9#f g" );
++    hr = IHttpResponseHeaderCollection_put_Location( headers, uri );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_lookup( headers, L"Location", L"http://example.com/p%20q?%C3%A9#f%20g" );
++    IUriRuntimeClass_Release( uri );
++    IHttpResponseHeaderCollection_Release( headers );
++
++    /* text appended as it is is made a Uri when it is asked for */
++    headers = response_headers();
++    name = hstr( L"Location" );
++    str = hstr( L"http://example.com/r s" );
++    result = FALSE;
++    hr = IHttpResponseHeaderCollection_TryAppendWithoutValidation( headers, name, str, &result );
++    ok( hr == S_OK && result, "got hr %#lx, result %d.\n", hr, result );
++    WindowsDeleteString( str );
++    check_lookup( headers, L"Location", L"http://example.com/r s" );
++    uri = NULL;
++    hr = IHttpResponseHeaderCollection_get_Location( headers, &uri );
++    ok( hr == S_OK && uri, "got hr %#lx, uri %p.\n", hr, uri );
++    if (uri) IUriRuntimeClass_Release( uri );
++    check_lookup( headers, L"Location", L"http://example.com/r%20s" );
++    WindowsDeleteString( name );
++    IHttpResponseHeaderCollection_Release( headers );
++
++    /* a host name reads as its canonical name, an IPv6 address in brackets */
++    request = request_headers();
++    hr = insert( request, L"Host", L"[::1]" );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_lookup( request, L"Host", L"[::1]" );
++    hr = IHttpRequestHeaderCollection_get_Host( request, &host );
++    ok( hr == S_OK && host, "got hr %#lx, host %p.\n", hr, host );
++    IHostName_get_DisplayName( host, &str );
++    ok( !wcscmp( WindowsGetStringRawBuffer( str, NULL ), L"::1" ), "got %s.\n", debugstr_hstring( str ) );
++    WindowsDeleteString( str );
++    IHostName_Release( host );
++    hr = insert( request, L"Host", L"EXAMPLE.com" );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_lookup( request, L"Host", L"example.com" );
++    hr = IHttpRequestHeaderCollection_get_Host( request, &host );
++    ok( hr == S_OK && host, "got hr %#lx, host %p.\n", hr, host );
++    IHostName_get_DisplayName( host, &str );
++    ok( !wcscmp( WindowsGetStringRawBuffer( str, NULL ), L"EXAMPLE.com" ), "got %s.\n", debugstr_hstring( str ) );
++    WindowsDeleteString( str );
++    IHostName_Release( host );
++    hr = insert( request, L"Host", L"example.com:8080" );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    check_lookup( request, L"Host", NULL );
++    IHttpRequestHeaderCollection_Release( request );
++}
++
++static IBuffer *create_buffer( const void *data, UINT32 len )
++{
++    IBufferFactory *factory = get_factory( L"Windows.Storage.Streams.Buffer", &IID_IBufferFactory );
++    IBufferByteAccess *access;
++    IBuffer *buffer;
++    BYTE *bytes;
++
++    IBufferFactory_Create( factory, len ? len : 1, &buffer );
++    IBufferFactory_Release( factory );
++    IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&access );
++    IBufferByteAccess_Buffer( access, &bytes );
++    IBufferByteAccess_Release( access );
++    memcpy( bytes, data, len );
++    IBuffer_put_Length( buffer, len );
++    return buffer;
++}
++
++/* How a body reads as text, by what its Content-Type says. */
++static void test_content_text(void)
++{
++    static const struct
++    {
++        const WCHAR *type;
++        const char *data;
++        UINT32 len;
++        HRESULT hr;
++        const WCHAR *text;
++    }
++    tests[] =
++    {
++        {L"text/plain", "x\xc3\xa9y", 4, S_OK, L"x\x00c3\x00a9y"},
++        {L"text/plain", "\x80\x93", 2, S_OK, L"\x0080\x0093"},
++        {L"text/html", "x\xc3\xa9y", 4, S_OK, L"x\x00c3\x00a9y"},
++        {NULL, "x\xc3\xa9y", 4, S_OK, L"x\x00c3\x00a9y"},
++        {L"application/json", "x\xc3\xa9y", 4, S_OK, L"x\x00e9y"},
++        {L"application/problem+json", "x\xc3\xa9y", 4, S_OK, L"x\x00e9y"},
++        {L"text/json", "x\xc3\xa9y", 4, S_OK, L"x\x00c3\x00a9y"},
++        {L"application/json; charset=iso-8859-1", "x\xc3\xa9y", 4, S_OK, L"x\x00c3\x00a9y"},
++        {L"application/json", "x\x93y", 3, 0x80070459 /* HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION) */},
++        {L"text/plain", "\xef\xbb\xbfx\xc3\xa9y", 7, S_OK, L"x\x00e9y"},
++        {L"text/plain", "\xff\xfeh\0i\0", 6, S_OK, L"hi"},
++        {L"text/plain", "\xfe\xff\0h\0i", 6, S_OK, L"hi"},
++        {L"text/plain; charset=utf-8", "x\xc3\xa9y", 4, S_OK, L"x\x00e9y"},
++        {L"text/plain; charset=\"utf-8\"", "x\xc3\xa9y", 4, S_OK, L"x\x00e9y"},
++        {L"text/plain; charset=utf-8", "a\xff" "b", 3, 0x80070459 /* HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION) */},
++        {L"text/plain; charset=utf-8", "a\xff" "bc", 4, S_OK, L"\xff61\x6362"},
++        {L"text/plain; charset=utf-16", "h\0i\0", 4, S_OK, L"hi"},
++        {L"text/plain; charset=utf-16", "h\0i", 3, 0x80070459 /* HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION) */},
++        {L"text/plain; charset=windows-1252", "\x80\x93", 2, S_OK, L"\x20ac\x201c"},
++        {L"text/plain; charset=gbk", "\xd6\xd0", 2, S_OK, L"\x4e2d"},
++        {L"text/plain; charset=x-bogus", "x", 1, E_FAIL},
++    };
++    IAsyncOperationWithProgress_HSTRING_UINT64 *op;
++    IHttpBufferContentFactory *factory;
++    IHttpContentHeaderCollection *headers;
++    IHttpContent *content;
++    AsyncStatus status;
++    IBuffer *buffer;
++    HRESULT hr, error;
++    HSTRING str;
++    UINT32 i;
++
++    factory = get_factory( L"Windows.Web.Http.HttpBufferContent", &IID_IHttpBufferContentFactory );
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context( "%u", i );
++        buffer = create_buffer( tests[i].data, tests[i].len );
++        hr = IHttpBufferContentFactory_CreateFromBuffer( factory, buffer, &content );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        IBuffer_Release( buffer );
++        IHttpContent_get_Headers( content, &headers );
++        if (tests[i].type)
++        {
++            hr = insert( headers, L"Content-Type", tests[i].type );
++            ok( hr == S_OK, "got hr %#lx.\n", hr );
++        }
++        IHttpContentHeaderCollection_Release( headers );
++
++        hr = IHttpContent_ReadAsStringAsync( content, &op );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        status = wait_op( op, &error );
++        str = NULL;
++        hr = IAsyncOperationWithProgress_HSTRING_UINT64_GetResults( op, &str );
++        if (tests[i].hr == S_OK)
++        {
++            ok( status == Completed, "got status %d, error %#lx.\n", status, error );
++            ok( hr == S_OK, "got hr %#lx.\n", hr );
++            ok( !wcscmp( WindowsGetStringRawBuffer( str, NULL ), tests[i].text ), "got %s.\n", debugstr_hstring( str ) );
++        }
++        else
++        {
++            ok( status == Completed, "got status %d, error %#lx.\n", status, error );
++            ok( hr == tests[i].hr, "got hr %#lx.\n", hr );
++            ok( !str, "got %s.\n", debugstr_hstring( str ) );
++        }
++        WindowsDeleteString( str );
++        IAsyncOperationWithProgress_HSTRING_UINT64_Release( op );
++        IHttpContent_Release( content );
++        winetest_pop_context();
++    }
++    IHttpBufferContentFactory_Release( factory );
++}
++
++/* The buffer a content reads into is exactly as long as what it holds, and
++ * of a class Windows names after the interface. */
++static void test_content_buffer(void)
++{
++    IAsyncOperationWithProgress_IBuffer_UINT64 *op;
++    IHttpStringContentFactory *factory;
++    UINT32 capacity, length;
++    IHttpContent *content;
++    IBuffer *buffer = NULL;
++    IUnknown *unknown;
++    HRESULT hr, error;
++    HSTRING str;
++
++    factory = get_factory( L"Windows.Web.Http.HttpStringContent", &IID_IHttpStringContentFactory );
++    str = hstr( L"hello" );
++    IHttpStringContentFactory_CreateFromString( factory, str, &content );
++    WindowsDeleteString( str );
++    hr = IHttpContent_ReadAsBufferAsync( content, &op );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    wait_op( op, &error );
++    hr = IAsyncOperationWithProgress_IBuffer_UINT64_GetResults( op, &buffer );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IAsyncOperationWithProgress_IBuffer_UINT64_Release( op );
++
++    hr = IBuffer_GetRuntimeClassName( buffer, &str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( !wcscmp( WindowsGetStringRawBuffer( str, NULL ), L"Windows.Storage.Streams.IBuffer" ), "got %s.\n",
++        debugstr_hstring( str ) );
++    WindowsDeleteString( str );
++    IBuffer_get_Capacity( buffer, &capacity );
++    IBuffer_get_Length( buffer, &length );
++    ok( capacity == 5 && length == 5, "got capacity %u, length %u.\n", capacity, length );
++    hr = IBuffer_put_Length( buffer, 6 );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    hr = IBuffer_QueryInterface( buffer, &IID_IMarshal, (void **)&unknown );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (SUCCEEDED(hr)) IUnknown_Release( unknown );
++    hr = IBuffer_QueryInterface( buffer, &IID_IAgileObject, (void **)&unknown );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (SUCCEEDED(hr)) IUnknown_Release( unknown );
++    IBuffer_Release( buffer );
++    IHttpContent_Release( content );
++    IHttpStringContentFactory_Release( factory );
++}
++
++/*** a server in this process ***/
++
++static SOCKET listener;
++static int port;
++static char last_request[4096];
++
++static void send_all( SOCKET s, const char *data, int len )
++{
++    int ret;
++    while (len > 0 && (ret = send( s, data, len, 0 )) > 0)
++    {
++        data += ret;
++        len -= ret;
++    }
++}
++
++static int serve( SOCKET s )
++{
++    char buffer[4096], head[512], *end, *path, *length;
++    int len = 0, ret, body = 0, head_request;
++
++    for (;;)
++    {
++        if ((ret = recv( s, buffer + len, sizeof(buffer) - 1 - len, 0 )) <= 0) return 0;
++        len += ret;
++        buffer[len] = 0;
++        if ((end = strstr( buffer, "\r\n\r\n" ))) break;
++    }
++    if ((length = strstr( buffer, "Content-Length: " )) && length < end) body = atoi( length + 16 );
++    while (len < end - buffer + 4 + body)
++    {
++        if ((ret = recv( s, buffer + len, sizeof(buffer) - 1 - len, 0 )) <= 0) break;
++        len += ret;
++    }
++    buffer[len] = 0;
++    memcpy( last_request, buffer, len + 1 );
++    head_request = !strncmp( buffer, "HEAD ", 5 );
++    path = strchr( buffer, ' ' ) + 1;
++
++    if (!strncmp( path, "/set-cookies ", 13 ))
++    {
++        strcpy( head, "HTTP/1.1 200 OK\r\nSet-Cookie: tc1=1\r\nSet-Cookie: tc2=2; HttpOnly\r\nContent-Length: 0\r\n\r\n" );
++        send_all( s, head, strlen( head ) );
++    }
++    else if (!strncmp( path, "/cookie-again ", 14 ))
++    {
++        strcpy( head, "HTTP/1.1 200 OK\r\nSet-Cookie: tc1=3\r\nContent-Length: 0\r\n\r\n" );
++        send_all( s, head, strlen( head ) );
++    }
++    else if (!strncmp( path, "/see-other ", 11 ))
++    {
++        strcpy( head, "HTTP/1.1 303 See Other\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n" );
++        send_all( s, head, strlen( head ) );
++    }
++    else if (!strncmp( path, "/json ", 6 ))
++    {
++        strcpy( head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{\"a\":\"\xc3\xa9\"}" );
++        send_all( s, head, strlen( head ) );
++    }
++    else /* /echo */
++    {
++        sprintf( head, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n", len );
++        send_all( s, head, strlen( head ) );
++        if (!head_request) send_all( s, buffer, len );
++    }
++    return 1;
++}
++
++static DWORD WINAPI server_thread( void *arg )
++{
++    SOCKET s;
++
++    while ((s = accept( listener, NULL, NULL )) != INVALID_SOCKET)
++    {
++        while (serve( s )) ;
++        closesocket( s );
++    }
++    return 0;
++}
++
++static BOOL start_server(void)
++{
++    struct sockaddr_in addr = {0};
++    int addr_len = sizeof(addr);
++    WSADATA wsa;
++
++    WSAStartup( MAKEWORD(2, 2), &wsa );
++    if ((listener = socket( AF_INET, SOCK_STREAM, 0 )) == INVALID_SOCKET) return FALSE;
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
++    if (bind( listener, (struct sockaddr *)&addr, sizeof(addr) )) return FALSE;
++    getsockname( listener, (struct sockaddr *)&addr, &addr_len );
++    port = ntohs( addr.sin_port );
++    listen( listener, 16 );
++    CloseHandle( CreateThread( NULL, 0, server_thread, NULL, 0, NULL ) );
++    return TRUE;
++}
++
++static IHttpResponseMessage *send_request( IHttpClient *client, const WCHAR *method, const char *path,
++                                           IHttpContent *content )
++{
++    IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress *op;
++    IHttpRequestMessageFactory *factory;
++    IHttpResponseMessage *response = NULL;
++    IHttpMethodFactory *method_factory;
++    IHttpRequestMessage *request;
++    IHttpMethod *http_method;
++    IUriRuntimeClass *uri;
++    WCHAR url[256];
++    HSTRING str;
++    HRESULT hr, error;
++    AsyncStatus status;
++
++    swprintf( url, ARRAY_SIZE(url), L"http://127.0.0.1:%d%S", port, path );
++    uri = create_uri( url );
++    method_factory = get_factory( L"Windows.Web.Http.HttpMethod", &IID_IHttpMethodFactory );
++    str = hstr( method );
++    IHttpMethodFactory_Create( method_factory, str, &http_method );
++    WindowsDeleteString( str );
++    IHttpMethodFactory_Release( method_factory );
++    factory = get_factory( L"Windows.Web.Http.HttpRequestMessage", &IID_IHttpRequestMessageFactory );
++    IHttpRequestMessageFactory_Create( factory, http_method, uri, &request );
++    IHttpRequestMessageFactory_Release( factory );
++    IHttpMethod_Release( http_method );
++    IUriRuntimeClass_Release( uri );
++    if (content) IHttpRequestMessage_put_Content( request, content );
++
++    hr = IHttpClient_SendRequestAsync( client, request, &op );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    status = wait_op( op, &error );
++    ok( status == Completed, "got status %d, error %#lx.\n", status, error );
++    IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress_GetResults( op, &response );
++    IAsyncOperationWithProgress_HttpResponseMessage_HttpProgress_Release( op );
++    IHttpRequestMessage_Release( request );
++    return response;
++}
++
++static HSTRING read_string( IHttpResponseMessage *response )
++{
++    IAsyncOperationWithProgress_HSTRING_UINT64 *op;
++    IHttpContent *content;
++    HSTRING str = NULL;
++    HRESULT hr, error;
++
++    IHttpResponseMessage_get_Content( response, &content );
++    hr = IHttpContent_ReadAsStringAsync( content, &op );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    wait_op( op, &error );
++    IAsyncOperationWithProgress_HSTRING_UINT64_GetResults( op, &str );
++    IAsyncOperationWithProgress_HSTRING_UINT64_Release( op );
++    IHttpContent_Release( content );
++    return str;
++}
++
++static void test_client(void)
++{
++    const char *custom, *host, *connection, *cookie;
++    IHttpRequestHeaderCollection *defaults;
++    IHttpStringContentFactory *factory;
++    IHttpResponseMessage *response;
++    IHttpContent *content;
++    IHttpClient *client;
++    HttpStatusCode code;
++    HSTRING str;
++
++    if (!start_server())
++    {
++        skip( "no server.\n" );
++        return;
++    }
++    client = activate( L"Windows.Web.Http.HttpClient", &IID_IHttpClient );
++    IHttpClient_get_DefaultRequestHeaders( client, &defaults );
++    insert( defaults, L"X-Test", L"1" );
++    IHttpRequestHeaderCollection_Release( defaults );
++
++    /* the cookies a response sets go back with the next request, the one set again in its place */
++    response = send_request( client, L"GET", "/set-cookies", NULL );
++    ok( response != NULL, "no response.\n" );
++    if (response) IHttpResponseMessage_Release( response );
++    response = send_request( client, L"GET", "/cookie-again", NULL );
++    if (response) IHttpResponseMessage_Release( response );
++    response = send_request( client, L"GET", "/echo", NULL );
++    ok( response != NULL, "no response.\n" );
++    if (response) IHttpResponseMessage_Release( response );
++    ok( strstr( last_request, "Cookie: tc1=3; tc2=2\r\n" ) != NULL, "got %s\n", last_request );
++
++    /* the caller's headers first, then Host, Connection and Cookie */
++    custom = strstr( last_request, "X-Test: 1\r\n" );
++    host = strstr( last_request, "Host: " );
++    connection = strstr( last_request, "Connection: Keep-Alive\r\n" );
++    cookie = strstr( last_request, "Cookie: " );
++    ok( custom && host && connection && cookie, "got %s\n", last_request );
++    ok( custom < host && host < connection && connection < cookie, "got %s\n", last_request );
++    ok( strstr( last_request, "Accept-Encoding: gzip, deflate\r\n" ) != NULL, "got %s\n", last_request );
++
++    /* HEAD says nothing of a length */
++    response = send_request( client, L"HEAD", "/echo", NULL );
++    ok( response != NULL, "no response.\n" );
++    if (response) IHttpResponseMessage_Release( response );
++    ok( !strncmp( last_request, "HEAD ", 5 ), "got %s\n", last_request );
++    ok( !strstr( last_request, "Content-Length" ), "got %s\n", last_request );
++
++    /* a POST redirected by 303 is a GET, and still says Cache-Control */
++    factory = get_factory( L"Windows.Web.Http.HttpStringContent", &IID_IHttpStringContentFactory );
++    str = hstr( L"posted" );
++    IHttpStringContentFactory_CreateFromString( factory, str, &content );
++    WindowsDeleteString( str );
++    IHttpStringContentFactory_Release( factory );
++    response = send_request( client, L"POST", "/see-other", content );
++    IHttpContent_Release( content );
++    ok( response != NULL, "no response.\n" );
++    if (response)
++    {
++        IHttpResponseMessage_get_StatusCode( response, &code );
++        ok( code == HttpStatusCode_Ok, "got %d.\n", code );
++        IHttpResponseMessage_Release( response );
++    }
++    ok( !strncmp( last_request, "GET /echo ", 10 ), "got %s\n", last_request );
++    ok( strstr( last_request, "Cache-Control: no-cache\r\n" ) != NULL, "got %s\n", last_request );
++    ok( !strstr( last_request, "Content-Length" ), "got %s\n", last_request );
++
++    /* JSON reads as UTF-8 */
++    response = send_request( client, L"GET", "/json", NULL );
++    ok( response != NULL, "no response.\n" );
++    if (response)
++    {
++        str = read_string( response );
++        ok( !wcscmp( WindowsGetStringRawBuffer( str, NULL ), L"{\"a\":\"\x00e9\"}" ), "got %s.\n", debugstr_hstring( str ) );
++        WindowsDeleteString( str );
++        IHttpResponseMessage_Release( response );
++    }
++
++    IHttpClient_Release( client );
++    closesocket( listener );
++}
++
++START_TEST(http)
++{
++    HRESULT hr;
++
++    hr = RoInitialize( RO_INIT_MULTITHREADED );
++    ok( hr == S_OK, "RoInitialize failed, hr %#lx\n", hr );
++
++    test_header_order();
++    test_header_objects();
++    test_content_text();
++    test_content_buffer();
++    test_client();
++
++    RoUninitialize();
++}

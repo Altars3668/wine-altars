@@ -1,0 +1,2599 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 09:53:42 -0400
+Subject: [PATCH] dcomp: run an InteractionTracker's custom animations and
+ inertia.
+
+Word scrolls its document with the mouse wheel by handing the canvas's
+tracker a Vector3 key frame animation, one key frame at the end and 267ms
+long, through TryUpdatePositionWithAnimation.  That was a stub that left the
+position where it was, so the wheel moved the scroll bar and nothing else.
+
+The tracker is now the state machine Windows documents: idle, a custom
+animation, inertia, and interacting, which only input brings about and so
+cannot be reached yet.  Each request takes the next request id before
+anything else is looked at, is ignored while input moves the tracker, and
+tells the owner of the state it enters, with the id of the request that
+took it there; values that change on a frame are reported with it too.
+
+- TryUpdatePositionWithAnimation and TryUpdateScaleWithAnimation run the
+  animation as a "motion": an animation run on a value of the tracker's own
+  rather than started on a property, checked and copied as a started one is
+  and counted in the batches.  The tracker reads it each frame and keeps it
+  within its bounds, as the documentation says custom animations always are;
+  scale is animated about the given center point.  When every one of its
+  animations has ended it is idle again, for the request that started it.
+- TryUpdatePosition, TryUpdatePositionBy and TryUpdateScale end whatever
+  moves it, unless told that an animation of scale may go on.
+- The velocity requests set it coasting: each axis loses the same fraction
+  of its velocity every second, the decay rate, 0.95 unless set, and comes to
+  rest where that ends, or where the first inertia modifier whose condition
+  holds says, within bounds.  InertiaStateEntered says where it would have
+  rested, where it will, and how fast it went.  Center point modifiers move
+  the point scale inertia keeps in place.  Motion modifiers are not run.
+- The modifiers a VisualInteractionSource is configured with are kept, for
+  the input that would use them.
+
+What Windows answers there and then was measured on a Windows 11 desktop
+(build 29671), in tools/trackerprobe: an animation of the wrong type, a Vector2 one or a scalar
+expression for position, fails with E_INVALIDARG after taking a request id,
+without handing it back; a clamping or update option out of range fails
+after handing its id back; StartAnimation takes a tracker's bounds but not
+its position, scale, resting places or velocities.  That session was locked,
+so its compositor drew no frames and what happens over time could not be
+measured there; that part follows the documentation, and its tests skip
+where no frames come.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit c6024d31f1cfa8e18b8d808db4418d472d54b73c)
+
+diff --git a/dlls/dcomp/animation.c b/dlls/dcomp/animation.c
+index 1fcf5bbc212..9a3b0cf65dc 100644
+--- a/dlls/dcomp/animation.c
++++ b/dlls/dcomp/animation.c
+@@ -122,6 +122,7 @@ struct running
+     struct value last;              /* what the latest frame made of it */
+     BOOL has_last;
+     struct batch *batches[2];       /* the scoped and the commit batch it counts in */
++    BOOL motion;                    /* run by its object on a value of its own, not on a property */
+ };
+ 
+ /*** easing functions ***/
+@@ -522,6 +523,15 @@ BOOL object_animate( struct object *object, const WCHAR *name, struct value *val
+ 
+ static void batch_release_animation( struct batch *batch );
+ 
++static void running_free( struct running *running )
++{
++    parameters_free( &running->parameters );
++    expression_free( running->expression );
++    frames_free( running->frames, running->frame_count );
++    free( running->property );
++    free( running );
++}
++
+ /* called with the compositor locked; the property keeps the value the stop behavior says */
+ static void running_stop( struct running *running, BOOL completed )
+ {
+@@ -530,7 +540,7 @@ static void running_stop( struct running *running, BOOL completed )
+     BOOL set = FALSE;
+     unsigned int i;
+ 
+-    if (running->kind == ANIMATION_KEY_FRAME)
++    if (running->kind == ANIMATION_KEY_FRAME && !running->motion)
+     {
+         switch (completed ? AnimationStopBehavior_LeaveCurrentValue : running->stop_behavior)
+         {
+@@ -553,11 +563,7 @@ static void running_stop( struct running *running, BOOL completed )
+     if (running->kind == ANIMATION_KEY_FRAME) list_remove( &running->time_entry );
+     for (i = 0; i < ARRAY_SIZE(running->batches); i++)
+         if (running->batches[i]) batch_release_animation( running->batches[i] );
+-    parameters_free( &running->parameters );
+-    expression_free( running->expression );
+-    frames_free( running->frames, running->frame_count );
+-    free( running->property );
+-    free( running );
++    running_free( running );
+     compositor_changed( compositor );
+ }
+ 
+@@ -570,6 +576,66 @@ void object_stop_animations( struct object *object )
+ static BOOL batch_take_animation( struct compositor *compositor, struct running *running );
+ static struct animation *unsafe_impl_from_ICompositionAnimation( ICompositionAnimation *iface );
+ 
++/*
++ * Copies what an animation says into what runs, and checks it as Windows does
++ * when it starts: an expression has to compute a value of the type animated,
++ * and a key frame animation has to be of that type.  The running record's
++ * object, starting value and type are set already.
++ */
++static HRESULT running_prepare( struct running *running, struct animation *animation )
++{
++    const WCHAR *what = running->property ? running->property : L"a motion";
++    struct eval_context context;
++    struct value check;
++    unsigned int i;
++    HRESULT hr;
++
++    running->kind = animation->kind;
++    if (FAILED(hr = parameters_copy( &running->parameters, &animation->parameters ))) return hr;
++    if (animation->kind == ANIMATION_EXPRESSION)
++    {
++        if (!animation->text || FAILED(expression_parse( WindowsGetStringRawBuffer( animation->text, NULL ),
++                                                           &running->expression )))
++            return E_INVALIDARG;
++        running_context( running, &context, NULL );
++        if (!evaluate_as( running->expression, &context, running->type, &check ))
++        {
++            WARN( "%s does not make %s.\n", debugstr_hstring( animation->text ), debugstr_w( what ) );
++            return E_INVALIDARG;
++        }
++        return S_OK;
++    }
++
++    if (animation->type != running->type)
++    {
++        WARN( "a key frame animation of type %u does not animate %s.\n", animation->type, debugstr_w( what ) );
++        return E_INVALIDARG;
++    }
++    if (FAILED(hr = frames_copy( animation->frames, animation->frame_count, &running->frames ))) return hr;
++    running->frame_count = animation->frame_count;
++    if (!animation->frames_checked)
++    {
++        animation->frames_checked = TRUE;
++        for (i = 0; i < running->frame_count; i++)
++        {
++            if (!running->frames[i].text) continue;
++            if (!running->frames[i].expression || !frame_value( running, &running->frames[i], &check, 0 ))
++            {
++                WARN( "key frame %s does not make %s.\n", debugstr_w( running->frames[i].text ), debugstr_w( what ) );
++                return E_INVALIDARG;
++            }
++        }
++    }
++    running->delay = animation->delay.Duration;
++    running->duration = animation->duration.Duration;
++    running->iteration_behavior = animation->iteration_behavior;
++    running->iteration_count = animation->iteration_count;
++    running->stop_behavior = animation->stop_behavior;
++    running->direction = animation->direction;
++    running->delay_behavior = animation->delay_behavior;
++    return S_OK;
++}
++
+ /*
+  * Starts an animation on a property of an object, or on a member of one, as in
+  * Offset.X: checked as Windows checks it, and copied.
+@@ -579,9 +645,7 @@ HRESULT object_start_animation( struct object *object, HSTRING property, ICompos
+     const WCHAR *name = WindowsGetStringRawBuffer( property, NULL ), *dot;
+     struct animation *animation = unsafe_impl_from_ICompositionAnimation( iface );
+     struct running *running, *other, *next;
+-    struct value whole, part, check;
+-    struct eval_context context;
+-    unsigned int i;
++    struct value whole, part;
+     HRESULT hr;
+ 
+     if (!property || !*name) return E_INVALIDARG;
+@@ -603,7 +667,6 @@ HRESULT object_start_animation( struct object *object, HSTRING property, ICompos
+         *(WCHAR *)dot = 0;
+     }
+     running->object = object;
+-    running->kind = animation->kind;
+ 
+     compositor_lock( object->compositor );
+ 
+@@ -615,58 +678,16 @@ HRESULT object_start_animation( struct object *object, HSTRING property, ICompos
+         hr = E_INVALIDARG;
+         goto failed;
+     }
+-    running->starting = running->member ? part : whole;
+-    running->type = running->starting.type;
+-
+-    if (FAILED(hr = parameters_copy( &running->parameters, &animation->parameters ))) goto failed;
+-    if (animation->kind == ANIMATION_EXPRESSION)
+-    {
+-        if (!animation->text || FAILED(expression_parse( WindowsGetStringRawBuffer( animation->text, NULL ),
+-                                                           &running->expression )))
+-        {
+-            hr = E_INVALIDARG;
+-            goto failed;
+-        }
+-        running_context( running, &context, NULL );
+-        if (!evaluate_as( running->expression, &context, running->type, &check ))
+-        {
+-            WARN( "%s does not make a %s.\n", debugstr_hstring( animation->text ), debugstr_w( name ) );
+-            hr = E_INVALIDARG;
+-            goto failed;
+-        }
+-    }
+-    else
++    /* some are there to be read only, as a tracker's position is its own to move */
++    if (object->ops->animatable && !object->ops->animatable( object, running->property ))
+     {
+-        if (animation->type != running->type)
+-        {
+-            WARN( "a key frame animation of type %u does not animate %s.\n", animation->type, debugstr_w( name ) );
+-            hr = E_INVALIDARG;
+-            goto failed;
+-        }
+-        if (FAILED(hr = frames_copy( animation->frames, animation->frame_count, &running->frames ))) goto failed;
+-        running->frame_count = animation->frame_count;
+-        if (!animation->frames_checked)
+-        {
+-            animation->frames_checked = TRUE;
+-            for (i = 0; i < running->frame_count; i++)
+-            {
+-                if (!running->frames[i].text) continue;
+-                if (!running->frames[i].expression || !frame_value( running, &running->frames[i], &check, 0 ))
+-                {
+-                    WARN( "key frame %s does not make a %s.\n", debugstr_w( running->frames[i].text ), debugstr_w( name ) );
+-                    hr = E_INVALIDARG;
+-                    goto failed;
+-                }
+-            }
+-        }
+-        running->delay = animation->delay.Duration;
+-        running->duration = animation->duration.Duration;
+-        running->iteration_behavior = animation->iteration_behavior;
+-        running->iteration_count = animation->iteration_count;
+-        running->stop_behavior = animation->stop_behavior;
+-        running->direction = animation->direction;
+-        running->delay_behavior = animation->delay_behavior;
++        WARN( "%s of %s %p cannot be animated.\n", debugstr_w( name ), debugstr_w( object->ops->class_name ), object );
++        hr = E_INVALIDARG;
++        goto failed;
+     }
++    running->starting = running->member ? part : whole;
++    running->type = running->starting.type;
++    if (FAILED(hr = running_prepare( running, animation ))) goto failed;
+ 
+     /* one animation to a property: what was running there stops, as told to */
+     LIST_FOR_EACH_ENTRY_SAFE( other, next, &object->animations, struct running, entry )
+@@ -684,14 +705,101 @@ HRESULT object_start_animation( struct object *object, HSTRING property, ICompos
+ 
+ failed:
+     compositor_unlock( object->compositor );
+-    parameters_free( &running->parameters );
+-    expression_free( running->expression );
+-    frames_free( running->frames, running->frame_count );
+-    free( running->property );
+-    free( running );
++    running_free( running );
+     return hr;
+ }
+ 
++/*
++ * A motion is an animation an object runs on a value of its own instead of on
++ * a property: an interaction tracker's custom animations, which it keeps
++ * within its bounds and reports as they go.  It is checked and copied as a
++ * started animation is, and counts in the batches, but it is applied to
++ * nothing; its object asks where it is each frame, and ends it.  All of these
++ * are called with the compositor locked.
++ */
++HRESULT motion_start( struct object *object, ICompositionAnimation *iface, const struct value *starting,
++                      struct running **out )
++{
++    struct animation *animation = unsafe_impl_from_ICompositionAnimation( iface );
++    struct running *running;
++    HRESULT hr;
++
++    if (!animation)
++    {
++        if (iface) FIXME( "animation %p is not one of ours.\n", iface );
++        return E_INVALIDARG;
++    }
++    if (!(running = calloc( 1, sizeof(*running) ))) return E_OUTOFMEMORY;
++    list_init( &running->parameters );
++    list_init( &running->entry );
++    list_init( &running->time_entry );
++    running->object = object;
++    running->motion = TRUE;
++    running->starting = *starting;
++    running->type = starting->type;
++    if (FAILED(hr = running_prepare( running, animation )))
++    {
++        running_free( running );
++        return hr;
++    }
++    if (running->kind == ANIMATION_KEY_FRAME) list_add_tail( compositor_running( object->compositor ), &running->time_entry );
++    batch_take_animation( object->compositor, running );
++    compositor_changed( object->compositor );
++    *out = running;
++    return S_OK;
++}
++
++/* where a motion has got to; FALSE until it has anything to say */
++BOOL motion_value( struct running *running, struct value *out )
++{
++    if (!running_value( running, compositor_time(), out, 0 ))
++    {
++        if (!running->has_last) return FALSE;
++        *out = running->last;
++    }
++    running->last = *out;
++    running->has_last = TRUE;
++    return TRUE;
++}
++
++/* whether a key frame motion has run its course; an expression never does */
++BOOL motion_done( struct running *running )
++{
++    return running_done( running, compositor_time() );
++}
++
++void motion_stop( struct running *running )
++{
++    running_stop( running, FALSE );
++}
++
++/*
++ * What an expression animation computes now, of the type of like, with target
++ * as this.Target: the conditions and values a tracker's inertia modifiers are
++ * made of.  Called with the compositor locked.
++ */
++BOOL animation_evaluate( ICompositionAnimation *iface, struct object *target, const struct value *like,
++                         struct value *out )
++{
++    struct animation *animation = unsafe_impl_from_ICompositionAnimation( iface );
++    struct running running = {0};
++    struct eval_context context;
++    BOOL ret;
++
++    if (!animation || animation->kind != ANIMATION_EXPRESSION || !animation->text) return FALSE;
++    if (FAILED(expression_parse( WindowsGetStringRawBuffer( animation->text, NULL ), &running.expression )))
++        return FALSE;
++    list_init( &running.parameters );
++    running.object = target;
++    running.starting = *like;
++    running.type = like->type;
++    running_context( &running, &context, NULL );
++    context.lookup_data = &animation->parameters;
++    ret = evaluate_as( running.expression, &context, running.type, out );
++    expression_free( running.expression );
++    return ret;
++}
++
+ HRESULT object_stop_animation( struct object *object, HSTRING property )
+ {
+     const WCHAR *name = WindowsGetStringRawBuffer( property, NULL );
+@@ -736,6 +844,7 @@ void animations_frame( struct compositor *compositor )
+             running->start = now;
+             continue;
+         }
++        if (running->motion) continue;
+         if (running_done( running, now )) running_stop( running, TRUE );
+     }
+ }
+diff --git a/dlls/dcomp/compositor.c b/dlls/dcomp/compositor.c
+index e4f250cfa82..740d79a412a 100644
+--- a/dlls/dcomp/compositor.c
++++ b/dlls/dcomp/compositor.c
+@@ -141,6 +141,12 @@ void compositor_release( struct compositor *compositor )
+     ICompositor_Release( &compositor->ICompositor_iface );
+ }
+ 
++/* while key frame animations run or trackers coast, frames go on; called with the compositor locked */
++static BOOL frames_wanted( struct compositor *compositor )
++{
++    return animations_running( compositor ) || trackers_moving( compositor );
++}
++
+ /*
+  * Draws every window target as its tree stands now.  The graphics devices the
+  * trees draw with are locked first: an application may hold a device's lock
+@@ -184,7 +190,7 @@ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+         HRESULT ret = render_target( compositor, target );
+         if (FAILED(ret) && SUCCEEDED(hr)) hr = ret;
+     }
+-    if (animations_running( compositor )) compositor_request_frames( compositor );
++    if (frames_wanted( compositor )) compositor_request_frames( compositor );
+     compositor_unlock( compositor );
+     for (i = 0; i < count; i++)
+     {
+@@ -240,7 +246,7 @@ static HRESULT WINAPI frame_handler_Invoke( ITypedEventHandler_DispatcherQueueTi
+ 
+     compositor_render( compositor, FALSE );
+     compositor_lock( compositor );
+-    if (compositor->frames_running && !animations_running( compositor ))
++    if (compositor->frames_running && !frames_wanted( compositor ))
+     {
+         IDispatcherQueueTimer_Stop( compositor->frame_timer );
+         compositor->frames_running = FALSE;
+diff --git a/dlls/dcomp/interaction.c b/dlls/dcomp/interaction.c
+index 3b0d54ad95e..f7987f349ce 100644
+--- a/dlls/dcomp/interaction.c
++++ b/dlls/dcomp/interaction.c
+@@ -18,18 +18,81 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
++
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+ 
+ /*
+  * An interaction tracker holds a position and a scale that input or the
+- * application moves, within bounds, and tells its owner what they became.
+- * Nothing here turns input into motion yet: the position moves when the
+- * application asks it to, and inertia and animated updates end where they
+- * would have ended, at once.
++ * application moves, within bounds, and tells its owner what they became.  It
++ * is a state machine, as Windows documents it: idle; moved by a custom
++ * animation, which is kept within the bounds; coasting to rest in inertia,
++ * slowing as its decay rates say and ending where its inertia modifiers say;
++ * and interacting, which only input brings about -- and nothing here turns
++ * input into motion yet, so a tracker is never in that state.
+  */
+ 
++/* conditional values or inertia modifiers, as configured: copies of what the iterable held */
++struct modifiers
++{
++    IUnknown **items;
++    UINT count;
++};
++
++static void modifiers_clear( struct modifiers *modifiers )
++{
++    while (modifiers->count)
++    {
++        modifiers->count--;
++        IUnknown_Release( modifiers->items[modifiers->count] );
++    }
++    free( modifiers->items );
++    modifiers->items = NULL;
++}
++
++/* replaces what was configured with what the iterable holds now; NULL configures none */
++static HRESULT modifiers_set( struct compositor *compositor, struct modifiers *modifiers, IIterable_IInspectable *iterable )
++{
++    struct modifiers new = {0}, old;
++    IIterator_IInspectable *iterator;
++    IInspectable *item, **items;
++    boolean more = FALSE;
++    HRESULT hr;
++
++    if (iterable)
++    {
++        if (FAILED(hr = IIterable_IInspectable_First( iterable, &iterator ))) return hr;
++        hr = IIterator_IInspectable_get_HasCurrent( iterator, &more );
++        while (SUCCEEDED(hr) && more)
++        {
++            if (FAILED(hr = IIterator_IInspectable_get_Current( iterator, &item ))) break;
++            if (!(items = realloc( new.items, (new.count + 1) * sizeof(*items) )))
++            {
++                if (item) IInspectable_Release( item );
++                hr = E_OUTOFMEMORY;
++                break;
++            }
++            new.items = (IUnknown **)items;
++            if (item) new.items[new.count++] = (IUnknown *)item;
++            hr = IIterator_IInspectable_MoveNext( iterator, &more );
++        }
++        IIterator_IInspectable_Release( iterator );
++        if (FAILED(hr))
++        {
++            modifiers_clear( &new );
++            return hr;
++        }
++    }
++    compositor_lock( compositor );
++    old = *modifiers;
++    *modifiers = new;
++    compositor_unlock( compositor );
++    modifiers_clear( &old );
++    return S_OK;
++}
++
+ struct interaction_source
+ {
+     struct object base;
+@@ -47,6 +110,8 @@ struct interaction_source
+     InteractionSourceMode x_mode, y_mode, scale_mode;
+     Vector3 delta_position, position, position_velocity;
+     FLOAT delta_scale, scale, scale_velocity;
++    /* how input would be modified on its way to the trackers: center point x and y, delta x, y, and scale */
++    struct modifiers modifiers[5];
+ };
+ 
+ struct source_config
+@@ -68,6 +133,25 @@ struct source_collection
+     UINT count;
+ };
+ 
++enum tracker_state
++{
++    TRACKER_IDLE,
++    TRACKER_INTERACTING,
++    TRACKER_INERTIA,
++    TRACKER_CUSTOM_ANIMATION,
++};
++
++/* one axis of inertia -- x, y, or the logarithm of scale -- slowing as its decay rate says */
++struct inertia_axis
++{
++    float from;                     /* where it was when inertia started */
++    float velocity;                 /* how fast it went then, per second */
++    float rate;                     /* the fraction of its velocity it loses each second */
++    float rest;                     /* where it comes to rest: naturally, or where a modifier says, within bounds */
++    float at, speed;                /* where the latest frame put it, and how fast it went there */
++    BOOL moving;
++};
++
+ struct tracker
+ {
+     struct object base;
+@@ -86,6 +170,17 @@ struct tracker
+     boolean position_rounding;
+     IReference_Vector3 *position_decay;
+     IReference_FLOAT *scale_decay;
++
++    enum tracker_state state;
++    INT32 motion_request;           /* the request that set it moving */
++    struct running *position_motion;    /* its custom animations */
++    struct running *scale_motion;
++    Vector3 scale_center;           /* what a scale animation or scale inertia keeps where it is */
++    LONGLONG inertia_start;         /* 0 until inertia's first frame */
++    struct inertia_axis inertia[3]; /* x, y and scale */
++    boolean from_impulse;           /* whether the latest inertia was a request's rather than input's */
++    struct modifiers inertia_modifiers[3];  /* for position x, position y and scale */
++    struct modifiers center_modifiers[2];   /* for the center point scale inertia keeps, x and y */
+ };
+ 
+ /*** InteractionSourceConfiguration ***/
+@@ -252,12 +347,14 @@ static HRESULT source_query_interface( struct object *object, REFIID iid, void *
+ static void source_destroy( struct object *object )
+ {
+     struct interaction_source *source = impl_from_source_object( object );
++    unsigned int i;
+ 
+     compositor_lock( source->base.compositor );
+     if (source->visual->interaction_source == source) source->visual->interaction_source = NULL;
+     compositor_unlock( source->base.compositor );
+     IVisual_Release( &source->visual->IVisual_iface );
+     IInteractionSourceConfiguration_Release( source->wheel_config );
++    for (i = 0; i < ARRAY_SIZE(source->modifiers); i++) modifiers_clear( &source->modifiers[i] );
+     free( source );
+ }
+ 
+@@ -656,32 +753,37 @@ static HRESULT WINAPI source2_get_ScaleVelocity( IVisualInteractionSource2 *ifac
+ 
+ static HRESULT WINAPI source2_ConfigureCenterPointXModifiers( IVisualInteractionSource2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, modifiers ignored.\n", iface, conditionalValues );
+-    return S_OK;
++    struct interaction_source *source = impl_from_IVisualInteractionSource2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( source->base.compositor, &source->modifiers[0], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static HRESULT WINAPI source2_ConfigureCenterPointYModifiers( IVisualInteractionSource2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, modifiers ignored.\n", iface, conditionalValues );
+-    return S_OK;
++    struct interaction_source *source = impl_from_IVisualInteractionSource2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( source->base.compositor, &source->modifiers[1], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static HRESULT WINAPI source2_ConfigureDeltaPositionXModifiers( IVisualInteractionSource2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, modifiers ignored.\n", iface, conditionalValues );
+-    return S_OK;
++    struct interaction_source *source = impl_from_IVisualInteractionSource2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( source->base.compositor, &source->modifiers[2], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static HRESULT WINAPI source2_ConfigureDeltaPositionYModifiers( IVisualInteractionSource2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, modifiers ignored.\n", iface, conditionalValues );
+-    return S_OK;
++    struct interaction_source *source = impl_from_IVisualInteractionSource2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( source->base.compositor, &source->modifiers[3], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static HRESULT WINAPI source2_ConfigureDeltaScaleModifiers( IVisualInteractionSource2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, modifiers ignored.\n", iface, conditionalValues );
+-    return S_OK;
++    struct interaction_source *source = impl_from_IVisualInteractionSource2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( source->base.compositor, &source->modifiers[4], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static const struct IVisualInteractionSource2Vtbl source2_vtbl =
+@@ -835,6 +937,19 @@ enum tracker_callback
+     CALLBACK_IDLE,
+     CALLBACK_REQUEST_IGNORED,
+     CALLBACK_CUSTOM_ANIMATION,
++    CALLBACK_INERTIA,
++    CALLBACK_INTERACTING,
++};
++
++/* what inertia is told it starts with */
++struct inertia_args
++{
++    Vector3 natural_position, velocity;
++    FLOAT natural_scale, scale_velocity;
++    BOOL position_modified, scale_modified;
++    Vector3 modified_position;
++    FLOAT modified_scale;
++    boolean from_impulse;
+ };
+ 
+ struct tracker_args
+@@ -846,11 +961,17 @@ struct tracker_args
+     IInteractionTrackerRequestIgnoredArgs IInteractionTrackerRequestIgnoredArgs_iface;
+     IInteractionTrackerCustomAnimationStateEnteredArgs IInteractionTrackerCustomAnimationStateEnteredArgs_iface;
+     IInteractionTrackerCustomAnimationStateEnteredArgs2 IInteractionTrackerCustomAnimationStateEnteredArgs2_iface;
++    IInteractionTrackerInertiaStateEnteredArgs IInteractionTrackerInertiaStateEnteredArgs_iface;
++    IInteractionTrackerInertiaStateEnteredArgs2 IInteractionTrackerInertiaStateEnteredArgs2_iface;
++    IInteractionTrackerInertiaStateEnteredArgs3 IInteractionTrackerInertiaStateEnteredArgs3_iface;
++    IInteractionTrackerInteractingStateEnteredArgs IInteractionTrackerInteractingStateEnteredArgs_iface;
++    IInteractionTrackerInteractingStateEnteredArgs2 IInteractionTrackerInteractingStateEnteredArgs2_iface;
+     LONG ref;
+     enum tracker_callback kind;
+     INT32 request_id;
+     Vector3 position;
+     FLOAT scale;
++    struct inertia_args inertia;
+ };
+ 
+ static inline struct tracker_args *impl_from_IInspectable( IInspectable *iface )
+@@ -876,6 +997,16 @@ static HRESULT WINAPI args_QueryInterface( IInspectable *iface, REFIID iid, void
+         *out = &args->IInteractionTrackerCustomAnimationStateEnteredArgs_iface;
+     else if (args->kind == CALLBACK_CUSTOM_ANIMATION && IsEqualGUID( iid, &IID_IInteractionTrackerCustomAnimationStateEnteredArgs2 ))
+         *out = &args->IInteractionTrackerCustomAnimationStateEnteredArgs2_iface;
++    else if (args->kind == CALLBACK_INERTIA && IsEqualGUID( iid, &IID_IInteractionTrackerInertiaStateEnteredArgs ))
++        *out = &args->IInteractionTrackerInertiaStateEnteredArgs_iface;
++    else if (args->kind == CALLBACK_INERTIA && IsEqualGUID( iid, &IID_IInteractionTrackerInertiaStateEnteredArgs2 ))
++        *out = &args->IInteractionTrackerInertiaStateEnteredArgs2_iface;
++    else if (args->kind == CALLBACK_INERTIA && IsEqualGUID( iid, &IID_IInteractionTrackerInertiaStateEnteredArgs3 ))
++        *out = &args->IInteractionTrackerInertiaStateEnteredArgs3_iface;
++    else if (args->kind == CALLBACK_INTERACTING && IsEqualGUID( iid, &IID_IInteractionTrackerInteractingStateEnteredArgs ))
++        *out = &args->IInteractionTrackerInteractingStateEnteredArgs_iface;
++    else if (args->kind == CALLBACK_INTERACTING && IsEqualGUID( iid, &IID_IInteractionTrackerInteractingStateEnteredArgs2 ))
++        *out = &args->IInteractionTrackerInteractingStateEnteredArgs2_iface;
+     else
+     {
+         FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+@@ -914,6 +1045,8 @@ static HRESULT WINAPI args_GetRuntimeClassName( IInspectable *iface, HSTRING *cl
+         L"Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs",
+         L"Windows.UI.Composition.Interactions.InteractionTrackerRequestIgnoredArgs",
+         L"Windows.UI.Composition.Interactions.InteractionTrackerCustomAnimationStateEnteredArgs",
++        L"Windows.UI.Composition.Interactions.InteractionTrackerInertiaStateEnteredArgs",
++        L"Windows.UI.Composition.Interactions.InteractionTrackerInteractingStateEnteredArgs",
+     };
+     struct tracker_args *args = impl_from_IInspectable( iface );
+     return WindowsCreateString( names[args->kind], wcslen( names[args->kind] ), class_name );
+@@ -1089,6 +1222,347 @@ static const struct IInteractionTrackerCustomAnimationStateEnteredArgs2Vtbl cust
+     custom_args2_get_IsFromBinding,
+ };
+ 
++/* a value boxed as an IReference, as the modified resting position and scale are handed out */
++struct boxed
++{
++    IReference_Vector3 IReference_Vector3_iface;
++    IReference_FLOAT IReference_FLOAT_iface;
++    LONG ref;
++    BOOL scalar;
++    Vector3 vector;
++    FLOAT value;
++};
++
++static inline struct boxed *impl_from_IReference_Vector3( IReference_Vector3 *iface )
++{
++    return CONTAINING_RECORD( iface, struct boxed, IReference_Vector3_iface );
++}
++
++static inline struct boxed *impl_from_IReference_FLOAT( IReference_FLOAT *iface )
++{
++    return CONTAINING_RECORD( iface, struct boxed, IReference_FLOAT_iface );
++}
++
++static HRESULT boxed_query_interface( struct boxed *boxed, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        (boxed->scalar ? IsEqualGUID( iid, &IID_IReference_FLOAT ) : IsEqualGUID( iid, &IID_IReference_Vector3 )))
++    {
++        *out = boxed->scalar ? (void *)&boxed->IReference_FLOAT_iface : (void *)&boxed->IReference_Vector3_iface;
++        InterlockedIncrement( &boxed->ref );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG boxed_release( struct boxed *boxed )
++{
++    ULONG ref = InterlockedDecrement( &boxed->ref );
++    if (!ref) free( boxed );
++    return ref;
++}
++
++static HRESULT WINAPI boxed3_QueryInterface( IReference_Vector3 *iface, REFIID iid, void **out )
++{
++    return boxed_query_interface( impl_from_IReference_Vector3( iface ), iid, out );
++}
++
++static ULONG WINAPI boxed3_AddRef( IReference_Vector3 *iface )
++{
++    return InterlockedIncrement( &impl_from_IReference_Vector3( iface )->ref );
++}
++
++static ULONG WINAPI boxed3_Release( IReference_Vector3 *iface )
++{
++    return boxed_release( impl_from_IReference_Vector3( iface ) );
++}
++
++static HRESULT WINAPI boxed3_GetIids( IReference_Vector3 *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI boxed3_GetRuntimeClassName( IReference_Vector3 *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Foundation.IReference`1<Windows.Foundation.Numerics.Vector3>";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI boxed3_GetTrustLevel( IReference_Vector3 *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI boxed3_get_Value( IReference_Vector3 *iface, Vector3 *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IReference_Vector3( iface )->vector;
++    return S_OK;
++}
++
++static const struct IReference_Vector3Vtbl boxed3_vtbl =
++{
++    boxed3_QueryInterface,
++    boxed3_AddRef,
++    boxed3_Release,
++    boxed3_GetIids,
++    boxed3_GetRuntimeClassName,
++    boxed3_GetTrustLevel,
++    boxed3_get_Value,
++};
++
++static HRESULT WINAPI boxedf_QueryInterface( IReference_FLOAT *iface, REFIID iid, void **out )
++{
++    return boxed_query_interface( impl_from_IReference_FLOAT( iface ), iid, out );
++}
++
++static ULONG WINAPI boxedf_AddRef( IReference_FLOAT *iface )
++{
++    return InterlockedIncrement( &impl_from_IReference_FLOAT( iface )->ref );
++}
++
++static ULONG WINAPI boxedf_Release( IReference_FLOAT *iface )
++{
++    return boxed_release( impl_from_IReference_FLOAT( iface ) );
++}
++
++static HRESULT WINAPI boxedf_GetIids( IReference_FLOAT *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI boxedf_GetRuntimeClassName( IReference_FLOAT *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Foundation.IReference`1<Single>";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI boxedf_GetTrustLevel( IReference_FLOAT *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI boxedf_get_Value( IReference_FLOAT *iface, FLOAT *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IReference_FLOAT( iface )->value;
++    return S_OK;
++}
++
++static const struct IReference_FLOATVtbl boxedf_vtbl =
++{
++    boxedf_QueryInterface,
++    boxedf_AddRef,
++    boxedf_Release,
++    boxedf_GetIids,
++    boxedf_GetRuntimeClassName,
++    boxedf_GetTrustLevel,
++    boxedf_get_Value,
++};
++
++static struct boxed *boxed_create( BOOL scalar, Vector3 vector, FLOAT value )
++{
++    struct boxed *boxed;
++
++    if (!(boxed = calloc( 1, sizeof(*boxed) ))) return NULL;
++    boxed->IReference_Vector3_iface.lpVtbl = &boxed3_vtbl;
++    boxed->IReference_FLOAT_iface.lpVtbl = &boxedf_vtbl;
++    boxed->ref = 1;
++    boxed->scalar = scalar;
++    boxed->vector = vector;
++    boxed->value = value;
++    return boxed;
++}
++
++DEFINE_IINSPECTABLE( inertia_args, IInteractionTrackerInertiaStateEnteredArgs, struct tracker_args, IInspectable_iface )
++
++/* NULL when no modifier changed where it rests */
++static HRESULT WINAPI inertia_args_get_ModifiedRestingPosition( IInteractionTrackerInertiaStateEnteredArgs *iface,
++                                                                IReference_Vector3 **value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    struct boxed *boxed;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!args->inertia.position_modified) return S_OK;
++    if (!(boxed = boxed_create( FALSE, args->inertia.modified_position, 0.0f ))) return E_OUTOFMEMORY;
++    *value = &boxed->IReference_Vector3_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI inertia_args_get_ModifiedRestingScale( IInteractionTrackerInertiaStateEnteredArgs *iface,
++                                                             IReference_FLOAT **value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    struct boxed *boxed;
++    Vector3 zero = {0};
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!args->inertia.scale_modified) return S_OK;
++    if (!(boxed = boxed_create( TRUE, zero, args->inertia.modified_scale ))) return E_OUTOFMEMORY;
++    *value = &boxed->IReference_FLOAT_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI inertia_args_get_NaturalRestingPosition( IInteractionTrackerInertiaStateEnteredArgs *iface, Vector3 *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    if (!value) return E_POINTER;
++    *value = args->inertia.natural_position;
++    return S_OK;
++}
++
++static HRESULT WINAPI inertia_args_get_NaturalRestingScale( IInteractionTrackerInertiaStateEnteredArgs *iface, FLOAT *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    if (!value) return E_POINTER;
++    *value = args->inertia.natural_scale;
++    return S_OK;
++}
++
++static HRESULT WINAPI inertia_args_get_PositionVelocityInPixelsPerSecond( IInteractionTrackerInertiaStateEnteredArgs *iface,
++                                                                          Vector3 *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    if (!value) return E_POINTER;
++    *value = args->inertia.velocity;
++    return S_OK;
++}
++
++static HRESULT WINAPI inertia_args_get_RequestId( IInteractionTrackerInertiaStateEnteredArgs *iface, INT32 *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    if (!value) return E_POINTER;
++    *value = args->request_id;
++    return S_OK;
++}
++
++static HRESULT WINAPI inertia_args_get_ScaleVelocityInPercentPerSecond( IInteractionTrackerInertiaStateEnteredArgs *iface,
++                                                                        FLOAT *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs( iface );
++    if (!value) return E_POINTER;
++    *value = args->inertia.scale_velocity;
++    return S_OK;
++}
++
++static const struct IInteractionTrackerInertiaStateEnteredArgsVtbl inertia_args_vtbl =
++{
++    inertia_args_QueryInterface,
++    inertia_args_AddRef,
++    inertia_args_Release,
++    /* IInspectable methods */
++    inertia_args_GetIids,
++    inertia_args_GetRuntimeClassName,
++    inertia_args_GetTrustLevel,
++    /* IInteractionTrackerInertiaStateEnteredArgs methods */
++    inertia_args_get_ModifiedRestingPosition,
++    inertia_args_get_ModifiedRestingScale,
++    inertia_args_get_NaturalRestingPosition,
++    inertia_args_get_NaturalRestingScale,
++    inertia_args_get_PositionVelocityInPixelsPerSecond,
++    inertia_args_get_RequestId,
++    inertia_args_get_ScaleVelocityInPercentPerSecond,
++};
++
++DEFINE_IINSPECTABLE( inertia_args2, IInteractionTrackerInertiaStateEnteredArgs2, struct tracker_args, IInspectable_iface )
++
++static HRESULT WINAPI inertia_args2_get_IsInertiaFromImpulse( IInteractionTrackerInertiaStateEnteredArgs2 *iface, boolean *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInertiaStateEnteredArgs2( iface );
++    if (!value) return E_POINTER;
++    *value = args->inertia.from_impulse;
++    return S_OK;
++}
++
++static const struct IInteractionTrackerInertiaStateEnteredArgs2Vtbl inertia_args2_vtbl =
++{
++    inertia_args2_QueryInterface,
++    inertia_args2_AddRef,
++    inertia_args2_Release,
++    /* IInspectable methods */
++    inertia_args2_GetIids,
++    inertia_args2_GetRuntimeClassName,
++    inertia_args2_GetTrustLevel,
++    /* IInteractionTrackerInertiaStateEnteredArgs2 methods */
++    inertia_args2_get_IsInertiaFromImpulse,
++};
++
++DEFINE_IINSPECTABLE( inertia_args3, IInteractionTrackerInertiaStateEnteredArgs3, struct tracker_args, IInspectable_iface )
++
++static HRESULT WINAPI inertia_args3_get_IsFromBinding( IInteractionTrackerInertiaStateEnteredArgs3 *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static const struct IInteractionTrackerInertiaStateEnteredArgs3Vtbl inertia_args3_vtbl =
++{
++    inertia_args3_QueryInterface,
++    inertia_args3_AddRef,
++    inertia_args3_Release,
++    /* IInspectable methods */
++    inertia_args3_GetIids,
++    inertia_args3_GetRuntimeClassName,
++    inertia_args3_GetTrustLevel,
++    /* IInteractionTrackerInertiaStateEnteredArgs3 methods */
++    inertia_args3_get_IsFromBinding,
++};
++
++DEFINE_IINSPECTABLE( interacting_args, IInteractionTrackerInteractingStateEnteredArgs, struct tracker_args, IInspectable_iface )
++
++static HRESULT WINAPI interacting_args_get_RequestId( IInteractionTrackerInteractingStateEnteredArgs *iface, INT32 *value )
++{
++    struct tracker_args *args = impl_from_IInteractionTrackerInteractingStateEnteredArgs( iface );
++    if (!value) return E_POINTER;
++    *value = args->request_id;
++    return S_OK;
++}
++
++static const struct IInteractionTrackerInteractingStateEnteredArgsVtbl interacting_args_vtbl =
++{
++    interacting_args_QueryInterface,
++    interacting_args_AddRef,
++    interacting_args_Release,
++    /* IInspectable methods */
++    interacting_args_GetIids,
++    interacting_args_GetRuntimeClassName,
++    interacting_args_GetTrustLevel,
++    /* IInteractionTrackerInteractingStateEnteredArgs methods */
++    interacting_args_get_RequestId,
++};
++
++DEFINE_IINSPECTABLE( interacting_args2, IInteractionTrackerInteractingStateEnteredArgs2, struct tracker_args, IInspectable_iface )
++
++static HRESULT WINAPI interacting_args2_get_IsFromBinding( IInteractionTrackerInteractingStateEnteredArgs2 *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static const struct IInteractionTrackerInteractingStateEnteredArgs2Vtbl interacting_args2_vtbl =
++{
++    interacting_args2_QueryInterface,
++    interacting_args2_AddRef,
++    interacting_args2_Release,
++    /* IInspectable methods */
++    interacting_args2_GetIids,
++    interacting_args2_GetRuntimeClassName,
++    interacting_args2_GetTrustLevel,
++    /* IInteractionTrackerInteractingStateEnteredArgs2 methods */
++    interacting_args2_get_IsFromBinding,
++};
++
+ static struct tracker_args *args_create( enum tracker_callback kind, INT32 request_id, Vector3 position, FLOAT scale )
+ {
+     struct tracker_args *args;
+@@ -1101,6 +1575,11 @@ static struct tracker_args *args_create( enum tracker_callback kind, INT32 reque
+     args->IInteractionTrackerRequestIgnoredArgs_iface.lpVtbl = &ignored_args_vtbl;
+     args->IInteractionTrackerCustomAnimationStateEnteredArgs_iface.lpVtbl = &custom_args_vtbl;
+     args->IInteractionTrackerCustomAnimationStateEnteredArgs2_iface.lpVtbl = &custom_args2_vtbl;
++    args->IInteractionTrackerInertiaStateEnteredArgs_iface.lpVtbl = &inertia_args_vtbl;
++    args->IInteractionTrackerInertiaStateEnteredArgs2_iface.lpVtbl = &inertia_args2_vtbl;
++    args->IInteractionTrackerInertiaStateEnteredArgs3_iface.lpVtbl = &inertia_args3_vtbl;
++    args->IInteractionTrackerInteractingStateEnteredArgs_iface.lpVtbl = &interacting_args_vtbl;
++    args->IInteractionTrackerInteractingStateEnteredArgs2_iface.lpVtbl = &interacting_args2_vtbl;
+     args->ref = 1;
+     args->kind = kind;
+     args->request_id = request_id;
+@@ -1175,6 +1654,12 @@ static HRESULT WINAPI owner_call_Invoke( IDispatcherQueueHandler *iface )
+     case CALLBACK_CUSTOM_ANIMATION:
+         return IInteractionTrackerOwner_CustomAnimationStateEntered( owner, sender,
+                 &args->IInteractionTrackerCustomAnimationStateEnteredArgs_iface );
++    case CALLBACK_INERTIA:
++        return IInteractionTrackerOwner_InertiaStateEntered( owner, sender,
++                &args->IInteractionTrackerInertiaStateEnteredArgs_iface );
++    case CALLBACK_INTERACTING:
++        return IInteractionTrackerOwner_InteractingStateEntered( owner, sender,
++                &args->IInteractionTrackerInteractingStateEnteredArgs_iface );
+     }
+     return S_OK;
+ }
+@@ -1189,7 +1674,8 @@ static const struct IDispatcherQueueHandlerVtbl owner_call_vtbl =
+ };
+ 
+ /* called with the compositor locked */
+-static void tracker_tell_owner( struct tracker *tracker, enum tracker_callback kind, INT32 request_id )
++static void tracker_tell_owner_args( struct tracker *tracker, enum tracker_callback kind, INT32 request_id,
++                                     const struct inertia_args *inertia )
+ {
+     IDispatcherQueue *queue;
+     struct owner_call *call;
+@@ -1202,6 +1688,7 @@ static void tracker_tell_owner( struct tracker *tracker, enum tracker_callback k
+         free( call );
+         return;
+     }
++    if (inertia) call->args->inertia = *inertia;
+     call->IDispatcherQueueHandler_iface.lpVtbl = &owner_call_vtbl;
+     call->ref = 1;
+     IInteractionTracker_AddRef( &tracker->IInteractionTracker_iface );
+@@ -1211,6 +1698,11 @@ static void tracker_tell_owner( struct tracker *tracker, enum tracker_callback k
+     IDispatcherQueueHandler_Release( &call->IDispatcherQueueHandler_iface );
+ }
+ 
++static void tracker_tell_owner( struct tracker *tracker, enum tracker_callback kind, INT32 request_id )
++{
++    tracker_tell_owner_args( tracker, kind, request_id, NULL );
++}
++
+ static void tracker_values_changed( struct tracker *tracker, INT32 request_id )
+ {
+     tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, request_id );
+@@ -1259,68 +1751,533 @@ static void tracker_clamp( struct tracker *tracker, BOOL position_unclamped )
+     tracker->position.Z = clampf( tracker->position.Z, low.Z, max( low.Z, high.Z ) );
+ }
+ 
+-/* called with the compositor locked, each frame: bounds that animations moved move the position with them */
++/* keeps the point center where it is on the screen while scale goes from old to new */
++static void tracker_scale_about( struct tracker *tracker, float old, float new, Vector3 center )
++{
++    float ratio;
++
++    if (!old || old == new) return;
++    ratio = new / old;
++    tracker->position.X = (tracker->position.X + center.X) * ratio - center.X;
++    tracker->position.Y = (tracker->position.Y + center.Y) * ratio - center.Y;
++}
++
++/*** the states it goes through ***/
++
++/* a request moves the tracker unless input is moving it; its id is taken either way */
++static BOOL tracker_request( struct tracker *tracker, INT32 *id )
++{
++    *id = ++tracker->request_id;
++    if (tracker->state != TRACKER_INTERACTING) return TRUE;
++    TRACE( "tracker %p ignores request %d.\n", tracker, *id );
++    tracker_tell_owner( tracker, CALLBACK_REQUEST_IGNORED, *id );
++    return FALSE;
++}
++
++/* ends its custom animations, or that of position only */
++static void tracker_stop_animations( struct tracker *tracker, BOOL keep_scale )
++{
++    if (tracker->position_motion) motion_stop( tracker->position_motion );
++    tracker->position_motion = NULL;
++    if (keep_scale) return;
++    if (tracker->scale_motion) motion_stop( tracker->scale_motion );
++    tracker->scale_motion = NULL;
++}
++
++static void tracker_stop_inertia( struct tracker *tracker )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++) tracker->inertia[i].moving = FALSE;
++    tracker->inertia_start = 0;
++    tracker->position_velocity.X = tracker->position_velocity.Y = tracker->position_velocity.Z = 0.0f;
++    tracker->scale_velocity = 0.0f;
++}
++
++/* enters a state, as a request or the end of a motion takes it there, and tells the owner */
++static void tracker_enter( struct tracker *tracker, enum tracker_state state, INT32 request_id,
++                           const struct inertia_args *inertia )
++{
++    static const enum tracker_callback callbacks[] =
++    {
++        [TRACKER_IDLE] = CALLBACK_IDLE,
++        [TRACKER_INTERACTING] = CALLBACK_INTERACTING,
++        [TRACKER_INERTIA] = CALLBACK_INERTIA,
++        [TRACKER_CUSTOM_ANIMATION] = CALLBACK_CUSTOM_ANIMATION,
++    };
++
++    TRACE( "tracker %p enters state %u for request %d.\n", tracker, state, request_id );
++    tracker->state = state;
++    tracker->motion_request = request_id;
++    tracker_tell_owner_args( tracker, callbacks[state], request_id, inertia );
++    compositor_changed( tracker->base.compositor );
++}
++
++/*** inertia ***/
++
++/*
++ * An axis in inertia loses the same fraction of its velocity every second, the
++ * decay rate: after t seconds it goes at v * (1 - rate)^t, and it has covered
++ * v * (1 - (1 - rate)^t) / k of the v / k it covers in all, k being
++ * -ln(1 - rate).  Where it comes to rest can be moved -- by an inertia modifier,
++ * or by a bound in the way -- and then the same curve is stretched to end there.
++ * Scale coasts the same way in its logarithm: its velocity is a fraction of
++ * itself per second.
++ */
++#define DEFAULT_DECAY_RATE 0.95f
++
++static void inertia_axis_at( struct inertia_axis *axis, float t, float epsilon )
++{
++    float k, f;
++
++    if (!axis->moving) return;
++    if (axis->rate <= 0.0f)
++    {
++        /* nothing slows it: it goes on at its speed until it gets where it rests, which is a bound */
++        axis->at = axis->from + axis->velocity * t;
++        axis->speed = axis->velocity;
++        if (axis->velocity > 0.0f ? axis->at >= axis->rest : axis->at <= axis->rest) axis->moving = FALSE;
++    }
++    else
++    {
++        k = -logf( 1.0f - min( axis->rate, 0.999999f ) );
++        f = expf( -k * t );
++        axis->at = axis->from + (axis->rest - axis->from) * (1.0f - f);
++        axis->speed = (axis->rest - axis->from) * k * f;
++        if (fabsf( axis->rest - axis->at ) < epsilon) axis->moving = FALSE;
++    }
++    if (axis->moving) return;
++    axis->at = axis->rest;
++    axis->speed = 0.0f;
++}
++
++/* the decay rates set, and the default for those that are not */
++static void tracker_decay_rates( struct tracker *tracker, float rates[3] )
++{
++    Vector3 vector;
++    FLOAT value;
++
++    rates[0] = rates[1] = rates[2] = DEFAULT_DECAY_RATE;
++    if (tracker->position_decay && SUCCEEDED(IReference_Vector3_get_Value( tracker->position_decay, &vector )))
++    {
++        rates[0] = vector.X;
++        rates[1] = vector.Y;
++    }
++    if (tracker->scale_decay && SUCCEEDED(IReference_FLOAT_get_Value( tracker->scale_decay, &value ))) rates[2] = value;
++}
++
++/*
++ * What the first of some modifiers whose condition holds gives, the tracker's
++ * natural resting place being known to their expressions as this.Target's.
++ */
++static BOOL tracker_modified( struct tracker *tracker, const struct modifiers *modifiers, float *value )
++{
++    ICompositionAnimation *condition, *result;
++    struct value like, out;
++    enum modifier_kind kind;
++    BOOL found = FALSE, holds;
++    unsigned int i;
++
++    for (i = 0; i < modifiers->count; i++)
++    {
++        if (!modifier_parts( modifiers->items[i], &kind, &condition, &result )) continue;
++        value_boolean( &like, FALSE );
++        holds = condition && animation_evaluate( condition, &tracker->base, &like, &out ) && out.f[0];
++        if (holds)
++        {
++            value_scalar( &like, 0.0f );
++            if (kind == MODIFIER_MOTION) FIXME( "inertia motion modifiers are not run, the tracker coasts to rest.\n" );
++            else if (result && animation_evaluate( result, &tracker->base, &like, &out ))
++            {
++                *value = out.f[0];
++                found = TRUE;
++            }
++        }
++        if (condition) ICompositionAnimation_Release( condition );
++        if (result) ICompositionAnimation_Release( result );
++        if (holds) break;
++    }
++    return found;
++}
++
++/* sets it coasting from where it is, as fast as it is told */
++static void tracker_start_inertia( struct tracker *tracker, Vector3 velocity, float scale_velocity, Vector3 center,
++                                   INT32 request_id, boolean from_impulse )
++{
++    struct inertia_args args = {0};
++    float rates[3], lows[3], highs[3], natural[3], value, low_scale, high_scale;
++    const float velocities[3] = {velocity.X, velocity.Y, scale_velocity};
++    BOOL modified[3];
++    Vector3 low, high;
++    unsigned int i;
++
++    tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
++    lows[0] = low.X;
++    highs[0] = max( low.X, high.X );
++    lows[1] = low.Y;
++    highs[1] = max( low.Y, high.Y );
++    lows[2] = logf( max( low_scale, 1e-6f ) );
++    highs[2] = logf( max( max( low_scale, high_scale ), 1e-6f ) );
++    tracker_decay_rates( tracker, rates );
++
++    tracker->inertia[0].from = tracker->position.X;
++    tracker->inertia[1].from = tracker->position.Y;
++    tracker->inertia[2].from = logf( max( tracker->scale, 1e-6f ) );
++    for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++)
++    {
++        struct inertia_axis *axis = &tracker->inertia[i];
++
++        axis->velocity = velocities[i];
++        axis->rate = clampf( rates[i], 0.0f, 1.0f );
++        if (!axis->velocity || axis->rate >= 1.0f) natural[i] = axis->from;
++        else if (axis->rate <= 0.0f) natural[i] = axis->velocity > 0.0f ? INFINITY : -INFINITY;
++        else natural[i] = axis->from - axis->velocity / logf( 1.0f - axis->rate );
++    }
++
++    /* what the modifiers read of it */
++    tracker->natural_resting_position.X = natural[0];
++    tracker->natural_resting_position.Y = natural[1];
++    tracker->natural_resting_position.Z = tracker->position.Z;
++    tracker->natural_resting_scale = expf( natural[2] );
++    tracker->position_velocity.X = velocity.X;
++    tracker->position_velocity.Y = velocity.Y;
++    tracker->position_velocity.Z = 0.0f;
++    tracker->scale_velocity = scale_velocity;
++
++    args.natural_position = tracker->natural_resting_position;
++    args.natural_scale = tracker->natural_resting_scale;
++    args.velocity = tracker->position_velocity;
++    args.scale_velocity = scale_velocity;
++    args.modified_position = tracker->natural_resting_position;
++    args.modified_scale = tracker->natural_resting_scale;
++    for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++)
++    {
++        struct inertia_axis *axis = &tracker->inertia[i];
++        float rest = natural[i];
++
++        if ((modified[i] = tracker_modified( tracker, &tracker->inertia_modifiers[i], &value )))
++        {
++            if (i == 0) args.modified_position.X = value;
++            else if (i == 1) args.modified_position.Y = value;
++            else args.modified_scale = value;
++            rest = i == 2 ? logf( max( value, 1e-6f ) ) : value;
++        }
++        axis->rest = clampf( rest, lows[i], highs[i] );
++        axis->at = axis->from;
++        axis->speed = axis->velocity;
++        axis->moving = axis->rest != axis->from;
++    }
++    args.position_modified = modified[0] || modified[1];
++    args.scale_modified = modified[2];
++    args.from_impulse = from_impulse;
++
++    tracker->scale_center = center;
++    if (tracker_modified( tracker, &tracker->center_modifiers[0], &value )) tracker->scale_center.X = value;
++    if (tracker_modified( tracker, &tracker->center_modifiers[1], &value )) tracker->scale_center.Y = value;
++    tracker->inertia_start = 0;
++    tracker->from_impulse = from_impulse;
++    tracker_enter( tracker, TRACKER_INERTIA, request_id, &args );
++}
++
++/* moves it along its inertia; FALSE once every axis has come to rest */
++static BOOL tracker_inertia_frame( struct tracker *tracker, LONGLONG now )
++{
++    float before[3], scale, t;
++    BOOL moving = FALSE;
++    unsigned int i;
++
++    /* the first frame is where the clock starts */
++    if (!tracker->inertia_start)
++    {
++        tracker->inertia_start = now;
++        return TRUE;
++    }
++    t = (now - tracker->inertia_start) / 10000000.0f;
++    for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++)
++    {
++        before[i] = tracker->inertia[i].at;
++        inertia_axis_at( &tracker->inertia[i], t, i == 2 ? 1e-4f : 0.05f );
++        moving |= tracker->inertia[i].moving;
++    }
++    /* scale moves what is under the center point with it, and position goes on from there as it would have */
++    scale = expf( tracker->inertia[2].at );
++    tracker_scale_about( tracker, tracker->scale, scale, tracker->scale_center );
++    tracker->scale = scale;
++    tracker->position.X += tracker->inertia[0].at - before[0];
++    tracker->position.Y += tracker->inertia[1].at - before[1];
++    tracker_clamp( tracker, FALSE );
++    tracker->position_velocity.X = tracker->inertia[0].speed;
++    tracker->position_velocity.Y = tracker->inertia[1].speed;
++    tracker->scale_velocity = tracker->inertia[2].speed;
++    return moving;
++}
++
++/*** custom animations ***/
++
++/* moves it as its custom animations say, within bounds; FALSE once they have all run their course */
++static BOOL tracker_animation_frame( struct tracker *tracker )
++{
++    Vector3 low, high;
++    float low_scale, high_scale;
++    struct value value;
++    BOOL done;
++
++    tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
++    if (tracker->scale_motion)
++    {
++        done = motion_done( tracker->scale_motion );
++        if (motion_value( tracker->scale_motion, &value ))
++        {
++            float scale = clampf( value.f[0], low_scale, max( low_scale, high_scale ) );
++            tracker_scale_about( tracker, tracker->scale, scale, tracker->scale_center );
++            tracker->scale = scale;
++        }
++        if (done)
++        {
++            motion_stop( tracker->scale_motion );
++            tracker->scale_motion = NULL;
++        }
++    }
++    if (tracker->position_motion)
++    {
++        done = motion_done( tracker->position_motion );
++        if (motion_value( tracker->position_motion, &value )) value_get_vector3( &value, &tracker->position );
++        if (done)
++        {
++            motion_stop( tracker->position_motion );
++            tracker->position_motion = NULL;
++        }
++    }
++    /* custom animations are always kept within bounds */
++    tracker_clamp( tracker, FALSE );
++    if (tracker->position_motion || tracker->scale_motion) return TRUE;
++    tracker->natural_resting_position = tracker->position;
++    tracker->natural_resting_scale = tracker->scale;
++    return FALSE;
++}
++
++/*
++ * Called with the compositor locked, each frame: moves what custom animations
++ * and inertia move, and what bounds that animations moved carry with them, and
++ * tells the owners.
++ */
+ void trackers_frame( struct compositor *compositor )
+ {
++    LONGLONG now = compositor_time();
+     struct tracker *tracker;
+ 
+     LIST_FOR_EACH_ENTRY( tracker, compositor_trackers( compositor ), struct tracker, compositor_entry )
+     {
+         Vector3 position = tracker->position;
+         float scale = tracker->scale;
+-
+-        if (list_empty( &tracker->base.animations )) continue;
+-        tracker_clamp( tracker, FALSE );
+-        if (!memcmp( &position, &tracker->position, sizeof(position) ) && scale == tracker->scale) continue;
+-        tracker->natural_resting_position = tracker->position;
+-        tracker->natural_resting_scale = tracker->scale;
+-        tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, 0 );
++        BOOL moving = FALSE;
++
++        switch (tracker->state)
++        {
++        case TRACKER_CUSTOM_ANIMATION:
++            moving = tracker_animation_frame( tracker );
++            break;
++        case TRACKER_INERTIA:
++            moving = tracker_inertia_frame( tracker, now );
++            break;
++        case TRACKER_INTERACTING:
++            continue;
++        case TRACKER_IDLE:
++            if (list_empty( &tracker->base.animations )) continue;
++            tracker_clamp( tracker, FALSE );
++            if (!memcmp( &position, &tracker->position, sizeof(position) ) && scale == tracker->scale) continue;
++            tracker->natural_resting_position = tracker->position;
++            tracker->natural_resting_scale = tracker->scale;
++            tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, 0 );
++            continue;
++        }
++        if (memcmp( &position, &tracker->position, sizeof(position) ) || scale != tracker->scale)
++            tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, tracker->motion_request );
++        if (moving) continue;
++        if (tracker->state == TRACKER_INERTIA)
++        {
++            tracker_stop_inertia( tracker );
++            tracker->natural_resting_position = tracker->position;
++            tracker->natural_resting_scale = tracker->scale;
++        }
++        tracker_enter( tracker, TRACKER_IDLE, tracker->motion_request, NULL );
+     }
+ }
+ 
++/* whether any tracker needs frames to go on: custom animations have theirs already */
++BOOL trackers_moving( struct compositor *compositor )
++{
++    struct tracker *tracker;
++
++    LIST_FOR_EACH_ENTRY( tracker, compositor_trackers( compositor ), struct tracker, compositor_entry )
++        if (tracker->state == TRACKER_INERTIA) return TRUE;
++    return FALSE;
++}
++
++/*** what it is asked to do ***/
++
++/* moves it there at once, ending what moved it; an animation of scale may be told to go on */
+ static HRESULT tracker_update_position( struct tracker *tracker, Vector3 value, BOOL relative, BOOL clamp,
+-                                        INT32 *result )
++                                        BOOL keep_scale_animation, INT32 *result )
+ {
++    enum tracker_state state;
++    INT32 id;
++
+     if (!result) return E_POINTER;
+ 
+     compositor_lock( tracker->base.compositor );
+-    *result = ++tracker->request_id;
+-    if (relative)
++    if (tracker_request( tracker, &id ))
+     {
+-        value.X += tracker->position.X;
+-        value.Y += tracker->position.Y;
+-        value.Z += tracker->position.Z;
++        state = tracker->state;
++        if (state == TRACKER_INERTIA) tracker_stop_inertia( tracker );
++        tracker_stop_animations( tracker, keep_scale_animation );
++        if (relative)
++        {
++            value.X += tracker->position.X;
++            value.Y += tracker->position.Y;
++            value.Z += tracker->position.Z;
++        }
++        tracker->position = value;
++        tracker_clamp( tracker, !clamp );
++        tracker->natural_resting_position = tracker->position;
++        if (!tracker->scale_motion) tracker->natural_resting_scale = tracker->scale;
++        tracker_values_changed( tracker, id );
++        if (state != TRACKER_IDLE && !tracker->scale_motion) tracker_enter( tracker, TRACKER_IDLE, id, NULL );
+     }
+-    tracker->position = value;
+-    tracker_clamp( tracker, !clamp );
+-    tracker->natural_resting_position = tracker->position;
+-    tracker_values_changed( tracker, *result );
++    *result = id;
+     compositor_unlock( tracker->base.compositor );
+     return S_OK;
+ }
+ 
+-/* scaled about the center point: what is under it stays under it */
++/* the clamping and update options are looked at after the request is counted, and its id handed back */
++static HRESULT tracker_update_position_option( struct tracker *tracker, Vector3 value, BOOL relative,
++                                               InteractionTrackerClampingOption option,
++                                               InteractionTrackerPositionUpdateOption update, INT32 *result )
++{
++    if (!result) return E_POINTER;
++    if ((UINT)option > InteractionTrackerClampingOption_Disabled ||
++        (UINT)update > InteractionTrackerPositionUpdateOption_AllowActiveCustomScaleAnimation)
++    {
++        compositor_lock( tracker->base.compositor );
++        *result = ++tracker->request_id;
++        compositor_unlock( tracker->base.compositor );
++        return E_INVALIDARG;
++    }
++    return tracker_update_position( tracker, value, relative, option == InteractionTrackerClampingOption_Auto,
++                                    update == InteractionTrackerPositionUpdateOption_AllowActiveCustomScaleAnimation,
++                                    result );
++}
++
++/* scaled about the center point at once: what is under it stays under it */
+ static HRESULT tracker_update_scale( struct tracker *tracker, FLOAT value, Vector3 center, INT32 *result )
+ {
++    enum tracker_state state;
+     float old;
++    INT32 id;
+ 
+     if (!result) return E_POINTER;
+ 
+     compositor_lock( tracker->base.compositor );
+-    *result = ++tracker->request_id;
+-    old = tracker->scale;
+-    tracker->scale = value;
+-    tracker_clamp( tracker, TRUE );
+-    if (old)
++    if (tracker_request( tracker, &id ))
+     {
+-        float ratio = tracker->scale / old;
+-        tracker->position.X = (tracker->position.X + center.X) * ratio - center.X;
+-        tracker->position.Y = (tracker->position.Y + center.Y) * ratio - center.Y;
++        state = tracker->state;
++        if (state == TRACKER_INERTIA) tracker_stop_inertia( tracker );
++        tracker_stop_animations( tracker, FALSE );
++        old = tracker->scale;
++        tracker->scale = value;
++        tracker_clamp( tracker, TRUE );
++        tracker_scale_about( tracker, old, tracker->scale, center );
++        tracker_clamp( tracker, FALSE );
++        tracker->natural_resting_scale = tracker->scale;
++        tracker->natural_resting_position = tracker->position;
++        tracker_values_changed( tracker, id );
++        if (state != TRACKER_IDLE) tracker_enter( tracker, TRACKER_IDLE, id, NULL );
+     }
+-    tracker_clamp( tracker, FALSE );
+-    tracker->natural_resting_scale = tracker->scale;
+-    tracker->natural_resting_position = tracker->position;
+-    tracker_values_changed( tracker, *result );
++    *result = id;
++    compositor_unlock( tracker->base.compositor );
++    return S_OK;
++}
++
++/*
++ * Moves position or scale as an animation says: a key frame animation or an
++ * expression of the type moved, else the request fails -- its id taken all
++ * the same, as on Windows.  An animation of the other one goes on.
++ */
++static HRESULT tracker_animate( struct tracker *tracker, ICompositionAnimation *animation, BOOL scale, Vector3 center,
++                                INT32 *result )
++{
++    struct running *motion;
++    struct value starting;
++    HRESULT hr;
++    INT32 id;
++
++    if (!animation) return E_INVALIDARG;
++    if (!result) return E_POINTER;
++
++    compositor_lock( tracker->base.compositor );
++    if (tracker_request( tracker, &id ))
++    {
++        if (scale) value_scalar( &starting, tracker->scale );
++        else value_vector3( &starting, tracker->position );
++        if (FAILED(hr = motion_start( &tracker->base, animation, &starting, &motion )))
++        {
++            compositor_unlock( tracker->base.compositor );
++            return hr;
++        }
++        if (tracker->state == TRACKER_INERTIA) tracker_stop_inertia( tracker );
++        if (scale)
++        {
++            if (tracker->scale_motion) motion_stop( tracker->scale_motion );
++            tracker->scale_motion = motion;
++            tracker->scale_center = center;
++        }
++        else
++        {
++            if (tracker->position_motion) motion_stop( tracker->position_motion );
++            tracker->position_motion = motion;
++        }
++        tracker_enter( tracker, TRACKER_CUSTOM_ANIMATION, id, NULL );
++    }
++    *result = id;
++    compositor_unlock( tracker->base.compositor );
++    return S_OK;
++}
++
++/*
++ * Adds velocity, and so inertia: from idle it starts with that velocity; in
++ * inertia it starts again from where it is, with that added to how fast it
++ * goes; a custom animation stops for it.
++ */
++static HRESULT tracker_add_velocity( struct tracker *tracker, const Vector3 *velocity, const FLOAT *scale_velocity,
++                                     Vector3 center, INT32 *result )
++{
++    Vector3 position_velocity = {0};
++    float scale_speed = 0.0f;
++    INT32 id;
++
++    if (!result) return E_POINTER;
++
++    compositor_lock( tracker->base.compositor );
++    if (tracker_request( tracker, &id ))
++    {
++        if (tracker->state == TRACKER_INERTIA)
++        {
++            position_velocity.X = tracker->inertia[0].speed;
++            position_velocity.Y = tracker->inertia[1].speed;
++            scale_speed = tracker->inertia[2].speed;
++            tracker_stop_inertia( tracker );
++        }
++        tracker_stop_animations( tracker, FALSE );
++        if (velocity)
++        {
++            position_velocity.X += velocity->X;
++            position_velocity.Y += velocity->Y;
++            center = tracker->scale_center;
++        }
++        if (scale_velocity) scale_speed += *scale_velocity;
++        tracker_start_inertia( tracker, position_velocity, scale_speed, center, id, TRUE );
++    }
++    *result = id;
+     compositor_unlock( tracker->base.compositor );
+     return S_OK;
+ }
+@@ -1658,21 +2615,54 @@ static HRESULT tracker_query_interface( struct object *object, REFIID iid, void
+     return S_OK;
+ }
+ 
++static void tracker_stop_animations( struct tracker *tracker, BOOL keep_scale );
++static void tracker_stop_inertia( struct tracker *tracker );
++
+ static void tracker_destroy( struct object *object )
+ {
+     struct tracker *tracker = impl_from_tracker_object( object );
++    unsigned int i;
+ 
+     compositor_lock( tracker->base.compositor );
+     tracker->sources->tracker = NULL;
+     list_remove( &tracker->compositor_entry );
++    tracker_stop_animations( tracker, FALSE );
+     compositor_unlock( tracker->base.compositor );
+     ICompositionInteractionSourceCollection_Release( &tracker->sources->ICompositionInteractionSourceCollection_iface );
+     if (tracker->owner) IInteractionTrackerOwner_Release( tracker->owner );
+     if (tracker->position_decay) IReference_Vector3_Release( tracker->position_decay );
+     if (tracker->scale_decay) IReference_FLOAT_Release( tracker->scale_decay );
++    for (i = 0; i < ARRAY_SIZE(tracker->inertia_modifiers); i++) modifiers_clear( &tracker->inertia_modifiers[i] );
++    for (i = 0; i < ARRAY_SIZE(tracker->center_modifiers); i++) modifiers_clear( &tracker->center_modifiers[i] );
+     free( tracker );
+ }
+ 
++/* closed, nothing moves it any more */
++static void tracker_close( struct object *object )
++{
++    struct tracker *tracker = impl_from_tracker_object( object );
++
++    compositor_lock( tracker->base.compositor );
++    tracker_stop_animations( tracker, FALSE );
++    tracker_stop_inertia( tracker );
++    tracker->state = TRACKER_IDLE;
++    compositor_unlock( tracker->base.compositor );
++}
++
++/* its bounds can be animated; what it works out, position and scale first, cannot */
++static BOOL tracker_animatable( struct object *object, const WCHAR *name )
++{
++    static const WCHAR *const computed[] =
++    {
++        L"Position", L"Scale", L"NaturalRestingPosition", L"NaturalRestingScale", L"PositionVelocityInPixelsPerSecond",
++        L"ScaleVelocityInPercentPerSecond", L"IsPositionRoundingSuggested", L"IsInertiaFromImpulse",
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(computed); i++) if (!wcsicmp( name, computed[i] )) return FALSE;
++    return TRUE;
++}
++
+ static BOOL tracker_get_value( struct object *object, const WCHAR *name, struct value *value );
+ static BOOL tracker_set_value( struct object *object, const WCHAR *name, const struct value *value );
+ 
+@@ -1681,9 +2671,10 @@ static const struct object_ops tracker_ops =
+     L"Windows.UI.Composition.Interactions.InteractionTracker",
+     tracker_query_interface,
+     tracker_destroy,
+-    NULL,
++    tracker_close,
+     tracker_get_value,
+     tracker_set_value,
++    tracker_animatable,
+ };
+ 
+ DEFINE_IINSPECTABLE( tracker, IInteractionTracker, struct tracker, base.ICompositionObject_iface )
+@@ -2005,34 +2996,37 @@ static HRESULT WINAPI tracker_AdjustPositionYIfGreaterThanThreshold( IInteractio
+ 
+ static HRESULT WINAPI tracker_ConfigurePositionXInertiaModifiers( IInteractionTracker *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CInteractionTrackerInertiaModifier *modifiers )
+ {
+-    FIXME( "iface %p, modifiers %p, there is no inertia to modify.\n", iface, modifiers );
+-    return S_OK;
++    struct tracker *tracker = impl_from_IInteractionTracker( iface );
++    TRACE( "iface %p, modifiers %p.\n", iface, modifiers );
++    return modifiers_set( tracker->base.compositor, &tracker->inertia_modifiers[0], (IIterable_IInspectable *)modifiers );
+ }
+ 
+ static HRESULT WINAPI tracker_ConfigurePositionYInertiaModifiers( IInteractionTracker *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CInteractionTrackerInertiaModifier *modifiers )
+ {
+-    FIXME( "iface %p, modifiers %p, there is no inertia to modify.\n", iface, modifiers );
+-    return S_OK;
++    struct tracker *tracker = impl_from_IInteractionTracker( iface );
++    TRACE( "iface %p, modifiers %p.\n", iface, modifiers );
++    return modifiers_set( tracker->base.compositor, &tracker->inertia_modifiers[1], (IIterable_IInspectable *)modifiers );
+ }
+ 
+ static HRESULT WINAPI tracker_ConfigureScaleInertiaModifiers( IInteractionTracker *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CInteractionTrackerInertiaModifier *modifiers )
+ {
+-    FIXME( "iface %p, modifiers %p, there is no inertia to modify.\n", iface, modifiers );
+-    return S_OK;
++    struct tracker *tracker = impl_from_IInteractionTracker( iface );
++    TRACE( "iface %p, modifiers %p.\n", iface, modifiers );
++    return modifiers_set( tracker->base.compositor, &tracker->inertia_modifiers[2], (IIterable_IInspectable *)modifiers );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdatePosition( IInteractionTracker *iface, Vector3 value, INT32 *result )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     TRACE( "iface %p, value %f,%f,%f, result %p.\n", iface, value.X, value.Y, value.Z, result );
+-    return tracker_update_position( tracker, value, FALSE, TRUE, result );
++    return tracker_update_position( tracker, value, FALSE, TRUE, FALSE, result );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdatePositionBy( IInteractionTracker *iface, Vector3 amount, INT32 *result )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     TRACE( "iface %p, amount %f,%f,%f, result %p.\n", iface, amount.X, amount.Y, amount.Z, result );
+-    return tracker_update_position( tracker, amount, TRUE, TRUE, result );
++    return tracker_update_position( tracker, amount, TRUE, TRUE, FALSE, result );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( IInteractionTracker *iface, ICompositionAnimation *animation, INT32 *result )
+@@ -2040,10 +3034,8 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( IInteractionTracke
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     Vector3 zero = {0};
+ 
+-    FIXME( "iface %p, animation %p, result %p, the animation is not run.\n", iface, animation, result );
+-
+-    if (!animation) return E_INVALIDARG;
+-    return tracker_update_position( tracker, zero, TRUE, TRUE, result );
++    TRACE( "iface %p, animation %p, result %p.\n", iface, animation, result );
++    return tracker_animate( tracker, animation, FALSE, zero, result );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdatePositionWithAdditionalVelocity( IInteractionTracker *iface, Vector3 velocityInPixelsPerSecond, INT32 *result )
+@@ -2051,10 +3043,9 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAdditionalVelocity( IInteract
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     Vector3 zero = {0};
+ 
+-    FIXME( "iface %p, velocity %f,%f,%f, result %p, there is no inertia.\n", iface, velocityInPixelsPerSecond.X,
++    TRACE( "iface %p, velocity %f,%f,%f, result %p.\n", iface, velocityInPixelsPerSecond.X,
+            velocityInPixelsPerSecond.Y, velocityInPixelsPerSecond.Z, result );
+-
+-    return tracker_update_position( tracker, zero, TRUE, TRUE, result );
++    return tracker_add_velocity( tracker, &velocityInPixelsPerSecond, NULL, zero, result );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdateScale( IInteractionTracker *iface, FLOAT value, Vector3 centerPoint, INT32 *result )
+@@ -2069,19 +3060,18 @@ static HRESULT WINAPI tracker_TryUpdateScaleWithAnimation( IInteractionTracker *
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+ 
+-    FIXME( "iface %p, animation %p, result %p, the animation is not run.\n", iface, animation, result );
+-
+-    if (!animation) return E_INVALIDARG;
+-    return tracker_update_scale( tracker, tracker->scale, centerPoint, result );
++    TRACE( "iface %p, animation %p, centerPoint %f,%f,%f, result %p.\n", iface, animation, centerPoint.X,
++           centerPoint.Y, centerPoint.Z, result );
++    return tracker_animate( tracker, animation, TRUE, centerPoint, result );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdateScaleWithAdditionalVelocity( IInteractionTracker *iface, FLOAT velocityInPercentPerSecond, Vector3 centerPoint, INT32 *result )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+ 
+-    FIXME( "iface %p, velocity %f, result %p, there is no inertia.\n", iface, velocityInPercentPerSecond, result );
+-
+-    return tracker_update_scale( tracker, tracker->scale, centerPoint, result );
++    TRACE( "iface %p, velocity %f, centerPoint %f,%f,%f, result %p.\n", iface, velocityInPercentPerSecond,
++           centerPoint.X, centerPoint.Y, centerPoint.Z, result );
++    return tracker_add_velocity( tracker, NULL, &velocityInPercentPerSecond, centerPoint, result );
+ }
+ 
+ static const struct IInteractionTrackerVtbl tracker_vtbl =
+@@ -2133,14 +3123,16 @@ DEFINE_IINSPECTABLE( tracker2, IInteractionTracker2, struct tracker, base.ICompo
+ 
+ static HRESULT WINAPI tracker2_ConfigureCenterPointXInertiaModifiers( IInteractionTracker2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, there is no inertia to modify.\n", iface, conditionalValues );
+-    return S_OK;
++    struct tracker *tracker = impl_from_IInteractionTracker2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( tracker->base.compositor, &tracker->center_modifiers[0], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static HRESULT WINAPI tracker2_ConfigureCenterPointYInertiaModifiers( IInteractionTracker2 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CCompositionConditionalValue *conditionalValues )
+ {
+-    FIXME( "iface %p, conditionalValues %p, there is no inertia to modify.\n", iface, conditionalValues );
+-    return S_OK;
++    struct tracker *tracker = impl_from_IInteractionTracker2( iface );
++    TRACE( "iface %p, conditionalValues %p.\n", iface, conditionalValues );
++    return modifiers_set( tracker->base.compositor, &tracker->center_modifiers[1], (IIterable_IInspectable *)conditionalValues );
+ }
+ 
+ static const struct IInteractionTracker2Vtbl tracker2_vtbl =
+@@ -2161,7 +3153,7 @@ DEFINE_IINSPECTABLE( tracker3, IInteractionTracker3, struct tracker, base.ICompo
+ 
+ static HRESULT WINAPI tracker3_ConfigureVector2PositionInertiaModifiers( IInteractionTracker3 *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CInteractionTrackerVector2InertiaModifier *modifiers )
+ {
+-    FIXME( "iface %p, modifiers %p, there is no inertia to modify.\n", iface, modifiers );
++    FIXME( "iface %p, modifiers %p, natural motion modifiers are not run.\n", iface, modifiers );
+     return S_OK;
+ }
+ 
+@@ -2184,22 +3176,28 @@ static HRESULT WINAPI tracker4_TryUpdatePositionWithOption( IInteractionTracker4
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker4( iface );
+     TRACE( "iface %p, value %f,%f,%f, option %u, result %p.\n", iface, value.X, value.Y, value.Z, option, result );
+-    return tracker_update_position( tracker, value, FALSE, option != InteractionTrackerClampingOption_Disabled, result );
++    return tracker_update_position_option( tracker, value, FALSE, option, InteractionTrackerPositionUpdateOption_Default,
++                                           result );
+ }
+ 
+ static HRESULT WINAPI tracker4_TryUpdatePositionByWithOption( IInteractionTracker4 *iface, Vector3 amount, InteractionTrackerClampingOption option, INT32 *result )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker4( iface );
+     TRACE( "iface %p, amount %f,%f,%f, option %u, result %p.\n", iface, amount.X, amount.Y, amount.Z, option, result );
+-    return tracker_update_position( tracker, amount, TRUE, option != InteractionTrackerClampingOption_Disabled, result );
++    return tracker_update_position_option( tracker, amount, TRUE, option, InteractionTrackerPositionUpdateOption_Default,
++                                           result );
+ }
+ 
+ static HRESULT WINAPI tracker4_get_IsInertiaFromImpulse( IInteractionTracker4 *iface, boolean *value )
+ {
++    struct tracker *tracker = impl_from_IInteractionTracker4( iface );
++
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    *value = FALSE;
++    compositor_lock( tracker->base.compositor );
++    *value = tracker->from_impulse;
++    compositor_unlock( tracker->base.compositor );
+     return S_OK;
+ }
+ 
+@@ -2225,7 +3223,7 @@ static HRESULT WINAPI tracker5_TryUpdatePositionWithOption( IInteractionTracker5
+     struct tracker *tracker = impl_from_IInteractionTracker5( iface );
+     TRACE( "iface %p, value %f,%f,%f, option %u, posUpdateOption %u, result %p.\n", iface, value.X, value.Y, value.Z,
+            option, posUpdateOption, result );
+-    return tracker_update_position( tracker, value, FALSE, option != InteractionTrackerClampingOption_Disabled, result );
++    return tracker_update_position_option( tracker, value, FALSE, option, posUpdateOption, result );
+ }
+ 
+ static const struct IInteractionTracker5Vtbl tracker5_vtbl =
+@@ -2296,7 +3294,7 @@ static BOOL tracker_get_value( struct object *object, const WCHAR *name, struct
+     if (!wcsicmp( name, L"PositionVelocityInPixelsPerSecond" )) return value_vector3( value, tracker->position_velocity );
+     if (!wcsicmp( name, L"ScaleVelocityInPercentPerSecond" )) return value_scalar( value, tracker->scale_velocity );
+     if (!wcsicmp( name, L"IsPositionRoundingSuggested" )) return value_boolean( value, tracker->position_rounding );
+-    if (!wcsicmp( name, L"IsInertiaFromImpulse" )) return value_boolean( value, FALSE );
++    if (!wcsicmp( name, L"IsInertiaFromImpulse" )) return value_boolean( value, tracker->from_impulse );
+     return FALSE;
+ }
+ 
+diff --git a/dlls/dcomp/modifier.c b/dlls/dcomp/modifier.c
+index f59b2919946..a61d522a308 100644
+--- a/dlls/dcomp/modifier.c
++++ b/dlls/dcomp/modifier.c
+@@ -28,13 +28,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+  * expression animations, for a source or a tracker to use when input moves
+  * it.  They are kept as given.
+  */
+-enum modifier_kind
+-{
+-    MODIFIER_CONDITIONAL_VALUE,
+-    MODIFIER_RESTING_VALUE,
+-    MODIFIER_MOTION,
+-};
+-
+ struct modifier
+ {
+     struct object base;
+@@ -84,6 +77,34 @@ static const struct object_ops modifier_ops[] =
+     { L"Windows.UI.Composition.Interactions.InteractionTrackerInertiaMotion", modifier_query_interface, modifier_destroy },
+ };
+ 
++/* what a modifier is made of, for a tracker to use: its kind and its two expressions, NULL where unset */
++BOOL modifier_parts( IUnknown *iface, enum modifier_kind *kind, ICompositionAnimation **condition,
++                     ICompositionAnimation **value )
++{
++    ICompositionObject *composition;
++    struct modifier *modifier;
++    struct object *object;
++    unsigned int i;
++
++    *condition = *value = NULL;
++    if (!iface || FAILED(IUnknown_QueryInterface( iface, &IID_ICompositionObject, (void **)&composition ))) return FALSE;
++    object = unsafe_impl_from_ICompositionObject( composition );
++    ICompositionObject_Release( composition );
++    if (!object) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(modifier_ops); i++) if (object->ops == &modifier_ops[i]) break;
++    if (i == ARRAY_SIZE(modifier_ops)) return FALSE;
++    modifier = impl_from_modifier_object( object );
++
++    compositor_lock( object->compositor );
++    *kind = modifier->kind;
++    if (modifier->expressions[0])
++        IExpressionAnimation_QueryInterface( modifier->expressions[0], &IID_ICompositionAnimation, (void **)condition );
++    if (modifier->expressions[1])
++        IExpressionAnimation_QueryInterface( modifier->expressions[1], &IID_ICompositionAnimation, (void **)value );
++    compositor_unlock( object->compositor );
++    return TRUE;
++}
++
+ DEFINE_IINSPECTABLE( cond, ICompositionConditionalValue, struct modifier, base.ICompositionObject_iface )
+ 
+ static HRESULT WINAPI cond_get_Condition( ICompositionConditionalValue *iface, IExpressionAnimation **value )
+diff --git a/dlls/dcomp/private.h b/dlls/dcomp/private.h
+index 5b2a4b6f3c4..afd32c183da 100644
+--- a/dlls/dcomp/private.h
++++ b/dlls/dcomp/private.h
+@@ -212,6 +212,8 @@ struct object_ops
+     /* the properties expressions read and animations set, called with the compositor locked */
+     BOOL (*get_property)( struct object *object, const WCHAR *name, struct value *value );
+     BOOL (*set_property)( struct object *object, const WCHAR *name, const struct value *value );
++    /* whether StartAnimation may take a property it reads; without it, all of them */
++    BOOL (*animatable)( struct object *object, const WCHAR *name );
+ };
+ 
+ struct object
+@@ -255,6 +257,15 @@ extern HRESULT property_set_create( struct compositor *compositor, struct object
+ extern HRESULT batch_create( struct compositor *compositor, CompositionBatchTypes types, BOOL scoped,
+                              IInspectable **out );
+ extern void animations_frame( struct compositor *compositor );
++/* an animation an object runs on a value of its own */
++struct running;
++extern HRESULT motion_start( struct object *object, ICompositionAnimation *animation, const struct value *starting,
++                             struct running **out );
++extern BOOL motion_value( struct running *motion, struct value *out );
++extern BOOL motion_done( struct running *motion );
++extern void motion_stop( struct running *motion );
++extern BOOL animation_evaluate( ICompositionAnimation *animation, struct object *target, const struct value *like,
++                                struct value *out );
+ extern BOOL animations_running( struct compositor *compositor );
+ extern void batches_commit( struct compositor *compositor );
+ struct batch;
+@@ -523,7 +534,16 @@ extern IActivationFactory *conditional_value_factory;
+ extern IActivationFactory *resting_value_factory;
+ extern IActivationFactory *inertia_motion_factory;
+ extern struct tracker *unsafe_impl_from_IInteractionTracker( IInteractionTracker *iface );
++enum modifier_kind
++{
++    MODIFIER_CONDITIONAL_VALUE,
++    MODIFIER_RESTING_VALUE,
++    MODIFIER_MOTION,
++};
++extern BOOL modifier_parts( IUnknown *iface, enum modifier_kind *kind, ICompositionAnimation **condition,
++                            ICompositionAnimation **value );
+ extern void trackers_frame( struct compositor *compositor );
++extern BOOL trackers_moving( struct compositor *compositor );
+ 
+ /* rendering */
+ extern HRESULT render_target( struct compositor *compositor, struct target *target );
+diff --git a/dlls/dcomp/tests/composition.c b/dlls/dcomp/tests/composition.c
+index 9641757e200..7ae656be4f9 100644
+--- a/dlls/dcomp/tests/composition.c
++++ b/dlls/dcomp/tests/composition.c
+@@ -20,6 +20,7 @@
+ 
+ #define COBJMACROS
+ #include <stdarg.h>
++#include <math.h>
+ 
+ #include "windef.h"
+ #include "initguid.h"
+@@ -1255,6 +1256,595 @@ done:
+     if (queue) IDispatcherQueueController_Release( queue );
+ }
+ 
++/*** what an interaction tracker's owner hears ***/
++
++enum tracker_event_kind
++{
++    EVENT_VALUES,
++    EVENT_IDLE,
++    EVENT_CUSTOM_ANIMATION,
++    EVENT_INERTIA,
++    EVENT_INTERACTING,
++    EVENT_IGNORED,
++};
++
++struct tracker_event
++{
++    enum tracker_event_kind kind;
++    INT32 id;
++    Vector3 position;
++    FLOAT scale;
++    Vector3 natural, velocity, modified;
++    BOOL has_modified;
++};
++
++static struct tracker_event events[512];
++static unsigned int event_count;
++
++static struct tracker_event *add_event( enum tracker_event_kind kind, INT32 id )
++{
++    struct tracker_event *event;
++
++    if (event_count == ARRAY_SIZE(events)) return NULL;
++    event = &events[event_count++];
++    memset( event, 0, sizeof(*event) );
++    event->kind = kind;
++    event->id = id;
++    return event;
++}
++
++static HRESULT WINAPI owner_QueryInterface( IInteractionTrackerOwner *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IInteractionTrackerOwner ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI owner_AddRef( IInteractionTrackerOwner *iface ) { return 2; }
++static ULONG WINAPI owner_Release( IInteractionTrackerOwner *iface ) { return 1; }
++static HRESULT WINAPI owner_GetIids( IInteractionTrackerOwner *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI owner_GetRuntimeClassName( IInteractionTrackerOwner *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI owner_GetTrustLevel( IInteractionTrackerOwner *iface, TrustLevel *level ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI owner_CustomAnimationStateEntered( IInteractionTrackerOwner *iface, IInteractionTracker *sender,
++                                                         IInteractionTrackerCustomAnimationStateEnteredArgs *args )
++{
++    INT32 id = -1;
++    IInteractionTrackerCustomAnimationStateEnteredArgs_get_RequestId( args, &id );
++    add_event( EVENT_CUSTOM_ANIMATION, id );
++    return S_OK;
++}
++
++static HRESULT WINAPI owner_IdleStateEntered( IInteractionTrackerOwner *iface, IInteractionTracker *sender,
++                                              IInteractionTrackerIdleStateEnteredArgs *args )
++{
++    INT32 id = -1;
++    IInteractionTrackerIdleStateEnteredArgs_get_RequestId( args, &id );
++    add_event( EVENT_IDLE, id );
++    return S_OK;
++}
++
++static HRESULT WINAPI owner_InertiaStateEntered( IInteractionTrackerOwner *iface, IInteractionTracker *sender,
++                                                 IInteractionTrackerInertiaStateEnteredArgs *args )
++{
++    struct tracker_event *event;
++    IReference_Vector3 *modified = NULL;
++    INT32 id = -1;
++
++    IInteractionTrackerInertiaStateEnteredArgs_get_RequestId( args, &id );
++    if (!(event = add_event( EVENT_INERTIA, id ))) return S_OK;
++    IInteractionTrackerInertiaStateEnteredArgs_get_NaturalRestingPosition( args, &event->natural );
++    IInteractionTrackerInertiaStateEnteredArgs_get_PositionVelocityInPixelsPerSecond( args, &event->velocity );
++    IInteractionTrackerInertiaStateEnteredArgs_get_ModifiedRestingPosition( args, &modified );
++    if ((event->has_modified = !!modified))
++    {
++        IReference_Vector3_get_Value( modified, &event->modified );
++        IReference_Vector3_Release( modified );
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI owner_InteractingStateEntered( IInteractionTrackerOwner *iface, IInteractionTracker *sender,
++                                                     IInteractionTrackerInteractingStateEnteredArgs *args )
++{
++    INT32 id = -1;
++    IInteractionTrackerInteractingStateEnteredArgs_get_RequestId( args, &id );
++    add_event( EVENT_INTERACTING, id );
++    return S_OK;
++}
++
++static HRESULT WINAPI owner_RequestIgnored( IInteractionTrackerOwner *iface, IInteractionTracker *sender,
++                                            IInteractionTrackerRequestIgnoredArgs *args )
++{
++    INT32 id = -1;
++    IInteractionTrackerRequestIgnoredArgs_get_RequestId( args, &id );
++    add_event( EVENT_IGNORED, id );
++    return S_OK;
++}
++
++static HRESULT WINAPI owner_ValuesChanged( IInteractionTrackerOwner *iface, IInteractionTracker *sender,
++                                           IInteractionTrackerValuesChangedArgs *args )
++{
++    struct tracker_event *event;
++    INT32 id = -1;
++
++    IInteractionTrackerValuesChangedArgs_get_RequestId( args, &id );
++    if (!(event = add_event( EVENT_VALUES, id ))) return S_OK;
++    IInteractionTrackerValuesChangedArgs_get_Position( args, &event->position );
++    IInteractionTrackerValuesChangedArgs_get_Scale( args, &event->scale );
++    return S_OK;
++}
++
++static const IInteractionTrackerOwnerVtbl owner_vtbl =
++{
++    owner_QueryInterface,
++    owner_AddRef,
++    owner_Release,
++    owner_GetIids,
++    owner_GetRuntimeClassName,
++    owner_GetTrustLevel,
++    owner_CustomAnimationStateEntered,
++    owner_IdleStateEntered,
++    owner_InertiaStateEntered,
++    owner_InteractingStateEntered,
++    owner_RequestIgnored,
++    owner_ValuesChanged,
++};
++
++static IInteractionTrackerOwner tracker_owner = {&owner_vtbl};
++
++/* pumps until the owner hears of kind for request id; the index of the event, or -1 */
++static int wait_for_event( enum tracker_event_kind kind, INT32 id, DWORD timeout )
++{
++    DWORD end = GetTickCount() + timeout;
++    unsigned int i, seen = 0;
++
++    do
++    {
++        for (i = seen; i < event_count; i++) if (events[i].kind == kind && events[i].id == id) return i;
++        seen = event_count;
++        pump_messages( 10 );
++    } while ((int)(end - GetTickCount()) > 0);
++    return -1;
++}
++
++/* an IIterable of inertia modifiers, as an application hands them to a tracker */
++struct modifier_list
++{
++    IIterable_InteractionTrackerInertiaModifier IIterable_InteractionTrackerInertiaModifier_iface;
++    IIterator_InteractionTrackerInertiaModifier IIterator_InteractionTrackerInertiaModifier_iface;
++    IInteractionTrackerInertiaModifier *items[4];
++    UINT count, index;
++};
++
++static struct modifier_list *list_from_iterable( IIterable_InteractionTrackerInertiaModifier *iface )
++{
++    return CONTAINING_RECORD( iface, struct modifier_list, IIterable_InteractionTrackerInertiaModifier_iface );
++}
++
++static struct modifier_list *list_from_iterator( IIterator_InteractionTrackerInertiaModifier *iface )
++{
++    return CONTAINING_RECORD( iface, struct modifier_list, IIterator_InteractionTrackerInertiaModifier_iface );
++}
++
++static HRESULT WINAPI modifier_iterable_QueryInterface( IIterable_InteractionTrackerInertiaModifier *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IIterable_InteractionTrackerInertiaModifier ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI modifier_iterable_AddRef( IIterable_InteractionTrackerInertiaModifier *iface ) { return 2; }
++static ULONG WINAPI modifier_iterable_Release( IIterable_InteractionTrackerInertiaModifier *iface ) { return 1; }
++static HRESULT WINAPI modifier_iterable_GetIids( IIterable_InteractionTrackerInertiaModifier *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI modifier_iterable_GetRuntimeClassName( IIterable_InteractionTrackerInertiaModifier *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI modifier_iterable_GetTrustLevel( IIterable_InteractionTrackerInertiaModifier *iface, TrustLevel *level ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI modifier_iterable_First( IIterable_InteractionTrackerInertiaModifier *iface,
++                                               IIterator_InteractionTrackerInertiaModifier **value )
++{
++    struct modifier_list *list = list_from_iterable( iface );
++
++    list->index = 0;
++    *value = &list->IIterator_InteractionTrackerInertiaModifier_iface;
++    return S_OK;
++}
++
++static const IIterable_InteractionTrackerInertiaModifierVtbl modifier_iterable_vtbl =
++{
++    modifier_iterable_QueryInterface,
++    modifier_iterable_AddRef,
++    modifier_iterable_Release,
++    modifier_iterable_GetIids,
++    modifier_iterable_GetRuntimeClassName,
++    modifier_iterable_GetTrustLevel,
++    modifier_iterable_First,
++};
++
++static HRESULT WINAPI modifier_iterator_QueryInterface( IIterator_InteractionTrackerInertiaModifier *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IIterator_InteractionTrackerInertiaModifier ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI modifier_iterator_AddRef( IIterator_InteractionTrackerInertiaModifier *iface ) { return 2; }
++static ULONG WINAPI modifier_iterator_Release( IIterator_InteractionTrackerInertiaModifier *iface ) { return 1; }
++static HRESULT WINAPI modifier_iterator_GetIids( IIterator_InteractionTrackerInertiaModifier *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI modifier_iterator_GetRuntimeClassName( IIterator_InteractionTrackerInertiaModifier *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI modifier_iterator_GetTrustLevel( IIterator_InteractionTrackerInertiaModifier *iface, TrustLevel *level ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI modifier_iterator_get_Current( IIterator_InteractionTrackerInertiaModifier *iface,
++                                                     IInteractionTrackerInertiaModifier **value )
++{
++    struct modifier_list *list = list_from_iterator( iface );
++
++    if (list->index >= list->count) return E_BOUNDS;
++    IInteractionTrackerInertiaModifier_AddRef( (*value = list->items[list->index]) );
++    return S_OK;
++}
++
++static HRESULT WINAPI modifier_iterator_get_HasCurrent( IIterator_InteractionTrackerInertiaModifier *iface, boolean *value )
++{
++    struct modifier_list *list = list_from_iterator( iface );
++    *value = list->index < list->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI modifier_iterator_MoveNext( IIterator_InteractionTrackerInertiaModifier *iface, boolean *value )
++{
++    struct modifier_list *list = list_from_iterator( iface );
++    if (list->index < list->count) list->index++;
++    *value = list->index < list->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI modifier_iterator_GetMany( IIterator_InteractionTrackerInertiaModifier *iface, UINT32 size,
++                                                 IInteractionTrackerInertiaModifier **items, UINT32 *count )
++{
++    return E_NOTIMPL;
++}
++
++static const IIterator_InteractionTrackerInertiaModifierVtbl modifier_iterator_vtbl =
++{
++    modifier_iterator_QueryInterface,
++    modifier_iterator_AddRef,
++    modifier_iterator_Release,
++    modifier_iterator_GetIids,
++    modifier_iterator_GetRuntimeClassName,
++    modifier_iterator_GetTrustLevel,
++    modifier_iterator_get_Current,
++    modifier_iterator_get_HasCurrent,
++    modifier_iterator_MoveNext,
++    modifier_iterator_GetMany,
++};
++
++static ICompositionAnimation *create_vector3_animation( ICompositor *compositor, Vector3 value, INT64 duration )
++{
++    IVector3KeyFrameAnimation *key_frames;
++    ICompositionAnimation *animation;
++    IKeyFrameAnimation *key_frame;
++    TimeSpan span = {duration};
++
++    ICompositor_CreateVector3KeyFrameAnimation( compositor, &key_frames );
++    IVector3KeyFrameAnimation_InsertKeyFrame( key_frames, 1.0f, value );
++    IVector3KeyFrameAnimation_QueryInterface( key_frames, &IID_IKeyFrameAnimation, (void **)&key_frame );
++    IKeyFrameAnimation_put_Duration( key_frame, span );
++    IKeyFrameAnimation_Release( key_frame );
++    IVector3KeyFrameAnimation_QueryInterface( key_frames, &IID_ICompositionAnimation, (void **)&animation );
++    IVector3KeyFrameAnimation_Release( key_frames );
++    return animation;
++}
++
++static ICompositionAnimation *create_scalar_animation( ICompositor *compositor, FLOAT value )
++{
++    IScalarKeyFrameAnimation *key_frames;
++    ICompositionAnimation *animation;
++    IKeyFrameAnimation *key_frame;
++    TimeSpan span = {2000000};
++
++    ICompositor_CreateScalarKeyFrameAnimation( compositor, &key_frames );
++    IScalarKeyFrameAnimation_InsertKeyFrame( key_frames, 1.0f, value );
++    IScalarKeyFrameAnimation_QueryInterface( key_frames, &IID_IKeyFrameAnimation, (void **)&key_frame );
++    IKeyFrameAnimation_put_Duration( key_frame, span );
++    IKeyFrameAnimation_Release( key_frame );
++    IScalarKeyFrameAnimation_QueryInterface( key_frames, &IID_ICompositionAnimation, (void **)&animation );
++    IScalarKeyFrameAnimation_Release( key_frames );
++    return animation;
++}
++
++static IExpressionAnimation *create_expression( ICompositor *compositor, const WCHAR *text )
++{
++    IExpressionAnimation *expression;
++    HSTRING str = hstring( text );
++
++    ICompositor_CreateExpressionAnimationWithExpression( compositor, str, &expression );
++    WindowsDeleteString( str );
++    return expression;
++}
++
++static ICompositionAnimation *create_expression_animation( ICompositor *compositor, const WCHAR *text )
++{
++    IExpressionAnimation *expression = create_expression( compositor, text );
++    ICompositionAnimation *animation;
++
++    IExpressionAnimation_QueryInterface( expression, &IID_ICompositionAnimation, (void **)&animation );
++    IExpressionAnimation_Release( expression );
++    return animation;
++}
++
++static HRESULT start_on_tracker( IInteractionTracker *tracker, const WCHAR *property, ICompositionAnimation *animation )
++{
++    ICompositionObject *object;
++    HSTRING str = hstring( property );
++    HRESULT hr;
++
++    IInteractionTracker_QueryInterface( tracker, &IID_ICompositionObject, (void **)&object );
++    hr = ICompositionObject_StartAnimation( object, str, animation );
++    if (SUCCEEDED(hr)) ICompositionObject_StopAnimation( object, str );
++    WindowsDeleteString( str );
++    ICompositionObject_Release( object );
++    return hr;
++}
++
++static void test_tracker_motion(void)
++{
++    struct modifier_list modifiers = {{&modifier_iterable_vtbl}, {&modifier_iterator_vtbl}};
++    IInteractionTrackerInertiaRestingValueStatics *resting_statics;
++    IInteractionTrackerInertiaRestingValue *resting;
++    IInteractionTrackerStatics *tracker_statics;
++    IDispatcherQueueController *queue;
++    ICompositionAnimation *animation;
++    IInteractionTracker5 *tracker5;
++    IInteractionTracker *tracker;
++    IExpressionAnimation *expression;
++    ICompositor *compositor;
++    IInspectable *inspectable;
++    Vector3 v3, center = {0};
++    int i, idle, custom;
++    BOOL between, beyond;
++    HSTRING str;
++    INT32 id;
++    HRESULT hr;
++
++    queue = create_queue( DQTAT_COM_STA );
++    str = hstring( L"Windows.UI.Composition.Compositor" );
++    hr = RoActivateInstance( str, &inspectable );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto done;
++    IInspectable_QueryInterface( inspectable, &IID_ICompositor, (void **)&compositor );
++    IInspectable_Release( inspectable );
++    str = hstring( L"Windows.UI.Composition.Interactions.InteractionTracker" );
++    hr = RoGetActivationFactory( str, &IID_IInteractionTrackerStatics, (void **)&tracker_statics );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++    hr = IInteractionTrackerStatics_CreateWithOwner( tracker_statics, compositor, &tracker_owner, &tracker );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    v3.X = 0.0f;
++    v3.Y = 1000.0f;
++    v3.Z = 0.0f;
++    IInteractionTracker_put_MaxPosition( tracker, v3 );
++    /* these two take requests 1 and 2 */
++    IInteractionTracker_put_MaxScale( tracker, 4.0f );
++    IInteractionTracker_put_MinScale( tracker, 0.5f );
++
++    /* what it takes as an animation of its position is checked there and then; the request is counted all the same */
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, NULL, &id );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    animation = create_vector3_animation( compositor, (Vector3){0, 100, 0}, 2000000 );
++    id = -1;
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( id == 3, "got request %d.\n", id );
++    hr = IInteractionTracker_TryUpdateScaleWithAnimation( tracker, animation, center, &id );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    animation = create_scalar_animation( compositor, 2.0f );
++    id = -1;
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ok( id == -1, "got request %d.\n", id );
++    hr = IInteractionTracker_TryUpdateScaleWithAnimation( tracker, animation, center, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( id == 6, "got request %d.\n", id );
++    ICompositionAnimation_Release( animation );
++    animation = create_expression_animation( compositor, L"Vector3(0, 50, 0)" );
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( id == 7, "got request %d.\n", id );
++    ICompositionAnimation_Release( animation );
++    animation = create_expression_animation( compositor, L"2.5" );
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    hr = IInteractionTracker_TryUpdatePositionWithAdditionalVelocity( tracker, (Vector3){0, 500, 0}, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( id == 9, "got request %d.\n", id );
++    /* options are looked at once the request has its number, which is handed back */
++    IInteractionTracker_QueryInterface( tracker, &IID_IInteractionTracker5, (void **)&tracker5 );
++    id = -1;
++    hr = IInteractionTracker5_TryUpdatePositionWithOption( tracker5, (Vector3){0, 5, 0}, 7, 0, &id );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ok( id == 10, "got request %d.\n", id );
++    id = -1;
++    hr = IInteractionTracker5_TryUpdatePositionWithOption( tracker5, (Vector3){0, 5, 0},
++            InteractionTrackerClampingOption_Auto, 7, &id );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ok( id == 11, "got request %d.\n", id );
++    IInteractionTracker5_Release( tracker5 );
++    /* its bounds can be animated; what it works out cannot */
++    animation = create_vector3_animation( compositor, (Vector3){0, 100, 0}, 2000000 );
++    hr = start_on_tracker( tracker, L"Position", animation );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    hr = start_on_tracker( tracker, L"MinPosition", animation );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = start_on_tracker( tracker, L"NaturalRestingPosition", animation );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    hr = start_on_tracker( tracker, L"PositionVelocityInPixelsPerSecond", animation );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    animation = create_scalar_animation( compositor, 2.0f );
++    hr = start_on_tracker( tracker, L"Scale", animation );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    hr = start_on_tracker( tracker, L"MaxScale", animation );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = start_on_tracker( tracker, L"Position.Y", animation );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    IInteractionTracker_Release( tracker );
++
++    /* the rest needs a compositor that draws frames, which a locked session's does not */
++    hr = IInteractionTrackerStatics_CreateWithOwner( tracker_statics, compositor, &tracker_owner, &tracker );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IInteractionTracker_put_MaxPosition( tracker, v3 );
++    pump_messages( 100 );
++    event_count = 0;
++    animation = create_vector3_animation( compositor, (Vector3){0, 300, 0}, 2000000 );
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    if ((idle = wait_for_event( EVENT_IDLE, id, 3000 )) < 0 && !event_count)
++    {
++        skip( "the compositor draws no frames here.\n" );
++        IInteractionTracker_Release( tracker );
++        goto release;
++    }
++    ok( idle >= 0, "the animation did not end.\n" );
++    /* it goes into its custom animation state, moves through the values between, and comes to rest where it goes */
++    ok( event_count && events[0].kind == EVENT_CUSTOM_ANIMATION && events[0].id == id,
++        "got first event %d for request %d.\n", events[0].kind, events[0].id );
++    between = FALSE;
++    for (i = 0; i < idle; i++)
++    {
++        if (events[i].kind != EVENT_VALUES) continue;
++        ok( events[i].id == id, "got request %d.\n", events[i].id );
++        if (events[i].position.Y > 0.0f && events[i].position.Y < 300.0f) between = TRUE;
++    }
++    ok( between, "saw nothing between where it started and where it went.\n" );
++    IInteractionTracker_get_Position( tracker, &v3 );
++    ok( v3.Y == 300.0f, "got position %f,%f,%f.\n", v3.X, v3.Y, v3.Z );
++
++    /* custom animations are kept within bounds */
++    event_count = 0;
++    animation = create_vector3_animation( compositor, (Vector3){0, 5000, 0}, 2000000 );
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    idle = wait_for_event( EVENT_IDLE, id, 3000 );
++    ok( idle >= 0, "the animation did not end.\n" );
++    beyond = FALSE;
++    for (i = 0; i < idle; i++) if (events[i].kind == EVENT_VALUES && events[i].position.Y > 1000.0f) beyond = TRUE;
++    ok( !beyond, "it went beyond its bounds.\n" );
++    IInteractionTracker_get_Position( tracker, &v3 );
++    ok( v3.Y == 1000.0f, "got position %f,%f,%f.\n", v3.X, v3.Y, v3.Z );
++
++    /* a position set outright ends an animation, and it is idle for that request */
++    event_count = 0;
++    animation = create_vector3_animation( compositor, (Vector3){0, 0, 0}, 20000000 );
++    hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ICompositionAnimation_Release( animation );
++    custom = wait_for_event( EVENT_CUSTOM_ANIMATION, id, 1000 );
++    ok( custom >= 0, "no custom animation state.\n" );
++    pump_messages( 200 );
++    hr = IInteractionTracker_TryUpdatePosition( tracker, (Vector3){0, 500, 0}, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    idle = wait_for_event( EVENT_IDLE, id, 1000 );
++    ok( idle >= 0, "not idle for the update.\n" );
++    pump_messages( 300 );
++    for (i = idle + 1; i < event_count; i++)
++        ok( events[i].kind != EVENT_VALUES, "the animation went on, to %f.\n", events[i].position.Y );
++    IInteractionTracker_get_Position( tracker, &v3 );
++    ok( v3.Y == 500.0f, "got position %f,%f,%f.\n", v3.X, v3.Y, v3.Z );
++
++    /* velocity starts inertia, which ends where it naturally rests */
++    event_count = 0;
++    hr = IInteractionTracker_TryUpdatePositionWithAdditionalVelocity( tracker, (Vector3){0, 200, 0}, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    i = wait_for_event( EVENT_INERTIA, id, 1000 );
++    ok( i >= 0, "no inertia.\n" );
++    if (i >= 0)
++    {
++        ok( events[i].velocity.Y == 200.0f, "got velocity %f.\n", events[i].velocity.Y );
++        ok( events[i].natural.Y > 500.0f && events[i].natural.Y < 1000.0f, "got natural resting position %f.\n",
++            events[i].natural.Y );
++        ok( !events[i].has_modified, "got a modified resting position.\n" );
++        v3 = events[i].natural;
++    }
++    idle = wait_for_event( EVENT_IDLE, id, 5000 );
++    ok( idle >= 0, "inertia did not end.\n" );
++    if (i >= 0)
++    {
++        Vector3 at;
++        IInteractionTracker_get_Position( tracker, &at );
++        ok( fabsf( at.Y - v3.Y ) < 1.0f, "got position %f, expected %f.\n", at.Y, v3.Y );
++    }
++
++    /* an inertia modifier whose condition holds says where it rests instead */
++    str = hstring( L"Windows.UI.Composition.Interactions.InteractionTrackerInertiaRestingValue" );
++    hr = RoGetActivationFactory( str, &IID_IInteractionTrackerInertiaRestingValueStatics, (void **)&resting_statics );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IInteractionTrackerInertiaRestingValueStatics_Create( resting_statics, compositor, &resting );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    expression = create_expression( compositor, L"this.Target.NaturalRestingPosition.Y > 0" );
++    IInteractionTrackerInertiaRestingValue_put_Condition( resting, expression );
++    IExpressionAnimation_Release( expression );
++    expression = create_expression( compositor, L"700" );
++    IInteractionTrackerInertiaRestingValue_put_RestingValue( resting, expression );
++    IExpressionAnimation_Release( expression );
++    IInteractionTrackerInertiaRestingValue_QueryInterface( resting, &IID_IInteractionTrackerInertiaModifier,
++                                                           (void **)&modifiers.items[0] );
++    modifiers.count = 1;
++    hr = IInteractionTracker_ConfigurePositionYInertiaModifiers( tracker,
++            &modifiers.IIterable_InteractionTrackerInertiaModifier_iface );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    event_count = 0;
++    hr = IInteractionTracker_TryUpdatePositionWithAdditionalVelocity( tracker, (Vector3){0, -50, 0}, &id );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    i = wait_for_event( EVENT_INERTIA, id, 1000 );
++    ok( i >= 0, "no inertia.\n" );
++    if (i >= 0)
++    {
++        ok( events[i].has_modified, "got no modified resting position.\n" );
++        ok( events[i].modified.Y == 700.0f, "got modified resting position %f.\n", events[i].modified.Y );
++    }
++    idle = wait_for_event( EVENT_IDLE, id, 5000 );
++    ok( idle >= 0, "inertia did not end.\n" );
++    IInteractionTracker_get_Position( tracker, &v3 );
++    ok( fabsf( v3.Y - 700.0f ) < 1.0f, "got position %f.\n", v3.Y );
++    hr = IInteractionTracker_ConfigurePositionYInertiaModifiers( tracker, NULL );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IInteractionTrackerInertiaModifier_Release( modifiers.items[0] );
++    IInteractionTrackerInertiaRestingValue_Release( resting );
++    IInteractionTrackerInertiaRestingValueStatics_Release( resting_statics );
++    IInteractionTracker_Release( tracker );
++
++release:
++    IInteractionTrackerStatics_Release( tracker_statics );
++    ICompositor_Release( compositor );
++    pump_messages( 100 );
++done:
++    if (queue) IDispatcherQueueController_Release( queue );
++}
++
+ START_TEST(composition)
+ {
+     IDispatcherQueueController *queue;
+@@ -1271,5 +1861,6 @@ START_TEST(composition)
+     test_drop_shadow();
+     test_redirect_visual();
+     test_interactions();
++    test_tracker_motion();
+     RoUninitialize();
+ }

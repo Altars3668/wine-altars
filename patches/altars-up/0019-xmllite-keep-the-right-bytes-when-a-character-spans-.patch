@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 02:25:15 -0400
+Subject: [PATCH] xmllite: keep the right bytes when a character spans a read
+ boundary.
+
+The reader pulls the stream in chunks and converts whole UTF-8 sequences
+only, so whatever is left of a character that straddles the end of a chunk
+has to survive until the next one arrives. Two things stood in the way.
+
+readerinput_shrinkraw() moved the last `len` bytes to the front, where
+`len` counts the bytes that were just converted and thrown away. What has
+to be kept is the tail behind them: written - cur - len bytes starting at
+cur + len. The byte count it stored was already that value, so the buffer
+described a tail it did not actually hold.
+
+readerinput_get_utf8_convlen() walked back over bytes whose top two bits
+are 00, which is a slice of ASCII, not the 10xxxxxx continuation bytes it
+meant to skip. Any buffer ending in a non-ASCII byte therefore lost its
+last byte: complete characters were cut apart and incomplete ones were
+still not kept whole. Walk back over continuation bytes instead and let
+the lead byte say how long the sequence is, so a sequence that did arrive
+in full is converted and only a truncated one is held back.
+
+A document large enough to need several chunks came apart at those seams.
+Text was silently rewritten, and often enough the damage landed inside a
+name and parsing stopped with NC_E_QNAMECHARACTER -- which is what kept
+Word from opening a Chinese OOXML document of any size, since Office
+parses OOXML with XmlLite.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 106a65b12fa40aac451f6a37b8e9297623fc91ac)
+
+diff --git a/dlls/xmllite/reader.c b/dlls/xmllite/reader.c
+index 27d4fd014c1..ce465822fba 100644
+--- a/dlls/xmllite/reader.c
++++ b/dlls/xmllite/reader.c
+@@ -928,17 +928,30 @@ static int readerinput_get_utf8_convlen(xmlreaderinput *readerinput)
+ {
+     encoded_buffer *buffer = &readerinput->buffer->encoded;
+     int len = buffer->written;
++    unsigned char lead;
++    int need;
+ 
+     assert(len);
+ 
+     /* complete single byte char */
+     if (!(buffer->data[len-1] & 0x80)) return len;
+ 
+-    /* find start byte of multibyte char */
+-    while (--len && !(buffer->data[len] & 0xc0))
+-        ;
++    /* 往回跳过续字节 10xxxxxx，停在多字节序列的首字节上。原先的条件筛的是
++       0x00-0x3f 这段 ASCII，对续字节和首字节一律立即停下，于是任何以非 ASCII
++       结尾的缓冲都被截掉最后一个字节 —— 完整的字符被切开，没读完的字符又留不全。 */
++    while (len && (buffer->data[len-1] & 0xc0) == 0x80)
++        len--;
++
++    if (!len) return 0;
++
++    /* 首字节声明了整个序列有多长，据此判断它在本次缓冲里是否已经读齐 */
++    lead = buffer->data[len-1];
++    need = (lead & 0xe0) == 0xc0 ? 2 :
++           (lead & 0xf0) == 0xe0 ? 3 :
++           (lead & 0xf8) == 0xf0 ? 4 : 1;
+ 
+-    return len;
++    /* 读齐了就整块都能转换，没读齐就截在这个字符之前 */
++    return len - 1 + need <= buffer->written ? buffer->written : len - 1;
+ }
+ 
+ /* Returns byte length of complete char sequence for buffer code page,
+@@ -969,7 +982,10 @@ static void readerinput_shrinkraw(xmlreaderinput *readerinput, int len)
+         len = readerinput_get_convlen(readerinput);
+ 
+     assert(len >= 0);
+-    memmove(buffer->data, buffer->data + buffer->cur + (buffer->written - len), len);
++    /* len 是已经转换掉的字节数，要留下的是它后面那段还不成整字符的尾巴：
++       起点 cur + len，长度 written - cur - len。原先按"末尾 len 字节"搬运，
++       当多字节字符恰好跨在读取块边界上时留错字节，解析随后报 NC_E_QNAMECHARACTER。 */
++    memmove(buffer->data, buffer->data + buffer->cur + len, buffer->written - buffer->cur - len);
+     /* everything below cur is lost too */
+     buffer->written -= len + buffer->cur;
+     /* after this point we don't need cur offset really,
+diff --git a/dlls/xmllite/tests/reader.c b/dlls/xmllite/tests/reader.c
+index 0dd490ff989..edabad65c42 100644
+--- a/dlls/xmllite/tests/reader.c
++++ b/dlls/xmllite/tests/reader.c
+@@ -2671,6 +2671,74 @@ static void test_attribute_by_name(void)
+     IXmlReader_Release(reader);
+ }
+ 
++static void test_multibyte_chunk_boundary(void)
++{
++    /* 输入缓冲一次只从流里取一块，块长不是 3 的倍数，所以连续的三字节 UTF-8 字符
++       必然会有一个跨在块边界上。缓冲里余下的半个字符要原样留到下一次转换，留错
++       字节的话后面的内容就被破坏，解析会在中途以 NC_E_QNAMECHARACTER 停下。 */
++    static const char start[] = "<?xml version=\"1.0\" encoding=\"utf-8\"?><a>";
++    static const char cjk[] = "\xe4\xb8\xad";   /* U+4E2D，占 3 字节 */
++    static const char end[] = "</a>";
++    const unsigned int count = 40000;           /* 足够跨过多次缓冲增长 */
++    unsigned int i, size, depth, elements, chars, bad;
++    IXmlReader *reader;
++    XmlNodeType type;
++    IStream *stream;
++    HRESULT hr;
++    char *xml;
++
++    hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    size = (sizeof(start) - 1) + count * (sizeof(cjk) - 1) + (sizeof(end) - 1);
++    xml = malloc(size);
++    ok(xml != NULL, "Failed to allocate test input.\n");
++    if (!xml)
++    {
++        IXmlReader_Release(reader);
++        return;
++    }
++
++    memcpy(xml, start, sizeof(start) - 1);
++    for (i = 0; i < count; i++)
++        memcpy(xml + (sizeof(start) - 1) + i * (sizeof(cjk) - 1), cjk, sizeof(cjk) - 1);
++    memcpy(xml + size - (sizeof(end) - 1), end, sizeof(end) - 1);
++
++    stream = create_stream_on_data(xml, size);
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    depth = elements = 0;
++    chars = bad = 0;
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK)
++    {
++        if (type == XmlNodeType_Element) { depth++; elements++; }
++        if (type == XmlNodeType_EndElement) depth--;
++        if (type == XmlNodeType_Text)
++        {
++            const WCHAR *value;
++            UINT len = 0, k;
++
++            hr = IXmlReader_GetValue(reader, &value, &len);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            for (k = 0; k < len; k++)
++                if (value[k] != 0x4e2d) bad++;
++            chars += len;
++        }
++    }
++    ok(hr == S_FALSE, "Parsing stopped early, hr %#lx.\n", hr);
++    ok(elements == 1, "Unexpected element count %u.\n", elements);
++    ok(!depth, "Unbalanced elements, depth %u.\n", depth);
++    /* 内容必须一字不差地还原：坏字节不会让解析失败，只会把文本改掉 */
++    ok(chars == count, "Got %u characters, expected %u.\n", chars, count);
++    ok(!bad, "%u characters were corrupted.\n", bad);
++
++    IXmlReader_SetInput(reader, NULL);
++    IStream_Release(stream);
++    free(xml);
++    IXmlReader_Release(reader);
++}
++
+ START_TEST(reader)
+ {
+     test_reader_create();
+@@ -2699,4 +2767,5 @@ START_TEST(reader)
+     test_reader_position();
+     test_string_pointers();
+     test_attribute_by_name();
++    test_multibyte_chunk_boundary();
+ }

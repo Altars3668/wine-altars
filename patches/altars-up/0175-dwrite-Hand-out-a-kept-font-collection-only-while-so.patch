@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 20:32:30 -0400
+Subject: [PATCH] dwrite: Hand out a kept font collection only while something
+ holds it.
+
+The factory keeps its system and EUDC collections without holding them,
+and a collection takes itself off the factory as its last reference goes.
+factory_get_system_collection() looked at the kept one, then read the
+pointer again to query it, with no lock between: a last reference going on
+another thread in between left it NULL or pointing at freed memory.  A
+thread that lost the race to create the collection released its own and
+then the winner's once more, one reference fewer than the collection had
+holders.  GetEudcFontCollection() handed out the kept one the same way.
+
+The kept collection is now looked at under the factory's lock, which a
+collection takes too to let go, and handed out only with a reference added
+while there still is one; one created meanwhile gives way to one kept and
+still held.
+
+The d2d1 tests, whose threads make text formats from one factory at once,
+died on the first of twelve runs, reading address 0 in
+IDWriteFontCollection_QueryInterface() under
+factory_get_system_collection(); with this, 24 runs (12 each on the GL and
+Vulkan renderers) pass.  The dwrite tests fail as they did before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 918d65f35b44b2350b62b92b90c1920c563ca0fd)
+
+diff --git a/dlls/dwrite/dwrite_private.h b/dlls/dwrite/dwrite_private.h
+index 2d7987d5159..a7f24da3d33 100644
+--- a/dlls/dwrite/dwrite_private.h
++++ b/dlls/dwrite/dwrite_private.h
+@@ -363,6 +363,7 @@ extern HRESULT create_fontfacereference(IDWriteFactory7 *factory, IDWriteFontFil
+ extern HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFontFile * const *files, UINT32 num_files,
+         DWRITE_FONT_SIMULATIONS simulations, struct list **cache, REFIID riid, void **obj);
+ extern void factory_detach_fontcollection(IDWriteFactory7 *factory, IDWriteFontCollection3 *collection);
++extern BOOL fontcollection_try_addref(IDWriteFontCollection3 *collection);
+ extern void factory_detach_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 *interop);
+ extern struct fontfacecached *factory_cache_fontface(IDWriteFactory7 *factory, struct list *fontfaces,
+         IDWriteFontFace5 *fontface);
+diff --git a/dlls/dwrite/font.c b/dlls/dwrite/font.c
+index 9544784b8cc..fc1bc25a508 100644
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -3263,6 +3263,23 @@ static ULONG WINAPI dwritefontcollection_AddRef(IDWriteFontCollection3 *iface)
+     return refcount;
+ }
+ 
++/* A reference to a collection that something still holds, or none: one whose last reference is gone is on its way
++ * out, however it was found. */
++BOOL fontcollection_try_addref(IDWriteFontCollection3 *iface)
++{
++    struct dwrite_fontcollection *collection = impl_from_IDWriteFontCollection3(iface);
++    LONG refcount;
++
++    do
++    {
++        if (!(refcount = collection->refcount))
++            return FALSE;
++    } while (InterlockedCompareExchange(&collection->refcount, refcount + 1, refcount) != refcount);
++
++    TRACE("%p, refcount %ld.\n", iface, refcount + 1);
++    return TRUE;
++}
++
+ static ULONG WINAPI dwritefontcollection_Release(IDWriteFontCollection3 *iface)
+ {
+     struct dwrite_fontcollection *collection = impl_from_IDWriteFontCollection3(iface);
+diff --git a/dlls/dwrite/main.c b/dlls/dwrite/main.c
+index b343d65631c..c8172d3f59e 100644
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -724,10 +724,47 @@ static struct collectionloader *factory_get_collection_loader(struct dwritefacto
+     return found;
+ }
+ 
++/*
++ * The factory keeps its system and EUDC collections without holding them, and a collection lets go of the factory
++ * as its last reference goes (factory_detach_fontcollection()).  One kept is handed out again only while something
++ * still holds it, looked at under the factory's lock, which letting go takes too: on another thread its last
++ * reference may be going just then.
++ */
++static IDWriteFontCollection3 *factory_get_kept_collection(struct dwritefactory *factory, void **slot)
++{
++    IDWriteFontCollection3 *collection;
++
++    EnterCriticalSection(&factory->cs);
++    if ((collection = *slot) && !fontcollection_try_addref(collection))
++        collection = NULL;
++    LeaveCriticalSection(&factory->cs);
++    return collection;
++}
++
++/* A new collection is kept unless another, still held, is kept already; whichever it is comes back held. */
++static IDWriteFontCollection3 *factory_keep_collection(struct dwritefactory *factory, void **slot,
++        IDWriteFontCollection3 *collection)
++{
++    IDWriteFontCollection3 *kept;
++
++    EnterCriticalSection(&factory->cs);
++    if ((kept = *slot) && fontcollection_try_addref(kept))
++    {
++        LeaveCriticalSection(&factory->cs);
++        IDWriteFontCollection3_Release(collection);
++        return kept;
++    }
++    *slot = collection;
++    LeaveCriticalSection(&factory->cs);
++    return collection;
++}
++
+ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
+         DWRITE_FONT_FAMILY_MODEL family_model, REFIID riid, void **out)
+ {
+-    IDWriteFontCollection *collection;
++    void **slot = (void **)&factory->system_collections[family_model];
++    IDWriteFontCollection3 *collection;
++    IDWriteFontCollection *created;
+     HRESULT hr;
+ 
+     *out = NULL;
+@@ -738,20 +775,18 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
+         return E_INVALIDARG;
+     }
+ 
+-    if (factory->system_collections[family_model])
+-        return IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
+-
+-    if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
++    if (!(collection = factory_get_kept_collection(factory, slot)))
+     {
+-        WARN("Failed to create system font collection, hr %#lx.\n", hr);
+-        return hr;
++        if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &created)))
++        {
++            WARN("Failed to create system font collection, hr %#lx.\n", hr);
++            return hr;
++        }
++        collection = factory_keep_collection(factory, slot, (IDWriteFontCollection3 *)created);
+     }
+ 
+-    if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, NULL))
+-        IDWriteFontCollection_Release(collection);
+-
+-    hr = IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
+-    IDWriteFontCollection_Release(factory->system_collections[family_model]);
++    hr = IDWriteFontCollection3_QueryInterface(collection, riid, out);
++    IDWriteFontCollection3_Release(collection);
+     return hr;
+ }
+ 
+@@ -1348,6 +1383,7 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
+     BOOL check_for_updates)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
++    IDWriteFontCollection3 *eudc_collection;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p, %p, %d.\n", iface, collection, check_for_updates);
+@@ -1355,23 +1391,18 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
+     if (check_for_updates)
+         FIXME("checking for eudc updates not implemented\n");
+ 
+-    if (factory->eudc_collection)
+-        IDWriteFontCollection1_AddRef(factory->eudc_collection);
+-    else {
+-        IDWriteFontCollection3 *eudc_collection;
+-
++    if (!(eudc_collection = factory_get_kept_collection(factory, (void **)&factory->eudc_collection)))
++    {
+         if (FAILED(hr = get_eudc_fontcollection(iface, &eudc_collection)))
+         {
+             *collection = NULL;
+             WARN("Failed to get EUDC collection, hr %#lx.\n", hr);
+             return hr;
+         }
+-
+-        if (InterlockedCompareExchangePointer((void **)&factory->eudc_collection, eudc_collection, NULL))
+-            IDWriteFontCollection3_Release(eudc_collection);
++        eudc_collection = factory_keep_collection(factory, (void **)&factory->eudc_collection, eudc_collection);
+     }
+ 
+-    *collection = (IDWriteFontCollection *)factory->eudc_collection;
++    *collection = (IDWriteFontCollection *)eudc_collection;
+ 
+     return hr;
+ }
+@@ -2251,9 +2282,12 @@ void factory_detach_fontcollection(IDWriteFactory7 *iface, IDWriteFontCollection
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+     unsigned int i;
+ 
++    /* under the lock, so that nothing looking for it finds it gone half way */
++    EnterCriticalSection(&factory->cs);
+     for (i = 0; i < ARRAY_SIZE(factory->system_collections); ++i)
+         InterlockedCompareExchangePointer((void **)&factory->system_collections[i], NULL, collection);
+     InterlockedCompareExchangePointer((void **)&factory->eudc_collection, NULL, collection);
++    LeaveCriticalSection(&factory->cs);
+     IDWriteFactory7_Release(iface);
+ }
+ 

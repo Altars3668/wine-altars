@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 17:03:03 -0400
+Subject: [PATCH] wined3d: Keep the table of shared handles under a lock of its
+ own.
+
+resource_cleanup() took the wined3d mutex to drop a resource's shared
+handle, and resources are also released on the command stream thread,
+for example the temporary textures of a blit.  A Map() on an application
+thread holds the mutex while it waits for the command stream to go idle,
+so the two waited for each other: the d3d11 tests hung for good in
+test_multisample_resolve on GL, and Office would hang the same way when
+a Map() met such a blit.
+
+With a lock of its own the table is never held by anyone waiting for the
+command stream.  The d3d11 tests now run to the end on GL: 563041 tests,
+the same 416 failures with and without the change to the context code
+that follows; of the 351 printed, 336 are in test_shared_resource, 13 in
+test_keyed_mutex and 2 in test_negative_viewports.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8f9cc9f064d685d86228d48e44dc7556c9438381)
+
+diff --git a/dlls/wined3d/resource.c b/dlls/wined3d/resource.c
+index 3d7822d351c..f8a3acafd17 100644
+--- a/dlls/wined3d/resource.c
++++ b/dlls/wined3d/resource.c
+@@ -239,6 +239,18 @@ static void wined3d_resource_destroy_object(void *object)
+ 
+ static struct list wined3d_shared_resources = LIST_INIT(wined3d_shared_resources);
+ 
++/* Not the wined3d mutex: resources are also released on the command stream
++ * thread, for example the temporary textures of a blit, while an application
++ * thread holding the mutex waits for the command stream to finish. */
++static CRITICAL_SECTION wined3d_shared_resources_cs;
++static CRITICAL_SECTION_DEBUG wined3d_shared_resources_cs_debug =
++{
++    0, 0, &wined3d_shared_resources_cs,
++    {&wined3d_shared_resources_cs_debug.ProcessLocksList, &wined3d_shared_resources_cs_debug.ProcessLocksList},
++    0, 0, {(DWORD_PTR)(__FILE__ ": wined3d_shared_resources_cs")}
++};
++static CRITICAL_SECTION wined3d_shared_resources_cs = {&wined3d_shared_resources_cs_debug, -1, 0, 0, 0, 0};
++
+ struct wined3d_shared_resource
+ {
+     struct list entry;
+@@ -255,14 +267,14 @@ HRESULT CDECL wined3d_resource_get_shared_handle(struct wined3d_resource *resour
+     if (!handle)
+         return E_INVALIDARG;
+ 
+-    wined3d_mutex_lock();
++    EnterCriticalSection(&wined3d_shared_resources_cs);
+ 
+     LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
+     {
+         if (shared->resource == resource)
+         {
+             *handle = shared->handle;
+-            wined3d_mutex_unlock();
++            LeaveCriticalSection(&wined3d_shared_resources_cs);
+             TRACE("Returning existing handle %p.\n", *handle);
+             return WINED3D_OK;
+         }
+@@ -270,7 +282,7 @@ HRESULT CDECL wined3d_resource_get_shared_handle(struct wined3d_resource *resour
+ 
+     if (!(shared = malloc(sizeof(*shared))))
+     {
+-        wined3d_mutex_unlock();
++        LeaveCriticalSection(&wined3d_shared_resources_cs);
+         return E_OUTOFMEMORY;
+     }
+ 
+@@ -280,13 +292,13 @@ HRESULT CDECL wined3d_resource_get_shared_handle(struct wined3d_resource *resour
+     if (!(shared->handle = CreateEventW(NULL, TRUE, FALSE, NULL)))
+     {
+         free(shared);
+-        wined3d_mutex_unlock();
++        LeaveCriticalSection(&wined3d_shared_resources_cs);
+         return E_FAIL;
+     }
+     shared->resource = resource;
+     list_add_head(&wined3d_shared_resources, &shared->entry);
+ 
+-    wined3d_mutex_unlock();
++    LeaveCriticalSection(&wined3d_shared_resources_cs);
+ 
+     *handle = shared->handle;
+     TRACE("Created handle %p.\n", *handle);
+@@ -301,7 +313,7 @@ struct wined3d_resource * CDECL wined3d_resource_from_shared_handle(HANDLE handl
+ 
+     TRACE("handle %p.\n", handle);
+ 
+-    wined3d_mutex_lock();
++    EnterCriticalSection(&wined3d_shared_resources_cs);
+     LIST_FOR_EACH_ENTRY(shared, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
+     {
+         if (shared->handle == handle)
+@@ -310,7 +322,7 @@ struct wined3d_resource * CDECL wined3d_resource_from_shared_handle(HANDLE handl
+             break;
+         }
+     }
+-    wined3d_mutex_unlock();
++    LeaveCriticalSection(&wined3d_shared_resources_cs);
+ 
+     return resource;
+ }
+@@ -319,7 +331,7 @@ static void wined3d_resource_release_shared_handle(struct wined3d_resource *reso
+ {
+     struct wined3d_shared_resource *shared, *next;
+ 
+-    wined3d_mutex_lock();
++    EnterCriticalSection(&wined3d_shared_resources_cs);
+     LIST_FOR_EACH_ENTRY_SAFE(shared, next, &wined3d_shared_resources, struct wined3d_shared_resource, entry)
+     {
+         if (shared->resource != resource)
+@@ -328,7 +340,7 @@ static void wined3d_resource_release_shared_handle(struct wined3d_resource *reso
+         CloseHandle(shared->handle);
+         free(shared);
+     }
+-    wined3d_mutex_unlock();
++    LeaveCriticalSection(&wined3d_shared_resources_cs);
+ }
+ 
+ void resource_cleanup(struct wined3d_resource *resource)

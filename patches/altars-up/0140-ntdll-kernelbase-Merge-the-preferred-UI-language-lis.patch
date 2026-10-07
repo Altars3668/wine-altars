@@ -1,0 +1,800 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 14:14:02 -0400
+Subject: [PATCH] ntdll, kernelbase: Merge the preferred UI language lists as
+ Windows 11 does.
+
+Word asks GetUserPreferredUILanguages and GetSystemPreferredUILanguages
+for names, in pairs, as it picks the language of its resources.
+Upstream keeps the thread's, the process's, the user's and the
+system's lists, loads the last two from the registry, and looks for
+resources through them.  tools/uilangprobe measured Windows 11 (a
+zh-CN system with the en-US UI installed, and no PreferredUILanguages
+value in the registry), and where upstream's lists differ from what it
+answers, they now answer the same:
+
+- The user's list is the user's languages and en-US, which every UI
+  language falls back to; the system's, the system's languages and
+  en-US.  Upstream left en-US out.
+- The thread's list is the thread's own languages, then the process's,
+  then the user's with their parents (LOCALE_SPARENT: zh-CN, zh-Hans,
+  zh), then, with the user fallback, which is the default, en-US and
+  the system's languages.  MUI_MERGE_SYSTEM_FALLBACK follows every
+  language with its parents (sr-Latn-RS, sr-Latn, sr) and keeps the
+  user's languages, which upstream's left out; MUI_THREAD_LANGUAGES
+  gives the thread's own only.
+- A thread or a process keeps at most five languages, by the name of
+  their language id (de-DE_phoneb is de-DE, zh-Hans-CN is zh-CN).
+  Names that are not languages are passed over, and a list with none
+  fails with ERROR_GEN_FAILURE, as does one that begins with an empty
+  name; an empty or no list takes them away.  An id is as many hex
+  digits as there are, so 0x0409 is not one.
+- The console and complex script filters stay with the thread and
+  leave its languages alone, where upstream's took them away.  Its own
+  list then leaves out what they do not pass and puts en-US in instead,
+  or the language's console fallback when the console has its code
+  page; the merged lists, and the languages resources are looked for
+  in, keep those after the user's languages.  Which languages pass was
+  measured for 85 of them.
+- Counts, sizes and buffers on success and failure are as measured: a
+  thread's list has its count even when the buffer is short, a
+  process's empty list has none.
+
+SetThreadUILanguage with a neutral language makes the thread's list the
+language it defaults to (zh-Hans: zh-CN) and returns the one given, and
+a thread's languages are freed as it exits.
+
+Wine's locale data puts sa-IN in the Latin script and has no
+tzm-Tfng-MA, so the complex script filter keeps the first and cannot be
+given the second.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/locale.c b/dlls/kernel32/tests/locale.c
+index aa21d3a7449..a30fae46683 100644
+--- a/dlls/kernel32/tests/locale.c
++++ b/dlls/kernel32/tests/locale.c
+@@ -87,6 +87,9 @@ static BOOL (WINAPI *pGetSystemPreferredUILanguages)(DWORD, ULONG*, WCHAR*, ULON
+ static BOOL (WINAPI *pGetThreadPreferredUILanguages)(DWORD, ULONG*, WCHAR*, ULONG*);
+ static BOOL (WINAPI *pSetThreadPreferredUILanguages)(DWORD, const WCHAR*, ULONG*);
+ static BOOL (WINAPI *pGetUserPreferredUILanguages)(DWORD, ULONG*, WCHAR*, ULONG*);
++static BOOL (WINAPI *pGetProcessPreferredUILanguages)(DWORD, ULONG*, WCHAR*, ULONG*);
++static BOOL (WINAPI *pSetProcessPreferredUILanguages)(DWORD, const WCHAR*, ULONG*);
++static BOOL (WINAPI *pSetThreadPreferredUILanguages)(DWORD, const WCHAR*, ULONG*);
+ static WCHAR (WINAPI *pRtlUpcaseUnicodeChar)(WCHAR);
+ static INT (WINAPI *pGetNumberFormatEx)(LPCWSTR, DWORD, LPCWSTR, const NUMBERFMTW *, LPWSTR, int);
+ static INT (WINAPI *pFindNLSStringEx)(LPCWSTR, DWORD, LPCWSTR, INT, LPCWSTR, INT, LPINT, LPNLSVERSIONINFO, LPVOID, LPARAM);
+@@ -143,6 +146,9 @@ static void InitFunctionPointers(void)
+   X(GetSystemPreferredUILanguages);
+   X(GetThreadPreferredUILanguages);
+   X(GetUserPreferredUILanguages);
++  X(GetProcessPreferredUILanguages);
++  X(SetProcessPreferredUILanguages);
++  X(SetThreadPreferredUILanguages);
+   X(GetNumberFormatEx);
+   X(FindNLSStringEx);
+   X(SetThreadPreferredUILanguages);
+@@ -7110,6 +7116,212 @@ static void test_GetUserPreferredUILanguages(void)
+     HeapFree(GetProcessHeap(), 0, buffer);
+ }
+ 
++/* a list of preferred UI languages as a string with its languages separated by '|' */
++static const char *debugstr_langs( const WCHAR *list )
++{
++    char buffer[512], *p = buffer;
++
++    if (!*list) return "\"\"";
++    while (*list && p < buffer + sizeof(buffer) - 64)
++    {
++        if (p != buffer) *p++ = '|';
++        p += sprintf( p, "%ls", list );
++        list += wcslen( list ) + 1;
++    }
++    return wine_dbg_sprintf( "\"%s\"", buffer );
++}
++
++static BOOL thread_languages( DWORD flags, WCHAR *buffer, ULONG *count )
++{
++    ULONG size = 256;
++
++    *count = 0xdead;
++    memset( buffer, 0xcc, size * sizeof(WCHAR) );
++    return pGetThreadPreferredUILanguages( flags, count, buffer, &size );
++}
++
++static void test_PreferredUILanguagesLists(void)
++{
++    static const WCHAR six[] = L"en-US\0fr-FR\0de-DE\0es-ES\0it-IT\0ja-JP\0";
++    WCHAR buffer[256], parent[LOCALE_NAME_MAX_LENGTH], user[LOCALE_NAME_MAX_LENGTH];
++    ULONG count, size;
++    LANGID lang;
++    DWORD err;
++    BOOL ret;
++
++    if (!pSetThreadPreferredUILanguages || !pGetProcessPreferredUILanguages)
++    {
++        win_skip( "SetThreadPreferredUILanguages is not available.\n" );
++        return;
++    }
++    pSetThreadPreferredUILanguages( MUI_RESET_FILTERS, NULL, NULL );
++    pSetThreadPreferredUILanguages( 0, NULL, NULL );
++    pSetProcessPreferredUILanguages( 0, NULL, NULL );
++
++    /* with nothing set, the thread list starts with the user's language and its parents */
++    LCIDToLocaleName( GetUserDefaultUILanguage(), user, ARRAY_SIZE(user), LOCALE_ALLOW_NEUTRAL_NAMES );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_MERGE_SYSTEM_FALLBACK, buffer, &count );
++    ok( ret, "got error %lu\n", GetLastError() );
++    ok( !wcscmp( buffer, user ), "got %s, user language %s\n", debugstr_langs( buffer ), debugstr_w(user) );
++    if (GetLocaleInfoEx( user, LOCALE_SPARENT, parent, ARRAY_SIZE(parent) ) && parent[0])
++        ok( !wcscmp( buffer + wcslen( buffer ) + 1, parent ), "got %s, parent %s\n",
++            debugstr_langs( buffer ), debugstr_w(parent) );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && !count && !buffer[0] && !buffer[1], "got %d, count %lu, %s\n", ret, count, debugstr_langs( buffer ) );
++    ok( GetThreadUILanguage() == GetUserDefaultUILanguage(), "got %04x\n", GetThreadUILanguage() );
++
++    size = ARRAY_SIZE(buffer);
++    ret = pGetUserPreferredUILanguages( MUI_LANGUAGE_NAME, &count, buffer, &size );
++    ok( ret && !wcscmp( buffer, user ), "got %d, %s\n", ret, debugstr_langs( buffer ) );
++
++    /* the thread's own languages, as they are named */
++    count = 0xdead;
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"en-us\0FR-fr\0en-US\0", &count );
++    ok( ret, "got error %lu\n", GetLastError() );
++    ok( count == 2, "got count %lu\n", count );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && count == 2 && !memcmp( buffer, L"en-US\0fr-FR\0", 13 * sizeof(WCHAR) ),
++        "got %d, count %lu, %s\n", ret, count, debugstr_langs( buffer ) );
++    ret = thread_languages( MUI_LANGUAGE_ID | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && !memcmp( buffer, L"0409\0" L"040C\0", 11 * sizeof(WCHAR) ), "got %s\n", debugstr_langs( buffer ) );
++    ret = thread_languages( MUI_LANGUAGE_NAME, buffer, &count );
++    ok( ret && !memcmp( buffer, L"en-US\0fr-FR\0", 12 * sizeof(WCHAR) ), "got %s\n", debugstr_langs( buffer ) );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_MERGE_SYSTEM_FALLBACK, buffer, &count );
++    ok( ret && !memcmp( buffer, L"en-US\0en\0fr-FR\0fr\0", 18 * sizeof(WCHAR) ), "got %s\n", debugstr_langs( buffer ) );
++    ok( GetThreadUILanguage() == MAKELANGID( LANG_ENGLISH, SUBLANG_ENGLISH_US ), "got %04x\n", GetThreadUILanguage() );
++
++    /* a short buffer: the size, and the count for a thread */
++    count = 0xdead;
++    size = 2;
++    SetLastError( 0xdeadbeef );
++    ret = pGetThreadPreferredUILanguages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, &count, buffer, &size );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INSUFFICIENT_BUFFER, "got %d, error %lu\n", ret, err );
++    ok( size == 13 && count == 2, "got size %lu, count %lu\n", size, count );
++
++    /* at most five, names that are not languages passed over, and an empty one to begin with fails */
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, six, &count );
++    ok( ret && count == 5, "got %d, count %lu\n", ret, count );
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"de-DE_phoneb\0xx-XX\0fr-FR\0", &count );
++    ok( ret && count == 2, "got %d, count %lu\n", ret, count );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && !memcmp( buffer, L"de-DE\0fr-FR\0", 13 * sizeof(WCHAR) ), "got %s\n", debugstr_langs( buffer ) );
++    SetLastError( 0xdeadbeef );
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"xx-XX\0", &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_GEN_FAILURE, "got %d, error %lu\n", ret, err );
++    SetLastError( 0xdeadbeef );
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"\0en-US\0", &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_GEN_FAILURE, "got %d, error %lu\n", ret, err );
++
++    /* ids are hex digits, as many as there are */
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_ID, L"407\0", &count );
++    ok( ret && count == 1, "got %d, count %lu\n", ret, count );
++    ok( GetThreadUILanguage() == MAKELANGID( LANG_GERMAN, SUBLANG_GERMAN ), "got %04x\n", GetThreadUILanguage() );
++    SetLastError( 0xdeadbeef );
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_ID, L"0x0409\0", &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_GEN_FAILURE, "got %d, error %lu\n", ret, err );
++
++    SetLastError( 0xdeadbeef );
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID, L"en-US\0", &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++    SetLastError( 0xdeadbeef );
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME | MUI_CONSOLE_FILTER, L"en-US\0", &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++    SetLastError( 0xdeadbeef );
++    ret = pSetThreadPreferredUILanguages( 0x80, NULL, &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++
++    SetLastError( 0xdeadbeef );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES | MUI_MERGE_USER_FALLBACK, buffer, &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++    SetLastError( 0xdeadbeef );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES | MUI_MERGE_SYSTEM_FALLBACK, buffer, &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++    SetLastError( 0xdeadbeef );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_RESET_FILTERS, buffer, &count );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++
++    /* a filter keeps the languages, and leaves out of the lists what it does not pass */
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"ar-SA\0de-DE\0", &count );
++    ok( ret && count == 2, "got %d, count %lu\n", ret, count );
++    ret = pSetThreadPreferredUILanguages( MUI_COMPLEX_SCRIPT_FILTER, NULL, &count );
++    ok( ret, "got error %lu\n", GetLastError() );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && count == 2 && !wcscmp( buffer, L"de-DE" ), "got %d, count %lu, %s\n", ret, count, debugstr_langs( buffer ) );
++    ret = thread_languages( MUI_LANGUAGE_NAME, buffer, &count );
++    ok( ret && !wcscmp( buffer, L"de-DE" ) && !wcscmp( buffer + 6, user ), "got %s\n", debugstr_langs( buffer ) );
++    ok( GetThreadUILanguage() == MAKELANGID( LANG_GERMAN, SUBLANG_GERMAN ), "got %04x\n", GetThreadUILanguage() );
++    ret = pSetThreadPreferredUILanguages( MUI_RESET_FILTERS, NULL, &count );
++    ok( ret, "got error %lu\n", GetLastError() );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && count == 2 && !memcmp( buffer, L"ar-SA\0de-DE\0", 13 * sizeof(WCHAR) ), "got %s\n", debugstr_langs( buffer ) );
++
++    /* an empty list takes the thread's languages away */
++    ret = pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"\0", &count );
++    ok( ret, "got error %lu\n", GetLastError() );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && !count, "got %d, count %lu\n", ret, count );
++
++    /* SetThreadUILanguage sets the thread's list, a neutral language as the one it defaults to */
++    lang = SetThreadUILanguage( MAKELANGID( LANG_FRENCH, SUBLANG_FRENCH ) );
++    ok( lang == MAKELANGID( LANG_FRENCH, SUBLANG_FRENCH ), "got %04x\n", lang );
++    ret = thread_languages( MUI_LANGUAGE_NAME | MUI_THREAD_LANGUAGES, buffer, &count );
++    ok( ret && count == 1 && !wcscmp( buffer, L"fr-FR" ), "got %s\n", debugstr_langs( buffer ) );
++    lang = SetThreadUILanguage( 0 );
++    ok( lang == MAKELANGID( LANG_FRENCH, SUBLANG_FRENCH ), "got %04x\n", lang );
++    lang = SetThreadUILanguage( 0x7804 );
++    ok( lang == 0x7804, "got %04x\n", lang );
++    ok( GetThreadUILanguage() == MAKELANGID( LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED ), "got %04x\n", GetThreadUILanguage() );
++    pSetThreadPreferredUILanguages( 0, NULL, NULL );
++
++    /* the process's, which come after the thread's */
++    count = 0xdead;
++    ret = pSetProcessPreferredUILanguages( MUI_LANGUAGE_NAME, L"it-IT\0", &count );
++    ok( ret && count == 1, "got %d, count %lu\n", ret, count );
++    count = 0xdead;
++    size = ARRAY_SIZE(buffer);
++    ret = pGetProcessPreferredUILanguages( MUI_LANGUAGE_ID, &count, buffer, &size );
++    ok( ret && count == 1 && size == 6 && !wcscmp( buffer, L"0410" ), "got %d, count %lu, size %lu, %s\n",
++        ret, count, size, debugstr_langs( buffer ) );
++    ok( GetThreadUILanguage() == MAKELANGID( LANG_ITALIAN, SUBLANG_ITALIAN ), "got %04x\n", GetThreadUILanguage() );
++    pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"fr-FR\0", NULL );
++    ret = thread_languages( MUI_LANGUAGE_NAME, buffer, &count );
++    ok( ret && !memcmp( buffer, L"fr-FR\0it-IT\0", 12 * sizeof(WCHAR) ), "got %s\n", debugstr_langs( buffer ) );
++    pSetThreadPreferredUILanguages( 0, NULL, NULL );
++
++    count = 0xdead;
++    size = 2;
++    memset( buffer, 0xcc, sizeof(buffer) );
++    SetLastError( 0xdeadbeef );
++    ret = pGetProcessPreferredUILanguages( MUI_LANGUAGE_NAME, &count, buffer, &size );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INSUFFICIENT_BUFFER, "got %d, error %lu\n", ret, err );
++    ok( count == 1 && size == 7 && buffer[0] == 0xcccc, "got count %lu, size %lu, %#x\n", count, size, buffer[0] );
++
++    SetLastError( 0xdeadbeef );
++    ret = pSetProcessPreferredUILanguages( MUI_CONSOLE_FILTER, NULL, NULL );
++    err = GetLastError();
++    ok( !ret && err == ERROR_INVALID_PARAMETER, "got %d, error %lu\n", ret, err );
++
++    /* an empty list has no count */
++    ret = pSetProcessPreferredUILanguages( MUI_LANGUAGE_NAME, NULL, NULL );
++    ok( ret, "got error %lu\n", GetLastError() );
++    count = 0xdead;
++    size = ARRAY_SIZE(buffer);
++    memset( buffer, 0xcc, sizeof(buffer) );
++    ret = pGetProcessPreferredUILanguages( MUI_LANGUAGE_NAME, &count, buffer, &size );
++    ok( ret && count == 0xdead && size == 2 && !buffer[0] && !buffer[1], "got %d, count %#lx, size %lu\n", ret, count, size );
++}
++
+ static void test_FindNLSStringEx(void)
+ {
+     INT res;
+@@ -7284,6 +7496,8 @@ static void test_SetThreadUILanguage(void)
+     res = pSetThreadUILanguage(0);
+     ok(res == MAKELANGID(LANG_DUTCH, SUBLANG_DUTCH_BELGIAN),
+     "expected %d got %d\n", MAKELANGID(LANG_DUTCH, SUBLANG_DUTCH_BELGIAN), res);
++
++    if (pSetThreadPreferredUILanguages) pSetThreadPreferredUILanguages(0, NULL, NULL);
+ }
+ 
+ /* read a Unicode string from NormalizationTest.txt format; helper for test_NormalizeString */
+@@ -8838,6 +9052,7 @@ START_TEST(locale)
+   test_GetSystemPreferredUILanguages();
+   test_GetThreadPreferredUILanguages();
+   test_GetUserPreferredUILanguages();
++  test_PreferredUILanguagesLists();
+   test_FindNLSStringEx();
+   test_FindStringOrdinal();
+   test_SetThreadUILanguage();
+diff --git a/dlls/kernelbase/locale.c b/dlls/kernelbase/locale.c
+index dc3e33bf839..ab00d3eff54 100644
+--- a/dlls/kernelbase/locale.c
++++ b/dlls/kernelbase/locale.c
+@@ -6417,6 +6417,8 @@ LANGID WINAPI DECLSPEC_HOTPATCH SetThreadUILanguage( LANGID langid )
+ 
+     if (!langid) return GetThreadUILanguage(); /* FIXME: set MUI_CONSOLE_FILTER */
+ 
++    /* a neutral language sets the language it defaults to (zh-Hans: zh-CN), and is what is returned */
++    if (PRIMARYLANGID( langid ) != LANG_NEUTRAL) lcid = ConvertDefaultLocale( langid );
+     if (!(locale = NlsValidateLocale( &lcid, 0 )))
+     {
+         SetLastError( ERROR_INVALID_PARAMETER );
+@@ -6425,7 +6427,7 @@ LANGID WINAPI DECLSPEC_HOTPATCH SetThreadUILanguage( LANGID langid )
+     wcscpy( buffer, locale_strings + locale->sname + 1 );
+     buffer[wcslen(buffer) + 1] = 0;
+     if (!SetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, buffer, NULL )) return 0;
+-    return LANGIDFROMLCID( lcid );
++    return PRIMARYLANGID( langid ) != LANG_NEUTRAL ? langid : LANGIDFROMLCID( lcid );
+ }
+ 
+ 
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index b0b2392c504..123eae25aeb 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4010,6 +4010,7 @@ void WINAPI LdrShutdownThread(void)
+     /* don't call DbgUiGetThreadDebugObject as some apps hook it and terminate if called */
+     if (NtCurrentTeb()->DbgSsReserved[1]) NtClose( NtCurrentTeb()->DbgSsReserved[1] );
+     RtlFreeThreadActivationContextStack();
++    free_thread_ui_languages();
+ 
+     heap_thread_detach();
+ }
+diff --git a/dlls/ntdll/locale.c b/dlls/ntdll/locale.c
+index a100a936531..86cf08071b7 100644
+--- a/dlls/ntdll/locale.c
++++ b/dlls/ntdll/locale.c
+@@ -46,6 +46,13 @@ static const WCHAR *locale_strings;
+ #define MAX_UI_LANGS_MERGED (MAX_UI_LANGS * 16)  /* enough room for thread/process/user/system + neutrals */
+ #define UI_LANG_END  0xffff  /* end marker in UI language array */
+ 
++/* the languages a thread asked for, and the filters it asked them to go through */
++struct thread_ui_languages
++{
++    DWORD  filters;                  /* MUI_CONSOLE_FILTER and MUI_COMPLEX_SCRIPT_FILTER */
++    USHORT langs[MAX_UI_LANGS + 1];  /* terminated by UI_LANG_END */
++};
++
+ static USHORT *process_ui_languages;
+ static USHORT *system_ui_languages;
+ static USHORT *user_ui_languages;
+@@ -163,31 +170,59 @@ static USHORT *dup_ui_languages( const USHORT *langs, ULONG len )
+     return ret;
+ }
+ 
+-static NTSTATUS parse_ui_languages( USHORT *langs, DWORD flags, PCZZWSTR buffer, ULONG *len )
++/* the language a name or an id stands for, by the name of its language id: de-DE_phoneb is de-DE,
++ * zh-Hans-CN is zh-CN; an id is as many hex digits as there are, and nothing is made of what follows */
++static BOOL get_ui_language_index( const WCHAR *str, DWORD flags, USHORT *idx )
+ {
+-    *len = 0;
+-    if (!buffer || !*buffer) return STATUS_SUCCESS;
++    const NLS_LOCALE_LCNAME_INDEX *name_entry;
++    const NLS_LOCALE_LCID_INDEX *id_entry;
++    LCID lcid = 0;
++    UINT i;
+ 
+     if (flags & MUI_LANGUAGE_ID)
+     {
+-        for (const WCHAR *p = buffer; *p && *len < MAX_UI_LANGS; p += wcslen(p) + 1)
++        for (i = 0; i < 8; i++, str++)
+         {
+-            WCHAR *end;
+-            LCID lcid = wcstoul( p, &end, 16 );
+-
+-            if (!*end) append_ui_lang_lcid( langs, len, lcid );
++            if (*str >= '0' && *str <= '9') lcid = lcid * 16 + *str - '0';
++            else if (*str >= 'a' && *str <= 'f') lcid = lcid * 16 + *str - 'a' + 10;
++            else if (*str >= 'A' && *str <= 'F') lcid = lcid * 16 + *str - 'A' + 10;
++            else break;
+         }
+     }
+     else
+     {
+-        for (const WCHAR *p = buffer; *p && *len < MAX_UI_LANGS; p += wcslen(p) + 1)
+-            append_ui_lang_lcname( langs, len, p );
++        if (!(name_entry = find_lcname_entry( locale_table, str ))) return FALSE;
++        if ((lcid = name_entry->id) == LOCALE_CUSTOM_UNSPECIFIED)
++        {
++            *idx = name_entry->idx;
++            return TRUE;
++        }
+     }
++    if (!LANGIDFROMLCID( lcid ) || !(id_entry = find_lcid_entry( locale_table, LANGIDFROMLCID( lcid ))))
++        return FALSE;
++    *idx = id_entry->idx;
++    return TRUE;
++}
++
++static NTSTATUS parse_ui_languages( USHORT *langs, DWORD flags, PCZZWSTR buffer, ULONG *len )
++{
++    USHORT idx;
++
++    *len = 0;
++    /* no list, or an empty one, takes the languages away; an empty name to begin one is not a list,
++     * and names that are not languages are passed over */
++    if (!buffer || (!buffer[0] && !buffer[1])) return STATUS_SUCCESS;
++
++    for (const WCHAR *p = buffer; *p && *len < MAX_UI_LANGS; p += wcslen(p) + 1)
++        if (get_ui_language_index( p, flags, &idx )) append_ui_language( langs, len, idx );
+     return *len ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+ }
+ 
+-static NTSTATUS get_ui_languages( const USHORT *langs, DWORD flags,
+-                                  ULONG *count, WCHAR *buffer, ULONG *size )
++/* A thread's list has its count even when the buffer is short, and an empty one has a count of 0;
++ * a process's has its count when the buffer is short, but an empty one has none; the user's and
++ * the system's have theirs only when they fit, and a short buffer is left empty. */
++static NTSTATUS get_ui_languages( const USHORT *langs, DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size,
++                                  BOOL count_if_short, BOOL count_if_empty )
+ {
+     UINT i, len = 1;
+ 
+@@ -200,12 +235,14 @@ static NTSTATUS get_ui_languages( const USHORT *langs, DWORD flags,
+         {
+             if (*size < 2)
+             {
++                if (*size && count_if_empty) buffer[0] = 0;
+                 *size = 2;
++                if (count && count_if_empty) *count = 0;
+                 return STATUS_BUFFER_TOO_SMALL;
+             }
+             buffer[0] = buffer[1] = 0;
+         }
+-        if (count) *count = 0;
++        if (count && count_if_empty) *count = 0;
+         *size = 2;
+         return STATUS_SUCCESS;
+     }
+@@ -224,7 +261,9 @@ static NTSTATUS get_ui_languages( const USHORT *langs, DWORD flags,
+     {
+         if (len > *size)
+         {
++            if (*size && (count_if_empty || !count_if_short)) buffer[0] = 0;
+             *size = len;
++            if (count && count_if_short) *count = i;
+             return STATUS_BUFFER_TOO_SMALL;
+         }
+         if (flags & MUI_LANGUAGE_ID)
+@@ -254,6 +293,113 @@ static NTSTATUS get_ui_languages( const USHORT *langs, DWORD flags,
+     return STATUS_SUCCESS;
+ }
+ 
++/* the script a language is written in, as a complex script filter sees it */
++static BOOL is_complex_ui_language( USHORT idx )
++{
++    static const WCHAR complex_scripts[] = L"Arab;Beng;Cans;Cher;Deva;Ethi;Gujr;Guru;Hebr;Khmr;Knda;Laoo;Mlym;"
++                                           L"Mymr;Orya;Sinh;Syrc;Taml;Telu;Thaa;Thai;Tibt;Tfng;Yiii;";
++    const NLS_LOCALE_DATA *data = get_locale_data( locale_table, idx );
++    const WCHAR *name = locale_strings + data->sname + 1, *p, *scripts;
++    WCHAR script[5];
++
++    /* a script in the name is the one */
++    if ((p = wcschr( name, '-' )) && wcslen( p + 1 ) >= 4 && (!p[5] || p[5] == '-') && !(p[1] >= '0' && p[1] <= '9'))
++    {
++        memcpy( script, p + 1, 4 * sizeof(WCHAR) );
++        script[4] = 0;
++        return wcsstr( complex_scripts, script ) != NULL;
++    }
++    /* then the code page of those with one: Arabic, Hebrew, Thai and Vietnamese are complex */
++    switch (data->idefaultansicodepage)
++    {
++    case 874: case 1255: case 1256: case 1258:
++        return TRUE;
++    case 0: case CP_UTF8:
++        break;
++    default:
++        return FALSE;
++    }
++    /* and a language written only in Unicode is complex if all its scripts are */
++    scripts = locale_strings + data->sscripts + 1;
++    if (!*scripts) return FALSE;
++    for (p = scripts; *p; p += 5)
++    {
++        memcpy( script, p, 4 * sizeof(WCHAR) );
++        script[4] = 0;
++        if (!wcsstr( complex_scripts, script )) return FALSE;
++        if (p[4] != ';') break;
++    }
++    return TRUE;
++}
++
++static BOOL ui_language_passes( USHORT idx, DWORD filters )
++{
++    const NLS_LOCALE_DATA *data = get_locale_data( locale_table, idx );
++
++    /* a neutral language passes only in the Latin script (en, sr, no; not zh, zh-Hans or mn) */
++    if (!data->inotneutral && !wcsstr( locale_strings + data->sscripts + 1, L"Latn" )) return FALSE;
++    if (is_complex_ui_language( idx )) return FALSE;
++    if (!(filters & MUI_CONSOLE_FILTER)) return TRUE;
++    /* the console shows the Latin code pages, and its own */
++    switch (data->idefaultansicodepage)
++    {
++    case 1250: case 1252: case 1254: case 1257:
++        return TRUE;
++    }
++    return data->idefaultcodepage == nls_info.OemTableInfo.CodePage;
++}
++
++/* what a filter puts in for a language it takes out: the language's console fallback when the
++ * console has its code page (zh-Hans: zh-CN), en-US otherwise */
++static USHORT get_ui_language_substitute( USHORT idx )
++{
++    const WCHAR *name = locale_strings + get_locale_data( locale_table, idx )->sconsolefallbackname;
++    const NLS_LOCALE_LCNAME_INDEX *entry;
++
++    if (*name && (entry = find_lcname_entry( locale_table, name + 1 )) &&
++        get_locale_data( locale_table, entry->idx )->idefaultcodepage == nls_info.OemTableInfo.CodePage)
++        return entry->idx;
++    return find_lcname_entry( locale_table, L"en-US" )->idx;
++}
++
++/* the thread's own languages as its filters leave them, and what the filters put in for the others */
++static void get_thread_ui_languages( USHORT *kept, USHORT *subst )
++{
++    const struct thread_ui_languages *thread = NtCurrentTeb()->PreferredLanguages;
++    ULONG kept_len = 0, subst_len = 0;
++
++    if (thread)
++    {
++        for (const USHORT *lang = thread->langs; *lang != UI_LANG_END; lang++)
++        {
++            if (!thread->filters || ui_language_passes( *lang, thread->filters ))
++                append_ui_language( kept, &kept_len, *lang );
++            else
++                append_ui_language( subst, &subst_len, get_ui_language_substitute( *lang ));
++        }
++    }
++    kept[kept_len] = subst[subst_len] = UI_LANG_END;
++}
++
++static struct thread_ui_languages *alloc_thread_ui_languages(void)
++{
++    struct thread_ui_languages *thread = NtCurrentTeb()->PreferredLanguages;
++
++    if (!thread && (thread = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*thread) )))
++    {
++        thread->filters = 0;
++        thread->langs[0] = UI_LANG_END;
++        NtCurrentTeb()->PreferredLanguages = thread;
++    }
++    return thread;
++}
++
++void free_thread_ui_languages(void)
++{
++    RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->PreferredLanguages );
++    NtCurrentTeb()->PreferredLanguages = NULL;
++}
++
+ static void load_ui_languages( USHORT *dst, ULONG *len, HKEY parent, const WCHAR *name, const WCHAR *value )
+ {
+     char initial_buf[4096];
+@@ -389,8 +535,7 @@ void locale_init(void)
+ /* return LCIDs to use for resource lookup */
+ ULONG get_resource_lcids( LANGID *langs, ULONG size, LCID lcid )
+ {
+-    USHORT *thread_ui_languages = NtCurrentTeb()->PreferredLanguages;
+-    USHORT merged[MAX_UI_LANGS_MERGED];
++    USHORT merged[MAX_UI_LANGS_MERGED], thread[MAX_UI_LANGS + 1], subst[MAX_UI_LANGS + 1];
+     ULONG i, len = 0;
+ 
+     if (PRIMARYLANGID(lcid) != LANG_NEUTRAL)  /* explicit language */
+@@ -402,11 +547,13 @@ ULONG get_resource_lcids( LANGID *langs, ULONG size, LCID lcid )
+     else
+     {
+         merged[len++] = 0;  /* neutral */
++        get_thread_ui_languages( thread, subst );
+         RtlAcquireSRWLockShared( &locale_srwlock );
+-        append_ui_languages_with_neutral( merged, &len, thread_ui_languages );
++        append_ui_languages_with_neutral( merged, &len, thread );
+         append_ui_languages_with_neutral( merged, &len, process_ui_languages );
+         if (SUBLANGID(lcid) != SUBLANG_SYS_DEFAULT)
+             append_ui_languages_with_neutral( merged, &len, user_ui_languages_default );
++        append_ui_languages_with_neutral( merged, &len, subst );
+         append_ui_languages_with_neutral( merged, &len, system_ui_languages );
+         append_ui_lang_lcid( merged, &len, MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT ));
+         RtlReleaseSRWLockShared( &locale_srwlock );
+@@ -421,6 +568,12 @@ ULONG get_resource_lcids( LANGID *langs, ULONG size, LCID lcid )
+ }
+ 
+ 
++static void append_ui_languages_merged( USHORT *dst, ULONG *len, const USHORT *src, BOOL parents )
++{
++    if (parents) append_ui_languages_with_neutral( dst, len, src );
++    else append_ui_languages( dst, len, src );
++}
++
+ /**************************************************************************
+  *      RtlGetProcessPreferredUILanguages   (NTDLL.@)
+  */
+@@ -428,8 +581,11 @@ NTSTATUS WINAPI RtlGetProcessPreferredUILanguages( DWORD flags, ULONG *count, WC
+ {
+     NTSTATUS status;
+ 
++    if (flags & ~(MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
++    if ((flags & MUI_LANGUAGE_NAME) && (flags & MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
++
+     RtlAcquireSRWLockShared( &locale_srwlock );
+-    status = get_ui_languages( process_ui_languages, flags, count, buffer, size );
++    status = get_ui_languages( process_ui_languages, flags, count, buffer, size, TRUE, FALSE );
+     RtlReleaseSRWLockShared( &locale_srwlock );
+     return status;
+ }
+@@ -441,62 +597,62 @@ NTSTATUS WINAPI RtlGetProcessPreferredUILanguages( DWORD flags, ULONG *count, WC
+ NTSTATUS WINAPI RtlGetSystemPreferredUILanguages( DWORD flags, ULONG unknown, ULONG *count,
+                                                   WCHAR *buffer, ULONG *size )
+ {
++    USHORT merged[MAX_UI_LANGS_MERGED];
++    ULONG len = 0;
++
+     if (flags & ~(MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID | MUI_MACHINE_LANGUAGE_SETTINGS)) return STATUS_INVALID_PARAMETER;
+     if ((flags & MUI_LANGUAGE_NAME) && (flags & MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
+ 
+-    return get_ui_languages( system_ui_languages_default, flags, count, buffer, size );
++    /* the system's languages, then en-US, which every UI language falls back to */
++    append_ui_languages( merged, &len, system_ui_languages_default );
++    append_ui_lang_lcname( merged, &len, L"en-US" );
++    merged[len] = UI_LANG_END;
++    return get_ui_languages( merged, flags, count, buffer, size, FALSE, FALSE );
+ }
+ 
+ 
+ /**************************************************************************
+  *      RtlGetThreadPreferredUILanguages   (NTDLL.@)
++ *
++ * The thread's own languages, as its filters leave them, then the process's and the user's, the
++ * user's always with their parents (zh-CN, zh-Hans, zh); then what the filters put in for what they
++ * took out; then, with the user fallback, which is what no fallback asks for too, en-US and the
++ * system's languages.  With the system fallback each language is followed by its parents.
+  */
+ NTSTATUS WINAPI RtlGetThreadPreferredUILanguages( DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size )
+ {
+-    USHORT *thread_ui_languages = NtCurrentTeb()->PreferredLanguages;
+-    USHORT merged[MAX_UI_LANGS_MERGED];
+-    const UINT merge_flags = MUI_MERGE_SYSTEM_FALLBACK | MUI_MERGE_USER_FALLBACK | MUI_THREAD_LANGUAGES;
++    static const DWORD valid = MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID | MUI_MERGE_SYSTEM_FALLBACK |
++                               MUI_MERGE_USER_FALLBACK | MUI_THREAD_LANGUAGES | MUI_CONSOLE_FILTER |
++                               MUI_COMPLEX_SCRIPT_FILTER;
++    USHORT merged[MAX_UI_LANGS_MERGED], thread[MAX_UI_LANGS + 1], subst[MAX_UI_LANGS + 1];
++    BOOL parents = !!(flags & MUI_MERGE_SYSTEM_FALLBACK);
+     ULONG len = 0;
+ 
++    if (flags & ~valid) return STATUS_INVALID_PARAMETER;
+     if ((flags & MUI_LANGUAGE_NAME) && (flags & MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
++    if ((flags & MUI_THREAD_LANGUAGES) && (flags & (MUI_MERGE_SYSTEM_FALLBACK | MUI_MERGE_USER_FALLBACK)))
++        return STATUS_INVALID_PARAMETER;
+ 
+-    if (flags & (MUI_CONSOLE_FILTER | MUI_COMPLEX_SCRIPT_FILTER))
+-        FIXME( "console flags %lx not implemented\n", flags );
+-
+-    switch (flags & merge_flags)
++    get_thread_ui_languages( thread, subst );
++    append_ui_languages_merged( merged, &len, thread, parents );
++    if (flags & MUI_THREAD_LANGUAGES)
++        append_ui_languages_merged( merged, &len, subst, parents );
++    else
+     {
+-    case 0:
+-    case MUI_MERGE_USER_FALLBACK:
+-        RtlAcquireSRWLockShared( &locale_srwlock );
+-        append_ui_languages( merged, &len, thread_ui_languages );
+-        append_ui_languages( merged, &len, process_ui_languages );
+-        append_ui_languages( merged, &len, user_ui_languages );
+-        append_ui_languages_with_neutral( merged, &len, system_ui_languages_default );
+-        RtlReleaseSRWLockShared( &locale_srwlock );
+-        break;
+-    case MUI_MERGE_SYSTEM_FALLBACK:
+         RtlAcquireSRWLockShared( &locale_srwlock );
+-        append_ui_languages_with_neutral( merged, &len, thread_ui_languages );
+-        append_ui_languages_with_neutral( merged, &len, process_ui_languages );
+-        append_ui_languages_with_neutral( merged, &len, system_ui_languages );
++        append_ui_languages_merged( merged, &len, process_ui_languages, parents );
+         RtlReleaseSRWLockShared( &locale_srwlock );
+-        break;
+-    case MUI_UI_FALLBACK:
+-        RtlAcquireSRWLockShared( &locale_srwlock );
+-        append_ui_languages_with_neutral( merged, &len, thread_ui_languages );
+-        append_ui_languages_with_neutral( merged, &len, process_ui_languages );
+         append_ui_languages_with_neutral( merged, &len, user_ui_languages_default );
+-        append_ui_languages_with_neutral( merged, &len, system_ui_languages );
+-        RtlReleaseSRWLockShared( &locale_srwlock );
+-        break;
+-    case MUI_THREAD_LANGUAGES:
+-        append_ui_languages( merged, &len, thread_ui_languages );
+-        break;
+-    default:
+-        return STATUS_INVALID_PARAMETER;
++        append_ui_languages_merged( merged, &len, subst, parents );
++        if ((flags & MUI_MERGE_USER_FALLBACK) || !(flags & MUI_MERGE_SYSTEM_FALLBACK))
++        {
++            if (parents) append_ui_lang_with_neutral( merged, &len, find_lcname_entry( locale_table, L"en-US" )->idx );
++            else append_ui_lang_lcname( merged, &len, L"en-US" );
++            append_ui_languages_merged( merged, &len, system_ui_languages_default, parents );
++        }
+     }
+     merged[len] = UI_LANG_END;
+-    return get_ui_languages( merged, flags, count, buffer, size );
++    return get_ui_languages( merged, flags, count, buffer, size, TRUE, TRUE );
+ }
+ 
+ 
+@@ -506,10 +662,17 @@ NTSTATUS WINAPI RtlGetThreadPreferredUILanguages( DWORD flags, ULONG *count, WCH
+ NTSTATUS WINAPI RtlGetUserPreferredUILanguages( DWORD flags, ULONG unknown, ULONG *count,
+                                                 WCHAR *buffer, ULONG *size )
+ {
++    USHORT merged[MAX_UI_LANGS_MERGED];
++    ULONG len = 0;
++
+     if (flags & ~(MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
+     if ((flags & MUI_LANGUAGE_NAME) && (flags & MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
+ 
+-    return get_ui_languages( user_ui_languages_default, flags, count, buffer, size );
++    /* the user's languages, then en-US, which every UI language falls back to */
++    append_ui_languages( merged, &len, user_ui_languages_default );
++    append_ui_lang_lcname( merged, &len, L"en-US" );
++    merged[len] = UI_LANG_END;
++    return get_ui_languages( merged, flags, count, buffer, size, FALSE, FALSE );
+ }
+ 
+ 
+@@ -522,6 +685,9 @@ NTSTATUS WINAPI RtlSetProcessPreferredUILanguages( DWORD flags, PCZZWSTR buffer,
+     NTSTATUS status;
+     ULONG len;
+ 
++    if (flags & ~(MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
++    if ((flags & MUI_LANGUAGE_NAME) && (flags & MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
++
+     if (!(status = parse_ui_languages( langs, flags, buffer, &len )))
+     {
+         RtlAcquireSRWLockExclusive( &locale_srwlock );
+@@ -535,20 +701,34 @@ NTSTATUS WINAPI RtlSetProcessPreferredUILanguages( DWORD flags, PCZZWSTR buffer,
+ 
+ /**************************************************************************
+  *      RtlSetThreadPreferredUILanguages   (NTDLL.@)
++ *
++ * The console and complex script filters stay with the thread and leave its languages alone.
+  */
+ NTSTATUS WINAPI RtlSetThreadPreferredUILanguages( DWORD flags, PCZZWSTR buffer, ULONG *count )
+ {
++    static const DWORD filters = MUI_RESET_FILTERS | MUI_CONSOLE_FILTER | MUI_COMPLEX_SCRIPT_FILTER;
++    struct thread_ui_languages *thread;
+     USHORT langs[MAX_UI_LANGS + 1];
+     NTSTATUS status;
+     ULONG len;
+ 
+-    if (!(status = parse_ui_languages( langs, flags, buffer, &len )))
++    if (flags & ~(MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID | filters)) return STATUS_INVALID_PARAMETER;
++    if ((flags & MUI_LANGUAGE_NAME) && (flags & MUI_LANGUAGE_ID)) return STATUS_INVALID_PARAMETER;
++    if ((flags & filters) && (flags & (MUI_LANGUAGE_NAME | MUI_LANGUAGE_ID))) return STATUS_INVALID_PARAMETER;
++
++    if (flags & filters)
+     {
+-        RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->PreferredLanguages );
+-        NtCurrentTeb()->PreferredLanguages = dup_ui_languages( langs, len );
+-        if (len && count) *count = len;
++        if (!(thread = alloc_thread_ui_languages())) return STATUS_NO_MEMORY;
++        if (flags & MUI_RESET_FILTERS) thread->filters = 0;
++        thread->filters |= flags & (MUI_CONSOLE_FILTER | MUI_COMPLEX_SCRIPT_FILTER);
++        return STATUS_SUCCESS;
+     }
+-    return status;
++    if ((status = parse_ui_languages( langs, flags, buffer, &len ))) return status;
++    if (!(thread = alloc_thread_ui_languages())) return STATUS_NO_MEMORY;
++    memcpy( thread->langs, langs, len * sizeof(*langs) );
++    thread->langs[len] = UI_LANG_END;
++    if (len && count) *count = len;
++    return STATUS_SUCCESS;
+ }
+ 
+ 
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 2bf3cfaca32..2e00e2fb0da 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -84,6 +84,7 @@ extern void loader_init( CONTEXT *context, void **entry );
+ extern void version_init(void);
+ extern void actctx_init(void);
+ extern void locale_init(void);
++extern void free_thread_ui_languages(void);
+ extern void init_user_process_params(void);
+ extern ULONG get_resource_lcids( LANGID *langs, ULONG size, LCID lcid );
+ 

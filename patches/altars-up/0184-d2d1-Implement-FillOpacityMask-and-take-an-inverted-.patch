@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:20:44 -0400
+Subject: [PATCH] d2d1: Implement FillOpacityMask(), and take an inverted
+ DrawBitmap() source the right way round.
+
+Both FillOpacityMask() methods only validated their arguments and recorded into command
+lists; on a bitmap target they drew nothing.  Measured on Windows (build 29671): the mask
+is sampled bilinearly and clamped at its own edges rather than the source rectangle's; the
+source rectangle is normalised and cut to the mask, and without a destination it goes at
+the origin at its own size in DIPs; only the mask's alpha counts, and the content kind is
+only validated.  Fill a rectangle with the brush through a clamped, linear bitmap brush of
+the mask, which is FillGeometry()'s opacity brush path.
+
+DrawBitmap() dropped an inverted source rectangle and drew the whole bitmap; Windows
+normalises it, as it does for FillOpacityMask().  The existing test only inverted a
+source spanning the whole bitmap, where the two agree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8755ae51a50a1e046b315b99470c8e6030c71528)
+
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 939af2a5812..e5285ecdb2a 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1619,19 +1619,96 @@ static void STDMETHODCALLTYPE d2d_device_context_FillMesh(ID2D1DeviceContext6 *i
+         d2d_command_list_fill_mesh(context->target.command_list, context, mesh, brush);
+ }
+ 
++/* Where DrawBitmap() and FillOpacityMask() put a bitmap: the source rectangle, taken in
++ * either orientation and cut to the bitmap, stretched over the destination rectangle, or
++ * put at the origin at its own size when there is none.  The transform maps the bitmap's
++ * DIPs to the destination.  FALSE when the source rectangle is empty. */
++static BOOL d2d_bitmap_get_placement(ID2D1Bitmap *bitmap, const D2D1_RECT_F *dst_rect,
++        const D2D1_RECT_F *src_rect, D2D1_RECT_F *d, D2D1_MATRIX_3X2_F *transform)
++{
++    D2D1_SIZE_F size = ID2D1Bitmap_GetSize(bitmap);
++    D2D1_RECT_F s, r;
++
++    d2d_rect_set(&s, 0.0f, 0.0f, size.width, size.height);
++    if (src_rect)
++    {
++        d2d_rect_set(&r, min(src_rect->left, src_rect->right), min(src_rect->top, src_rect->bottom),
++                max(src_rect->left, src_rect->right), max(src_rect->top, src_rect->bottom));
++        d2d_rect_intersect(&s, &r);
++    }
++
++    if (s.left == s.right || s.top == s.bottom)
++        return FALSE;
++
++    if (dst_rect)
++        *d = *dst_rect;
++    else
++        d2d_rect_set(d, 0.0f, 0.0f, s.right - s.left, s.bottom - s.top);
++
++    transform->_11 = fabsf((d->right - d->left) / (s.right - s.left));
++    transform->_21 = 0.0f;
++    transform->_31 = min(d->left, d->right) - min(s.left, s.right) * transform->_11;
++    transform->_12 = 0.0f;
++    transform->_22 = fabsf((d->bottom - d->top) / (s.bottom - s.top));
++    transform->_32 = min(d->top, d->bottom) - min(s.top, s.bottom) * transform->_22;
++
++    return TRUE;
++}
++
++/* The mask is sampled bilinearly and clamped at its own edges, not at those of the
++ * source rectangle; only its alpha is used.  What kind of content it holds changes
++ * nothing. */
++static void d2d_device_context_fill_opacity_mask(struct d2d_device_context *context, ID2D1Bitmap *mask,
++        ID2D1Brush *brush, const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect)
++{
++    D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_brush_desc;
++    ID2D1RectangleGeometry *geometry;
++    D2D1_BRUSH_PROPERTIES brush_desc;
++    struct d2d_brush *opacity_brush;
++    D2D1_RECT_F d;
++    HRESULT hr;
++
++    if (!d2d_bitmap_get_placement(mask, dst_rect, src_rect, &d, &brush_desc.transform))
++        return;
++
++    bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
++    bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
++    bitmap_brush_desc.interpolationMode = D2D1_INTERPOLATION_MODE_LINEAR;
++    brush_desc.opacity = 1.0f;
++    if (FAILED(hr = d2d_bitmap_brush_create(context->factory, mask, &bitmap_brush_desc, &brush_desc, &opacity_brush)))
++    {
++        ERR("Failed to create opacity brush, hr %#lx.\n", hr);
++        return;
++    }
++
++    if (SUCCEEDED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, &d, &geometry)))
++    {
++        d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
++                unsafe_impl_from_ID2D1Brush(brush), opacity_brush);
++        ID2D1RectangleGeometry_Release(geometry);
++    }
++    else
++    {
++        ERR("Failed to create geometry, hr %#lx.\n", hr);
++    }
++
++    ID2D1Brush_Release(&opacity_brush->ID2D1Brush_iface);
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_FillOpacityMask(ID2D1DeviceContext6 *iface,
+         ID2D1Bitmap *mask, ID2D1Brush *brush, D2D1_OPACITY_MASK_CONTENT content,
+         const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
+-    FIXME("iface %p, mask %p, brush %p, content %#x, dst_rect %s, src_rect %s stub!\n",
++    TRACE("iface %p, mask %p, brush %p, content %#x, dst_rect %s, src_rect %s.\n",
+             iface, mask, brush, content, debug_d2d_rect_f(dst_rect), debug_d2d_rect_f(src_rect));
+ 
+     if (FAILED(context->error.code))
+         return;
+ 
+-    if (context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_ALIASED)
++    if (context->target.type == D2D_TARGET_UNKNOWN || !context->drawing
++            || context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_ALIASED)
+     {
+         d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+         return;
+@@ -1645,6 +1722,8 @@ static void STDMETHODCALLTYPE d2d_device_context_FillOpacityMask(ID2D1DeviceCont
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_fill_opacity_mask(context->target.command_list, context, mask, brush, dst_rect, src_rect);
++    else
++        d2d_device_context_fill_opacity_mask(context, mask, brush, dst_rect, src_rect);
+ }
+ 
+ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
+@@ -1655,42 +1734,23 @@ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, I
+     D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_brush_desc;
+     D2D1_BRUSH_PROPERTIES brush_desc;
+     struct d2d_brush *brush;
+-    D2D1_SIZE_F size;
+-    D2D1_RECT_F s, d;
++    D2D1_RECT_F d;
+     HRESULT hr;
+ 
+     if (perspective_transform)
+         FIXME("Perspective transform is ignored.\n");
+ 
+-    size = ID2D1Bitmap_GetSize(bitmap);
+-    d2d_rect_set(&s, 0.0f, 0.0f, size.width, size.height);
+-    if (src_rect && src_rect->left <= src_rect->right
+-            && src_rect->top <= src_rect->bottom)
+-    {
+-        d2d_rect_intersect(&s, src_rect);
+-    }
+-
+-    if (s.left == s.right || s.top == s.bottom)
++    if (!d2d_bitmap_get_placement(bitmap, dst_rect, src_rect, &d, &brush_desc.transform))
+         return;
+ 
+-    if (dst_rect)
+-    {
+-        d = *dst_rect;
+-    }
+-    else
+-    {
+-        d.left = 0.0f;
+-        d.top = 0.0f;
+-        d.right = s.right - s.left;
+-        d.bottom = s.bottom - s.top;
+-    }
+-
+     if (offset)
+     {
+         d.left += offset->x;
+         d.top += offset->y;
+         d.right += offset->x;
+         d.bottom += offset->y;
++        brush_desc.transform._31 += offset->x;
++        brush_desc.transform._32 += offset->y;
+     }
+ 
+     bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
+@@ -1698,12 +1758,6 @@ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, I
+     bitmap_brush_desc.interpolationMode = interpolation_mode;
+ 
+     brush_desc.opacity = opacity;
+-    brush_desc.transform._11 = fabsf((d.right - d.left) / (s.right - s.left));
+-    brush_desc.transform._21 = 0.0f;
+-    brush_desc.transform._31 = min(d.left, d.right) - min(s.left, s.right) * brush_desc.transform._11;
+-    brush_desc.transform._12 = 0.0f;
+-    brush_desc.transform._22 = fabsf((d.bottom - d.top) / (s.bottom - s.top));
+-    brush_desc.transform._32 = min(d.top, d.bottom) - min(s.top, s.bottom) * brush_desc.transform._22;
+ 
+     if (FAILED(hr = d2d_bitmap_brush_create(context->factory, bitmap, &bitmap_brush_desc, &brush_desc, &brush)))
+     {
+@@ -4143,13 +4197,14 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_FillOpacityM
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
+-    FIXME("iface %p, mask %p, brush %p, dst_rect %s, src_rect %s stub!\n",
++    TRACE("iface %p, mask %p, brush %p, dst_rect %s, src_rect %s.\n",
+             iface, mask, brush, debug_d2d_rect_f(dst_rect), debug_d2d_rect_f(src_rect));
+ 
+     if (FAILED(context->error.code))
+         return;
+ 
+-    if (context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_ALIASED)
++    if (context->target.type == D2D_TARGET_UNKNOWN || !context->drawing
++            || context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_ALIASED)
+     {
+         d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+         return;
+@@ -4157,6 +4212,8 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_FillOpacityM
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_fill_opacity_mask(context->target.command_list, context, mask, brush, dst_rect, src_rect);
++    else
++        d2d_device_context_fill_opacity_mask(context, mask, brush, dst_rect, src_rect);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateFilledGeometryRealization(ID2D1DeviceContext6 *iface,
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index c90b18eb421..ad48e28facd 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -8359,6 +8359,200 @@ static void test_antialiasing(BOOL d3d11)
+     release_test_context(&ctx);
+ }
+ 
++static void test_fill_opacity_mask(BOOL d3d11)
++{
++    static const BYTE mask_data[16] =
++    {
++          0,  64, 128, 255,
++         64, 128, 255,   0,
++        128, 255,   0,  64,
++        255,   0,  64, 128,
++    };
++    /* The first row, read bilinearly: the whole mask four times as big, and its middle eight times. */
++    static const unsigned int whole[16] = {0, 0, 8, 24, 40, 56, 72, 88, 104, 120, 144, 176, 207, 239, 255, 255};
++    static const unsigned int part[16] = {80, 88, 96, 104, 115, 128, 142, 155, 168, 182, 195, 209, 207, 190, 173, 156};
++    static const struct
++    {
++        unsigned int x, y, alpha;
++    }
++    pixels[] =
++    {
++        /* A source and no destination: the source at its own size, at the origin. */
++        {164, 0, 128}, {165, 0, 255}, {164, 1, 255}, {165, 1,   0}, {166, 0, 0}, {164, 2, 0},
++        /* Text is drawn no differently. */
++        {170, 0,   0}, {171, 0,  64}, {172, 0, 128}, {173, 0, 255}, {174, 0, 0},
++        /* Only a BGRA mask's alpha counts. */
++        {176, 0,   0}, {177, 0,  64}, {178, 0, 128}, {179, 0, 255},
++        {176, 3, 255}, {177, 3,   0}, {178, 3,  64}, {179, 3, 128},
++        /* A 192 DPI mask is two DIPs across. */
++        {182, 0,  64}, {183, 0, 160}, {182, 1, 160}, {183, 1,  64}, {184, 0, 0}, {182, 2, 0},
++    };
++    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    static const D2D1_RECT_F src = {1.0f, 1.0f, 3.0f, 3.0f}, src_inverted = {3.0f, 1.0f, 1.0f, 3.0f};
++    static const D2D1_RECT_F src_beyond = {5.0f, 5.0f, 8.0f, 8.0f}, src_empty = {1.0f, 1.0f, 1.0f, 3.0f};
++    ID2D1Bitmap *mask, *mask_bgra, *mask_dpi;
++    D2D1_BITMAP_PROPERTIES bitmap_desc;
++    ID2D1CommandList *command_list;
++    D2D1_SIZE_U size = {4, 4};
++    ID2D1SolidColorBrush *brush;
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    D2D1_MATRIX_3X2_F m;
++    D2D1_COLOR_F colour;
++    ID2D1Image *target;
++    unsigned int i;
++    DWORD bgra[16];
++    D2D1_RECT_F dst;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++
++    set_color(&colour, 1.0f, 1.0f, 1.0f, 1.0f);
++    hr = ID2D1RenderTarget_CreateSolidColorBrush(ctx.rt, &colour, NULL, &brush);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
++    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++    bitmap_desc.dpiX = bitmap_desc.dpiY = 96.0f;
++    hr = ID2D1RenderTarget_CreateBitmap(ctx.rt, size, mask_data, 4, &bitmap_desc, &mask);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    bitmap_desc.dpiX = bitmap_desc.dpiY = 192.0f;
++    hr = ID2D1RenderTarget_CreateBitmap(ctx.rt, size, mask_data, 4, &bitmap_desc, &mask_dpi);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    for (i = 0; i < ARRAY_SIZE(bgra); ++i)
++        bgra[i] = (DWORD)mask_data[i] << 24;
++    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    bitmap_desc.dpiX = bitmap_desc.dpiY = 96.0f;
++    hr = ID2D1RenderTarget_CreateBitmap(ctx.rt, size, bgra, 4 * sizeof(*bgra), &bitmap_desc, &mask_bgra);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    ID2D1RenderTarget_SetAntialiasMode(ctx.rt, D2D1_ANTIALIAS_MODE_ALIASED);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    set_color(&colour, 0.0f, 0.0f, 0.0f, 0.0f);
++    ID2D1RenderTarget_Clear(ctx.rt, &colour);
++    set_rect(&dst, 4.0f, 4.0f, 20.0f, 20.0f);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, NULL);
++    set_rect(&dst, 24.0f, 4.0f, 40.0f, 20.0f);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, &src);
++    set_rect(&dst, 44.0f, 4.0f, 60.0f, 20.0f);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, &src_inverted);
++    set_rect(&dst, 80.0f, 4.0f, 64.0f, 20.0f);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, NULL);
++    set_rect(&dst, 84.0f, 4.0f, 100.0f, 20.0f);
++    ID2D1DeviceContext_FillOpacityMask(ctx.context, mask, (ID2D1Brush *)brush, &dst, &src);
++    set_rect(&dst, 104.0f, 4.0f, 120.0f, 20.0f);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, &src_beyond);
++    set_rect(&dst, 124.0f, 4.0f, 140.0f, 20.0f);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, &src_empty);
++    /* DrawBitmap() also takes an inverted source rectangle the right way round. */
++    set_rect(&dst, 144.0f, 4.0f, 160.0f, 20.0f);
++    ID2D1RenderTarget_DrawBitmap(ctx.rt, mask_bgra, &dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src_inverted);
++    m = identity;
++    m._31 = 164.0f;
++    ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, NULL, &src);
++    m._31 = 170.0f;
++    ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_TEXT_GDI_COMPATIBLE, NULL, NULL);
++    m._31 = 176.0f;
++    ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask_bgra, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, NULL, NULL);
++    m._31 = 182.0f;
++    ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask_dpi, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, NULL, NULL);
++    ID2D1RenderTarget_SetTransform(ctx.rt, &identity);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    /* Content that is none of the kinds, and a target that is not aliased, through either method. */
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_TEXT_GDI_COMPATIBLE + 1, NULL, NULL);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    ID2D1RenderTarget_SetAntialiasMode(ctx.rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1RenderTarget_FillOpacityMask(ctx.rt, mask, (ID2D1Brush *)brush,
++            D2D1_OPACITY_MASK_CONTENT_GRAPHICS, NULL, NULL);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1DeviceContext_FillOpacityMask(ctx.context, mask, (ID2D1Brush *)brush, NULL, NULL);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
++
++    /* A list plays a fill back. */
++    if (ctx.factory1)
++    {
++        hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ID2D1DeviceContext_GetTarget(ctx.context, &target);
++        ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)command_list);
++        ID2D1DeviceContext_BeginDraw(ctx.context);
++        ID2D1DeviceContext_SetAntialiasMode(ctx.context, D2D1_ANTIALIAS_MODE_ALIASED);
++        set_rect(&dst, 204.0f, 4.0f, 220.0f, 20.0f);
++        ID2D1DeviceContext_FillOpacityMask(ctx.context, mask, (ID2D1Brush *)brush, &dst, NULL);
++        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        hr = ID2D1CommandList_Close(command_list);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++        ID2D1DeviceContext_SetTarget(ctx.context, target);
++        ID2D1DeviceContext_BeginDraw(ctx.context);
++        ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, NULL, NULL,
++                D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
++        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ID2D1Image_Release(target);
++        ID2D1CommandList_Release(command_list);
++    }
++
++    get_surface_readback(&ctx, &rb);
++#define alpha(x, y) ((unsigned int)(get_readback_colour(&rb, x, y) >> 24))
++    for (i = 0; i < 16; ++i)
++    {
++        /* The whole mask, also into an upside-down destination. */
++        ok(compare_uint(alpha(4 + i, 5), whole[i], 1), "Got unexpected alpha %u at %u.\n", alpha(4 + i, 5), i);
++        ok(compare_uint(alpha(64 + i, 5), whole[i], 1), "Got unexpected alpha %u at %u.\n", alpha(64 + i, 5), i);
++        /* Its middle, with the source either way round, through both methods, and as a bitmap. */
++        ok(compare_uint(alpha(24 + i, 5), part[i], 1), "Got unexpected alpha %u at %u.\n", alpha(24 + i, 5), i);
++        ok(compare_uint(alpha(44 + i, 5), part[i], 1), "Got unexpected alpha %u at %u.\n", alpha(44 + i, 5), i);
++        ok(compare_uint(alpha(84 + i, 5), part[i], 1), "Got unexpected alpha %u at %u.\n", alpha(84 + i, 5), i);
++        ok(compare_uint(alpha(144 + i, 5), part[i], 1), "Got unexpected alpha %u at %u.\n", alpha(144 + i, 5), i);
++        /* A source past the mask takes its corner, and an empty one draws nothing. */
++        ok(alpha(104 + i, 4 + i) == 128, "Got unexpected alpha %u at %u.\n", alpha(104 + i, 4 + i), i);
++        ok(!alpha(124 + i, 4 + i), "Got unexpected alpha %u at %u.\n", alpha(124 + i, 4 + i), i);
++        if (ctx.factory1)
++            ok(compare_uint(alpha(204 + i, 5), whole[i], 1), "Got unexpected alpha %u at %u.\n", alpha(204 + i, 5), i);
++    }
++    ok(!alpha(3, 5) && !alpha(20, 5) && !alpha(4, 3) && !alpha(4, 20), "Got unexpected alpha.\n");
++    for (i = 0; i < ARRAY_SIZE(pixels); ++i)
++    {
++        ok(compare_uint(alpha(pixels[i].x, pixels[i].y), pixels[i].alpha, 1),
++                "Got unexpected alpha %u at (%u, %u).\n", alpha(pixels[i].x, pixels[i].y), pixels[i].x, pixels[i].y);
++    }
++    /* Nothing failed to be drawn. */
++    ok(!alpha(1, 0) && !alpha(3, 0) && !alpha(0, 3), "Got unexpected alpha.\n");
++#undef alpha
++    release_resource_readback(&rb);
++
++    ID2D1Bitmap_Release(mask_dpi);
++    ID2D1Bitmap_Release(mask_bgra);
++    ID2D1Bitmap_Release(mask);
++    ID2D1SolidColorBrush_Release(brush);
++    release_test_context(&ctx);
++}
++
+ static void test_draw_geometry(BOOL d3d11)
+ {
+     ID2D1TransformedGeometry *transformed_geometry[4];
+@@ -20869,6 +21063,7 @@ START_TEST(d2d1)
+     queue_test(test_gradient);
+     queue_test(test_gradient_drawing);
+     queue_test(test_antialiasing);
++    queue_test(test_fill_opacity_mask);
+     queue_test(test_draw_geometry);
+     queue_test(test_fill_geometry);
+     queue_test(test_wic_gdi_interop);

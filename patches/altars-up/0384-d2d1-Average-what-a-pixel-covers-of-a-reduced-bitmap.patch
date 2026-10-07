@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:47:58 -0400
+Subject: [PATCH] d2d1: Average what a pixel covers of a reduced bitmap in the
+ modes that do not alias.
+
+Every interpolation mode but nearest neighbour sampled a bitmap
+bilinearly once per pixel, so a picture drawn smaller with high quality
+cubic, multi-sample linear or anisotropic aliased as linear does; the
+first is what PowerPoint uses for pictures.  In those modes the pixel
+shader now takes bilinear samples spread over the pixel's footprint in
+the bitmap, from the texture coordinates' derivatives, up to 8 along
+each of the pixel's axes, and averages them.  Enlarging is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/d2d1/brush.c b/dlls/d2d1/brush.c
+index aa827f81a1c..b7b237c0822 100644
+--- a/dlls/d2d1/brush.c
++++ b/dlls/d2d1/brush.c
+@@ -1684,6 +1684,19 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
+             }
+ 
+             cb->u.bitmap.ignore_alpha = bitmap->format.alphaMode == D2D1_ALPHA_MODE_IGNORE;
++            /* the modes that do not alias when they reduce */
++            switch (brush->type == D2D_BRUSH_TYPE_BITMAP ? brush->u.bitmap.interpolation_mode
++                    : brush->u.image.interpolation_mode)
++            {
++                case D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR:
++                case D2D1_INTERPOLATION_MODE_ANISOTROPIC:
++                case D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC:
++                    cb->u.bitmap.filtered = TRUE;
++                    break;
++                default:
++                    cb->u.bitmap.filtered = FALSE;
++                    break;
++            }
+ 
+             if (image_bitmap)
+                 ID2D1Bitmap_Release(image_bitmap);
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 554efd41bc8..a8161d072e7 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -127,7 +127,8 @@ struct d2d_brush_cb
+         } radial;
+         struct
+         {
+-            float _11, _21, _31, pad;
++            float _11, _21, _31;
++            BOOL filtered;  /* averaged over what a pixel covers, when reduced */
+             float _12, _22, _32;
+             BOOL ignore_alpha;
+         } bitmap;
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 4894a93dca8..8505363fef9 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -5704,20 +5704,46 @@ static const char shape_ps_code[] =
+     "    return sample_gradient(stops, gradient, p, width);\n"
+     "}\n"
+     "\n"
++    "/* A reduced bitmap drawn in a mode that does not alias averages what each pixel covers of it: bilinear\n"
++    " * samples spread over the pixel's footprint in the bitmap, up to 8 along each of the pixel's axes. */\n"
++    "float4 sample_filtered(Texture2D t, SamplerState s, float2 texcoord)\n"
++    "{\n"
++    "    float2 dx = ddx(texcoord), dy = ddy(texcoord), size;\n"
++    "    float4 sum = 0.0f;\n"
++    "    uint w, h, n_x, n_y, i, j;\n"
++    "\n"
++    "    t.GetDimensions(w, h);\n"
++    "    size = float2(w, h);\n"
++    "    n_x = clamp((uint)ceil(length(dx * size)), 1, 8);\n"
++    "    n_y = clamp((uint)ceil(length(dy * size)), 1, 8);\n"
++    "    if (n_x == 1 && n_y == 1)\n"
++    "        return t.SampleLevel(s, texcoord, 0);\n"
++    "    [loop] for (j = 0; j < n_y; ++j)\n"
++    "    {\n"
++    "        [loop] for (i = 0; i < n_x; ++i)\n"
++    "            sum += t.SampleLevel(s, texcoord + ((i + 0.5f) / n_x - 0.5f) * dx + ((j + 0.5f) / n_y - 0.5f) * dy, 0);\n"
++    "    }\n"
++    "    return sum / (n_x * n_y);\n"
++    "}\n"
++    "\n"
+     "float4 brush_bitmap(struct brush brush, Texture2D t, SamplerState s, float2 position)\n"
+     "{\n"
+     "    float3 transform[2];\n"
+-    "    bool ignore_alpha;\n"
++    "    bool ignore_alpha, filtered;\n"
+     "    float2 texcoord;\n"
+     "    float4 colour;\n"
+     "\n"
+     "    transform[0] = brush.data[0].xyz;\n"
+     "    transform[1] = brush.data[1].xyz;\n"
++    "    filtered = asuint(brush.data[0].w);\n"
+     "    ignore_alpha = asuint(brush.data[1].w);\n"
+     "\n"
+     "    texcoord.x = dot(position.xy, transform[0].xy) + transform[0].z;\n"
+     "    texcoord.y = dot(position.xy, transform[1].xy) + transform[1].z;\n"
+-    "    colour = t.Sample(s, texcoord);\n"
++    "    if (filtered)\n"
++    "        colour = sample_filtered(t, s, texcoord);\n"
++    "    else\n"
++    "        colour = t.Sample(s, texcoord);\n"
+     "    if (ignore_alpha)\n"
+     "        colour.a = 1.0;\n"
+     "    return colour;\n"
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index 8e830846cda..f3282925a06 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -21435,6 +21435,64 @@ static void test_bitmap_interpolation_modes(BOOL d3d11)
+     }
+ }
+ 
++/* Reduced in a mode that does not alias, black and white columns one texel wide are grey. */
++static void test_bitmap_interpolation_reduction(BOOL d3d11)
++{
++    static const D2D1_INTERPOLATION_MODE modes[] =
++    {
++        D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR,
++        D2D1_INTERPOLATION_MODE_ANISOTROPIC,
++        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
++    };
++    D2D1_BITMAP_PROPERTIES1 bitmap_desc = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE}, 96.0f, 96.0f};
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    DWORD bitmap_data[30];
++    ID2D1Bitmap1 *bitmap;
++    D2D1_COLOR_F colour;
++    unsigned int i, x;
++    D2D1_SIZE_U size;
++    D2D1_RECT_F dst;
++    HRESULT hr;
++    BYTE value;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++
++    for (i = 0; i < ARRAY_SIZE(bitmap_data); ++i)
++        bitmap_data[i] = i & 1 ? 0xffffffff : 0xff000000;
++    set_size_u(&size, ARRAY_SIZE(bitmap_data), 1);
++    hr = ID2D1DeviceContext_CreateBitmap(ctx.context, size, bitmap_data, sizeof(bitmap_data), &bitmap_desc, &bitmap);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    ID2D1DeviceContext_BeginDraw(ctx.context);
++    set_color(&colour, 0.0f, 0.0f, 1.0f, 1.0f);
++    ID2D1DeviceContext_Clear(ctx.context, &colour);
++    for (i = 0; i < ARRAY_SIZE(modes); ++i)
++    {
++        set_rect(&dst, 0.0f, 8.0f * i, 8.0f, 8.0f * i + 4.0f);
++        ID2D1DeviceContext_DrawBitmap(ctx.context, (ID2D1Bitmap *)bitmap, &dst, 1.0f, modes[i], NULL, NULL);
++    }
++    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    get_surface_readback(&ctx, &rb);
++    for (i = 0; i < ARRAY_SIZE(modes); ++i)
++    {
++        winetest_push_context("mode %#x", modes[i]);
++        for (x = 0; x < 8; ++x)
++        {
++            value = get_readback_colour(&rb, x, 8 * i + 2) & 0xff;
++            ok(value >= 0x60 && value <= 0xa0, "Got %#x at %u.\n", value, x);
++        }
++        winetest_pop_context();
++    }
++    release_resource_readback(&rb);
++
++    ID2D1Bitmap1_Release(bitmap);
++    release_test_context(&ctx);
++}
++
+ static void test_sprite_batch(BOOL d3d11)
+ {
+     D2D1_MATRIX_3X2_F transforms[4];
+@@ -21924,6 +21982,7 @@ START_TEST(d2d1)
+     queue_d3d10_test(test_glyph_run_world_bounds);
+     queue_test(test_sprite_batch);
+     queue_test(test_bitmap_interpolation_modes);
++    queue_test(test_bitmap_interpolation_reduction);
+ 
+     run_queued_tests();
+ }

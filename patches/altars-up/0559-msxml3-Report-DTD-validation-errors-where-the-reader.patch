@@ -1,0 +1,660 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 11:19:33 -0400
+Subject: [PATCH] msxml3: Report DTD validation errors where the reader meets
+ them, as Windows does.
+
+Windows validates against the DTD as it reads and reports the first
+error it meets, where the reader is then (tools/msxmlmoreprobe in the
+wine-altars repository, 26 documents, MSXML 3.0 and 6.0): at the end of
+the start tag of an element that may not come where it is, is not
+declared, or has attributes it may not have or lacks some, in that
+order; at the start of text that may not be where it is, even spaces in
+an element declared EMPTY; at the name in the end tag of an element
+that lacks children, XML_EMPTY_NOT_ALLOWED with none, else
+XML_ELEMENT_NOT_COMPLETE; and at the end of the document for an IDREF
+to no ID, with no offset and no line text.  Those are the positions the
+reader's own locator gives for its startElement, characters and
+endElement.
+
+Wine validates the parsed tree with libxml2, which reports errors in
+another order and where none of these are, so the reader's positions
+are now kept on the nodes, every error libxml2 raises is placed at the
+event it is about and the first in reading order is kept.  The
+content model tells a child that may not come from children missing.
+Values of attributes of a type that is one name are read as Windows
+reads them: more than one name, or one starting with a character no
+name starts with, have their own codes, and an ID given twice its own.
+
+validate() names the same error at no position.  Only one case still
+differs: MSXML 6.0 keeps the spaces in an element declared EMPTY and
+validate() then finds them, where Wine leaves them out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index 58d7c2bff94..1d12a762864 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -285,7 +285,7 @@ static void parse_error_set_source(struct parse_error *error, const WCHAR *text,
+     size_t start = 0, end, i;
+     LONG line = 1;
+ 
+-    if (!error->code || error->line <= 0 || !text) return;
++    if (!error->code || error->line <= 0 || !text || error->nosource) return;
+     for (i = 0; i < len && line < error->line; i++)
+     {
+         if (text[i] == '\r' && i + 1 < len && text[i + 1] == '\n') i++;
+@@ -307,7 +307,7 @@ static void parse_error_set_source_bytes(struct parse_error *error, const BYTE *
+     WCHAR *text;
+     int len;
+ 
+-    if (!error->code || error->line <= 0 || !data || !size) return;
++    if (!error->code || error->line <= 0 || !data || !size || error->nosource) return;
+     if (size >= 2 && data[0] == 0xff && data[1] == 0xfe)
+         return parse_error_set_source(error, (const WCHAR *)(data + 2), (size - 2) / sizeof(WCHAR));
+     if (size >= 2 && data[0] && !data[1])
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index 7fa5f13fb64..e21f11f3a9f 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -88,6 +88,7 @@ enum error_codes
+     E_SAX_INVALID_TYPE = 0xc00ce572,
+     E_SAX_BADXMLCASE = 0xc00ce576,
+     E_SAX_INVALID_STANDALONE = 0xc00ce579,
++    E_SAX_MULTIPLE_NAMES = 0xc00ce574,
+     E_SAX_DOCTYPE_OUTSIDE_PROLOG = 0xc00ce57e,
+     E_SAX_INVALID_VERSION = 0xc00ce57f,
+     E_DOM_PROHIBIT_DTD = 0xc00ce584,
+@@ -244,6 +245,8 @@ struct domnode
+     unsigned int flags;
+     LONG parse_line;
+     LONG parse_end_column;
++    LONG parse_start_line;      /* where the reader was after the start tag, or at the start of the text */
++    LONG parse_start_column;
+ 
+     BSTR name;
+     BSTR prefix;
+@@ -285,6 +288,7 @@ struct parse_error
+     BSTR reason;
+     LONG filepos;               /* where the error is in the text, counting characters from 0 */
+     BSTR srctext;               /* the line it is on */
++    BOOL nosource;              /* an error about the whole text: no line or offset is given for it */
+ };
+ extern struct domnode *domnode_addref(struct domnode *node);
+ extern void domnode_release(struct domnode *node);
+@@ -604,6 +608,7 @@ extern HRESULT stream_wrapper_create(const void *, DWORD, ISequentialStream **);
+ #define E_XML_ILLEGAL_TEXT                  0xC00CE018
+ /* ... */
+ #define E_XML_REQUIRED_ATTRIBUTE_MISSING    0xC00CE020
++#define E_XML_DUPLICATE_ID                  0xC00CE200
+ #define E_XML_SCHEMA_DATATYPE               0xC00CE201
+ #define E_XML_NEW_PARSER_DTD_VALIDATION      0xC00CE23D
+ 
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index 3dc9ec4c0d5..cd350e6e1b5 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -3890,8 +3890,37 @@ struct parse_context
+ 
+     ISAXLocator *locator;
+     struct parse_error error;
++
++    /* for validation against the DTD, which reports errors where the reader was */
++    LONG text_line, text_column;    /* the start of the text read since the last tag */
++    LONG space_line, space_column;  /* the first space left out of an element declared EMPTY */
++    BSTR *empty;                    /* the elements declared EMPTY */
++    size_t empty_count, empty_size;
+ };
+ 
++static void parse_context_get_position(struct parse_context *c, LONG *line, LONG *column)
++{
++    int l = 0, col = 0;
++
++    if (c->locator)
++    {
++        ISAXLocator_getLineNumber(c->locator, &l);
++        ISAXLocator_getColumnNumber(c->locator, &col);
++    }
++    *line = l;
++    *column = col;
++}
++
++static bool parse_context_is_declared_empty(struct parse_context *c, const struct domnode *node)
++{
++    size_t i;
++
++    if (!node || node->type != NODE_ELEMENT || !node->qname) return false;
++    for (i = 0; i < c->empty_count; i++)
++        if (!wcscmp(c->empty[i], node->qname)) return true;
++    return false;
++}
++
+ /* the first error is the one a document reports, with the position the reader had reached */
+ static void parse_context_set_error(struct parse_context *c, ISAXLocator *locator, HRESULT code, const WCHAR *message)
+ {
+@@ -3967,6 +3996,11 @@ static HRESULT parse_context_create_text_node(struct parse_context *c, DOMNodeTy
+         parse_context_node_create(c, type, NULL, 0, NULL, 0, c->root, &node);
+         parse_context_node_put_data(c, node, c->buffer.data, c->buffer.count);
+         parse_context_append_child(c, c->node, node);
++        if (node)
++        {
++            node->parse_start_line = c->text_line;
++            node->parse_start_column = c->text_column;
++        }
+ 
+         c->buffer.count = 0;
+ 
+@@ -3999,11 +4033,22 @@ static HRESULT parse_context_create_text_node(struct parse_context *c, DOMNodeTy
+         parse_context_node_create(c, type, NULL, 0, NULL, 0, c->root, &node);
+         parse_context_node_put_data(c, node, c->buffer.data, c->buffer.count);
+         parse_context_append_child(c, c->node, node);
++        if (node)
++        {
++            node->parse_start_line = c->text_line;
++            node->parse_start_column = c->text_column;
++        }
+ 
+         c->buffer.count = 0;
+     }
+     else if (ignored_whitespace)
+     {
++        /* even spaces may not be in an element declared EMPTY */
++        if (!c->space_line && parse_context_is_declared_empty(c, c->node))
++        {
++            c->space_line = c->text_line;
++            c->space_column = c->text_column;
++        }
+         if (list_empty(&c->node->children))
+         {
+             c->node->flags |= DOMNODE_IGNORED_WS_AFTER_STARTTAG;
+@@ -4106,6 +4151,7 @@ static HRESULT WINAPI parse_content_handler_startElement(ISAXContentHandler *ifa
+     parse_context_node_create(c, NODE_ELEMENT, qname, qname_len, uri, uri_len, c->root, &element);
+     parse_context_append_child(c, c->node, element);
+     c->node = element;
++    if (element) parse_context_get_position(c, &element->parse_start_line, &element->parse_start_column);
+ 
+     /* TODO: error handling */
+ 
+@@ -4160,6 +4206,7 @@ static HRESULT WINAPI parse_content_handler_characters(ISAXContentHandler *iface
+ {
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+ 
++    if (!c->buffer.count) parse_context_get_position(c, &c->text_line, &c->text_column);
+     string_append(&c->buffer, chars, count);
+ 
+     return c->status;
+@@ -4329,6 +4376,13 @@ static ULONG WINAPI parse_decl_handler_Release(ISAXDeclHandler *iface)
+ static HRESULT WINAPI parse_decl_handler_elementDecl(ISAXDeclHandler *iface, const WCHAR *name,
+         int name_len, const WCHAR *model, int model_len)
+ {
++    struct parse_context *c = impl_from_ISAXDeclHandler(iface);
++    BSTR str;
++
++    /* validation needs to know them: not even spaces may be in their content */
++    if (model_len != 5 || wcsncmp(model, L"EMPTY", 5)) return S_OK;
++    if (!array_reserve((void **)&c->empty, &c->empty_size, c->empty_count + 1, sizeof(*c->empty))) return S_OK;
++    if ((str = SysAllocStringLen(name, name_len))) c->empty[c->empty_count++] = str;
+     return S_OK;
+ }
+ 
+@@ -4697,6 +4751,10 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+ 
+ static void parse_context_cleanup(struct parse_context *c)
+ {
++    size_t i;
++
++    for (i = 0; i < c->empty_count; i++) SysFreeString(c->empty[i]);
++    free(c->empty);
+     SysFreeString(c->error.reason);
+     free(c->buffer.data);
+     if (c->root) domnode_destroy_tree(c->root);
+@@ -4751,6 +4809,18 @@ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_
+         {
+             struct parse_error validation;
+             hr = node_validate_tree(context.root, context.root, &validation);
++            /* spaces in an element declared EMPTY, which the document leaves out, if they come first */
++            if (SUCCEEDED(hr) && context.space_line && (hr == S_OK || !validation.line ||
++                    context.space_line < validation.line || (context.space_line == validation.line &&
++                    context.space_column < validation.linepos)))
++            {
++                SysFreeString(validation.reason);
++                memset(&validation, 0, sizeof(validation));
++                validation.code = E_XML_ILLEGAL_TEXT;
++                validation.line = context.space_line;
++                validation.linepos = context.space_column;
++                hr = S_FALSE;
++            }
+             if (hr == S_FALSE)
+             {
+                 parse_context_set_error(&context, context.locator, validation.code, validation.reason);
+@@ -4759,6 +4829,7 @@ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_
+                     context.error.line = validation.line;
+                     context.error.linepos = validation.linepos;
+                 }
++                context.error.nosource = validation.nosource;
+                 hr = validation.code;
+             }
+             SysFreeString(validation.reason);
+@@ -5203,43 +5274,192 @@ static void LIBXML2_LOG_CALLBACK validate_warning(void* ctx, char const* msg, ..
+     va_end(ap);
+ }
+ 
+-/* the first error DTD validation raises, as MSXML names it */
++/* DTD validation as MSXML does it: in the order the reader meets things, each error at the start tag,
++ * the text or the end tag it is about, where the reader was then.  libxml2 validates a tree, and in
++ * another order, so each error it raises is placed in reading order and the first one is kept.  The
++ * nodes of the tree are numbered for that in document order. */
++struct dtd_validation
++{
++    xmlDocPtr doc;
++    HRESULT code;
++    ULONG_PTR key;          /* place in reading order: twice the node's number, plus one for its end tag */
++    int rank;               /* order of errors in one place */
++    xmlNodePtr node;        /* the node it is at, NULL for the end of the document */
++    BOOL end_tag;
++};
++
++static void dtd_number_nodes(xmlNodePtr node, ULONG_PTR *count)
++{
++    for (; node; node = node->next)
++    {
++        node->_private = (void *)++*count;
++        if (node->type == XML_ELEMENT_NODE) dtd_number_nodes(node->children, count);
++    }
++}
++
++static ULONG_PTR dtd_error_key(xmlNodePtr node, BOOL end_tag)
++{
++    if (!node) return ~(ULONG_PTR)0;
++    if (end_tag) while (node->last && node->type == XML_ELEMENT_NODE) node = node->last;
++    return 2 * (ULONG_PTR)node->_private + (end_tag ? 1 : 0);
++}
++
++static xmlElementPtr dtd_element_decl(xmlDocPtr doc, xmlNodePtr elem)
++{
++    xmlElementPtr decl = NULL;
++
++    if (!doc->intSubset) return NULL;
++    if (elem->ns && elem->ns->prefix) decl = xmlGetDtdQElementDesc(doc->intSubset, elem->name, elem->ns->prefix);
++    if (!decl) decl = xmlGetDtdElementDesc(doc->intSubset, elem->name);
++    return decl;
++}
++
++/* the name an element has in the DTD's content models */
++static const xmlChar *dtd_element_name(xmlNodePtr elem, xmlChar *buffer, int size)
++{
++    if (!elem->ns || !elem->ns->prefix) return elem->name;
++    return xmlBuildQName(elem->name, elem->ns->prefix, buffer, size);
++}
++
++static BOOL dtd_mixed_allows(xmlElementContentPtr content, const xmlChar *name)
++{
++    for (; content; content = content->c2)
++    {
++        xmlElementContentPtr item = content->type == XML_ELEMENT_CONTENT_OR ? content->c1 : content;
++        if (item && item->type == XML_ELEMENT_CONTENT_ELEMENT)
++        {
++            xmlChar buffer[64], *qname = item->prefix ? xmlBuildQName(item->name, item->prefix, buffer, sizeof(buffer)) : (xmlChar *)item->name;
++            BOOL match = xmlStrEqual(qname, name);
++            if (qname != item->name && qname != buffer) xmlFree(qname);
++            if (match) return TRUE;
++        }
++        if (content->type != XML_ELEMENT_CONTENT_OR) break;
++    }
++    return FALSE;
++}
++
++/* content the DTD does not allow: text where it may not be, an element that may not come there,
++ * or, at the end tag, elements missing; MSXML names each, where the reader meets it */
++static HRESULT dtd_content_error(xmlDocPtr doc, xmlNodePtr elem, xmlNodePtr *at, BOOL *end_tag)
++{
++    xmlElementPtr decl = dtd_element_decl(doc, elem);
++    xmlRegExecCtxtPtr exec = NULL;
++    BOOL elements = FALSE;
++    xmlNodePtr child;
++    HRESULT code = 0;
++
++    *at = elem;
++    *end_tag = FALSE;
++    if (!decl) return E_XML_INVALID_CONTENT;
++    if (decl->etype == XML_ELEMENT_TYPE_ELEMENT && decl->contModel)
++        exec = xmlRegNewExecCtxt(decl->contModel, NULL, NULL);
++    for (child = elem->children; child && !code; child = child->next)
++    {
++        xmlChar buffer[64];
++        const xmlChar *name;
++
++        switch (child->type)
++        {
++        case XML_TEXT_NODE:
++        case XML_CDATA_SECTION_NODE:
++            if (decl->etype == XML_ELEMENT_TYPE_EMPTY ||
++                    (decl->etype == XML_ELEMENT_TYPE_ELEMENT && !xmlIsBlankNode(child)))
++            {
++                code = E_XML_ILLEGAL_TEXT;
++                *at = child;
++            }
++            break;
++        case XML_ELEMENT_NODE:
++            elements = TRUE;
++            name = dtd_element_name(child, buffer, sizeof(buffer));
++            if (decl->etype == XML_ELEMENT_TYPE_EMPTY ||
++                    (decl->etype == XML_ELEMENT_TYPE_MIXED && !dtd_mixed_allows(decl->content, name)) ||
++                    (exec && xmlRegExecPushString(exec, name, NULL) < 0))
++            {
++                code = E_XML_INVALID_CONTENT;
++                *at = child;
++            }
++            if (name != child->name && name != buffer) xmlFree((xmlChar *)name);
++            break;
++        default:
++            break;
++        }
++    }
++    if (!code && decl->etype == XML_ELEMENT_TYPE_ELEMENT)
++    {
++        *end_tag = TRUE;
++        if (!elements) code = E_XML_EMPTY_NOT_ALLOWED;
++        else if (!exec || xmlRegExecPushString(exec, NULL, NULL) != 1) code = E_XML_ELEMENT_NOT_COMPLETE;
++        else code = E_XML_INVALID_CONTENT;
++    }
++    if (exec) xmlRegFreeExecCtxt(exec);
++    return code ? code : E_XML_INVALID_CONTENT;
++}
++
++/* a value of a type that is one name, or one name token: MSXML reads it as such */
++static HRESULT dtd_attribute_value_error(xmlDocPtr doc, xmlNodePtr elem, const char *attr_name)
++{
++    HRESULT code = E_XML_ATTRIBUTE_VALUE;
++    xmlAttributePtr decl;
++    xmlChar *value, *p, *end;
++
++    if (!doc->intSubset || !elem || !attr_name) return code;
++    if (!(decl = xmlGetDtdAttrDesc(doc->intSubset, elem->name, (const xmlChar *)attr_name))) return code;
++    if (decl->atype != XML_ATTRIBUTE_ID && decl->atype != XML_ATTRIBUTE_IDREF &&
++            decl->atype != XML_ATTRIBUTE_ENTITY && decl->atype != XML_ATTRIBUTE_NMTOKEN) return code;
++    if (!(value = xmlGetProp(elem, (const xmlChar *)attr_name))) return code;
++    for (p = value; xml_is_space(*p); p++);
++    for (end = p + xmlStrlen(p); end > p && xml_is_space(end[-1]); end--);
++    *end = 0;
++    if (xmlStrchr(p, ' ') || xmlStrchr(p, '\t') || xmlStrchr(p, '\r') || xmlStrchr(p, '\n'))
++        code = E_SAX_MULTIPLE_NAMES;
++    else if (decl->atype != XML_ATTRIBUTE_NMTOKEN && !xmlValidateNameValue(p) && xmlValidateNmtokenValue(p))
++        code = E_SAX_BADSTARTNAMECHAR;
++    xmlFree(value);
++    return code;
++}
++
+ static void dtd_validation_error(void *ctx, const xmlError *error)
+ {
+-    HRESULT *code = ctx;
+-    xmlNodePtr child, node = error->node;
+-    BOOL elements = FALSE, text = FALSE;
++    struct dtd_validation *v = ctx;
++    xmlNodePtr node = error->node, at = node;
++    BOOL end_tag = FALSE;
++    ULONG_PTR key;
++    HRESULT code;
++    int rank;
+ 
+     TRACE("%d: %s", error->code, debugstr_a(error->message));
+-    if (*code || error->domain != XML_FROM_VALID || error->level < XML_ERR_ERROR) return;
++    if (error->domain != XML_FROM_VALID || error->level < XML_ERR_ERROR) return;
++    if (node && node->type != XML_ELEMENT_NODE) node = at = NULL;
++    /* at the start tag of an element: whether its parent may have it there, then whether the root
++     * is the DOCTYPE's, whether it is declared, its attributes, the ones it lacks */
+     switch (error->code)
+     {
+-    case XML_DTD_UNKNOWN_ELEM: *code = E_XML_ELEMENT_UNDECLARED; break;
+-    case XML_DTD_UNKNOWN_ID: *code = E_XML_ELEMENT_ID_NOT_FOUND; break;
+-    case XML_DTD_ROOT_NAME: *code = E_XML_ROOT_NAME_MISMATCH; break;
+-    case XML_DTD_UNKNOWN_ATTRIBUTE: *code = E_XML_ATTRIBUTE_NOT_DEFINED; break;
+-    case XML_DTD_ATTRIBUTE_DEFAULT: *code = E_XML_ATTRIBUTE_FIXED; break;
+-    case XML_DTD_ATTRIBUTE_VALUE: *code = E_XML_ATTRIBUTE_VALUE; break;
+-    case XML_DTD_MISSING_ATTRIBUTE: *code = E_XML_REQUIRED_ATTRIBUTE_MISSING; break;
+     case XML_DTD_CONTENT_MODEL:
+     case XML_DTD_NOT_EMPTY:
+     case XML_DTD_NOT_PCDATA:
+-        /* MSXML tells apart text where only elements may be, no elements where some must be,
+-         * and the wrong elements */
+-        for (child = node && node->type == XML_ELEMENT_NODE ? node->children : NULL; child; child = child->next)
+-        {
+-            if (child->type == XML_ELEMENT_NODE) elements = TRUE;
+-            else if ((child->type == XML_TEXT_NODE || child->type == XML_CDATA_SECTION_NODE) &&
+-                    !xmlIsBlankNode(child)) text = TRUE;
+-        }
+-        if (error->code == XML_DTD_CONTENT_MODEL && text) *code = E_XML_ILLEGAL_TEXT;
+-        else if (error->code == XML_DTD_CONTENT_MODEL && !elements) *code = E_XML_EMPTY_NOT_ALLOWED;
+-        else *code = E_XML_INVALID_CONTENT;
+-        break;
+-    default:
+-        *code = E_XML_INVALID;
++    case XML_DTD_INVALID_CHILD:
++        code = node ? dtd_content_error(v->doc, node, &at, &end_tag) : E_XML_INVALID_CONTENT;
++        rank = 0;
+         break;
+-    }
++    case XML_DTD_ROOT_NAME: code = E_XML_ROOT_NAME_MISMATCH; rank = 1; break;
++    case XML_DTD_UNKNOWN_ELEM: code = E_XML_ELEMENT_UNDECLARED; rank = 2; break;
++    case XML_DTD_UNKNOWN_ATTRIBUTE: code = E_XML_ATTRIBUTE_NOT_DEFINED; rank = 3; break;
++    case XML_DTD_ATTRIBUTE_DEFAULT: code = E_XML_ATTRIBUTE_FIXED; rank = 3; break;
++    case XML_DTD_ATTRIBUTE_VALUE: code = dtd_attribute_value_error(v->doc, node, error->str1); rank = 3; break;
++    case XML_DTD_ID_REDEFINED: code = E_XML_DUPLICATE_ID; rank = 3; break;
++    case XML_DTD_MISSING_ATTRIBUTE: code = E_XML_REQUIRED_ATTRIBUTE_MISSING; rank = 4; break;
++    /* checked when the whole document has been read */
++    case XML_DTD_UNKNOWN_ID: code = E_XML_ELEMENT_ID_NOT_FOUND; at = NULL; rank = 5; break;
++    default: code = E_XML_INVALID; rank = 5; break;
++    }
++    key = dtd_error_key(at, end_tag);
++    if (v->code && (key > v->key || (key == v->key && rank >= v->rank))) return;
++    v->code = code;
++    v->key = key;
++    v->rank = rank;
++    v->node = at;
++    v->end_tag = end_tag;
+ }
+ 
+ static HRESULT node_validate_tree(struct domnode *doc, struct domnode *node, struct parse_error *error)
+@@ -5262,19 +5482,30 @@ static HRESULT node_validate_tree(struct domnode *doc, struct domnode *node, str
+         xmlValidCtxtPtr context = xmlNewValidCtxt();
+         xmlStructuredErrorFunc handler = xmlStructuredError;
+         void *handler_context = xmlStructuredErrorContext;
+-        HRESULT code = S_OK;
++        struct dtd_validation validation = { xmldoc };
++        ULONG_PTR count = 0;
+         int valid;
+ 
+         if (!context) { xmlFreeDoc(xmldoc); return E_OUTOFMEMORY; }
+         context->error = validate_error;
+         context->warning = validate_warning;
+         ++validated;
+-        xmlSetStructuredErrorFunc(&code, dtd_validation_error);
++        dtd_number_nodes(xmldoc->children, &count);
++        xmlSetStructuredErrorFunc(&validation, dtd_validation_error);
+         valid = node == doc ? xmlValidateDocument(context, xmldoc) : xmlValidateElement(context, xmldoc, xmlnode);
+         xmlSetStructuredErrorFunc(handler_context, handler);
+         if (!valid)
+         {
+-            error->code = code ? code : E_XML_INVALID;
++            struct domnode *at = validation.node ? validation.node->_private2 : NULL;
++
++            error->code = validation.code ? validation.code : E_XML_INVALID;
++            /* where the reader was, if it read the document; nothing more for an error about it all */
++            if (at)
++            {
++                error->line = validation.end_tag ? at->parse_line : at->parse_start_line;
++                error->linepos = validation.end_tag ? at->parse_end_column : at->parse_start_column;
++            }
++            else if (validation.code == E_XML_ELEMENT_ID_NOT_FOUND) error->nosource = TRUE;
+             hr = S_FALSE;
+         }
+         xmlFreeValidCtxt(context);
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index ae48396231a..fb7ba2a0592 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -20403,6 +20403,155 @@ static void test_load_pending_stream(void)
+     }
+ }
+ 
++/* Validating against the DTD as it reads, Windows reports the first error it meets, where it meets it:
++ * at the end of the start tag of an element that is undeclared, has attributes it may not have or
++ * lacks some, or may not come where it is; at the start of text that may not be where it is; at the
++ * name in the end tag of an element whose content is incomplete; and at the end of the document, with
++ * no offset or line, for an IDREF to no ID.  validate() on a document loaded without validation
++ * names the same errors at no position. */
++static void test_dtd_validation_errors(void)
++{
++    static const struct
++    {
++        const char *xml;
++        LONG code, line, linepos, filepos;
++        const WCHAR *src;   /* the line, when it is not the whole document */
++        BOOL nosource;
++        LONG validate_code[2];
++    }
++    tests[] =
++    {
++        { "<!DOCTYPE r [<!ELEMENT a ANY>]><r/>", 0xc00ce00d /* XML_ELEMENT_UNDECLARED */, 1, 36, 35,
++          .validate_code = { 0xc00ce00d, 0xc00ce00d } },
++        { "<!DOCTYPE r [<!ELEMENT r ANY>]><r><x/></r>", 0xc00ce00d, 1, 39, 38,
++          .validate_code = { 0xc00ce00d, 0xc00ce00d } },
++        { "<!DOCTYPE r [<!ELEMENT r ANY><!ELEMENT s ANY>]><s/>", 0xc00ce013 /* XML_ROOT_NAME_MISMATCH */, 1, 52, 51,
++          .validate_code = { 0xc00ce013, 0xc00ce013 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r></r>", 0xc00ce011 /* XML_EMPTY_NOT_ALLOWED */,
++          1, 55, 54, .validate_code = { 0xc00ce011, 0xc00ce011 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r> </r>", 0xc00ce011, 1, 56, 55,
++          .validate_code = { 0xc00ce011, 0xc00ce011 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><r><a/></r>",
++          0xc00ce012 /* XML_ELEMENT_NOT_COMPLETE */, 1, 79, 78, .validate_code = { 0xc00ce012, 0xc00ce012 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><r><b/></r>",
++          0xc00ce014 /* XML_INVALID_CONTENT */, 1, 75, 74, .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r><a/><a/></r>", 0xc00ce014, 1, 61, 60,
++          .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r>t<a/></r>", 0xc00ce018 /* XML_ILLEGAL_TEXT */,
++          1, 53, 52, .validate_code = { 0xc00ce018, 0xc00ce018 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ELEMENT a EMPTY>]><r><a/></r>", 0xc00ce014, 1, 59, 58,
++          .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY>]><r>t</r>", 0xc00ce018, 1, 37, 36,
++          .validate_code = { 0xc00ce018, 0xc00ce018 } },
++        /* MSXML 3.0 leaves the space out of the document, MSXML 6.0 does not */
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY>]><r> </r>", 0xc00ce018, 1, 37, 36, .validate_code = { 0, 0xc00ce018 } },
++        { "<!DOCTYPE r [<!ELEMENT r (#PCDATA)><!ELEMENT a EMPTY>]><r><a/></r>", 0xc00ce014, 1, 63, 62,
++          .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [<!ELEMENT r (#PCDATA|a)*><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><r>t<b/></r>",
++          0xc00ce014, 1, 85, 84, .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY>]><r x='1'/>", 0xc00ce015 /* XML_ATTRIBUTE_NOT_DEFINED */, 1, 44, 43,
++          .validate_code = { 0xc00ce015, 0xc00ce015 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x CDATA #REQUIRED>]><r/>",
++          0xc00ce020 /* XML_REQUIRED_ATTRIBUTE_MISSING */, 1, 68, 67, .validate_code = { 0xc00ce020, 0xc00ce020 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x CDATA #FIXED 'a'>]><r x='b'/>",
++          0xc00ce016 /* XML_ATTRIBUTE_FIXED */, 1, 75, 74, .validate_code = { 0xc00ce016, 0xc00ce016 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x (a|b) #IMPLIED>]><r x='c'/>",
++          0xc00ce017 /* XML_ATTRIBUTE_VALUE */, 1, 73, 72, .validate_code = { 0xc00ce017, 0xc00ce017 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x IDREF #IMPLIED>]><r x='i'/>",
++          0xc00ce00e /* XML_ELEMENT_ID_NOT_FOUND */, 1, 73, 0, NULL, TRUE, { 0xc00ce00e, 0xc00ce00e } },
++        { "<!DOCTYPE r [<!ELEMENT r (a,a)><!ELEMENT a EMPTY><!ATTLIST a i ID #IMPLIED>]><r><a i='x'/><a i='x'/></r>",
++          0xc00ce200, 1, 101, 100, .validate_code = { 0xc00ce200, 0xc00ce200 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r i ID #IMPLIED>]><r i='1x'/>",
++          0xc00ce504 /* XML_E_BADSTARTNAMECHAR */, 1, 71, 70, .validate_code = { 0xc00ce504, 0xc00ce504 } },
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ATTLIST r x NMTOKEN #IMPLIED>]><r x='a b'/>", 0xc00ce574, 1, 77, 76,
++          .validate_code = { 0xc00ce574, 0xc00ce574 } },
++        /* the first of three */
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r y='1'><b/></r>", 0xc00ce015, 1, 59, 58,
++          .validate_code = { 0xc00ce015, 0xc00ce015 } },
++        { "<!DOCTYPE r [\n<!ELEMENT r (a)>\n<!ELEMENT a EMPTY>\n]>\n<r>\n  <b/>\n</r>", 0xc00ce014, 6, 7, 63,
++          L"  <b/>", .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r><a/></r>" },
++        /* nothing to validate against */
++        { "<r><x/></r>", .validate_code = { 0xc00ce224 /* E_XML_NODTD */, 0xc00ce224 } },
++    };
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++    }
++    documents[] =
++    {
++        { &_create(CLSID_DOMDocument30) },
++        { &_create(CLSID_DOMDocument60) },
++    };
++    LONG code, line, linepos, filepos;
++    IXMLDOMParseError *error;
++    IXMLDOMDocument2 *doc;
++    VARIANT_BOOL loaded;
++    unsigned int i, j;
++    const WCHAR *expect;
++    HRESULT hr;
++    VARIANT v;
++    BSTR src;
++
++    for (i = 0; i < ARRAY_SIZE(documents); i++)
++    for (j = 0; j < ARRAY_SIZE(tests); j++)
++    {
++        winetest_push_context("%s, %u", documents[i].name, j);
++        doc = _create_object(documents[i].clsid, documents[i].name, &IID_IXMLDOMDocument2, __LINE__);
++        V_VT(&v) = VT_BOOL;
++        V_BOOL(&v) = VARIANT_FALSE;
++        IXMLDOMDocument2_setProperty(doc, _bstr_("ProhibitDTD"), v);
++        loaded = 0x55;
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_(tests[j].xml), &loaded);
++        ok(hr == (tests[j].code ? S_FALSE : S_OK), "Unexpected hr %#lx.\n", hr);
++        ok(loaded == (tests[j].code ? VARIANT_FALSE : VARIANT_TRUE), "Unexpected result %d.\n", loaded);
++        hr = IXMLDOMDocument2_get_parseError(doc, &error);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        code = line = linepos = filepos = -1;
++        src = NULL;
++        IXMLDOMParseError_get_errorCode(error, &code);
++        IXMLDOMParseError_get_line(error, &line);
++        IXMLDOMParseError_get_linepos(error, &linepos);
++        IXMLDOMParseError_get_filepos(error, &filepos);
++        IXMLDOMParseError_get_srcText(error, &src);
++        ok(code == tests[j].code, "Unexpected error code %#lx.\n", code);
++        ok(line == tests[j].line && linepos == tests[j].linepos && filepos == tests[j].filepos,
++                "Unexpected position %ld:%ld, %ld.\n", line, linepos, filepos);
++        expect = tests[j].src;
++        if (!expect && tests[j].code && !tests[j].nosource) expect = _bstr_(tests[j].xml);
++        if (expect)
++            ok(src && !wcscmp(src, expect), "Unexpected source %s.\n", debugstr_w(src));
++        else
++            ok(!src, "Unexpected source %s.\n", debugstr_w(src));
++        SysFreeString(src);
++        IXMLDOMParseError_Release(error);
++        IXMLDOMDocument2_Release(doc);
++
++        doc = _create_object(documents[i].clsid, documents[i].name, &IID_IXMLDOMDocument2, __LINE__);
++        IXMLDOMDocument2_setProperty(doc, _bstr_("ProhibitDTD"), v);
++        IXMLDOMDocument2_put_validateOnParse(doc, VARIANT_FALSE);
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_(tests[j].xml), &loaded);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        error = NULL;
++        hr = IXMLDOMDocument2_validate(doc, &error);
++        todo_wine_if(i == 1 && j == 11)
++        ok(hr == (tests[j].validate_code[i] ? S_FALSE : S_OK), "Unexpected hr %#lx.\n", hr);
++        code = line = linepos = filepos = -1;
++        IXMLDOMParseError_get_errorCode(error, &code);
++        IXMLDOMParseError_get_line(error, &line);
++        IXMLDOMParseError_get_linepos(error, &linepos);
++        IXMLDOMParseError_get_filepos(error, &filepos);
++        todo_wine_if(i == 1 && j == 11)
++        ok(code == tests[j].validate_code[i], "Unexpected error code %#lx.\n", code);
++        ok(!line && !linepos && !filepos, "Unexpected position %ld:%ld, %ld.\n", line, linepos, filepos);
++        IXMLDOMParseError_Release(error);
++        IXMLDOMDocument2_Release(doc);
++        free_bstrs();
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(domdoc)
+ {
+     HRESULT hr;
+@@ -20542,6 +20691,7 @@ START_TEST(domdoc)
+     test_parse_error_source();
+     test_load_failing_stream();
+     test_load_pending_stream();
++    test_dtd_validation_errors();
+ 
+     if (is_clsid_supported(&CLSID_MXNamespaceManager40, &IID_IMXNamespaceManager))
+     {

@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:43:54 -0400
+Subject: [PATCH] combase: Hand the message filter only the application's
+ calls, typed as Windows types them.
+
+COM's own calls on IRemUnknown went through the filter an apartment
+registers, with COM's remote unknown as the object: Word's filter asked
+it for one of Word's interfaces on every RemQueryInterface and
+RemRelease.  As on Windows, those calls no longer go through the filter,
+and a call arriving while the thread waits in CoWaitForMultipleHandles,
+for a call it made or for handles, arrives while a call is pending;
+one arriving in a plain message loop is top-level.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit c28e1b3bc421f7b559339c51ff8e2f24376f710a)
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 14030504b28..5f0a36a37f6 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -2215,6 +2215,7 @@ HRESULT WINAPI CoWaitForMultipleHandles(DWORD flags, DWORD timeout, ULONG handle
+         wait_flags |= MWMO_ALERTABLE;
+ 
+     start_time = GetTickCount();
++    tlsdata->waits++;
+ 
+     while (TRUE)
+     {
+@@ -2323,6 +2324,7 @@ HRESULT WINAPI CoWaitForMultipleHandles(DWORD flags, DWORD timeout, ULONG handle
+         }
+         break;
+     }
++    tlsdata->waits--;
+     if (quit.post) PostQuitMessage(quit.code);
+ 
+     TRACE("-- %#lx\n", hr);
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index 1016bad7631..5cc09e72dc3 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -95,6 +95,7 @@ struct tlsdata
+     DWORD             cancelcount;
+     CO_MTA_USAGE_COOKIE implicit_mta_cookie; /* mta referenced by roapi from sta thread */
+     DWORD             activation_type; /* what the next activation is to the activation filter */
++    DWORD             waits;         /* how deep the thread is in CoWaitForMultipleHandles */
+ };
+ 
+ extern HRESULT WINAPI InternalTlsAllocData(struct tlsdata **data);
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+index 27d1676f365..10b88aca4b1 100644
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -33,6 +33,7 @@
+ #include "combase_private.h"
+ 
+ #include "irpcss.h"
++#include "dcom.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ole);
+ 
+@@ -1924,9 +1925,10 @@ void rpc_execute_call(struct dispatch_params *params)
+     msg->Handle = message_state;
+     msg->BufferLength -= message_state->prefix_data_len;
+ 
+-    /* call message filter */
++    /* call message filter, which COM's own calls, on the apartment's remote unknown, do not go through */
+ 
+-    if (apt->filter)
++    if (apt->filter && !IsEqualIID(&params->iid, &IID_IRemUnknown) && !IsEqualIID(&params->iid, &IID_IRemUnknown2) &&
++        !IsEqualIID(&params->iid, &IID_IRundown))
+     {
+         DWORD handlecall;
+         INTERFACEINFO interface_info;
+@@ -1936,9 +1938,11 @@ void rpc_execute_call(struct dispatch_params *params)
+         interface_info.iid = params->iid;
+         interface_info.wMethod = msg->ProcNum;
+ 
++        /* a call arriving while the thread waits in COM, for a call it made or for handles, is one while a call
++         * is pending */
+         if (IsEqualGUID(&orpcthis.cid, &tlsdata->causality_id))
+             calltype = CALLTYPE_NESTED;
+-        else if (tlsdata->pending_call_count_server == 0)
++        else if (!tlsdata->waits)
+             calltype = CALLTYPE_TOPLEVEL;
+         else
+             calltype = CALLTYPE_TOPLEVEL_CALLPENDING;
+diff --git a/dlls/ole32/compobj_private.h b/dlls/ole32/compobj_private.h
+index 719a8930882..00c68359fec 100644
+--- a/dlls/ole32/compobj_private.h
++++ b/dlls/ole32/compobj_private.h
+@@ -64,6 +64,7 @@ struct oletls
+     DWORD             cancelcount;
+     CO_MTA_USAGE_COOKIE implicit_mta_cookie; /* mta referenced by roapi from sta thread */
+     DWORD             activation_type; /* what the next activation is to the activation filter */
++    DWORD             waits;         /* how deep the thread is in CoWaitForMultipleHandles */
+ };
+ 
+ /* Global Interface Table Functions */
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index 4699a5a0c2f..7b10b538752 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -3017,6 +3017,142 @@ static void test_message_filter(void)
+     ok_ole_success(hr, CoRegisterMessageFilter);
+ }
+ 
++/* a message filter that records the calls it is handed */
++static struct
++{
++    DWORD type;
++    IID iid;
++    WORD method;
++} filter_calls[8];
++static LONG filter_call_count;
++
++static DWORD WINAPI RecordingFilter_HandleInComingCall(IMessageFilter *iface, DWORD type, HTASK caller, DWORD tick,
++                                                       INTERFACEINFO *info)
++{
++    LONG i = InterlockedIncrement(&filter_call_count) - 1;
++
++    if (i < ARRAY_SIZE(filter_calls))
++    {
++        filter_calls[i].type = type;
++        filter_calls[i].iid = info->iid;
++        filter_calls[i].method = info->wMethod;
++    }
++    return SERVERCALL_ISHANDLED;
++}
++
++static DWORD WINAPI RecordingFilter_MessagePending(IMessageFilter *iface, HTASK callee, DWORD tick, DWORD type)
++{
++    return PENDINGMSG_WAITDEFPROCESS;
++}
++
++static const IMessageFilterVtbl RecordingFilter_Vtbl =
++{
++    MessageFilter_QueryInterface,
++    MessageFilter_AddRef,
++    MessageFilter_Release,
++    RecordingFilter_HandleInComingCall,
++    MessageFilter_RetryRejectedCall,
++    RecordingFilter_MessagePending
++};
++
++static IMessageFilter RecordingFilter = { &RecordingFilter_Vtbl };
++
++struct filter_client_params
++{
++    IStream *first, *second;
++    DWORD main_tid;
++    HANDLE first_done;
++};
++
++static DWORD CALLBACK filter_client_thread(void *arg)
++{
++    struct filter_client_params *params = arg;
++    IClassFactory *cf;
++    IUnknown *unk;
++    HRESULT hr;
++
++    CoInitializeEx(NULL, COINIT_MULTITHREADED);
++
++    hr = CoGetInterfaceAndReleaseStream(params->first, &IID_IClassFactory, (void **)&cf);
++    ok_ole_success(hr, CoGetInterfaceAndReleaseStream);
++    /* asks the object's apartment through IRemUnknown */
++    hr = IClassFactory_QueryInterface(cf, &IID_IOleWindow, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    hr = IClassFactory_CreateInstance(cf, NULL, &IID_IOleWindow, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    hr = IClassFactory_CreateInstance(cf, NULL, &IID_IOleWindow, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    IClassFactory_Release(cf);
++    SetEvent(params->first_done);
++
++    hr = CoGetInterfaceAndReleaseStream(params->second, &IID_IClassFactory, (void **)&cf);
++    ok_ole_success(hr, CoGetInterfaceAndReleaseStream);
++    hr = IClassFactory_CreateInstance(cf, NULL, &IID_IOleWindow, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    hr = IClassFactory_CreateInstance(cf, NULL, &IID_IOleWindow, (void **)&unk);
++    ok(hr == E_NOINTERFACE, "got %#lx.\n", hr);
++    IClassFactory_Release(cf);
++    PostThreadMessageA(params->main_tid, WM_QUIT, 0, 0);
++
++    CoUninitialize();
++    return 0;
++}
++
++static void test_message_filter_calls(void)
++{
++    struct filter_client_params params;
++    IMessageFilter *prev_filter;
++    HANDLE thread;
++    unsigned int i;
++    DWORD index;
++    HRESULT hr;
++    MSG msg;
++
++    cLocks = 0;
++
++    hr = CoRegisterMessageFilter(&RecordingFilter, &prev_filter);
++    ok_ole_success(hr, CoRegisterMessageFilter);
++    hr = CoMarshalInterThreadInterfaceInStream(&IID_IClassFactory, (IUnknown *)&Test_ClassFactory, &params.first);
++    ok_ole_success(hr, CoMarshalInterThreadInterfaceInStream);
++    hr = CoMarshalInterThreadInterfaceInStream(&IID_IClassFactory, (IUnknown *)&Test_ClassFactory, &params.second);
++    ok_ole_success(hr, CoMarshalInterThreadInterfaceInStream);
++    params.main_tid = GetCurrentThreadId();
++    params.first_done = CreateEventA(NULL, TRUE, FALSE, NULL);
++    filter_call_count = 0;
++    thread = CreateThread(NULL, 0, filter_client_thread, &params, 0, NULL);
++
++    /* COM's own calls on IRemUnknown are not handed to the filter, and calls arriving while the thread waits in
++     * COM arrive while a call is pending */
++    hr = CoWaitForMultipleHandles(0, 10000, 1, &params.first_done, &index);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    ok(filter_call_count == 2, "got %ld calls.\n", filter_call_count);
++    for (i = 0; i < min(filter_call_count, 2); i++)
++    {
++        ok(IsEqualIID(&filter_calls[i].iid, &IID_IClassFactory), "%u: got %s.\n", i,
++           wine_dbgstr_guid(&filter_calls[i].iid));
++        ok(filter_calls[i].method == 3, "%u: got method %u.\n", i, filter_calls[i].method);
++        ok(filter_calls[i].type == CALLTYPE_TOPLEVEL_CALLPENDING, "%u: got type %lu.\n", i, filter_calls[i].type);
++    }
++
++    /* while it only pumps messages, they are top-level calls */
++    filter_call_count = 0;
++    while (GetMessageA(&msg, NULL, 0, 0)) DispatchMessageA(&msg);
++    ok(filter_call_count == 2, "got %ld calls.\n", filter_call_count);
++    for (i = 0; i < min(filter_call_count, 2); i++)
++    {
++        ok(IsEqualIID(&filter_calls[i].iid, &IID_IClassFactory), "%u: got %s.\n", i,
++           wine_dbgstr_guid(&filter_calls[i].iid));
++        ok(filter_calls[i].type == CALLTYPE_TOPLEVEL, "%u: got type %lu.\n", i, filter_calls[i].type);
++    }
++
++    ok(!WaitForSingleObject(thread, 10000), "wait failed.\n");
++    CloseHandle(thread);
++    CloseHandle(params.first_done);
++    hr = CoRegisterMessageFilter(prev_filter, NULL);
++    ok_ole_success(hr, CoRegisterMessageFilter);
++    ok_no_locks();
++}
++
+ /* test failure case of trying to unmarshal from bad stream */
+ static void test_bad_marshal_stream(void)
+ {
+@@ -5139,6 +5275,7 @@ START_TEST(marshal)
+     test_hresult_marshaling();
+     test_proxy_used_in_wrong_thread();
+     test_message_filter();
++    test_message_filter_calls();
+     test_bad_marshal_stream();
+     test_proxy_interfaces();
+     test_stubbuffer(&IID_IClassFactory);

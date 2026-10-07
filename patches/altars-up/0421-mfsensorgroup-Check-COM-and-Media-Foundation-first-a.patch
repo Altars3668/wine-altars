@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 06:50:17 -0400
+Subject: [PATCH] mfsensorgroup: Check COM and Media Foundation first, as
+ Windows 11 does.
+
+Measured on build 29671: MFCreateSensorActivityMonitor says
+CO_E_NOTINITIALIZED without COM, before it looks at the arguments or
+touches the output; MF_E_SHUTDOWN before MFStartup, what allocating a work
+queue says then, with the output cleared; E_INVALIDARG for no callback.  A
+second Start is MF_E_INVALIDREQUEST.  A report's GetActivityReport past the
+end is MF_E_INVALIDINDEX, and GetActivityReportByDeviceName without a name
+E_INVALIDARG with the output untouched.  Reports come from Media
+Foundation's multithreaded queue, on a thread that has entered the MTA.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/mfsensorgroup/Makefile.in b/dlls/mfsensorgroup/Makefile.in
+index 804a217dfcf..bad72314e8a 100644
+--- a/dlls/mfsensorgroup/Makefile.in
++++ b/dlls/mfsensorgroup/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = mfsensorgroup.dll
+ IMPORTLIB = mfsensorgroup
+-IMPORTS   = mfuuid uuid
++IMPORTS   = mfplat ole32 mfuuid uuid
+ 
+ SOURCES = \
+ 	main.c
+diff --git a/dlls/mfsensorgroup/main.c b/dlls/mfsensorgroup/main.c
+index 5ae7bb6d313..83fda3e14ab 100644
+--- a/dlls/mfsensorgroup/main.c
++++ b/dlls/mfsensorgroup/main.c
+@@ -20,6 +20,7 @@
+ 
+ #define COBJMACROS
+ 
++#include "mfapi.h"
+ #include "mfidl.h"
+ #include "mferror.h"
+ 
+@@ -97,7 +98,7 @@ static HRESULT WINAPI activities_report_GetActivityReport(IMFSensorActivitiesRep
+         return E_POINTER;
+ 
+     *report = NULL;
+-    return E_INVALIDARG;
++    return MF_E_INVALIDINDEX;
+ }
+ 
+ static HRESULT WINAPI activities_report_GetActivityReportByDeviceName(IMFSensorActivitiesReport *iface,
+@@ -105,7 +106,9 @@ static HRESULT WINAPI activities_report_GetActivityReportByDeviceName(IMFSensorA
+ {
+     TRACE("iface %p, name %s, report %p.\n", iface, debugstr_w(name), report);
+ 
+-    if (!name || !report)
++    if (!name)
++        return E_INVALIDARG;
++    if (!report)
+         return E_POINTER;
+ 
+     *report = NULL;
+@@ -139,6 +142,7 @@ static HRESULT activities_report_create(IMFSensorActivitiesReport **out)
+ struct activity_monitor
+ {
+     IMFSensorActivityMonitor IMFSensorActivityMonitor_iface;
++    IMFAsyncCallback IMFAsyncCallback_iface;
+     LONG refcount;
+ 
+     IMFSensorActivitiesReportCallback *callback;
+@@ -193,12 +197,47 @@ static ULONG WINAPI activity_monitor_Release(IMFSensorActivityMonitor *iface)
+     return refcount;
+ }
+ 
+-/* The report is made on a thread of the pool, as the frame server's arrive on threads of
+- * their own.  The item holds a reference to the monitor until it has taken one to the
+- * callback, so that the monitor can go while its last report is being made. */
+-static void CALLBACK activity_monitor_report(TP_CALLBACK_INSTANCE *instance, void *context)
++static struct activity_monitor *impl_from_IMFAsyncCallback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct activity_monitor, IMFAsyncCallback_iface);
++}
++
++static HRESULT WINAPI activity_monitor_callback_QueryInterface(IMFAsyncCallback *iface, REFIID riid, void **out)
++{
++    if (IsEqualIID(riid, &IID_IMFAsyncCallback) || IsEqualIID(riid, &IID_IUnknown))
++    {
++        *out = iface;
++        IMFAsyncCallback_AddRef(iface);
++        return S_OK;
++    }
++
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI activity_monitor_callback_AddRef(IMFAsyncCallback *iface)
++{
++    struct activity_monitor *monitor = impl_from_IMFAsyncCallback(iface);
++    return IMFSensorActivityMonitor_AddRef(&monitor->IMFSensorActivityMonitor_iface);
++}
++
++static ULONG WINAPI activity_monitor_callback_Release(IMFAsyncCallback *iface)
+ {
+-    struct activity_monitor *monitor = context;
++    struct activity_monitor *monitor = impl_from_IMFAsyncCallback(iface);
++    return IMFSensorActivityMonitor_Release(&monitor->IMFSensorActivityMonitor_iface);
++}
++
++static HRESULT WINAPI activity_monitor_callback_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
++{
++    return E_NOTIMPL;
++}
++
++/* The report is made on a thread of Media Foundation's multithreaded queue, as Windows makes
++ * its own on a thread in the multithreaded apartment.  The work item holds a reference to the
++ * monitor, so that the monitor can go while its last report is being made. */
++static HRESULT WINAPI activity_monitor_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct activity_monitor *monitor = impl_from_IMFAsyncCallback(iface);
+     IMFSensorActivitiesReportCallback *callback = NULL;
+     IMFSensorActivitiesReport *report;
+     HRESULT hr;
+@@ -210,10 +249,9 @@ static void CALLBACK activity_monitor_report(TP_CALLBACK_INSTANCE *instance, voi
+         IMFSensorActivitiesReportCallback_AddRef(callback);
+     }
+     ReleaseSRWLockShared(&monitor->lock);
+-    IMFSensorActivityMonitor_Release(&monitor->IMFSensorActivityMonitor_iface);
+ 
+     if (!callback)
+-        return;
++        return S_OK;
+ 
+     if (SUCCEEDED(activities_report_create(&report)))
+     {
+@@ -222,29 +260,35 @@ static void CALLBACK activity_monitor_report(TP_CALLBACK_INSTANCE *instance, voi
+         IMFSensorActivitiesReport_Release(report);
+     }
+     IMFSensorActivitiesReportCallback_Release(callback);
++    return S_OK;
+ }
+ 
++static const IMFAsyncCallbackVtbl activity_monitor_callback_vtbl =
++{
++    activity_monitor_callback_QueryInterface,
++    activity_monitor_callback_AddRef,
++    activity_monitor_callback_Release,
++    activity_monitor_callback_GetParameters,
++    activity_monitor_callback_Invoke,
++};
++
+ static HRESULT WINAPI activity_monitor_Start(IMFSensorActivityMonitor *iface)
+ {
+     struct activity_monitor *monitor = impl_from_IMFSensorActivityMonitor(iface);
+-    HRESULT hr = S_OK;
++    HRESULT hr;
+ 
+     TRACE("iface %p.\n", iface);
+ 
+     AcquireSRWLockExclusive(&monitor->lock);
+-    if (!monitor->started)
++    if (monitor->started)
++        hr = MF_E_INVALIDREQUEST;
++    else
+     {
+         /* Windows learns from its frame server which processes stream from which sensor.
+          * Wine has none, so the one report it has to give is that no sensor is in use. */
+         FIXME("iface %p, the use of sensors by processes is not tracked.\n", iface);
+-        monitor->started = TRUE;
+-        IMFSensorActivityMonitor_AddRef(iface);
+-        if (!TrySubmitThreadpoolCallback(activity_monitor_report, monitor, NULL))
+-        {
+-            hr = HRESULT_FROM_WIN32(GetLastError());
+-            monitor->started = FALSE;
+-            InterlockedDecrement(&monitor->refcount);
+-        }
++        if (SUCCEEDED(hr = MFPutWorkItem(MFASYNC_CALLBACK_QUEUE_MULTITHREADED, &monitor->IMFAsyncCallback_iface, NULL)))
++            monitor->started = TRUE;
+     }
+     ReleaseSRWLockExclusive(&monitor->lock);
+ 
+@@ -280,19 +324,31 @@ HRESULT WINAPI MFCreateSensorActivityMonitor(IMFSensorActivitiesReportCallback *
+         IMFSensorActivityMonitor **out)
+ {
+     struct activity_monitor *monitor;
++    APTTYPEQUALIFIER qualifier;
++    APTTYPE type;
++    DWORD queue;
++    HRESULT hr;
+ 
+     TRACE("callback %p, out %p.\n", callback, out);
+ 
++    /* COM comes first, before the arguments are looked at */
++    if (FAILED(hr = CoGetApartmentType(&type, &qualifier)))
++        return hr;
+     if (!out)
+         return E_POINTER;
+     *out = NULL;
+     if (!callback)
+-        return E_POINTER;
++        return E_INVALIDARG;
++    /* Before MFStartup Windows says what allocating a work queue says then; the reports come from one. */
++    if (FAILED(hr = MFAllocateSerialWorkQueue(MFASYNC_CALLBACK_QUEUE_MULTITHREADED, &queue)))
++        return hr;
++    MFUnlockWorkQueue(queue);
+ 
+     if (!(monitor = calloc(1, sizeof(*monitor))))
+         return E_OUTOFMEMORY;
+ 
+     monitor->IMFSensorActivityMonitor_iface.lpVtbl = &activity_monitor_vtbl;
++    monitor->IMFAsyncCallback_iface.lpVtbl = &activity_monitor_callback_vtbl;
+     monitor->refcount = 1;
+     monitor->callback = callback;
+     IMFSensorActivitiesReportCallback_AddRef(callback);
+diff --git a/dlls/mfsensorgroup/tests/Makefile.in b/dlls/mfsensorgroup/tests/Makefile.in
+index ea3495c0445..bcc55dffd65 100644
+--- a/dlls/mfsensorgroup/tests/Makefile.in
++++ b/dlls/mfsensorgroup/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = mfsensorgroup.dll
+-IMPORTS   = mfsensorgroup mfuuid uuid
++IMPORTS   = mfsensorgroup mfplat ole32 mfuuid uuid
+ 
+ SOURCES = \
+ 	mfsensorgroup.c
+diff --git a/dlls/mfsensorgroup/tests/mfsensorgroup.c b/dlls/mfsensorgroup/tests/mfsensorgroup.c
+index 965a70da537..cdef3d4adbb 100644
+--- a/dlls/mfsensorgroup/tests/mfsensorgroup.c
++++ b/dlls/mfsensorgroup/tests/mfsensorgroup.c
+@@ -22,6 +22,8 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "objbase.h"
++#include "mfapi.h"
+ #include "mfidl.h"
+ #include "mferror.h"
+ 
+@@ -35,6 +37,9 @@ struct callback
+     HANDLE event;
+     DWORD thread;
+     ULONG count;
++    HRESULT apartment_hr;
++    APTTYPE apartment;
++    APTTYPEQUALIFIER qualifier;
+ };
+ 
+ static struct callback *impl_from_IMFSensorActivitiesReportCallback(IMFSensorActivitiesReportCallback *iface)
+@@ -74,6 +79,7 @@ static HRESULT WINAPI callback_OnActivitiesReport(IMFSensorActivitiesReportCallb
+     HRESULT hr;
+ 
+     callback->thread = GetCurrentThreadId();
++    callback->apartment_hr = CoGetApartmentType(&callback->apartment, &callback->qualifier);
+     ok(!!report, "Got no report.\n");
+ 
+     hr = IMFSensorActivitiesReport_GetCount(report, &count);
+@@ -97,7 +103,7 @@ static HRESULT WINAPI callback_OnActivitiesReport(IMFSensorActivitiesReportCallb
+ 
+     activity = (void *)0xdeadbeef;
+     hr = IMFSensorActivitiesReport_GetActivityReport(report, count, &activity);
+-    ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
++    ok(hr == MF_E_INVALIDINDEX, "Unexpected hr %#lx.\n", hr);
+     ok(!activity, "Got report %p.\n", activity);
+     hr = IMFSensorActivitiesReport_GetActivityReport(report, 0, NULL);
+     ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
+@@ -106,6 +112,10 @@ static HRESULT WINAPI callback_OnActivitiesReport(IMFSensorActivitiesReportCallb
+     hr = IMFSensorActivitiesReport_GetActivityReportByDeviceName(report, L"\\\\?\\wine#no#such#device", &activity);
+     ok(hr == MF_E_NOT_FOUND, "Unexpected hr %#lx.\n", hr);
+     ok(!activity, "Got report %p.\n", activity);
++    activity = (void *)0xdeadbeef;
++    hr = IMFSensorActivitiesReport_GetActivityReportByDeviceName(report, NULL, &activity);
++    ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
++    ok(activity == (void *)0xdeadbeef, "Got report %p.\n", activity);
+ 
+     InterlockedIncrement(&callback->reports);
+     SetEvent(callback->event);
+@@ -120,6 +130,39 @@ static const IMFSensorActivitiesReportCallbackVtbl callback_vtbl =
+     callback_OnActivitiesReport,
+ };
+ 
++/* what Windows checks before the arguments: COM, then Media Foundation */
++static void test_uninitialized(void)
++{
++    struct callback callback = {{&callback_vtbl}, 1};
++    IMFSensorActivityMonitor *monitor;
++    HRESULT hr;
++
++    hr = MFCreateSensorActivityMonitor(&callback.IMFSensorActivitiesReportCallback_iface, NULL);
++    ok(hr == CO_E_NOTINITIALIZED, "Unexpected hr %#lx.\n", hr);
++    monitor = (void *)0xdeadbeef;
++    hr = MFCreateSensorActivityMonitor(NULL, &monitor);
++    ok(hr == CO_E_NOTINITIALIZED, "Unexpected hr %#lx.\n", hr);
++    ok(monitor == (void *)0xdeadbeef, "Got monitor %p.\n", monitor);
++    hr = MFCreateSensorActivityMonitor(&callback.IMFSensorActivitiesReportCallback_iface, &monitor);
++    ok(hr == CO_E_NOTINITIALIZED, "Unexpected hr %#lx.\n", hr);
++    ok(monitor == (void *)0xdeadbeef, "Got monitor %p.\n", monitor);
++    ok(callback.refcount == 1, "Unexpected refcount %ld.\n", callback.refcount);
++
++    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = MFCreateSensorActivityMonitor(&callback.IMFSensorActivitiesReportCallback_iface, &monitor);
++    ok(hr == MF_E_SHUTDOWN, "Unexpected hr %#lx.\n", hr);
++    ok(!monitor, "Got monitor %p.\n", monitor);
++    ok(callback.refcount == 1, "Unexpected refcount %ld.\n", callback.refcount);
++    CoUninitialize();
++}
++
++static ULONG get_refcount(IMFSensorActivityMonitor *monitor)
++{
++    IMFSensorActivityMonitor_AddRef(monitor);
++    return IMFSensorActivityMonitor_Release(monitor);
++}
++
+ static void test_activity_monitor(void)
+ {
+     struct callback callback = {{&callback_vtbl}, 1};
+@@ -136,7 +179,7 @@ static void test_activity_monitor(void)
+     ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
+     monitor = (void *)0xdeadbeef;
+     hr = MFCreateSensorActivityMonitor(NULL, &monitor);
+-    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
+     ok(!monitor, "Got monitor %p.\n", monitor);
+ 
+     hr = MFCreateSensorActivityMonitor(&callback.IMFSensorActivitiesReportCallback_iface, &monitor);
+@@ -155,10 +198,16 @@ static void test_activity_monitor(void)
+     ret = WaitForSingleObject(callback.event, 5000);
+     ok(!ret, "Unexpected ret %#lx.\n", ret);
+     ok(callback.thread && callback.thread != GetCurrentThreadId(), "Reported on thread %#lx.\n", callback.thread);
++    /* a thread that has entered the multithreaded apartment itself */
++    ok(callback.apartment_hr == S_OK, "Unexpected hr %#lx.\n", callback.apartment_hr);
++    ok(callback.apartment == APTTYPE_MTA, "Got apartment %d.\n", callback.apartment);
++    ok(callback.qualifier == APTTYPEQUALIFIER_NONE, "Got qualifier %d.\n", callback.qualifier);
+     trace("%lu sensors in use.\n", callback.count);
++    /* Windows may follow with another */
++    while (!WaitForSingleObject(callback.event, 200));
+ 
+     hr = IMFSensorActivityMonitor_Start(monitor);
+-    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(hr == MF_E_INVALIDREQUEST, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IMFSensorActivityMonitor_Stop(monitor);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -174,12 +223,14 @@ static void test_activity_monitor(void)
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ret = WaitForSingleObject(callback.event, 5000);
+     ok(!ret, "Unexpected ret %#lx.\n", ret);
++    while (!WaitForSingleObject(callback.event, 200));
+     hr = IMFSensorActivityMonitor_Stop(monitor);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
++    /* the work item of the last report may still hold the monitor for a moment */
++    for (i = 0; i < 100 && get_refcount(monitor) != 1; i++) Sleep(10);
+     ref = IMFSensorActivityMonitor_Release(monitor);
+     ok(!ref, "Unexpected refcount %lu.\n", ref);
+-    /* the report that has just been made may still hold the callback for a moment */
+     for (i = 0; i < 100 && callback.refcount != 1; i++) Sleep(10);
+     ok(callback.refcount == 1, "Unexpected refcount %ld.\n", callback.refcount);
+ 
+@@ -188,5 +239,16 @@ static void test_activity_monitor(void)
+ 
+ START_TEST(mfsensorgroup)
+ {
++    HRESULT hr;
++
++    test_uninitialized();
++
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
+     test_activity_monitor();
++
++    MFShutdown();
++    CoUninitialize();
+ }

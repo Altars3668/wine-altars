@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 17:23:40 -0400
+Subject: [PATCH] d3d11: Follow which participant holds a keyed mutex.
+
+The keyed mutex knew only whether a shared texture was held, not by whom:
+any participant could release it, one could acquire it twice and wait on
+itself, and one going away holding it left it held.  It now records the
+holder, as Windows does:
+
+ - a participant acquiring what it already holds, or releasing what it
+   does not, gets DXGI_ERROR_INVALID_CALL;
+ - a holder that goes away leaves the surface abandoned, and every
+   acquire after that returns WAIT_ABANDONED;
+ - only a texture created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX has
+   an IDXGIKeyedMutex.
+
+test_keyed_mutex passes; Word composites its UI through these as before,
+with no participant acquiring or releasing out of turn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 2fd34b500948cf466e11402c53847aa3a047ee24)
+
+diff --git a/dlls/d3d11/shared.c b/dlls/d3d11/shared.c
+index 1151c85a923..0bc7beaf695 100644
+--- a/dlls/d3d11/shared.c
++++ b/dlls/d3d11/shared.c
+@@ -47,7 +47,10 @@ struct d3d_shared_surface
+     CRITICAL_SECTION cs;
+     CONDITION_VARIABLE cv;
+     UINT64 key;
+-    BOOL acquired;
++    /* The participant that holds the surface, if any.  One that goes away
++     * holding it leaves it abandoned: nobody can take it again. */
++    struct d3d_texture2d *holder;
++    BOOL abandoned;
+ 
+     /* The current pixels.  A texture cannot be the carrier: it belongs to one
+      * device, and reading it from another device's thread is the bug this
+@@ -438,6 +441,12 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_AcquireSync(IDXGIKeyedMutex *if
+         return E_FAIL;
+ 
+     EnterCriticalSection(&shared->cs);
++    if (shared->holder == texture)
++    {
++        LeaveCriticalSection(&shared->cs);
++        WARN("Texture %p already holds surface %p.\n", texture, shared);
++        return DXGI_ERROR_INVALID_CALL;
++    }
+     /* A participant that did not create this surface, taking it before anything
+      * has ever been carried into it, composites from a texture that has never
+      * held pixels -- on Windows it would have seen the creator's live pixels,
+@@ -452,11 +461,16 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_AcquireSync(IDXGIKeyedMutex *if
+     content_deadline = GetTickCount() + (timeout ? 250 : 0);
+     for (;;)
+     {
+-        BOOL blocked = shared->acquired || shared->key != key;
++        BOOL blocked = shared->holder || shared->key != key;
+         BOOL want_content = !shared->bits && texture != shared->owner
+                 && (int)(content_deadline - GetTickCount()) > 0;
+         DWORD slice;
+ 
++        if (shared->abandoned)
++        {
++            LeaveCriticalSection(&shared->cs);
++            return WAIT_ABANDONED;
++        }
+         if (!blocked && !want_content)
+             break;
+ 
+@@ -493,7 +507,7 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_AcquireSync(IDXGIKeyedMutex *if
+             }
+         }
+     }
+-    shared->acquired = TRUE;
++    shared->holder = texture;
+     if (waited_for_content && shared->bits)
+         WARN("altars-content-wait texture %p got surface %p after waiting.\n", texture, shared);
+     if (!shared->bits && texture != shared->owner)
+@@ -530,11 +544,11 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_ReleaseSync(IDXGIKeyedMutex *if
+         return E_FAIL;
+ 
+     EnterCriticalSection(&shared->cs);
+-    if (!shared->acquired)
++    if (shared->holder != texture)
+     {
+         LeaveCriticalSection(&shared->cs);
+-        WARN("Released without being acquired.\n");
+-        return E_FAIL;
++        WARN("Texture %p releases surface %p it does not hold.\n", texture, shared);
++        return DXGI_ERROR_INVALID_CALL;
+     }
+     /* Carry whenever this participant actually wrote.  It is tempting to skip
+      * that while the surface has only one participant -- nobody to carry to
+@@ -563,7 +577,7 @@ static HRESULT STDMETHODCALLTYPE d3d_keyed_mutex_ReleaseSync(IDXGIKeyedMutex *if
+             texture->shared_generation = ++shared->generation;
+             texture->shared_dirty = FALSE;
+         }
+-        shared->acquired = FALSE;
++        shared->holder = NULL;
+         shared->key = key;
+         WakeAllConditionVariable(&shared->cv);
+     }
+@@ -586,12 +600,6 @@ static const struct IDXGIKeyedMutexVtbl d3d_keyed_mutex_vtbl =
+     d3d_keyed_mutex_ReleaseSync,
+ };
+ 
+-static BOOL texture_is_shared(const struct d3d_texture2d *texture)
+-{
+-    return !!(texture->desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED
+-            | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE));
+-}
+-
+ /* Give this texture shared state, creating it if this is the first participant. */
+ static struct d3d_shared_surface *texture_get_shared(struct d3d_texture2d *texture)
+ {
+@@ -642,7 +650,7 @@ HRESULT d3d_shared_surface_attach(struct d3d_texture2d *owner, struct d3d_textur
+ 
+ HRESULT d3d_texture2d_get_keyed_mutex(struct d3d_texture2d *texture, void **out)
+ {
+-    if (!texture_is_shared(texture))
++    if (!(texture->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+         return E_NOINTERFACE;
+ 
+     if (!texture_get_shared(texture))
+@@ -674,6 +682,13 @@ void d3d_texture2d_cleanup_shared(struct d3d_texture2d *texture)
+ 
+     EnterCriticalSection(&shared->cs);
+     list_remove(&texture->shared_entry);
++    if (shared->holder == texture)
++    {
++        WARN("Texture %p goes away holding surface %p.\n", texture, shared);
++        shared->holder = NULL;
++        shared->abandoned = TRUE;
++        WakeAllConditionVariable(&shared->cv);
++    }
+     LeaveCriticalSection(&shared->cs);
+ 
+     texture->shared = NULL;

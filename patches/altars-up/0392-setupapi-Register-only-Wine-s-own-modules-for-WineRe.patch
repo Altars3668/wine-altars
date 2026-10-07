@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:36:26 -0400
+Subject: [PATCH] setupapi: Register only Wine's own modules for
+ WineRegisterDlls; use it in wine.inf.
+
+Every update of a prefix ran DllRegisterServer of whatever its system DLLs load as.  Where an
+installer replaced one, that is the installer's DLL, which that installer registered: the native
+mscoree of .NET 4 then looks for an older runtime, shows "This application could not be started"
+and waits for an answer, and the update and every program started meanwhile wait with it (bug
+47144).
+
+WineRegisterDlls registers like RegisterDlls but skips a module that is not a Wine builtin, the
+way WineFakeDlls leaves a native file alone; wine.inf uses it for its own DLLs.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/setupapi/install.c b/dlls/setupapi/install.c
+index 0321ff66bbf..5da293f92ac 100644
+--- a/dlls/setupapi/install.c
++++ b/dlls/setupapi/install.c
+@@ -64,6 +64,7 @@ struct register_dll_info
+     PSP_FILE_CALLBACK_W callback;
+     PVOID               callback_context;
+     BOOL                unregister;
++    BOOL                builtin_only;
+     int                 modules_size;
+     int                 modules_count;
+     HMODULE            *modules;
+@@ -551,6 +552,16 @@ static BOOL registry_callback( HINF hinf, PCWSTR field, void *arg )
+  *
+  * Register or unregister a dll.
+  */
++/* a module Wine built itself, as opposed to one an installer put in place of it */
++static BOOL is_builtin_module( HMODULE module )
++{
++    static const char builtin_signature[] = "Wine builtin DLL";
++    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)module;
++
++    return dos->e_lfanew >= sizeof(*dos) + sizeof(builtin_signature) &&
++           !memcmp( dos + 1, builtin_signature, sizeof(builtin_signature) );
++}
++
+ static BOOL do_register_dll( struct register_dll_info *info, const WCHAR *path,
+                              INT flags, INT timeout, const WCHAR *args )
+ {
+@@ -587,6 +598,18 @@ static BOOL do_register_dll( struct register_dll_info *info, const WCHAR *path,
+         goto done;
+     }
+ 
++    /* Wine's own setup registers Wine's own modules.  One that an installer replaced was
++     * registered by that installer, and registering it again is not Wine's business: the native
++     * mscoree of .NET 4 asks for a runtime it does not find and waits for an answer, stopping
++     * every update of the prefix. */
++    if (info->builtin_only && !is_builtin_module( module ))
++    {
++        TRACE( "not registering %s, not a builtin\n", debugstr_w(path) );
++        FreeLibrary( module );
++        module = NULL;
++        goto done;
++    }
++
+     if ((nt = RtlImageNtHeader( module )) && !(nt->FileHeader.Characteristics & IMAGE_FILE_DLL))
+     {
+         /* file is an executable, not a dll */
+@@ -1194,6 +1217,11 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section,
+         hr = CoInitialize(NULL);
+ 
+         ret = iterate_section_fields( hinf, section, L"RegisterDlls", register_dlls_callback, &info );
++        if (ret)
++        {
++            info.builtin_only = TRUE;
++            ret = iterate_section_fields( hinf, section, L"WineRegisterDlls", register_dlls_callback, &info );
++        }
+         for (i = 0; i < info.modules_count; i++) FreeLibrary( info.modules[i] );
+ 
+         if (SUCCEEDED(hr))
+diff --git a/dlls/setupapi/tests/install.c b/dlls/setupapi/tests/install.c
+index e489aea957e..5d200a643d4 100644
+--- a/dlls/setupapi/tests/install.c
++++ b/dlls/setupapi/tests/install.c
+@@ -2166,6 +2166,13 @@ static void test_register_dlls(void)
+             "UnregisterDlls=register_section\n"
+             "[register_section]\n"
+             "40000,,winetest_selfreg.dll,1\n";
++    /* Wine's own setup registers only modules Wine built, and Windows does not know the directive */
++    static const char wine_inf_data[] = "[Version]\n"
++            "Signature=\"$Chicago$\"\n"
++            "[DefaultInstall]\n"
++            "WineRegisterDlls=register_section\n"
++            "[register_section]\n"
++            "40000,,winetest_selfreg.dll,1\n";
+ 
+     void *context = SetupInitDefaultQueueCallbackEx(NULL, INVALID_HANDLE_VALUE, 0, 0, 0);
+     char path[MAX_PATH];
+@@ -2221,6 +2228,26 @@ static void test_register_dlls(void)
+ 
+     CoUninitialize();
+ 
++    SetupCloseInfFile(hinf);
++
++    create_inf_file("test.inf", wine_inf_data);
++    hinf = SetupOpenInfFileA(path, NULL, INF_STYLE_WIN4, NULL);
++    ok(hinf != INVALID_HANDLE_VALUE, "Failed to open INF file, error %#lx.\n", GetLastError());
++    ret = SetupSetDirectoryIdA(hinf, 40000, CURR_DIR);
++    ok(ret, "Failed to set directory ID, error %lu.\n", GetLastError());
++
++    ret = SetupInstallFromInfSectionA(NULL, hinf, "DefaultInstall", SPINST_REGSVR,
++            NULL, "C:\\", 0, SetupDefaultQueueCallbackA, context, NULL, NULL);
++    ok(ret, "Failed to install, error %#lx.\n", GetLastError());
++
++    l = RegOpenKeyA(HKEY_CURRENT_USER, "winetest_setupapi_selfreg", &key);
++    ok(l == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", l);
++    if (!l)
++    {
++        RegCloseKey(key);
++        RegDeleteKeyA(HKEY_CURRENT_USER, "winetest_setupapi_selfreg");
++    }
++
+     SetupCloseInfFile(hinf);
+     ret = DeleteFileA("test.inf");
+     ok(ret, "Failed to delete INF file, error %lu.\n", GetLastError());
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index d039b0c96e0..f39ef620fc1 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -51,7 +51,7 @@ AddService=MountMgr,0x800,MountMgrService
+ 12,,mountmgr.sys
+ 
+ [BaseInstall]
+-RegisterDlls=RegisterDllsSection
++WineRegisterDlls=RegisterDllsSection
+ WineFakeDlls=FakeDlls
+ UpdateInis=SystemIni
+ CopyFiles=ColorFiles,EtcFiles,InfFiles,NlsFiles,SortFiles,WinmdFiles
+@@ -109,7 +109,7 @@ AddReg=\
+     VersionInfo
+ 
+ [BaseWow64Install]
+-RegisterDlls=RegisterDllsSection
++WineRegisterDlls=RegisterDllsSection
+ WineFakeDlls=FakeDllsWin32,FakeDllsWow64
+ CopyFiles=NlsFiles,WinmdFiles
+ AddReg=\

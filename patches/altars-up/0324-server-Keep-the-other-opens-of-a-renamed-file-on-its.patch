@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 01:26:28 -0400
+Subject: [PATCH] server: Keep the other opens of a renamed file on its new
+ name.
+
+A name belongs to the file on Windows, so after a rename through one
+handle, NtQueryInformationFile and GetFinalPathNameByHandle on another
+handle report the new name, as two tests expect.  The server moved only
+the renaming fd, and the other fds kept the old path, which is also what
+their delete on close would have unlinked -- a file created there
+meanwhile rather than the renamed one.  The opens by the old name and
+the deletes pending on it now follow the file; opens through another
+hard link keep theirs.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/file.c b/dlls/kernel32/tests/file.c
+index 167e1be4b20..1849090d1f1 100644
+--- a/dlls/kernel32/tests/file.c
++++ b/dlls/kernel32/tests/file.c
+@@ -6040,8 +6040,8 @@ static void test_GetFinalPathNameByHandleW(void)
+     ok(success, "got error %ld.\n", GetLastError());
+ 
+     count = pGetFinalPathNameByHandleW(file, result_path, ARRAY_SIZE(result_path), 0);
+-    todo_wine ok(count == lstrlenW(test_path) + 4, "Expected length %u, got %lu\n", lstrlenW(test_path), count);
+-    todo_wine ok(wcscmp(test_path, result_path + 4) == 0, "Expected %s, got %s\n",
++    ok(count == lstrlenW(test_path) + 4, "Expected length %u, got %lu\n", lstrlenW(test_path), count);
++    ok(wcscmp(test_path, result_path + 4) == 0, "Expected %s, got %s\n",
+        wine_dbgstr_w(test_path), wine_dbgstr_w(result_path));
+     CloseHandle(file);
+ 
+diff --git a/dlls/ntdll/tests/file.c b/dlls/ntdll/tests/file.c
+index 75f47c822bc..567aeceaf8f 100644
+--- a/dlls/ntdll/tests/file.c
++++ b/dlls/ntdll/tests/file.c
+@@ -1912,7 +1912,7 @@ static void test_file_rename_information(FILE_INFORMATION_CLASS class)
+     res = pNtQueryInformationFile( handle2, &io, fni, sizeof(FILE_NAME_INFORMATION) + MAX_PATH * sizeof(WCHAR), FileNameInformation );
+     ok( res == STATUS_SUCCESS, "res expected STATUS_SUCCESS, got %lx\n", res );
+     fni->FileName[ fni->FileNameLength / sizeof(WCHAR) ] = 0;
+-    todo_wine ok( !lstrcmpiW(fni->FileName, newpath + 2), "FileName expected %s, got %s\n",
++    ok( !lstrcmpiW(fni->FileName, newpath + 2), "FileName expected %s, got %s\n",
+         wine_dbgstr_w(newpath + 2), wine_dbgstr_w(fni->FileName) );
+     HeapFree( GetProcessHeap(), 0, fni );
+ 
+diff --git a/server/fd.c b/server/fd.c
+index d81cc51da6f..cc166b9acf7 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2885,13 +2885,40 @@ static void set_fd_disposition( struct fd *fd, unsigned int flags )
+         ((fd->options & FILE_DELETE_ON_CLOSE) ? FILE_DISPOSITION_DELETE : 0);
+ }
+ 
++/* the other opens of a renamed file by the name it had, and the deletes pending on that name, follow it */
++static void rename_other_opens( struct fd *fd, const char *old_name )
++{
++    struct closed_fd *closed;
++    struct fd *fd_ptr;
++    char *name;
++
++    LIST_FOR_EACH_ENTRY( fd_ptr, &fd->inode->open, struct fd, inode_entry )
++    {
++        if (fd_ptr == fd || !fd_ptr->unix_name || strcmp( fd_ptr->unix_name, old_name )) continue;
++        if (!(name = strdup( fd->unix_name ))) continue;
++        free( fd_ptr->unix_name );
++        fd_ptr->unix_name = name;
++        if (fd_ptr->closed) fd_ptr->closed->unix_name = name;
++        free( fd_ptr->nt_name );
++        fd_ptr->nt_namelen = 0;
++        if ((fd_ptr->nt_name = memdup( fd->nt_name, fd->nt_namelen ))) fd_ptr->nt_namelen = fd->nt_namelen;
++    }
++    LIST_FOR_EACH_ENTRY( closed, &fd->inode->closed, struct closed_fd, entry )
++    {
++        if (!closed->unix_name || strcmp( closed->unix_name, old_name )) continue;
++        if (!(name = strdup( fd->unix_name ))) continue;
++        free( closed->unix_name );
++        closed->unix_name = name;
++    }
++}
++
+ /* set new name for the fd */
+ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, data_size_t len,
+                          struct unicode_str nt_name, int create_link, unsigned int flags )
+ {
+     struct inode *inode;
+     struct stat st, st2;
+-    char *name;
++    char *name, *old_name;
+     const unsigned int replace = flags & FILE_RENAME_REPLACE_IF_EXISTS;
+ 
+     if (!fd->inode || !fd->unix_name)
+@@ -3015,11 +3042,12 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
+ 
+     free( fd->nt_name );
+     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
+-    free( fd->unix_name );
++    old_name = fd->unix_name;
+     fd->closed->unix_name = fd->unix_name = realpath( name, NULL );
+     free( name );
+-    if (!fd->unix_name)
+-        set_error( STATUS_NO_MEMORY );
++    if (fd->unix_name) rename_other_opens( fd, old_name );
++    else set_error( STATUS_NO_MEMORY );
++    free( old_name );
+     return;
+ 
+ failed:

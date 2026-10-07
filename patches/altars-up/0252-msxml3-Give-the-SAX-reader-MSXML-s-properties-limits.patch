@@ -1,0 +1,1941 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 07:10:03 -0400
+Subject: [PATCH] msxml3: Give the SAX reader MSXML's properties, limits and
+ DTD handling.
+
+Ported from the measured behaviour of the old tree's libxml2-based
+reader (3d006c718c6, 010cc2744ad, 7525a31a253, 20b94d413ff) onto the
+new parser:
+
+- max-xml-size and max-element-depth stop the parse as each version
+  does: MSXML 3 with E_ABORT and a formatted system error naming the
+  limit, MSXML 6 with its own codes, at the positions Windows reports;
+  a string input counts characters before MSXML 6, bytes after;
+- baseURL and secureBaseURL are kept, and the identifiers of a
+  declaration that has none are empty strings from MSXML 4.0 on;
+- element declarations report their content model as written, and the
+  entities a DTD declares are expanded where they are referenced;
+- prohibit-dtd refuses a document type declaration.
+
+saxpropprobe now differs from Windows in 32 lines instead of 399 and
+saxdtdprobe in none instead of 19; the tests added pass on Windows 11.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/msxml.mc b/dlls/msxml3/msxml.mc
+index fe6b2901c23..c79948d2164 100644
+--- a/dlls/msxml3/msxml.mc
++++ b/dlls/msxml3/msxml.mc
+@@ -56,6 +56,13 @@ SymbolicName=E_SAX_UNDECLAREDPREFIX
+ Language=ENU
+ Namespace prefix hasn't been declared
+ .
++MessageId=0xe30a
++Severity=Error
++Facility=XML
++SymbolicName=E_SAX_SYSTEM_ERROR
++Language=ENU
++System error: %1.
++.
+ MessageId=0xe501
+ Severity=Error
+ Facility=XML
+@@ -315,3 +322,17 @@ SymbolicName=E_SAX_INVALID_VERSION
+ Language=ENU
+ Invalid xml version
+ .
++MessageId=0xee91
++Severity=Error
++Facility=XML
++SymbolicName=E_SAX_MAX_XML_SIZE
++Language=ENU
++Operation aborted: max-xml-size constraint violated.
++.
++MessageId=0xee92
++Severity=Error
++Facility=XML
++SymbolicName=E_SAX_MAX_ELEMENT_DEPTH
++Language=ENU
++Operation aborted: max-element-depth constraint violated.
++.
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index d7823dc3e71..af40d2bf039 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -40,6 +40,7 @@ enum error_codes
+     E_SAX_UNPARSEDENTITYREF = 0xc00ce006,
+     E_SAX_CONTAINSCOLON = 0xc00ce00c,
+     E_SAX_UNDECLAREDPREFIX = 0xc00ce01d,
++    E_SAX_SYSTEM_ERROR = 0xc00ce30a,
+ 
+     E_SAX_MISSINGEQUALS = 0xc00ce501,
+     E_SAX_MISSINGQUOTE = 0xc00ce502,
+@@ -85,6 +86,8 @@ enum error_codes
+     E_SAX_INVALID_VERSION = 0xc00ce57f,
+     E_DOM_MAX_ELEMENT_DEPTH = 0xc00ce586,
+ 
++    E_SAX_PROHIBIT_DTD = 0xc00cee4e,
++    E_SAX_MAX_XML_SIZE = 0xc00cee91,
+     E_SAX_MAX_ELEMENT_DEPTH = 0xc00cee92,
+ };
+ 
+diff --git a/dlls/msxml3/saxreader.c b/dlls/msxml3/saxreader.c
+index 1461c982acb..bc2c85adabc 100644
+--- a/dlls/msxml3/saxreader.c
++++ b/dlls/msxml3/saxreader.c
+@@ -256,6 +256,7 @@ struct element_decl
+ {
+     struct list entry;
+     BSTR name;
++    BSTR model;
+     enum element_type type;
+     struct element_content *content;
+ };
+@@ -471,10 +472,34 @@ struct saxreader
+     BSTR xmldecl_encoding;
+     int max_xml_size;
+     int max_element_depth;
++    BSTR base_url;
++    BSTR secure_base_url;
++    const WCHAR *parse_url;
+     BSTR empty_bstr;
+     MSXML_VERSION version;
+ };
+ 
++static const WCHAR *saxreader_get_url(const struct saxreader *reader, BSTR url)
++{
++    if (url || reader->version < MSXML4) return url;
++    return &empty_str;
++}
++
++static HRESULT saxreader_put_url(BSTR *url, const WCHAR *value)
++{
++    BSTR copy = NULL;
++
++    if (value && !(copy = SysAllocString(value))) return E_OUTOFMEMORY;
++    SysFreeString(*url);
++    *url = copy;
++    return S_OK;
++}
++
++static BSTR saxreader_optional_id(const struct saxreader *reader, BSTR id)
++{
++    return id || reader->version < MSXML4 ? id : reader->empty_bstr;
++}
++
+ static HRESULT saxreader_put_handler(struct saxreader *reader, enum saxhandler_type type, void *ptr, bool vb)
+ {
+     struct saxanyhandler_iface *iface = &reader->saxhandlers[type].u.anyhandler;
+@@ -914,6 +939,8 @@ struct saxlocator
+     } attributes;
+ 
+     struct dtd *dtd;
++    const WCHAR *limit_name;
++    bool string_input;
+ 
+     struct
+     {
+@@ -926,6 +953,7 @@ struct saxlocator
+ 
+     bool collect;
+     struct string_buffer scratch;
++    struct string_buffer *model_buffer;
+     struct input_buffer buffer;
+     struct text_position start_document_position;
+     HRESULT status;
+@@ -1051,6 +1079,9 @@ static void saxreader_free_attlist(struct attlist_decl *decl)
+ 
+ static void saxreader_free_entity(struct entity_decl *entity)
+ {
++    for (size_t i = 0; i < entity->content.count; ++i)
++        SysFreeString(entity->content.parts[i].value);
++    free(entity->content.parts);
+     SysFreeString(entity->name);
+     SysFreeString(entity->sysid);
+     SysFreeString(entity->value);
+@@ -1103,6 +1134,7 @@ static void saxreader_free_element_decl(struct element_decl *decl)
+     if (decl->content)
+         saxreader_free_element_content(decl->content);
+     SysFreeString(decl->name);
++    SysFreeString(decl->model);
+     free(decl);
+ }
+ 
+@@ -2143,14 +2175,27 @@ static BSTR saxreader_string_to_bstr(struct saxlocator *locator, struct string_b
+     return str;
+ }
+ 
++static void saxlocator_start_document(struct saxlocator *locator);
++
+ static bool saxreader_limit_xml_size(struct saxlocator *locator, ULONG read)
+ {
+-    if (locator->saxreader && locator->saxreader->max_xml_size > 0)
++    struct saxreader *reader = locator->saxreader;
++    size_t size;
++
++    if (reader && reader->max_xml_size > 0)
+     {
+         locator->buffer.raw_size += read;
+-        if (locator->buffer.raw_size > locator->saxreader->max_xml_size * 1024)
++        size = locator->buffer.raw_size;
++        if (locator->string_input && reader->version < MSXML6)
++            size /= sizeof(WCHAR);
++        if (size > (ULONGLONG)reader->max_xml_size * 1024)
+         {
+-            saxreader_set_error(locator, E_FAIL);
++            if (reader->version < MSXML6 && locator->state == SAX_PARSER_START)
++                saxlocator_start_document(locator);
++            locator->line = 1;
++            locator->column = reader->version < MSXML6 ? 1 : 0;
++            locator->limit_name = L"MaxXMLSize";
++            saxreader_set_error(locator, reader->version < MSXML6 ? E_ABORT : E_SAX_MAX_XML_SIZE);
+             locator->eos = true;
+             return false;
+         }
+@@ -2357,6 +2402,8 @@ static void saxreader_skip(struct saxlocator *locator, int n)
+     {
+         if (locator->collect)
+             saxreader_string_append(locator, &locator->scratch, &ch, 1);
++        if (locator->model_buffer && !xml_is_space(ch))
++            saxreader_string_append(locator, locator->model_buffer, &ch, 1);
+ 
+         if (saxreader_pop_entity(locator))
+             saxreader_update_position(locator, ch);
+@@ -2410,10 +2457,17 @@ static void saxreader_fatal_error(struct saxlocator *locator)
+ 
+     if (saxreader_has_handler(locator, SAXErrorHandler))
+     {
++        DWORD_PTR args[] = { (DWORD_PTR)locator->limit_name };
+         WCHAR msg[1024];
+ 
+-        if (!FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_FROM_HMODULE, MSXML_hInstance, locator->status, 0,
+-                msg, ARRAY_SIZE(msg), NULL))
++        if (locator->limit_name && locator->saxreader->version < MSXML6)
++        {
++            if (!FormatMessageW(FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY, MSXML_hInstance,
++                    E_SAX_SYSTEM_ERROR, 0, msg, ARRAY_SIZE(msg), (va_list *)args))
++                *msg = 0;
++        }
++        else if (!FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_FROM_HMODULE, MSXML_hInstance,
++                locator->status, 0, msg, ARRAY_SIZE(msg), NULL))
+         {
+             *msg = 0;
+         }
+@@ -2548,7 +2602,6 @@ static void saxlocator_start_element(struct saxlocator *locator, const struct te
+         struct element *element)
+ {
+     struct saxcontenthandler_iface *handler = saxreader_get_contenthandler(locator->saxreader);
+-    int max_depth = locator->saxreader->max_element_depth;
+     MSXML_VERSION version = locator->saxreader->version;
+     BSTR uri = NULL, local = NULL;
+     HRESULT hr;
+@@ -2557,8 +2610,6 @@ static void saxlocator_start_element(struct saxlocator *locator, const struct te
+         return;
+ 
+     ++locator->depth;
+-    if (max_depth && locator->depth > max_depth)
+-        return saxreader_set_error(locator, version < MSXML6 ? E_ABORT : E_SAX_MAX_ELEMENT_DEPTH);
+ 
+     if (!saxreader_has_handler(locator, SAXContentHandler))
+         return;
+@@ -2836,6 +2887,8 @@ static void saxlocator_notationdecl(struct saxlocator *locator, const struct tex
+     if (locator->status != S_OK)
+         return;
+ 
++    pubid = saxreader_optional_id(locator->saxreader, pubid);
++    sysid = saxreader_optional_id(locator->saxreader, sysid);
+     locator->line = position->line;
+     locator->column = position->column;
+ 
+@@ -2859,6 +2912,8 @@ static void saxlocator_unparsed_entitydecl(struct saxlocator *locator, BSTR name
+     if (locator->status != S_OK)
+         return;
+ 
++    pubid = saxreader_optional_id(locator->saxreader, pubid);
++    sysid = saxreader_optional_id(locator->saxreader, sysid);
+     locator->line = locator->buffer.position.line;
+     locator->column = locator->buffer.position.column;
+ 
+@@ -2882,6 +2937,8 @@ static void saxlocator_external_entitydecl(struct saxlocator *locator, BSTR name
+     if (locator->status != S_OK)
+         return;
+ 
++    pubid = saxreader_optional_id(locator->saxreader, pubid);
++    sysid = saxreader_optional_id(locator->saxreader, sysid);
+     locator->line = locator->buffer.position.line;
+     locator->column = locator->buffer.position.column;
+ 
+@@ -3005,14 +3062,14 @@ static void saxlocator_elementdecl(struct saxlocator *locator, struct element_de
+     if (!saxreader_has_handler(locator, SAXDeclHandler))
+         return;
+ 
+-    model = saxreader_element_decl_model_stringify(locator, decl);
++    model = decl->model ? decl->model : saxreader_element_decl_model_stringify(locator, decl);
+ 
+     if (locator->vbInterface)
+         hr = IVBSAXDeclHandler_elementDecl(handler->vbhandler, &decl->name, &model);
+     else
+         hr = ISAXDeclHandler_elementDecl(handler->handler, decl->name, SysStringLen(decl->name), model, SysStringLen(model));
+ 
+-    SysFreeString(model);
++    if (model != decl->model) SysFreeString(model);
+ 
+     locator->status = saxlocator_callback_result(locator, hr);
+ }
+@@ -3117,6 +3174,8 @@ static void saxlocator_startdtd(struct saxlocator *locator, BSTR name, BSTR pubi
+     if (locator->status != S_OK)
+         return;
+ 
++    pubid = saxreader_optional_id(locator->saxreader, pubid);
++    sysid = saxreader_optional_id(locator->saxreader, sysid);
+     locator->line = locator->buffer.position.line;
+     locator->column = locator->buffer.position.column;
+ 
+@@ -4254,15 +4313,29 @@ static void saxreader_reorder_attributes(struct saxlocator *locator)
+    [14 NS] EmptyElemTag ::= '<' QName (S Attribute)* S? '/>' */
+ static void saxreader_parse_starttag(struct saxlocator *locator)
+ {
+-    struct text_position position = { 0 };
++    struct text_position position = { 0 }, name_position;
+     bool empty_element = false;
+     struct element *element;
+     struct parsed_name name;
++    int max_depth;
+ 
+     if (!saxreader_cmp(locator, L"<"))
+         return saxreader_set_error(locator, E_SAX_INVALIDATROOTLEVEL);
+ 
++    name_position = locator->buffer.position;
+     saxreader_parse_qname(locator, &name);
++    max_depth = locator->saxreader->max_element_depth;
++    if (locator->status == S_OK && max_depth && locator->depth >= max_depth)
++    {
++        locator->line = name_position.line;
++        locator->column = name_position.column;
++        if (locator->saxreader->version >= MSXML6)
++            locator->column += SysStringLen(name.qname);
++        locator->limit_name = L"MaxElementDepth";
++        saxreader_set_error(locator, locator->saxreader->version < MSXML6 ? E_ABORT : E_SAX_MAX_ELEMENT_DEPTH);
++        saxreader_free_name(&name);
++        return;
++    }
+ 
+     if (bstr_startswith(name.prefix, L"xml", 3))
+     {
+@@ -4558,7 +4631,7 @@ static void saxreader_parse_reference(struct saxlocator *locator)
+             {
+                 if (entity->unparsed)
+                     saxreader_set_error(locator, E_SAX_UNPARSEDENTITYREF);
+-                else if (*entity->value)
++                else if (entity->value && *entity->value)
+                     saxreader_push_entity(locator, &position, entity);
+                 else
+                     saxlocator_skipped_entity(locator, &position, entity->name);
+@@ -4676,8 +4749,28 @@ static void saxreader_parse_chardata(struct saxlocator *locator)
+     context.count = locator->buffer.consumed;
+     context.ch = *saxreader_get_ptr(locator);
+ 
+-    while (context.ch)
++    while (context.ch && locator->status == S_OK)
+     {
++        if (!list_empty(&locator->buffer.entities))
++        {
++            struct entity_decl *entity = LIST_ENTRY(list_head(&locator->buffer.entities), struct entity_decl, input_entry);
++
++            if (!entity->remaining)
++            {
++                if (context.buffer.count)
++                {
++                    if (locator->saxreader->version >= MSXML4)
++                        context.position = locator->buffer.position;
++                    chars = saxreader_string_to_bstr(locator, &context.buffer);
++                    saxlocator_characters(locator, &context.position, chars);
++                    SysFreeString(chars);
++                }
++                saxreader_pop_entity(locator);
++                context.position = locator->buffer.position;
++                context.count = locator->buffer.consumed;
++            }
++        }
++
+         if (saxreader_cmp(locator, L"]]>"))
+         {
+             saxreader_set_error(locator, E_SAX_INVALID_CDATACLOSINGTAG);
+@@ -5102,6 +5195,7 @@ static void saxreader_parse_contentspec(struct saxlocator *locator, struct eleme
+ /* [45] elementdecl ::= '<!ELEMENT' S Name S contentspec S? '>' */
+ static void saxreader_parse_elementdecl(struct saxlocator *locator)
+ {
++    struct string_buffer model = { 0 };
+     struct element_decl *decl;
+ 
+     if (!(decl = saxreader_calloc(locator, 1, sizeof(*decl))))
+@@ -5113,7 +5207,10 @@ static void saxreader_parse_elementdecl(struct saxlocator *locator)
+     saxreader_skip_required_spaces(locator);
+     saxreader_parse_name(locator, &decl->name);
+     saxreader_skip_required_spaces(locator);
++    locator->model_buffer = &model;
+     saxreader_parse_contentspec(locator, decl);
++    locator->model_buffer = NULL;
++    decl->model = saxreader_string_to_bstr(locator, &model);
+     saxreader_skipspaces(locator);
+     if (saxreader_cmp(locator, L">"))
+         saxlocator_elementdecl(locator, decl);
+@@ -5206,6 +5303,34 @@ static BSTR saxreader_parse_systemliteral(struct saxlocator *locator)
+     return NULL;
+ }
+ 
++/* MSXML 4 and later resolve system identifiers against the reader's base URL or the current directory. */
++static void saxreader_resolve_system_id(struct saxlocator *locator, BSTR *systemid)
++{
++    WCHAR base[INTERNET_MAX_URL_LENGTH], url[INTERNET_MAX_URL_LENGTH], dir[MAX_PATH + 1];
++    DWORD len = ARRAY_SIZE(url), size = ARRAY_SIZE(base), dir_len;
++    const struct saxreader *reader = locator->saxreader;
++    BSTR resolved;
++
++    if (!*systemid || reader->version < MSXML4) return;
++
++    if (reader->base_url && *reader->base_url)
++        lstrcpynW(base, reader->base_url, ARRAY_SIZE(base));
++    else if (reader->parse_url)
++        lstrcpynW(base, reader->parse_url, ARRAY_SIZE(base));
++    else
++    {
++        dir_len = GetCurrentDirectoryW(MAX_PATH, dir);
++        if (!dir_len || dir_len >= MAX_PATH) return;
++        if (dir[dir_len - 1] != '\\') wcscpy(dir + dir_len, L"\\");
++        if (FAILED(UrlCreateFromPathW(dir, base, &size, 0))) return;
++    }
++    if (FAILED(UrlCombineW(base, *systemid, url, &len, 0))) return;
++    if (!(resolved = SysAllocString(url)))
++        return saxreader_set_error(locator, E_OUTOFMEMORY);
++    SysFreeString(*systemid);
++    *systemid = resolved;
++}
++
+ /* [75] ExternalID ::= 'SYSTEM' S SystemLiteral
+                      | 'PUBLIC' S PubidLiteral S SystemLiteral
+    [83] PublicID ::= 'PUBLIC' S PubidLiteral */
+@@ -5246,6 +5371,8 @@ static void saxreader_parse_externalid(struct saxlocator *locator, BSTR *systemi
+ 
+         *systemid = saxreader_parse_systemliteral(locator);
+     }
++
++    saxreader_resolve_system_id(locator, systemid);
+ }
+ 
+ /* Read EntityRef without much validation */
+@@ -5794,7 +5921,19 @@ static void saxreader_parse_doctype(struct saxlocator *locator)
+     BSTR name, sysid, pubid;
+ 
+     if (locator->saxreader->features & ProhibitDTD)
++    {
++        if (locator->saxreader->version >= MSXML6)
++        {
++            locator->line = locator->buffer.position.line;
++            locator->column = locator->buffer.position.column + 8;
++            return saxreader_set_error(locator, E_SAX_PROHIBIT_DTD);
++        }
++        saxreader_skip(locator, 9);
++        saxreader_skipspaces(locator);
++        locator->line = locator->buffer.position.line;
++        locator->column = locator->buffer.position.column;
+         return saxreader_set_error(locator, E_SAX_INVALIDATROOTLEVEL);
++    }
+ 
+     if (!(locator->dtd = saxreader_new_dtd(locator)))
+         return;
+@@ -5827,11 +5966,16 @@ static void saxreader_parse_doctype(struct saxlocator *locator)
+     }
+ 
+     if (sysid)
+-        FIXME("External subset is not supported.\n");
++    {
++        BSTR skipped = SysAllocString(L"[dtd]");
++        saxlocator_skipped_entity(locator, &locator->buffer.position, skipped);
++        SysFreeString(skipped);
++    }
+ 
+     saxlocator_extension_dtd(locator);
+     saxlocator_enddtd(locator);
+ 
++    SysFreeString(name);
+     SysFreeString(sysid);
+     SysFreeString(pubid);
+ }
+@@ -5938,7 +6082,7 @@ static void saxreader_detect_encoding(struct saxlocator *locator, bool force_utf
+ }
+ 
+ static HRESULT saxreader_parse_stream(struct saxreader *reader, ISequentialStream *stream,
+-        bool force_utf16, bool vbInterface)
++        bool force_utf16, bool string_input, bool vbInterface)
+ {
+     struct saxlocator *locator;
+     HRESULT hr;
+@@ -5946,6 +6090,13 @@ static HRESULT saxreader_parse_stream(struct saxreader *reader, ISequentialStrea
+     if (FAILED(hr = saxlocator_create(reader, stream, vbInterface, &locator)))
+         return hr;
+ 
++    SysFreeString(reader->xmldecl_version);
++    SysFreeString(reader->xmldecl_encoding);
++    SysFreeString(reader->xmldecl_standalone);
++    reader->xmldecl_version = reader->xmldecl_encoding = reader->xmldecl_standalone = NULL;
++    locator->string_input = string_input;
++    reader->isParsing = TRUE;
++
+     while (locator->state != SAX_PARSER_EOF)
+     {
+         if (locator->status != S_OK)
+@@ -6066,6 +6217,7 @@ static HRESULT saxreader_parse_stream(struct saxreader *reader, ISequentialStrea
+     }
+ 
+     hr = locator->status;
++    reader->isParsing = FALSE;
+     ISAXLocator_Release(&locator->ISAXLocator_iface);
+ 
+     return hr;
+@@ -6087,7 +6239,7 @@ static HRESULT saxreader_parse(struct saxreader *reader, VARIANT input, bool vbI
+ 
+             if (FAILED(hr = stream_wrapper_create((const void *)str, SysStringByteLen(str), &stream)))
+                 return hr;
+-            hr = saxreader_parse_stream(reader, stream, true, vbInterface);
++            hr = saxreader_parse_stream(reader, stream, true, true, vbInterface);
+             ISequentialStream_Release(stream);
+             break;
+         }
+@@ -6104,7 +6256,7 @@ static HRESULT saxreader_parse(struct saxreader *reader, VARIANT input, bool vbI
+             size = (uBound - lBound + 1) * SafeArrayGetElemsize(V_ARRAY(&input));
+             if (SUCCEEDED(hr = stream_wrapper_create(data, size, &stream)))
+             {
+-                hr = saxreader_parse_stream(reader, stream, false, vbInterface);
++                hr = saxreader_parse_stream(reader, stream, false, false, vbInterface);
+                 ISequentialStream_Release(stream);
+             }
+             SafeArrayUnaccessData(V_ARRAY(&input));
+@@ -6125,7 +6277,7 @@ static HRESULT saxreader_parse(struct saxreader *reader, VARIANT input, bool vbI
+ 
+                 IXMLDOMDocument_get_xml(xmlDoc, &bstrData);
+                 stream_wrapper_create(bstrData, SysStringByteLen(bstrData), &stream);
+-                hr = saxreader_parse_stream(reader, stream, false, vbInterface);
++                hr = saxreader_parse_stream(reader, stream, false, true, vbInterface);
+                 ISequentialStream_Release(stream);
+                 IXMLDOMDocument_Release(xmlDoc);
+                 SysFreeString(bstrData);
+@@ -6140,7 +6292,7 @@ static HRESULT saxreader_parse(struct saxreader *reader, VARIANT input, bool vbI
+ 
+             if (stream)
+             {
+-                hr = saxreader_parse_stream(reader, stream, false, vbInterface);
++                hr = saxreader_parse_stream(reader, stream, false, false, vbInterface);
+                 ISequentialStream_Release(stream);
+             }
+             else
+@@ -6167,7 +6319,7 @@ static HRESULT internal_vbonDataAvailable(void *obj, char *ptr, DWORD len)
+ 
+     if (SUCCEEDED(hr = stream_wrapper_create(ptr, len, &stream)))
+     {
+-        hr = saxreader_parse_stream(reader, stream, false, true);
++        hr = saxreader_parse_stream(reader, stream, false, false, true);
+         ISequentialStream_Release(stream);
+     }
+     return hr;
+@@ -6181,7 +6333,7 @@ static HRESULT internal_onDataAvailable(void *obj, char *ptr, DWORD len)
+ 
+     if (SUCCEEDED(hr = stream_wrapper_create(ptr, len, &stream)))
+     {
+-        hr = saxreader_parse_stream(reader, stream, false, false);
++        hr = saxreader_parse_stream(reader, stream, false, false, false);
+         ISequentialStream_Release(stream);
+     }
+     return hr;
+@@ -6202,14 +6354,14 @@ static HRESULT saxreader_parse_url(struct saxreader *reader, const WCHAR *url, b
+     if (FAILED(hr))
+         return hr;
+ 
++    reader->parse_url = url;
+     if (vbInterface) hr = bind_url(mon, internal_vbonDataAvailable, reader, &bsc);
+     else hr = bind_url(mon, internal_onDataAvailable, reader, &bsc);
+     IMoniker_Release(mon);
+ 
+-    if (FAILED(hr))
+-        return hr;
+-
+-    return detach_bsc(bsc);
++    if (SUCCEEDED(hr)) hr = detach_bsc(bsc);
++    reader->parse_url = NULL;
++    return hr;
+ }
+ 
+ static HRESULT saxreader_put_handler_from_variant(struct saxreader *reader, enum saxhandler_type type,
+@@ -6293,36 +6445,21 @@ static HRESULT saxreader_put_property(struct saxreader *reader, const WCHAR *pro
+     if (!wcscmp(prop, L"http://winehq.org/sax/properties/extension-handler"))
+         return saxreader_put_handler_from_variant(reader, SAXExtensionHandler, v, vbInterface);
+ 
+-    if (!wcscmp(prop, L"max-xml-size"))
+-    {
+-        int size;
+-
+-        if (FAILED(variant_get_int_property(&value, &size)))
+-            return E_FAIL;
+-
+-        if (size < 0)
+-            return E_INVALIDARG;
+-
+-        if (reader->version >= MSXML4 && size > 4194304)
+-            return E_INVALIDARG;
+-        if (reader->version < MSXML4 && size >= 4194304)
+-            return E_INVALIDARG;
+-
+-        reader->max_xml_size = size;
+-        return S_OK;
+-    }
+-
+-    if (!wcscmp(prop, L"max-element-depth"))
++    if (!wcscmp(prop, L"max-xml-size") || !wcscmp(prop, L"max-element-depth"))
+     {
+-        int depth;
++        bool size = !wcscmp(prop, L"max-xml-size");
++        VARIANT number;
++        HRESULT hr;
+ 
+-        if (FAILED(variant_get_int_property(&value, &depth)))
+-            return E_FAIL;
+-
+-        if (depth < 0)
++        VariantInit(&number);
++        if (FAILED(hr = VariantChangeType(&number, v, 0, VT_I8)))
++            return size && reader->version < MSXML6 ? E_INVALIDARG : hr;
++        if (V_I8(&number) < 0 || V_I8(&number) > (size ? (reader->version >= MSXML6 ? 4194304 : 4194303) : INT_MAX))
+             return E_INVALIDARG;
+-
+-        reader->max_element_depth = depth;
++        if (size)
++            reader->max_xml_size = V_I8(&number) & 0x3fffff;
++        else
++            reader->max_element_depth = V_I8(&number);
+         return S_OK;
+     }
+ 
+@@ -6370,22 +6507,19 @@ static HRESULT saxreader_get_property(const struct saxreader *reader, const WCHA
+         return S_OK;
+     }
+ 
+-    if (!wcscmp(prop, L"xmldecl-version"))
+-    {
+-        V_VT(value) = VT_BSTR;
+-        return return_bstr(reader->xmldecl_version, &V_BSTR(value));
+-    }
+-
+-    if (!wcscmp(prop, L"xmldecl-encoding"))
++    if (!wcscmp(prop, L"xmldecl-version") || !wcscmp(prop, L"xmldecl-encoding")
++            || !wcscmp(prop, L"xmldecl-standalone"))
+     {
+-        V_VT(value) = VT_BSTR;
+-        return return_bstr(reader->xmldecl_encoding, &V_BSTR(value));
+-    }
++        const WCHAR *str = NULL;
+ 
+-    if (!wcscmp(prop, L"xmldecl-standalone"))
+-    {
++        if (reader->version >= MSXML4)
++        {
++            if (!wcscmp(prop, L"xmldecl-version")) str = reader->xmldecl_version;
++            else if (!wcscmp(prop, L"xmldecl-encoding")) str = reader->xmldecl_encoding;
++            else str = reader->xmldecl_standalone;
++        }
+         V_VT(value) = VT_BSTR;
+-        return return_bstr(reader->xmldecl_encoding, &V_BSTR(value));
++        return return_bstr(str, &V_BSTR(value));
+     }
+ 
+     if (!wcscmp(prop, L"max-xml-size"))
+@@ -6402,9 +6536,42 @@ static HRESULT saxreader_get_property(const struct saxreader *reader, const WCHA
+         return S_OK;
+     }
+ 
+-    FIXME("(%p)->(%s) unsupported property\n", reader, debugstr_w(prop));
++    if (!wcscmp(prop, L"charset"))
++    {
++        if (reader->version < MSXML4)
++            V_VT(value) = VT_EMPTY;
++        else
++        {
++            V_VT(value) = VT_BSTR;
++            V_BSTR(value) = NULL;
++        }
++        return S_OK;
++    }
+ 
+-    return E_NOTIMPL;
++    if (!wcscmp(prop, L"input-source"))
++    {
++        V_VT(value) = VT_EMPTY;
++        return S_OK;
++    }
++
++    if (!wcscmp(prop, L"schema-declaration-handler"))
++    {
++        if (reader->version < MSXML4) return E_INVALIDARG;
++        V_VT(value) = VT_UNKNOWN;
++        V_UNKNOWN(value) = NULL;
++        return S_OK;
++    }
++
++    if (!wcscmp(prop, L"http://xml.org/sax/properties/dom-node"))
++    {
++        if (reader->version >= MSXML6) return E_FAIL;
++        V_VT(value) = vb ? VT_DISPATCH : VT_UNKNOWN;
++        V_UNKNOWN(value) = NULL;
++        return S_OK;
++    }
++
++    WARN("(%p)->(%s) unknown property\n", reader, debugstr_w(prop));
++    return E_INVALIDARG;
+ }
+ 
+ static HRESULT WINAPI saxxmlreader_QueryInterface(IVBSAXXMLReader *iface, REFIID riid, void **obj)
+@@ -6475,6 +6642,10 @@ static ULONG WINAPI saxxmlreader_Release(IVBSAXXMLReader *iface)
+         }
+ 
+         SysFreeString(reader->xmldecl_version);
++        SysFreeString(reader->xmldecl_encoding);
++        SysFreeString(reader->xmldecl_standalone);
++        SysFreeString(reader->base_url);
++        SysFreeString(reader->secure_base_url);
+         SysFreeString(reader->empty_bstr);
+ 
+         free(reader);
+@@ -6590,9 +6761,10 @@ static HRESULT WINAPI saxxmlreader_putref_errorHandler(IVBSAXXMLReader *iface, I
+ 
+ static HRESULT WINAPI saxxmlreader_get_baseURL(IVBSAXXMLReader *iface, BSTR *url)
+ {
+-    FIXME("%p, %p stub\n", iface, url);
++    struct saxreader *reader = impl_from_IVBSAXXMLReader(iface);
+ 
+-    return E_NOTIMPL;
++    if (!url) return E_POINTER;
++    return return_bstr(saxreader_get_url(reader, reader->base_url), url);
+ }
+ 
+ static HRESULT WINAPI saxxmlreader_put_baseURL(IVBSAXXMLReader *iface, BSTR url)
+@@ -6603,9 +6775,10 @@ static HRESULT WINAPI saxxmlreader_put_baseURL(IVBSAXXMLReader *iface, BSTR url)
+ 
+ static HRESULT WINAPI saxxmlreader_get_secureBaseURL(IVBSAXXMLReader *iface, BSTR *url)
+ {
+-    FIXME("%p, %p stub\n", iface, url);
++    struct saxreader *reader = impl_from_IVBSAXXMLReader(iface);
+ 
+-    return E_NOTIMPL;
++    if (!url) return E_POINTER;
++    return return_bstr(saxreader_get_url(reader, reader->secure_base_url), url);
+ }
+ 
+ static HRESULT WINAPI saxxmlreader_put_secureBaseURL(IVBSAXXMLReader *iface, BSTR url)
+@@ -6691,7 +6864,8 @@ static HRESULT WINAPI isaxxmlreader_getFeature(ISAXXMLReader *iface, const WCHAR
+             feature == NamespacePrefixes ||
+             feature == ExhaustiveErrors ||
+             feature == SchemaValidation ||
+-            feature == NormalizeLineBreaks)
++            feature == NormalizeLineBreaks ||
++            feature == ProhibitDTD)
+         return get_feature_value(reader, feature, value);
+ 
+     FIXME("%p, %s, %p stub\n", iface, debugstr_w(name), value);
+@@ -6802,30 +6976,34 @@ static HRESULT WINAPI isaxxmlreader_putErrorHandler(ISAXXMLReader *iface, ISAXEr
+ 
+ static HRESULT WINAPI isaxxmlreader_getBaseURL(ISAXXMLReader *iface, const WCHAR **url)
+ {
+-    FIXME("%p, %p stub\n", iface, url);
++    struct saxreader *reader = impl_from_ISAXXMLReader(iface);
+ 
+-    return E_NOTIMPL;
++    if (!url) return E_POINTER;
++    *url = saxreader_get_url(reader, reader->base_url);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI isaxxmlreader_putBaseURL(ISAXXMLReader *iface, const WCHAR *url)
+ {
+-    FIXME("%p, %s stub\n", iface, debugstr_w(url));
++    struct saxreader *reader = impl_from_ISAXXMLReader(iface);
+ 
+-    return E_NOTIMPL;
++    return saxreader_put_url(&reader->base_url, url);
+ }
+ 
+ static HRESULT WINAPI isaxxmlreader_getSecureBaseURL(ISAXXMLReader *iface, const WCHAR **url)
+ {
+-    FIXME("%p, %p stub\n", iface, url);
++    struct saxreader *reader = impl_from_ISAXXMLReader(iface);
+ 
+-    return E_NOTIMPL;
++    if (!url) return E_POINTER;
++    *url = saxreader_get_url(reader, reader->secure_base_url);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI isaxxmlreader_putSecureBaseURL(ISAXXMLReader *iface, const WCHAR *url)
+ {
+-    FIXME("%p, %s stub\n", iface, debugstr_w(url));
++    struct saxreader *reader = impl_from_ISAXXMLReader(iface);
+ 
+-    return E_NOTIMPL;
++    return saxreader_put_url(&reader->secure_base_url, url);
+ }
+ 
+ static HRESULT WINAPI isaxxmlreader_parse(ISAXXMLReader *iface, VARIANT input)
+@@ -6886,7 +7064,7 @@ static ULONG WINAPI saxxmlreader_extension_Release(ISAXXMLReaderExtension *iface
+ static HRESULT WINAPI saxxmlreader_extension_parseUTF16(ISAXXMLReaderExtension *iface, ISequentialStream *stream)
+ {
+     struct saxreader *reader = impl_from_ISAXXMLReaderExtension(iface);
+-    return saxreader_parse_stream(reader, stream, true, false);
++    return saxreader_parse_stream(reader, stream, true, false, false);
+ }
+ 
+ static const struct ISAXXMLReaderExtensionVtbl saxxmlreaderextensionvtbl =
+@@ -6924,7 +7102,8 @@ static HRESULT saxreader_create(MSXML_VERSION version, struct saxreader **reader
+     object->ISAXXMLReader_iface.lpVtbl = &saxxmlreadervtbl;
+     object->ISAXXMLReaderExtension_iface.lpVtbl = &saxxmlreaderextensionvtbl;
+     object->refcount = 1;
+-    object->features = Namespaces | NamespacePrefixes | NormalizeLineBreaks | NormalizeAttributeValues;
++    object->features = Namespaces | NamespacePrefixes | NormalizeLineBreaks | NormalizeAttributeValues
++            | (version >= MSXML6 ? ProhibitDTD : 0);
+     object->version = version;
+     object->empty_bstr = SysAllocString(L"");
+     object->max_element_depth = version > MSXML3 ? 256 : 5000;
+diff --git a/dlls/msxml3/tests/saxreader.c b/dlls/msxml3/tests/saxreader.c
+index 53c5702fc39..6df3ca92627 100644
+--- a/dlls/msxml3/tests/saxreader.c
++++ b/dlls/msxml3/tests/saxreader.c
+@@ -24,6 +24,7 @@
+ #define CONST_VTABLE
+ 
+ #include <stdbool.h>
++#include <stdarg.h>
+ #include <stdio.h>
+ #include <assert.h>
+ 
+@@ -6457,6 +6458,1112 @@ static void test_saxreader_max_element_depth(void)
+     ISAXXMLReader_Release(reader);
+ }
+ 
++static const GUID sax_reader_60 =
++{ 0x88d96a0c, 0xf192, 0x11d4, { 0xa6, 0x5f, 0x00, 0x40, 0x96, 0x32, 0x51, 0xe5 } };
++
++/* what the reader reports of a DTD: declarations, and entities expanded or skipped, as a list of events */
++static char dtd_events[128][320];
++static unsigned int dtd_event_count;
++
++static void WINAPIV add_dtd_event(const char *format, ...)
++{
++    va_list args;
++
++    if (dtd_event_count == ARRAY_SIZE(dtd_events)) return;
++    va_start(args, format);
++    vsnprintf(dtd_events[dtd_event_count++], sizeof(dtd_events[0]), format, args);
++    va_end(args);
++}
++
++static const char *dtd_str(const WCHAR *str, int len)
++{
++    static char buffers[16][160];
++    static unsigned int index;
++    char *buf = buffers[index++ % ARRAY_SIZE(buffers)];
++    int size = 0;
++
++    if (!str) return "NULL";
++    if (len) size = WideCharToMultiByte(CP_UTF8, 0, str, len, buf + 1, sizeof(buffers[0]) - 3, NULL, NULL);
++    buf[0] = '"';
++    buf[size + 1] = '"';
++    buf[size + 2] = 0;
++    return buf;
++}
++
++static HRESULT WINAPI dtd_content_QueryInterface(ISAXContentHandler *iface, REFIID riid, void **obj)
++{
++    *obj = iface;
++    return S_OK;
++}
++static ULONG WINAPI dtd_content_AddRef(ISAXContentHandler *iface) { return 2; }
++static ULONG WINAPI dtd_content_Release(ISAXContentHandler *iface) { return 1; }
++static HRESULT WINAPI dtd_content_putDocumentLocator(ISAXContentHandler *iface, ISAXLocator *locator)
++{
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_startDocument(ISAXContentHandler *iface)
++{
++    add_dtd_event("startDocument");
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_endDocument(ISAXContentHandler *iface)
++{
++    add_dtd_event("endDocument");
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_startPrefixMapping(ISAXContentHandler *iface, const WCHAR *prefix, int prefix_len,
++        const WCHAR *uri, int uri_len)
++{
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_endPrefixMapping(ISAXContentHandler *iface, const WCHAR *prefix, int len)
++{
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_startElement(ISAXContentHandler *iface, const WCHAR *uri, int uri_len,
++        const WCHAR *local, int local_len, const WCHAR *qname, int qname_len, ISAXAttributes *attributes)
++{
++    char event[320];
++    const WCHAR *name, *value;
++    int i, count = 0, name_len, value_len;
++
++    sprintf(event, "startElement %s", dtd_str(qname, qname_len));
++    ISAXAttributes_getLength(attributes, &count);
++    for (i = 0; i < count; i++)
++    {
++        ISAXAttributes_getQName(attributes, i, &name, &name_len);
++        ISAXAttributes_getValue(attributes, i, &value, &value_len);
++        sprintf(event + strlen(event), " %.*s=%s", name_len, dtd_str(name, name_len) + 1, dtd_str(value, value_len));
++    }
++    add_dtd_event("%s", event);
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_endElement(ISAXContentHandler *iface, const WCHAR *uri, int uri_len,
++        const WCHAR *local, int local_len, const WCHAR *qname, int qname_len)
++{
++    add_dtd_event("endElement %s", dtd_str(qname, qname_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_characters(ISAXContentHandler *iface, const WCHAR *chars, int len)
++{
++    add_dtd_event("characters %s", dtd_str(chars, len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_ignorableWhitespace(ISAXContentHandler *iface, const WCHAR *chars, int len)
++{
++    add_dtd_event("ignorableWhitespace %s", dtd_str(chars, len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_processingInstruction(ISAXContentHandler *iface, const WCHAR *target,
++        int target_len, const WCHAR *data, int data_len)
++{
++    add_dtd_event("processingInstruction %s %s", dtd_str(target, target_len), dtd_str(data, data_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_content_skippedEntity(ISAXContentHandler *iface, const WCHAR *name, int len)
++{
++    add_dtd_event("skippedEntity %s", dtd_str(name, len));
++    return S_OK;
++}
++
++static const ISAXContentHandlerVtbl dtd_content_vtbl =
++{
++    dtd_content_QueryInterface,
++    dtd_content_AddRef,
++    dtd_content_Release,
++    dtd_content_putDocumentLocator,
++    dtd_content_startDocument,
++    dtd_content_endDocument,
++    dtd_content_startPrefixMapping,
++    dtd_content_endPrefixMapping,
++    dtd_content_startElement,
++    dtd_content_endElement,
++    dtd_content_characters,
++    dtd_content_ignorableWhitespace,
++    dtd_content_processingInstruction,
++    dtd_content_skippedEntity,
++};
++static ISAXContentHandler dtd_content = { &dtd_content_vtbl };
++
++static HRESULT WINAPI dtd_decl_QueryInterface(ISAXDeclHandler *iface, REFIID riid, void **obj)
++{
++    *obj = iface;
++    return S_OK;
++}
++static ULONG WINAPI dtd_decl_AddRef(ISAXDeclHandler *iface) { return 2; }
++static ULONG WINAPI dtd_decl_Release(ISAXDeclHandler *iface) { return 1; }
++static HRESULT WINAPI dtd_decl_elementDecl(ISAXDeclHandler *iface, const WCHAR *name, int name_len,
++        const WCHAR *model, int model_len)
++{
++    add_dtd_event("elementDecl %s %s", dtd_str(name, name_len), dtd_str(model, model_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_decl_attributeDecl(ISAXDeclHandler *iface, const WCHAR *element, int element_len,
++        const WCHAR *attr, int attr_len, const WCHAR *type, int type_len, const WCHAR *default_value,
++        int default_value_len, const WCHAR *value, int value_len)
++{
++    add_dtd_event("attributeDecl %s %s %s %s %s", dtd_str(element, element_len), dtd_str(attr, attr_len),
++            dtd_str(type, type_len), dtd_str(default_value, default_value_len), dtd_str(value, value_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_decl_internalEntityDecl(ISAXDeclHandler *iface, const WCHAR *name, int name_len,
++        const WCHAR *value, int value_len)
++{
++    add_dtd_event("internalEntityDecl %s %s", dtd_str(name, name_len), dtd_str(value, value_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_decl_externalEntityDecl(ISAXDeclHandler *iface, const WCHAR *name, int name_len,
++        const WCHAR *publicid, int publicid_len, const WCHAR *systemid, int systemid_len)
++{
++    add_dtd_event("externalEntityDecl %s %s %s", dtd_str(name, name_len), dtd_str(publicid, publicid_len),
++            dtd_str(systemid, systemid_len));
++    return S_OK;
++}
++
++static const ISAXDeclHandlerVtbl dtd_decl_vtbl =
++{
++    dtd_decl_QueryInterface,
++    dtd_decl_AddRef,
++    dtd_decl_Release,
++    dtd_decl_elementDecl,
++    dtd_decl_attributeDecl,
++    dtd_decl_internalEntityDecl,
++    dtd_decl_externalEntityDecl,
++};
++static ISAXDeclHandler dtd_decl = { &dtd_decl_vtbl };
++
++static HRESULT WINAPI dtd_dtd_QueryInterface(ISAXDTDHandler *iface, REFIID riid, void **obj)
++{
++    *obj = iface;
++    return S_OK;
++}
++static ULONG WINAPI dtd_dtd_AddRef(ISAXDTDHandler *iface) { return 2; }
++static ULONG WINAPI dtd_dtd_Release(ISAXDTDHandler *iface) { return 1; }
++static HRESULT WINAPI dtd_dtd_notationDecl(ISAXDTDHandler *iface, const WCHAR *name, int name_len,
++        const WCHAR *publicid, int publicid_len, const WCHAR *systemid, int systemid_len)
++{
++    add_dtd_event("notationDecl %s %s %s", dtd_str(name, name_len), dtd_str(publicid, publicid_len),
++            dtd_str(systemid, systemid_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_dtd_unparsedEntityDecl(ISAXDTDHandler *iface, const WCHAR *name, int name_len,
++        const WCHAR *publicid, int publicid_len, const WCHAR *systemid, int systemid_len,
++        const WCHAR *notation, int notation_len)
++{
++    add_dtd_event("unparsedEntityDecl %s %s %s %s", dtd_str(name, name_len), dtd_str(publicid, publicid_len),
++            dtd_str(systemid, systemid_len), dtd_str(notation, notation_len));
++    return S_OK;
++}
++
++static const ISAXDTDHandlerVtbl dtd_dtd_vtbl =
++{
++    dtd_dtd_QueryInterface,
++    dtd_dtd_AddRef,
++    dtd_dtd_Release,
++    dtd_dtd_notationDecl,
++    dtd_dtd_unparsedEntityDecl,
++};
++static ISAXDTDHandler dtd_dtd = { &dtd_dtd_vtbl };
++
++static HRESULT WINAPI dtd_lexical_QueryInterface(ISAXLexicalHandler *iface, REFIID riid, void **obj)
++{
++    *obj = iface;
++    return S_OK;
++}
++static ULONG WINAPI dtd_lexical_AddRef(ISAXLexicalHandler *iface) { return 2; }
++static ULONG WINAPI dtd_lexical_Release(ISAXLexicalHandler *iface) { return 1; }
++static HRESULT WINAPI dtd_lexical_startDTD(ISAXLexicalHandler *iface, const WCHAR *name, int name_len,
++        const WCHAR *publicid, int publicid_len, const WCHAR *systemid, int systemid_len)
++{
++    add_dtd_event("startDTD %s %s %s", dtd_str(name, name_len), dtd_str(publicid, publicid_len),
++            dtd_str(systemid, systemid_len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_lexical_endDTD(ISAXLexicalHandler *iface)
++{
++    add_dtd_event("endDTD");
++    return S_OK;
++}
++static HRESULT WINAPI dtd_lexical_startEntity(ISAXLexicalHandler *iface, const WCHAR *name, int len)
++{
++    add_dtd_event("startEntity %s", dtd_str(name, len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_lexical_endEntity(ISAXLexicalHandler *iface, const WCHAR *name, int len)
++{
++    add_dtd_event("endEntity %s", dtd_str(name, len));
++    return S_OK;
++}
++static HRESULT WINAPI dtd_lexical_startCDATA(ISAXLexicalHandler *iface)
++{
++    add_dtd_event("startCDATA");
++    return S_OK;
++}
++static HRESULT WINAPI dtd_lexical_endCDATA(ISAXLexicalHandler *iface)
++{
++    add_dtd_event("endCDATA");
++    return S_OK;
++}
++static HRESULT WINAPI dtd_lexical_comment(ISAXLexicalHandler *iface, const WCHAR *chars, int len)
++{
++    add_dtd_event("comment %s", dtd_str(chars, len));
++    return S_OK;
++}
++
++static const ISAXLexicalHandlerVtbl dtd_lexical_vtbl =
++{
++    dtd_lexical_QueryInterface,
++    dtd_lexical_AddRef,
++    dtd_lexical_Release,
++    dtd_lexical_startDTD,
++    dtd_lexical_endDTD,
++    dtd_lexical_startEntity,
++    dtd_lexical_endEntity,
++    dtd_lexical_startCDATA,
++    dtd_lexical_endCDATA,
++    dtd_lexical_comment,
++};
++static ISAXLexicalHandler dtd_lexical = { &dtd_lexical_vtbl };
++
++static HRESULT WINAPI dtd_error_QueryInterface(ISAXErrorHandler *iface, REFIID riid, void **obj)
++{
++    *obj = iface;
++    return S_OK;
++}
++static ULONG WINAPI dtd_error_AddRef(ISAXErrorHandler *iface) { return 2; }
++static ULONG WINAPI dtd_error_Release(ISAXErrorHandler *iface) { return 1; }
++static HRESULT WINAPI dtd_error_error(ISAXErrorHandler *iface, ISAXLocator *locator, const WCHAR *message,
++        HRESULT hr)
++{
++    add_dtd_event("error %#lx", hr);
++    return S_OK;
++}
++static HRESULT WINAPI dtd_error_fatalError(ISAXErrorHandler *iface, ISAXLocator *locator, const WCHAR *message,
++        HRESULT hr)
++{
++    add_dtd_event("fatalError %#lx", hr);
++    return S_OK;
++}
++static HRESULT WINAPI dtd_error_ignorableWarning(ISAXErrorHandler *iface, ISAXLocator *locator,
++        const WCHAR *message, HRESULT hr)
++{
++    add_dtd_event("ignorableWarning %#lx", hr);
++    return S_OK;
++}
++
++static const ISAXErrorHandlerVtbl dtd_error_vtbl =
++{
++    dtd_error_QueryInterface,
++    dtd_error_AddRef,
++    dtd_error_Release,
++    dtd_error_error,
++    dtd_error_fatalError,
++    dtd_error_ignorableWarning,
++};
++static ISAXErrorHandler dtd_error = { &dtd_error_vtbl };
++
++static const WCHAR *dtd_docs[] =
++{
++    L"<!DOCTYPE a [<!ELEMENT a (#PCDATA|b)*><!ELEMENT b EMPTY><!ELEMENT c ANY><!ELEMENT d (b,(c|a)?)+>"
++     "<!ELEMENT e (b*,c+,a?)><!ELEMENT f (#PCDATA)>"
++     "<!ATTLIST a x CDATA #IMPLIED y (p|q) \"p\" z ID #REQUIRED w CDATA #FIXED \"f\" v NMTOKEN \"t\">"
++     "<!ENTITY e \"te&#x41;xt\"><!ENTITY e2 \"a&e;b\"><!ENTITY ext SYSTEM \"ext.xml\">"
++     "<!ENTITY pub PUBLIC \"-//P//EN\" \"pub.xml\"><!NOTATION gif SYSTEM \"image/gif\">"
++     "<!NOTATION png PUBLIC \"-//PNG//EN\"><!NOTATION jpg PUBLIC \"-//JPG//EN\" \"jpg.exe\">"
++     "<!ENTITY pic SYSTEM \"pic.gif\" NDATA gif><!ENTITY % pe \"<!ENTITY fromp 'q'>\"> %pe;"
++     "<!ENTITY lt2 \"&#38;#60;\"><!-- c -->]>"
++     "<a z=\"1\">x&e;y&fromp;z&e2;&lt2;</a>",
++    /* an external subset is not read, and the entities it would declare are skipped */
++    L"<!DOCTYPE a SYSTEM \"missing.dtd\"><a>&undeclared;</a>",
++    L"<!DOCTYPE a PUBLIC \"-//X//EN\" \"missing.dtd\" [<!ENTITY i \"in\">]><a>&i;</a>",
++    /* content models as written */
++    L"<!DOCTYPE a [<!ELEMENT g (b)*><!ELEMENT h (b*)><!ELEMENT i (a,(b,c))><!ELEMENT j ((a|b),c)>"
++     "<!ELEMENT k (a|(b|c))><!ELEMENT l (p:x|y)+><!ELEMENT m (#PCDATA|a|b)*><!ELEMENT n (a)>"
++     "<!ENTITY % pe \"<!ENTITY fromp 'q'>\"> %pe;]><a/>",
++    /* an entity in an attribute value is replaced without being reported */
++    L"<!DOCTYPE a [<!ENTITY e \"v\"><!ENTITY m \"<b>t</b>&e;\">]><a x=\"1&e;2\">&m;</a>",
++    L"<!DOCTYPE a><a/>",
++    L"<!DOCTYPE a [<!ENTITY ext SYSTEM \"nonexistent-wa.xml\">]><a>&ext;</a>",
++    L"<!DOCTYPE a PUBLIC \"-//X//EN\" \"sub/missing.dtd\" [<!NOTATION n SYSTEM \"rel/n\">]><a/>",
++};
++
++static void check_dtd_events(unsigned int line, const char **expect, const char *cwd)
++{
++    char event[400];
++    unsigned int i;
++    const char *p;
++
++    for (i = 0; expect[i] && i < dtd_event_count; i++)
++    {
++        if ((p = strstr(expect[i], "<cwd>")))
++            sprintf(event, "%.*s%s%s", (int)(p - expect[i]), expect[i], cwd, p + 5);
++        else
++            strcpy(event, expect[i]);
++        ok_(__FILE__, line)(!strcmp(dtd_events[i], event), "event %u: got %s, expected %s\n", i, dtd_events[i], event);
++    }
++    ok_(__FILE__, line)(!expect[i] && i == dtd_event_count, "got %u events, expected %u\n", dtd_event_count,
++            i + (expect[i] ? 1 : 0));
++    for (; i < dtd_event_count; i++) trace("extra event %u: %s\n", i, dtd_events[i]);
++    for (; expect[i]; i++) trace("missing event %u: %s\n", i, expect[i]);
++}
++
++static void get_dtd_cwd(char *cwd, int size)
++{
++    WCHAR dir[MAX_PATH];
++    char *p;
++
++    GetCurrentDirectoryW(ARRAY_SIZE(dir), dir);
++    strcpy(cwd, "file:///");
++    WideCharToMultiByte(CP_UTF8, 0, dir, -1, cwd + 8, size - 8, NULL, NULL);
++    for (p = cwd; *p; p++) if (*p == '\\') *p = '/';
++    if (p[-1] == '/') p[-1] = 0;
++}
++
++static const char *dtd_events0_v3[] =
++{
++    "startDocument", "startDTD \"a\" NULL NULL", "elementDecl \"a\" \"(#PCDATA|b)*\"", "elementDecl \"b\" \"EMPTY\"",
++    "elementDecl \"c\" \"ANY\"", "elementDecl \"d\" \"(b,(c|a)?)+\"", "elementDecl \"e\" \"(b*,c+,a?)\"",
++    "elementDecl \"f\" \"(#PCDATA)\"", "attributeDecl \"a\" \"x\" \"CDATA\" \"#IMPLIED\" NULL",
++    "attributeDecl \"a\" \"y\" \"(p|q)\" NULL \"p\"", "attributeDecl \"a\" \"z\" \"ID\" \"#REQUIRED\" NULL",
++    "attributeDecl \"a\" \"w\" \"CDATA\" \"#FIXED\" \"f\"", "attributeDecl \"a\" \"v\" \"NMTOKEN\" NULL \"t\"",
++    "internalEntityDecl \"e\" \"teAxt\"", "internalEntityDecl \"e2\" \"a&e;b\"",
++    "externalEntityDecl \"ext\" NULL \"ext.xml\"", "externalEntityDecl \"pub\" \"-//P//EN\" \"pub.xml\"",
++    "notationDecl \"gif\" NULL \"image/gif\"", "notationDecl \"png\" \"-//PNG//EN\" NULL",
++    "notationDecl \"jpg\" \"-//JPG//EN\" \"jpg.exe\"", "unparsedEntityDecl \"pic\" NULL \"pic.gif\" \"gif\"",
++    "internalEntityDecl \"%pe\" \"<!ENTITY fromp 'q'>\"", "startEntity \"%pe\"", "internalEntityDecl \"fromp\" \"q\"",
++    "endEntity \"%pe\"", "internalEntityDecl \"lt2\" \"&#60;\"", "comment \" c \"", "endDTD",
++    "startElement \"a\" z=\"1\" y=\"p\" w=\"f\" v=\"t\"", "characters \"x\"", "startEntity \"e\"",
++    "characters \"teAxt\"", "endEntity \"e\"", "characters \"y\"", "startEntity \"fromp\"", "characters \"q\"",
++    "endEntity \"fromp\"", "characters \"z\"", "startEntity \"e2\"", "characters \"a\"", "startEntity \"e\"",
++    "characters \"teAxt\"", "endEntity \"e\"", "characters \"b\"", "endEntity \"e2\"", "startEntity \"lt2\"",
++    "characters \"<\"", "endEntity \"lt2\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events1_v3[] =
++{
++    "startDocument", "startDTD \"a\" NULL \"missing.dtd\"", "skippedEntity \"[dtd]\"", "endDTD", "startElement \"a\"",
++    "skippedEntity \"undeclared\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events2_v3[] =
++{
++    "startDocument", "startDTD \"a\" \"-//X//EN\" \"missing.dtd\"", "internalEntityDecl \"i\" \"in\"",
++    "skippedEntity \"[dtd]\"", "endDTD", "startElement \"a\"", "startEntity \"i\"", "characters \"in\"",
++    "endEntity \"i\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events3_v3[] =
++{
++    "startDocument", "startDTD \"a\" NULL NULL", "elementDecl \"g\" \"(b)*\"", "elementDecl \"h\" \"(b*)\"",
++    "elementDecl \"i\" \"(a,(b,c))\"", "elementDecl \"j\" \"((a|b),c)\"", "elementDecl \"k\" \"(a|(b|c))\"",
++    "elementDecl \"l\" \"(p:x|y)+\"", "elementDecl \"m\" \"(#PCDATA|a|b)*\"", "elementDecl \"n\" \"(a)\"",
++    "internalEntityDecl \"%pe\" \"<!ENTITY fromp 'q'>\"", "startEntity \"%pe\"", "internalEntityDecl \"fromp\" \"q\"",
++    "endEntity \"%pe\"", "endDTD", "startElement \"a\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events4_v3[] =
++{
++    "startDocument", "startDTD \"a\" NULL NULL", "internalEntityDecl \"e\" \"v\"",
++    "internalEntityDecl \"m\" \"<b>t</b>&e;\"", "endDTD", "startElement \"a\" x=\"1v2\"", "startEntity \"m\"",
++    "startElement \"b\"", "characters \"t\"", "endElement \"b\"", "startEntity \"e\"", "characters \"v\"",
++    "endEntity \"e\"", "endEntity \"m\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events5_v3[] =
++{
++    "startDocument", "startDTD \"a\" NULL NULL", "endDTD", "startElement \"a\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events6_v3[] =
++{
++    "startDocument", "startDTD \"a\" NULL NULL", "externalEntityDecl \"ext\" NULL \"nonexistent-wa.xml\"", "endDTD",
++    "startElement \"a\"", "skippedEntity \"ext\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events7_v3[] =
++{
++    "startDocument", "startDTD \"a\" \"-//X//EN\" \"sub/missing.dtd\"", "notationDecl \"n\" NULL \"rel/n\"",
++    "skippedEntity \"[dtd]\"", "endDTD", "startElement \"a\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events0_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"\" \"\"", "elementDecl \"a\" \"(#PCDATA|b)*\"", "elementDecl \"b\" \"EMPTY\"",
++    "elementDecl \"c\" \"ANY\"", "elementDecl \"d\" \"(b,(c|a)?)+\"", "elementDecl \"e\" \"(b*,c+,a?)\"",
++    "elementDecl \"f\" \"(#PCDATA)\"", "attributeDecl \"a\" \"x\" \"CDATA\" \"#IMPLIED\" NULL",
++    "attributeDecl \"a\" \"y\" \"(p|q)\" NULL \"p\"", "attributeDecl \"a\" \"z\" \"ID\" \"#REQUIRED\" NULL",
++    "attributeDecl \"a\" \"w\" \"CDATA\" \"#FIXED\" \"f\"", "attributeDecl \"a\" \"v\" \"NMTOKEN\" NULL \"t\"",
++    "internalEntityDecl \"e\" \"teAxt\"", "internalEntityDecl \"e2\" \"a&e;b\"",
++    "externalEntityDecl \"ext\" \"\" \"<cwd>/ext.xml\"", "externalEntityDecl \"pub\" \"-//P//EN\" \"<cwd>/pub.xml\"",
++    "notationDecl \"gif\" \"\" \"<cwd>/image/gif\"", "notationDecl \"png\" \"-//PNG//EN\" \"\"",
++    "notationDecl \"jpg\" \"-//JPG//EN\" \"<cwd>/jpg.exe\"",
++    "unparsedEntityDecl \"pic\" \"\" \"<cwd>/pic.gif\" \"gif\"", "internalEntityDecl \"%pe\" \"<!ENTITY fromp 'q'>\"",
++    "startEntity \"%pe\"", "internalEntityDecl \"fromp\" \"q\"", "endEntity \"%pe\"",
++    "internalEntityDecl \"lt2\" \"&#60;\"", "comment \" c \"", "endDTD",
++    "startElement \"a\" z=\"1\" y=\"p\" w=\"f\" v=\"t\"", "characters \"x\"", "startEntity \"e\"",
++    "characters \"teAxt\"", "endEntity \"e\"", "characters \"y\"", "startEntity \"fromp\"", "characters \"q\"",
++    "endEntity \"fromp\"", "characters \"z\"", "startEntity \"e2\"", "characters \"a\"", "startEntity \"e\"",
++    "characters \"teAxt\"", "endEntity \"e\"", "characters \"b\"", "endEntity \"e2\"", "startEntity \"lt2\"",
++    "characters \"<\"", "endEntity \"lt2\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events1_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"\" \"<cwd>/missing.dtd\"", "skippedEntity \"[dtd]\"", "endDTD",
++    "startElement \"a\"", "skippedEntity \"undeclared\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events2_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"-//X//EN\" \"<cwd>/missing.dtd\"", "internalEntityDecl \"i\" \"in\"",
++    "skippedEntity \"[dtd]\"", "endDTD", "startElement \"a\"", "startEntity \"i\"", "characters \"in\"",
++    "endEntity \"i\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events3_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"\" \"\"", "elementDecl \"g\" \"(b)*\"", "elementDecl \"h\" \"(b*)\"",
++    "elementDecl \"i\" \"(a,(b,c))\"", "elementDecl \"j\" \"((a|b),c)\"", "elementDecl \"k\" \"(a|(b|c))\"",
++    "elementDecl \"l\" \"(p:x|y)+\"", "elementDecl \"m\" \"(#PCDATA|a|b)*\"", "elementDecl \"n\" \"(a)\"",
++    "internalEntityDecl \"%pe\" \"<!ENTITY fromp 'q'>\"", "startEntity \"%pe\"", "internalEntityDecl \"fromp\" \"q\"",
++    "endEntity \"%pe\"", "endDTD", "startElement \"a\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events4_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"\" \"\"", "internalEntityDecl \"e\" \"v\"",
++    "internalEntityDecl \"m\" \"<b>t</b>&e;\"", "endDTD", "startElement \"a\" x=\"1v2\"", "startEntity \"m\"",
++    "startElement \"b\"", "characters \"t\"", "endElement \"b\"", "startEntity \"e\"", "characters \"v\"",
++    "endEntity \"e\"", "endEntity \"m\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events5_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"\" \"\"", "endDTD", "startElement \"a\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events6_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"\" \"\"", "externalEntityDecl \"ext\" \"\" \"<cwd>/nonexistent-wa.xml\"",
++    "endDTD", "startElement \"a\"", "skippedEntity \"ext\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static const char *dtd_events7_v6[] =
++{
++    "startDocument", "startDTD \"a\" \"-//X//EN\" \"http://example.com/dir/sub/missing.dtd\"",
++    "notationDecl \"n\" \"\" \"http://example.com/dir/rel/n\"", "skippedEntity \"[dtd]\"", "endDTD",
++    "startElement \"a\"", "endElement \"a\"", "endDocument", NULL
++};
++
++static void test_saxreader_dtd_windows(void)
++{
++    static const struct { const CLSID *clsid; const char *name; } readers[] =
++    {
++        { &CLSID_SAXXMLReader, "SAXXMLReader" },
++        { &CLSID_SAXXMLReader30, "SAXXMLReader30" },
++        { &sax_reader_60, "SAXXMLReader60" },
++    };
++    static const char **expect_v3[] =
++    {
++        dtd_events0_v3, dtd_events1_v3, dtd_events2_v3, dtd_events3_v3, dtd_events4_v3, dtd_events5_v3,
++        dtd_events6_v3, dtd_events7_v3,
++    };
++    static const char **expect_v6[] =
++    {
++        dtd_events0_v6, dtd_events1_v6, dtd_events2_v6, dtd_events3_v6, dtd_events4_v6, dtd_events5_v6,
++        dtd_events6_v6, dtd_events7_v6,
++    };
++    const WCHAR *url;
++    char cwd[MAX_PATH * 3];
++    ISAXXMLReader *reader;
++    unsigned int i, j;
++    VARIANT v;
++    HRESULT hr;
++
++    get_dtd_cwd(cwd, sizeof(cwd));
++    for (i = 0; i < ARRAY_SIZE(readers); i++)
++    {
++        winetest_push_context("%s", readers[i].name);
++        hr = CoCreateInstance(readers[i].clsid, NULL, CLSCTX_INPROC_SERVER, &IID_ISAXXMLReader, (void **)&reader);
++        if (FAILED(hr))
++        {
++            win_skip("SAX reader %s is not registered\n", readers[i].name);
++            winetest_pop_context();
++            continue;
++        }
++
++        /* no base URL until one is set */
++        url = (const WCHAR *)0xdeadbeef;
++        hr = ISAXXMLReader_getBaseURL(reader, &url);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(i == 2 ? url && !*url : !url, "got %s\n", debugstr_w(url));
++        url = (const WCHAR *)0xdeadbeef;
++        hr = ISAXXMLReader_getSecureBaseURL(reader, &url);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(i == 2 ? url && !*url : !url, "got %s\n", debugstr_w(url));
++        hr = ISAXXMLReader_putSecureBaseURL(reader, L"http://example.com/secure/");
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        hr = ISAXXMLReader_getSecureBaseURL(reader, &url);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(url && !wcscmp(url, L"http://example.com/secure/"), "got %s\n", debugstr_w(url));
++        ISAXXMLReader_Release(reader);
++
++        for (j = 0; j < ARRAY_SIZE(dtd_docs); j++)
++        {
++            winetest_push_context("doc %u", j);
++            hr = CoCreateInstance(readers[i].clsid, NULL, CLSCTX_INPROC_SERVER, &IID_ISAXXMLReader, (void **)&reader);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ISAXXMLReader_putContentHandler(reader, &dtd_content);
++            ISAXXMLReader_putDTDHandler(reader, &dtd_dtd);
++            ISAXXMLReader_putErrorHandler(reader, &dtd_error);
++            V_VT(&v) = VT_UNKNOWN;
++            V_UNKNOWN(&v) = (IUnknown *)&dtd_decl;
++            hr = ISAXXMLReader_putProperty(reader, L"http://xml.org/sax/properties/declaration-handler", v);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            V_UNKNOWN(&v) = (IUnknown *)&dtd_lexical;
++            hr = ISAXXMLReader_putProperty(reader, L"http://xml.org/sax/properties/lexical-handler", v);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            hr = ISAXXMLReader_putFeature(reader, L"prohibit-dtd", VARIANT_FALSE);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            if (j == 7)
++            {
++                /* system identifiers are resolved against the base URL in MSXML 6 */
++                hr = ISAXXMLReader_putBaseURL(reader, L"http://example.com/dir/doc.xml");
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                hr = ISAXXMLReader_getBaseURL(reader, &url);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                ok(url && !wcscmp(url, L"http://example.com/dir/doc.xml"), "got %s\n", debugstr_w(url));
++            }
++
++            dtd_event_count = 0;
++            V_VT(&v) = VT_BSTR;
++            V_BSTR(&v) = SysAllocString(dtd_docs[j]);
++            hr = ISAXXMLReader_parse(reader, v);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            VariantClear(&v);
++            check_dtd_events(__LINE__, i == 2 ? expect_v6[j] : expect_v3[j], cwd);
++
++            ISAXXMLReader_Release(reader);
++            winetest_pop_context();
++        }
++        winetest_pop_context();
++    }
++}
++
++static HRESULT WINAPI limit_error_QueryInterface(ISAXErrorHandler *iface, REFIID riid, void **obj)
++{
++    *obj = iface;
++    return S_OK;
++}
++static ULONG WINAPI limit_error_AddRef(ISAXErrorHandler *iface) { return 2; }
++static ULONG WINAPI limit_error_Release(ISAXErrorHandler *iface) { return 1; }
++static HRESULT WINAPI limit_error_error(ISAXErrorHandler *iface, ISAXLocator *locator, const WCHAR *message, HRESULT hr)
++{
++    add_dtd_event("error %#lx", hr);
++    return S_OK;
++}
++static HRESULT WINAPI limit_error_fatalError(ISAXErrorHandler *iface, ISAXLocator *locator, const WCHAR *message,
++        HRESULT hr)
++{
++    int line = -1, column = -1;
++
++    ISAXLocator_getLineNumber(locator, &line);
++    ISAXLocator_getColumnNumber(locator, &column);
++    add_dtd_event("fatalError %#lx at %d:%d", hr, line, column);
++    return S_OK;
++}
++static HRESULT WINAPI limit_error_ignorableWarning(ISAXErrorHandler *iface, ISAXLocator *locator,
++        const WCHAR *message, HRESULT hr)
++{
++    add_dtd_event("ignorableWarning %#lx", hr);
++    return S_OK;
++}
++
++static const ISAXErrorHandlerVtbl limit_error_vtbl =
++{
++    limit_error_QueryInterface,
++    limit_error_AddRef,
++    limit_error_Release,
++    limit_error_error,
++    limit_error_fatalError,
++    limit_error_ignorableWarning,
++};
++static ISAXErrorHandler limit_error = { &limit_error_vtbl };
++
++static HRESULT parse_limit_stream(ISAXXMLReader *reader, const char *data, unsigned int size)
++{
++    IStream *stream;
++    VARIANT v;
++    HRESULT hr;
++
++    CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    IStream_Write(stream, data, size, NULL);
++    IStream_Seek(stream, (LARGE_INTEGER){{0}}, STREAM_SEEK_SET, NULL);
++    V_VT(&v) = VT_UNKNOWN;
++    V_UNKNOWN(&v) = (IUnknown *)stream;
++    hr = ISAXXMLReader_parse(reader, v);
++    IStream_Release(stream);
++    return hr;
++}
++
++static HRESULT parse_limit_string(ISAXXMLReader *reader, const WCHAR *xml)
++{
++    VARIANT v;
++    HRESULT hr;
++
++    V_VT(&v) = VT_BSTR;
++    if (!(V_BSTR(&v) = SysAllocString(xml))) return E_OUTOFMEMORY;
++    hr = ISAXXMLReader_parse(reader, v);
++    VariantClear(&v);
++    return hr;
++}
++
++#define check_limit_property(a, b, c, d, e) check_limit_property_(__LINE__, a, b, c, d, e)
++static void check_limit_property_(unsigned int line, ISAXXMLReader *reader, const WCHAR *name, HRESULT expect_hr,
++        VARTYPE expect_vt, LONG expect_value)
++{
++    VARIANT v;
++    HRESULT hr;
++
++    V_VT(&v) = VT_ERROR;
++    V_I4(&v) = 0xdead;
++    hr = ISAXXMLReader_getProperty(reader, name, &v);
++    ok_(__FILE__, line)(hr == expect_hr, "%s: got %#lx\n", debugstr_w(name), hr);
++    if (FAILED(hr)) return;
++    ok_(__FILE__, line)(V_VT(&v) == expect_vt, "%s: got type %d\n", debugstr_w(name), V_VT(&v));
++    if (V_VT(&v) == VT_I4)
++        ok_(__FILE__, line)(V_I4(&v) == expect_value, "%s: got %ld\n", debugstr_w(name), V_I4(&v));
++    else if (V_VT(&v) == VT_BSTR || V_VT(&v) == VT_UNKNOWN || V_VT(&v) == VT_DISPATCH)
++        ok_(__FILE__, line)(!V_UNKNOWN(&v), "%s: got %p\n", debugstr_w(name), V_UNKNOWN(&v));
++    VariantClear(&v);
++}
++
++#define put_limit(a, b, c, d, e) put_limit_(__LINE__, a, b, c, d, e)
++static void put_limit_(unsigned int line, ISAXXMLReader *reader, const WCHAR *name, VARIANT value, HRESULT expect_hr,
++        LONG expect_value)
++{
++    HRESULT hr;
++
++    if (V_VT(&value) == VT_BSTR)
++        V_BSTR(&value) = SysAllocString(V_BSTR(&value));
++    hr = ISAXXMLReader_putProperty(reader, name, value);
++    ok_(__FILE__, line)(hr == expect_hr, "%s %s: got %#lx\n", debugstr_w(name), wine_dbgstr_variant(&value), hr);
++    check_limit_property_(line, reader, name, S_OK, VT_I4, expect_value);
++    if (V_VT(&value) == VT_BSTR) VariantClear(&value);
++}
++
++#define check_decl(a, b, c) check_decl_(__LINE__, a, b, c)
++static void check_decl_(unsigned int line, ISAXXMLReader *reader, const WCHAR *name, const WCHAR *expect)
++{
++    VARIANT v;
++    HRESULT hr;
++
++    V_VT(&v) = VT_EMPTY;
++    hr = ISAXXMLReader_getProperty(reader, name, &v);
++    ok_(__FILE__, line)(hr == S_OK, "%s: got %#lx\n", debugstr_w(name), hr);
++    ok_(__FILE__, line)(V_VT(&v) == VT_BSTR, "%s: got type %d\n", debugstr_w(name), V_VT(&v));
++    if (V_VT(&v) != VT_BSTR) return;
++    ok_(__FILE__, line)(expect ? V_BSTR(&v) && !wcscmp(V_BSTR(&v), expect) : !V_BSTR(&v), "%s: got %s\n",
++            debugstr_w(name), debugstr_w(V_BSTR(&v)));
++    VariantClear(&v);
++}
++
++/* what the properties read, the limits max-xml-size and max-element-depth set, and where the reader stops */
++static void test_saxreader_limits(void)
++{
++    static const char *too_large_events[] = { "startDocument", "fatalError 0x80004004 at 1:1", NULL };
++    static const char *too_deep_events[] =
++    {
++        "startDocument", "startElement \"a\"", "startElement \"b\"", "characters \"x\"", "endElement \"b\"",
++        "startElement \"b\"", "fatalError 0x80004004 at 1:16", NULL
++    };
++    static const char *deep_enough_events[] =
++    {
++        "startDocument", "startElement \"a\"", "startElement \"b\"", "endElement \"b\"", "endElement \"a\"",
++        "endDocument", NULL
++    };
++    static const char decl_no[] = "<?xml version=\"1.0\" standalone=\"no\"?><e/>";
++    static const GUID *clsids[] = { &CLSID_SAXXMLReader, &CLSID_SAXXMLReader30 };
++    WCHAR *text = malloc(2101 * sizeof(WCHAR));
++    char *data = malloc(1100);
++    ISAXXMLReader *reader;
++    unsigned int i, j;
++    VARIANT v;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(clsids); i++)
++    {
++        winetest_push_context("%u", i);
++        hr = CoCreateInstance(clsids[i], NULL, CLSCTX_INPROC_SERVER, &IID_ISAXXMLReader, (void **)&reader);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        check_limit_property(reader, L"max-xml-size", S_OK, VT_I4, 0);
++        check_limit_property(reader, L"max-element-depth", S_OK, VT_I4, 5000);
++        check_limit_property(reader, L"charset", S_OK, VT_EMPTY, 0);
++        check_limit_property(reader, L"input-source", S_OK, VT_EMPTY, 0);
++        check_limit_property(reader, L"schema-declaration-handler", E_INVALIDARG, VT_UNKNOWN, 0);
++        check_limit_property(reader, L"http://xml.org/sax/properties/dom-node", S_OK, VT_UNKNOWN, 0);
++        check_limit_property(reader, L"output", E_INVALIDARG, VT_EMPTY, 0);
++
++        /* anything that converts to a number in range, sizes in kilobytes */
++        V_VT(&v) = VT_R4;
++        V_R4(&v) = 10.0f;
++        put_limit(reader, L"max-xml-size", v, S_OK, 10);
++        V_VT(&v) = VT_BSTR;
++        V_BSTR(&v) = (BSTR)L"abc";
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 10);
++        V_BSTR(&v) = (BSTR)L"7";
++        put_limit(reader, L"max-xml-size", v, S_OK, 7);
++        V_VT(&v) = VT_I4;
++        V_I4(&v) = -123;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 7);
++        V_I4(&v) = 4194303;
++        put_limit(reader, L"max-xml-size", v, S_OK, 4194303);
++        V_I4(&v) = 4194304;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 4194303);
++        V_I4(&v) = 4194305;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 4194303);
++        V_VT(&v) = VT_BOOL;
++        V_BOOL(&v) = VARIANT_TRUE;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 4194303);
++        V_VT(&v) = VT_EMPTY;
++        put_limit(reader, L"max-xml-size", v, S_OK, 0);
++
++        V_VT(&v) = VT_UI4;
++        V_UI4(&v) = 2147483648u;
++        put_limit(reader, L"max-element-depth", v, E_INVALIDARG, 5000);
++        V_VT(&v) = VT_I4;
++        V_I4(&v) = 2147483647;
++        put_limit(reader, L"max-element-depth", v, S_OK, 2147483647);
++        V_I4(&v) = -1;
++        put_limit(reader, L"max-element-depth", v, E_INVALIDARG, 2147483647);
++        V_VT(&v) = VT_BSTR;
++        V_BSTR(&v) = (BSTR)L"abc";
++        put_limit(reader, L"max-element-depth", v, DISP_E_TYPEMISMATCH, 2147483647);
++        V_VT(&v) = VT_R8;
++        V_R8(&v) = 2.5;
++        put_limit(reader, L"max-element-depth", v, S_OK, 2);
++        V_R8(&v) = 3.5;
++        put_limit(reader, L"max-element-depth", v, S_OK, 4);
++        V_VT(&v) = VT_EMPTY;
++        put_limit(reader, L"max-element-depth", v, S_OK, 0);
++
++        /* the XML declaration */
++        hr = parse_limit_string(reader, L"<?xml version=\"1.0\" encoding=\"uTf-16\" standalone=\"yes\"?><e/>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_decl(reader, L"xmldecl-version", NULL);
++        check_decl(reader, L"xmldecl-encoding", NULL);
++        check_decl(reader, L"xmldecl-standalone", NULL);
++        hr = parse_limit_stream(reader, decl_no, strlen(decl_no));
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_decl(reader, L"xmldecl-version", NULL);
++        check_decl(reader, L"xmldecl-encoding", NULL);
++        check_decl(reader, L"xmldecl-standalone", NULL);
++        hr = parse_limit_string(reader, L"<e/>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_decl(reader, L"xmldecl-version", NULL);
++        check_decl(reader, L"xmldecl-standalone", NULL);
++
++        /* a kilobyte at most, of a stream's bytes and of a string's characters */
++        hr = ISAXXMLReader_putContentHandler(reader, &dtd_content);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        hr = ISAXXMLReader_putErrorHandler(reader, &limit_error);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        V_VT(&v) = VT_I4;
++        V_I4(&v) = 1;
++        hr = ISAXXMLReader_putProperty(reader, L"max-xml-size", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        memcpy(data, "<a>", 3);
++        memset(data + 3, 'a', 1100 - 3);
++        for (j = 1024; j <= 1025; j++)
++        {
++            memcpy(data + j - 4, "</a>", 4);
++            dtd_event_count = 0;
++            hr = parse_limit_stream(reader, data, j);
++            ok(hr == (j == 1024 ? S_OK : E_ABORT), "%u bytes: got %#lx\n", j, hr);
++            if (j > 1024) check_dtd_events(__LINE__, too_large_events, NULL);
++        }
++        memcpy(text, L"<a>", 3 * sizeof(WCHAR));
++        for (j = 3; j < 1100; j++) text[j] = 'a';
++        for (j = 1024; j <= 1024 + 1; j++)
++        {
++            memcpy(text + j - 4, L"</a>", 5 * sizeof(WCHAR));
++            dtd_event_count = 0;
++            hr = parse_limit_string(reader, text);
++            ok(hr == (j == 1024 ? S_OK : E_ABORT), "%u characters: got %#lx\n", j, hr);
++            if (j > 1024) check_dtd_events(__LINE__, too_large_events, NULL);
++            text[j - 4] = 'a';
++        }
++        V_I4(&v) = 0;
++        hr = ISAXXMLReader_putProperty(reader, L"max-xml-size", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        /* two levels at most */
++        V_I4(&v) = 2;
++        hr = ISAXXMLReader_putProperty(reader, L"max-element-depth", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<a><b>x</b><b><c>y</c></b></a>");
++        ok(hr == E_ABORT, "got %#lx\n", hr);
++        check_dtd_events(__LINE__, too_deep_events, NULL);
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<a><b/></a>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_dtd_events(__LINE__, deep_enough_events, NULL);
++
++        /* 300 levels, within the 5000 of MSXML 3 by default */
++        V_I4(&v) = 5000;
++        hr = ISAXXMLReader_putProperty(reader, L"max-element-depth", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        for (j = 0; j < 300; j++) memcpy(text + 3 * j, L"<a>", 3 * sizeof(WCHAR));
++        for (j = 0; j < 300; j++) memcpy(text + 900 + 4 * j, L"</a>", 4 * sizeof(WCHAR));
++        text[2100] = 0;
++        hr = ISAXXMLReader_putContentHandler(reader, NULL);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        hr = parse_limit_string(reader, text);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        ISAXXMLReader_Release(reader);
++        winetest_pop_context();
++    }
++    free(text);
++    free(data);
++}
++
++/* what the properties read, the limits max-xml-size and max-element-depth set, and where the reader stops */
++static void test_saxreader_limits6(void)
++{
++    static const char *too_large_events[] = { "fatalError 0xc00cee91 at 1:0", NULL };
++    static const char *too_deep_events[] =
++    {
++        "startDocument", "startElement \"a\"", "startElement \"b\"", "characters \"x\"", "endElement \"b\"",
++        "startElement \"b\"", "fatalError 0xc00cee92 at 1:17", NULL
++    };
++    static const char *deep_enough_events[] =
++    {
++        "startDocument", "startElement \"a\"", "startElement \"b\"", "endElement \"b\"", "endElement \"a\"",
++        "endDocument", NULL
++    };
++    static const char decl_no[] = "<?xml version=\"1.0\" standalone=\"no\"?><e/>";
++    static const GUID *clsids[] = { &sax_reader_60 };
++    WCHAR *text = malloc(1100 * sizeof(WCHAR));
++    char *data = malloc(1100);
++    ISAXXMLReader *reader;
++    unsigned int i, j;
++    VARIANT v;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(clsids); i++)
++    {
++        winetest_push_context("%u", i);
++        hr = CoCreateInstance(clsids[i], NULL, CLSCTX_INPROC_SERVER, &IID_ISAXXMLReader, (void **)&reader);
++        if (FAILED(hr))
++        {
++            win_skip("SAXXMLReader60 is not registered\n");
++            winetest_pop_context();
++            continue;
++        }
++
++        check_limit_property(reader, L"max-xml-size", S_OK, VT_I4, 0);
++        check_limit_property(reader, L"max-element-depth", S_OK, VT_I4, 256);
++        check_limit_property(reader, L"charset", S_OK, VT_BSTR, 0);
++        check_limit_property(reader, L"input-source", S_OK, VT_EMPTY, 0);
++        check_limit_property(reader, L"schema-declaration-handler", S_OK, VT_UNKNOWN, 0);
++        check_limit_property(reader, L"http://xml.org/sax/properties/dom-node", E_FAIL, VT_UNKNOWN, 0);
++        check_limit_property(reader, L"output", E_INVALIDARG, VT_EMPTY, 0);
++
++        /* anything that converts to a number in range, sizes in kilobytes */
++        V_VT(&v) = VT_R4;
++        V_R4(&v) = 10.0f;
++        put_limit(reader, L"max-xml-size", v, S_OK, 10);
++        V_VT(&v) = VT_BSTR;
++        V_BSTR(&v) = (BSTR)L"abc";
++        put_limit(reader, L"max-xml-size", v, DISP_E_TYPEMISMATCH, 10);
++        V_BSTR(&v) = (BSTR)L"7";
++        put_limit(reader, L"max-xml-size", v, S_OK, 7);
++        V_VT(&v) = VT_I4;
++        V_I4(&v) = -123;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 7);
++        V_I4(&v) = 4194303;
++        put_limit(reader, L"max-xml-size", v, S_OK, 4194303);
++        V_I4(&v) = 4194304;
++        put_limit(reader, L"max-xml-size", v, S_OK, 0);
++        V_I4(&v) = 4194305;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 0);
++        V_VT(&v) = VT_BOOL;
++        V_BOOL(&v) = VARIANT_TRUE;
++        put_limit(reader, L"max-xml-size", v, E_INVALIDARG, 0);
++        V_VT(&v) = VT_EMPTY;
++        put_limit(reader, L"max-xml-size", v, S_OK, 0);
++
++        V_VT(&v) = VT_UI4;
++        V_UI4(&v) = 2147483648u;
++        put_limit(reader, L"max-element-depth", v, E_INVALIDARG, 256);
++        V_VT(&v) = VT_I4;
++        V_I4(&v) = 2147483647;
++        put_limit(reader, L"max-element-depth", v, S_OK, 2147483647);
++        V_I4(&v) = -1;
++        put_limit(reader, L"max-element-depth", v, E_INVALIDARG, 2147483647);
++        V_VT(&v) = VT_BSTR;
++        V_BSTR(&v) = (BSTR)L"abc";
++        put_limit(reader, L"max-element-depth", v, DISP_E_TYPEMISMATCH, 2147483647);
++        V_VT(&v) = VT_R8;
++        V_R8(&v) = 2.5;
++        put_limit(reader, L"max-element-depth", v, S_OK, 2);
++        V_R8(&v) = 3.5;
++        put_limit(reader, L"max-element-depth", v, S_OK, 4);
++        V_VT(&v) = VT_EMPTY;
++        put_limit(reader, L"max-element-depth", v, S_OK, 0);
++
++        /* the XML declaration */
++        hr = parse_limit_string(reader, L"<?xml version=\"1.0\" encoding=\"uTf-16\" standalone=\"yes\"?><e/>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_decl(reader, L"xmldecl-version", L"1.0");
++        check_decl(reader, L"xmldecl-encoding", L"uTf-16");
++        check_decl(reader, L"xmldecl-standalone", L"yes");
++        hr = parse_limit_stream(reader, decl_no, strlen(decl_no));
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_decl(reader, L"xmldecl-version", L"1.0");
++        check_decl(reader, L"xmldecl-encoding", NULL);
++        check_decl(reader, L"xmldecl-standalone", L"no");
++        hr = parse_limit_string(reader, L"<e/>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_decl(reader, L"xmldecl-version", NULL);
++        check_decl(reader, L"xmldecl-standalone", NULL);
++
++        /* a kilobyte at most, of a stream's bytes and of a string's bytes */
++        hr = ISAXXMLReader_putContentHandler(reader, &dtd_content);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        hr = ISAXXMLReader_putErrorHandler(reader, &limit_error);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        V_VT(&v) = VT_I4;
++        V_I4(&v) = 1;
++        hr = ISAXXMLReader_putProperty(reader, L"max-xml-size", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        memcpy(data, "<a>", 3);
++        memset(data + 3, 'a', 1100 - 3);
++        for (j = 1024; j <= 1025; j++)
++        {
++            memcpy(data + j - 4, "</a>", 4);
++            dtd_event_count = 0;
++            hr = parse_limit_stream(reader, data, j);
++            ok(hr == (j == 1024 ? S_OK : 0xc00cee91), "%u bytes: got %#lx\n", j, hr);
++            if (j > 1024) check_dtd_events(__LINE__, too_large_events, NULL);
++        }
++        memcpy(text, L"<a>", 3 * sizeof(WCHAR));
++        for (j = 3; j < 1100; j++) text[j] = 'a';
++        for (j = 512; j <= 512 + 1; j++)
++        {
++            memcpy(text + j - 4, L"</a>", 5 * sizeof(WCHAR));
++            dtd_event_count = 0;
++            hr = parse_limit_string(reader, text);
++            ok(hr == (j == 512 ? S_OK : 0xc00cee91), "%u characters: got %#lx\n", j, hr);
++            if (j > 512) check_dtd_events(__LINE__, too_large_events, NULL);
++            text[j - 4] = 'a';
++        }
++        V_I4(&v) = 0;
++        hr = ISAXXMLReader_putProperty(reader, L"max-xml-size", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        /* two levels at most */
++        V_I4(&v) = 2;
++        hr = ISAXXMLReader_putProperty(reader, L"max-element-depth", v);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<a><b>x</b><b><c>y</c></b></a>");
++        ok(hr == 0xc00cee92, "got %#lx\n", hr);
++        check_dtd_events(__LINE__, too_deep_events, NULL);
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<a><b/></a>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++        check_dtd_events(__LINE__, deep_enough_events, NULL);
++
++        ISAXXMLReader_Release(reader);
++        winetest_pop_context();
++    }
++    free(text);
++    free(data);
++}
++
++static void test_saxreader_prohibit_dtd_windows(void)
++{
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++        VARIANT_BOOL default_value;
++        HRESULT error;
++        const char *fatal_event;
++    }
++    tests[] =
++    {
++        { &CLSID_SAXXMLReader30, "SAXXMLReader30", VARIANT_FALSE, 0xc00ce556,
++            "fatalError 0xc00ce556 at 1:11" },
++        { &sax_reader_60, "SAXXMLReader60", VARIANT_TRUE, 0xc00cee4e,
++            "fatalError 0xc00cee4e at 1:9" },
++    };
++    ISAXXMLReader *reader;
++    VARIANT_BOOL value;
++    unsigned int i;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context("%s", tests[i].name);
++        hr = CoCreateInstance(tests[i].clsid, NULL, CLSCTX_INPROC_SERVER, &IID_ISAXXMLReader, (void **)&reader);
++        if (FAILED(hr))
++        {
++            win_skip("%s is not registered\n", tests[i].name);
++            winetest_pop_context();
++            continue;
++        }
++        hr = ISAXXMLReader_putErrorHandler(reader, &limit_error);
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        value = 0xdead;
++        hr = ISAXXMLReader_getFeature(reader, L"prohibit-dtd", &value);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        ok(value == tests[i].default_value, "got %d\n", value);
++
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>");
++        ok(hr == (i ? tests[i].error : S_OK), "default: got %#lx\n", hr);
++        if (i)
++        {
++            const char *events[] = { tests[i].fatal_event, NULL };
++            check_dtd_events(__LINE__, events, NULL);
++        }
++        hr = ISAXXMLReader_putFeature(reader, L"prohibit-dtd", VARIANT_TRUE);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>");
++        ok(hr == tests[i].error, "got %#lx\n", hr);
++        {
++            const char *events[] = { tests[i].fatal_event, NULL };
++            check_dtd_events(__LINE__, events, NULL);
++        }
++        dtd_event_count = 0;
++        hr = parse_limit_string(reader, L"<!DOCTYPE a><a>x</a>");
++        ok(hr == tests[i].error, "got %#lx\n", hr);
++        {
++            const char *events[] = { tests[i].fatal_event, NULL };
++            check_dtd_events(__LINE__, events, NULL);
++        }
++        hr = parse_limit_string(reader, L"<a>x</a>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        hr = ISAXXMLReader_putFeature(reader, L"prohibit-dtd", VARIANT_FALSE);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        hr = parse_limit_string(reader, L"<!DOCTYPE a [<!ELEMENT a (#PCDATA)>]><a>x</a>");
++        ok(hr == S_OK, "got %#lx\n", hr);
++
++        ISAXXMLReader_Release(reader);
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(saxreader)
+ {
+     ISAXXMLReader *reader;
+@@ -6493,6 +7600,10 @@ START_TEST(saxreader)
+     test_saxreader_pi();
+     test_saxreader_characters();
+     test_saxreader_dtd();
++    test_saxreader_dtd_windows();
++    test_saxreader_limits();
++    test_saxreader_limits6();
++    test_saxreader_prohibit_dtd_windows();
+     test_saxreader_parse_input();
+     test_saxreader_max_element_depth();
+ 

@@ -1,0 +1,814 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 09:59:01 -0400
+Subject: [PATCH] Show what the print queue is doing: implement EnumJobs and a
+ window for it.
+
+Printing under Wine leaves nothing on screen.  No notification, no queue, no
+page counter -- the paper either appears or it does not.  Every layer that
+would have shown something was missing.
+
+EnumJobsW was a stub in winspool.drv, so nothing could list a queue at all,
+and localspl registered NULL for fpEnumJobs even though it already keeps the
+jobs and already serialises them one at a time for GetJob.  This fills in
+fpEnumJobs for levels 1 and 2 -- the entries packed from the front, their
+strings and devmode taken from the back, the way the other Enums in the
+spooler lay it out -- and points EnumJobsW at the backend like GetJobW.  Job
+status is what the spooler can honestly say: spooling while the job still
+holds its file, printing once it has been handed to the port.
+tools/jobprobe calls it around a StartDoc/EndDoc pair and sees the job appear
+with its title and disappear afterwards.
+
+printui had a stub where the queue window belongs, so there was nowhere to
+show it either.  vQueueCreate and PrintUIEntry /o now open a real one:
+document, status, owner, pages and size, refreshed twice a second, with
+pause, resume and cancel on the selected job.  Its strings are localised, and
+the states it names include the ones that matter here -- out of paper, and
+waiting at the printer, which is what manual duplex looks like while the
+second side sits in the manual feeder.
+
+What it still cannot show is progress on the printer's side: once a job has
+gone to CUPS it is no longer localspl's, so the window empties.  Carrying the
+port's view of the job back into the spooler is the next piece.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 8a87dfc21b3ec773ce3c52ffeef69e9e6e17b38f)
+
+diff --git a/dlls/localspl/provider.c b/dlls/localspl/provider.c
+index e318736e09a..5159fa3f739 100644
+--- a/dlls/localspl/provider.c
++++ b/dlls/localspl/provider.c
+@@ -3779,6 +3779,146 @@ static BOOL WINAPI fpGetJob(HANDLE hprinter, DWORD job_id, DWORD level,
+     return ret;
+ }
+ 
++/* How far a job has got, as far as the spooler can tell.  A job still holding
++ * its file open is being written; once that is done it is waiting for, or
++ * going through, the port. */
++static DWORD job_status(const job_info_t *job)
++{
++    return job->hf ? JOB_STATUS_SPOOLING : JOB_STATUS_PRINTING;
++}
++
++static DWORD job_info_size(const printer_info_t *info, const job_info_t *job, DWORD level)
++{
++    DWORD s = level == 1 ? sizeof(JOB_INFO_1W) : sizeof(JOB_INFO_2W);
++
++    s += job->document_title ? (wcslen(job->document_title) + 1) * sizeof(WCHAR) : 0;
++    s += info->name ? (wcslen(info->name) + 1) * sizeof(WCHAR) : 0;
++    if (level == 2 && job->devmode)
++    {
++        s += (4 - (s & 3)) & 3;
++        s += job->devmode->dmSize + job->devmode->dmDriverExtra;
++    }
++    return s;
++}
++
++/* Write one entry, its strings taken from the end of the buffer working back,
++ * which is the layout every Enum in the spooler API uses. */
++static BYTE *write_job_info(const printer_info_t *info, const job_info_t *job,
++        DWORD level, BYTE *entry, BYTE *strings)
++{
++    WCHAR **doc, **printer_name;
++    DEVMODEW **devmode = NULL;
++
++    if (level == 1)
++    {
++        JOB_INFO_1W *ji = (JOB_INFO_1W *)entry;
++
++        memset(ji, 0, sizeof(*ji));
++        ji->JobId = job->id;
++        ji->Status = job_status(job);
++        doc = &ji->pDocument;
++        printer_name = &ji->pPrinterName;
++    }
++    else
++    {
++        JOB_INFO_2W *ji = (JOB_INFO_2W *)entry;
++
++        memset(ji, 0, sizeof(*ji));
++        ji->JobId = job->id;
++        ji->Status = job_status(job);
++        doc = &ji->pDocument;
++        printer_name = &ji->pPrinterName;
++        devmode = &ji->pDevMode;
++    }
++
++    if (job->document_title)
++    {
++        strings -= (wcslen(job->document_title) + 1) * sizeof(WCHAR);
++        wcscpy((WCHAR *)strings, job->document_title);
++        *doc = (WCHAR *)strings;
++    }
++    if (info->name)
++    {
++        strings -= (wcslen(info->name) + 1) * sizeof(WCHAR);
++        wcscpy((WCHAR *)strings, info->name);
++        *printer_name = (WCHAR *)strings;
++    }
++    if (devmode && job->devmode)
++    {
++        strings -= job->devmode->dmSize + job->devmode->dmDriverExtra;
++        strings = (BYTE *)((ULONG_PTR)strings & ~(ULONG_PTR)3);
++        memcpy(strings, job->devmode, job->devmode->dmSize + job->devmode->dmDriverExtra);
++        *devmode = (DEVMODEW *)strings;
++    }
++    return strings;
++}
++
++/* Nothing could list what was in the queue before this: EnumJobs was a stub
++ * all the way down, so a print job left no trace on screen anywhere. */
++static BOOL WINAPI fpEnumJobs(HANDLE hprinter, DWORD first_job, DWORD no_jobs,
++        DWORD level, BYTE *data, DWORD size, DWORD *needed, DWORD *returned)
++{
++    printer_t *printer = (printer_t *)hprinter;
++    DWORD s = 0, count = 0, index = 0;
++    BYTE *entry, *strings;
++    job_info_t *job;
++
++    TRACE("%p %ld %ld %ld %p %ld %p %p\n", hprinter, first_job, no_jobs, level,
++          data, size, needed, returned);
++
++    if (!printer || printer->header.type != HANDLE_PRINTER)
++    {
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++    if (!needed || !returned)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (level != 1 && level != 2)
++    {
++        FIXME("level %ld not supported\n", level);
++        SetLastError(ERROR_INVALID_LEVEL);
++        return FALSE;
++    }
++
++    EnterCriticalSection(&printer->info->jobs_cs);
++
++    LIST_FOR_EACH_ENTRY(job, &printer->info->jobs, job_info_t, entry)
++    {
++        if (index++ < first_job) continue;
++        if (count >= no_jobs) break;
++        s += job_info_size(printer->info, job, level);
++        count++;
++    }
++
++    *needed = s;
++    *returned = 0;
++
++    if (size < s)
++    {
++        LeaveCriticalSection(&printer->info->jobs_cs);
++        SetLastError(ERROR_INSUFFICIENT_BUFFER);
++        return FALSE;
++    }
++
++    entry = data;
++    strings = data + s;
++    index = 0;
++    LIST_FOR_EACH_ENTRY(job, &printer->info->jobs, job_info_t, entry)
++    {
++        if (index++ < first_job) continue;
++        if (*returned >= count) break;
++        strings = write_job_info(printer->info, job, level, entry, strings);
++        entry += level == 1 ? sizeof(JOB_INFO_1W) : sizeof(JOB_INFO_2W);
++        (*returned)++;
++    }
++
++    LeaveCriticalSection(&printer->info->jobs_cs);
++    return TRUE;
++}
++
+ static BOOL WINAPI fpScheduleJob(HANDLE hprinter, DWORD job_id)
+ {
+     printer_t *printer = (printer_t *)hprinter;
+@@ -4094,7 +4234,7 @@ static const PRINTPROVIDOR backend = {
+         fpOpenPrinter,
+         fpSetJob,
+         fpGetJob,
+-        NULL,   /* fpEnumJobs */
++        fpEnumJobs,
+         NULL,   /* fpAddPrinter */
+         NULL,   /* fpDeletePrinter */
+         NULL,   /* fpSetPrinter */
+diff --git a/dlls/printui/Makefile.in b/dlls/printui/Makefile.in
+index 6fecb49b153..ea36e272045 100644
+--- a/dlls/printui/Makefile.in
++++ b/dlls/printui/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = printui.dll
+-IMPORTS   = shell32
++IMPORTS   = shell32 comctl32 winspool user32 gdi32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+@@ -7,4 +7,7 @@ VER_FILEDESCRIPTION_STR = "User Interface for Printing"
+ VER_PRODUCTVERSION      = 5,1,2600,2180
+ 
+ SOURCES = \
+-	printui.c
++	printui.c \
++	printui.rc \
++	printui_Zh.rc \
++	queue.c
+diff --git a/dlls/printui/printui.c b/dlls/printui/printui.c
+index 13669f05aab..7f7247a765b 100644
+--- a/dlls/printui/printui.c
++++ b/dlls/printui/printui.c
+@@ -30,6 +30,7 @@
+ #include "winver.h"
+ #include "winnls.h"
+ #include "shellapi.h"
++#include "winspool.h"
+ 
+ #include "wine/debug.h"
+ #include "printui_private.h"
+@@ -210,6 +211,29 @@ static BOOL parse_rundll(context_t * cx)
+     return TRUE;
+ }
+ 
++BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
++{
++    if (reason == DLL_PROCESS_ATTACH)
++    {
++        DisableThreadLibraryCalls(inst);
++        printui_queue_init(inst);
++    }
++    return TRUE;
++}
++
++/*****************************************************
++ *  vQueueCreate                 [printui.@]
++ *
++ * Show the queue for a printer: what is waiting, what is printing, and how
++ * far it has got.  Without it a job leaves nothing on screen at all, which is
++ * the one thing every other system does show.
++ */
++BOOL WINAPI vQueueCreate(const WCHAR *printer, HWND hwnd, HINSTANCE inst, int cmd_show)
++{
++    TRACE("(%s, %p, %p, %d)\n", debugstr_w(printer), hwnd, inst, cmd_show);
++    return printui_show_queue(printer, cmd_show);
++}
++
+ /*****************************************************
+  *  PrintUIEntryW                [printui.@]
+  *  Commandline-Interface for using printui.dll with rundll32.exe
+@@ -237,6 +261,21 @@ void WINAPI PrintUIEntryW(HWND hWnd, HINSTANCE hInst, LPCWSTR pCommand, DWORD nC
+     if (res && cx.command) {
+         switch (cx.command)
+         {
++            case 'o':   /* open the queue for a printer */
++            {
++                const WCHAR *printer = cx.options[OPT_N];
++
++                if (!printer || !printer[0])
++                {
++                    WCHAR buf[MAX_PATH];
++                    DWORD len = ARRAY_SIZE(buf);
++
++                    if (GetDefaultPrinterW(buf, &len)) printui_show_queue(buf, cx.nCmdShow);
++                    else FIXME("no printer given and no default printer\n");
++                }
++                else printui_show_queue(printer, cx.nCmdShow);
++                break;
++            }
+ 
+             default:
+             {
+diff --git a/dlls/printui/printui.rc b/dlls/printui/printui.rc
+new file mode 100644
+index 00000000000..75f969ada37
+--- /dev/null
++++ b/dlls/printui/printui.rc
+@@ -0,0 +1,49 @@
++/*
++ * Resources for printui.dll
++ *
++ * Copyright 2007 Detlef Riekenberg
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ *
++ */
++
++#include "windef.h"
++#include "printui_private.h"
++
++LANGUAGE LANG_ENGLISH, SUBLANG_DEFAULT
++
++STRINGTABLE
++{
++    IDS_QUEUE_TITLE       "%s - Print queue"
++    IDS_COL_DOCUMENT      "Document"
++    IDS_COL_STATUS        "Status"
++    IDS_COL_OWNER         "Owner"
++    IDS_COL_PAGES         "Pages"
++    IDS_COL_SIZE          "Size"
++    IDS_JOB_QUEUED        "In queue"
++    IDS_JOB_SPOOLING      "Spooling"
++    IDS_JOB_PRINTING      "Printing"
++    IDS_JOB_PRINTED       "Printed"
++    IDS_JOB_PAUSED        "Paused"
++    IDS_JOB_ERROR         "Error"
++    IDS_JOB_DELETING      "Deleting"
++    IDS_JOB_OFFLINE       "Printer offline"
++    IDS_JOB_PAPEROUT      "Out of paper"
++    IDS_JOB_INTERVENTION  "Waiting at the printer"
++    IDS_JOB_BLOCKED       "Blocked"
++    IDS_MENU_PAUSE        "Pause"
++    IDS_MENU_RESUME       "Resume"
++    IDS_MENU_CANCEL       "Cancel"
++}
+diff --git a/dlls/printui/printui.spec b/dlls/printui/printui.spec
+index b498db6cf77..5b3bc1404bf 100644
+--- a/dlls/printui/printui.spec
++++ b/dlls/printui/printui.spec
+@@ -19,5 +19,5 @@
+ @ stub bPrinterSetup
+ @ stub vDocumentDefaults
+ @ stub vPrinterPropPages
+-@ stub vQueueCreate
++@ stdcall vQueueCreate(wstr ptr long long)
+ @ stub vServerPropPages
+diff --git a/dlls/printui/printui_Zh.rc b/dlls/printui/printui_Zh.rc
+new file mode 100644
+index 00000000000..5cbccc0328e
+--- /dev/null
++++ b/dlls/printui/printui_Zh.rc
+@@ -0,0 +1,50 @@
++/*
++ * Simplified Chinese resources for printui
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "windef.h"
++#include "printui_private.h"
++
++#pragma code_page(65001)
++
++LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
++
++STRINGTABLE
++{
++    IDS_QUEUE_TITLE       "%s - 打印队列"
++    IDS_COL_DOCUMENT      "文档名"
++    IDS_COL_STATUS        "状态"
++    IDS_COL_OWNER         "所有者"
++    IDS_COL_PAGES         "页数"
++    IDS_COL_SIZE          "大小"
++    IDS_JOB_QUEUED        "排队中"
++    IDS_JOB_SPOOLING      "正在后台处理"
++    IDS_JOB_PRINTING      "正在打印"
++    IDS_JOB_PRINTED       "已打印"
++    IDS_JOB_PAUSED        "已暂停"
++    IDS_JOB_ERROR         "错误"
++    IDS_JOB_DELETING      "正在删除"
++    IDS_JOB_OFFLINE       "打印机脱机"
++    IDS_JOB_PAPEROUT      "缺纸"
++    IDS_JOB_INTERVENTION  "等待打印机上的操作"
++    IDS_JOB_BLOCKED       "已阻塞"
++    IDS_MENU_PAUSE        "暂停(&P)"
++    IDS_MENU_RESUME       "继续(&R)"
++    IDS_MENU_CANCEL       "取消(&C)"
++}
+diff --git a/dlls/printui/printui_private.h b/dlls/printui/printui_private.h
+index fc63c752146..2b207ec9eb5 100644
+--- a/dlls/printui/printui_private.h
++++ b/dlls/printui/printui_private.h
+@@ -51,6 +51,31 @@ typedef enum _FLAG_INDEX {
+ } FLAG_INDEX;
+ 
+ 
++/* Strings for the print queue window */
++#define IDS_QUEUE_TITLE       100
++#define IDS_COL_DOCUMENT      101
++#define IDS_COL_STATUS        102
++#define IDS_COL_OWNER         103
++#define IDS_COL_PAGES         104
++#define IDS_COL_SIZE          105
++#define IDS_JOB_QUEUED        110
++#define IDS_JOB_SPOOLING      111
++#define IDS_JOB_PRINTING      112
++#define IDS_JOB_PRINTED       113
++#define IDS_JOB_PAUSED        114
++#define IDS_JOB_ERROR         115
++#define IDS_JOB_DELETING      116
++#define IDS_JOB_OFFLINE       117
++#define IDS_JOB_PAPEROUT      118
++#define IDS_JOB_INTERVENTION  119
++#define IDS_JOB_BLOCKED       120
++#define IDS_MENU_PAUSE        130
++#define IDS_MENU_RESUME       131
++#define IDS_MENU_CANCEL       132
++
++BOOL printui_show_queue( const WCHAR *printer, int cmd_show );
++void printui_queue_init( HINSTANCE inst );
++
+ typedef struct tag_context {
+     HWND    hWnd;
+     DWORD   nCmdShow;
+diff --git a/dlls/printui/queue.c b/dlls/printui/queue.c
+new file mode 100644
+index 00000000000..5f9a6effddc
+--- /dev/null
++++ b/dlls/printui/queue.c
+@@ -0,0 +1,332 @@
++/*
++ * The print queue window
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
++#include "winspool.h"
++#include "commctrl.h"
++
++#include "printui_private.h"
++
++#define QUEUE_REFRESH_TIMER  1
++#define QUEUE_REFRESH_MS     500
++
++#define IDM_JOB_PAUSE   0x100
++#define IDM_JOB_RESUME  0x101
++#define IDM_JOB_CANCEL  0x102
++
++struct queue_window
++{
++    WCHAR   printer[MAX_PATH];
++    HWND    list;
++};
++
++static HINSTANCE queue_instance;
++
++static void load_string( UINT id, WCHAR *buf, int len, const WCHAR *fallback )
++{
++    if (!LoadStringW( queue_instance, id, buf, len )) lstrcpynW( buf, fallback, len );
++}
++
++/* The one line that says what is happening to a job.  A queue that is waiting
++ * for someone to put paper in the manual feeder says so here, which is the
++ * whole point of showing this window during manual duplex. */
++static void status_text( const JOB_INFO_2W *job, WCHAR *buf, int len )
++{
++    static const struct { DWORD flag; UINT id; const WCHAR *text; } states[] =
++    {
++        { JOB_STATUS_ERROR,             IDS_JOB_ERROR,        L"Error" },
++        { JOB_STATUS_PAPEROUT,          IDS_JOB_PAPEROUT,     L"Out of paper" },
++        { JOB_STATUS_USER_INTERVENTION, IDS_JOB_INTERVENTION, L"Waiting at the printer" },
++        { JOB_STATUS_OFFLINE,           IDS_JOB_OFFLINE,      L"Printer offline" },
++        { JOB_STATUS_BLOCKED_DEVQ,      IDS_JOB_BLOCKED,      L"Blocked" },
++        { JOB_STATUS_DELETING,          IDS_JOB_DELETING,     L"Deleting" },
++        { JOB_STATUS_PAUSED,            IDS_JOB_PAUSED,       L"Paused" },
++        { JOB_STATUS_PRINTING,          IDS_JOB_PRINTING,     L"Printing" },
++        { JOB_STATUS_PRINTED,           IDS_JOB_PRINTED,      L"Printed" },
++        { JOB_STATUS_SPOOLING,          IDS_JOB_SPOOLING,     L"Spooling" },
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(states); i++)
++    {
++        if (!(job->Status & states[i].flag)) continue;
++        load_string( states[i].id, buf, len, states[i].text );
++        return;
++    }
++
++    if (job->pStatus && job->pStatus[0]) lstrcpynW( buf, job->pStatus, len );
++    else load_string( IDS_JOB_QUEUED, buf, len, L"In queue" );
++}
++
++static void fill_list( struct queue_window *qw )
++{
++    DWORD needed = 0, count = 0, i, sel;
++    JOB_INFO_2W *jobs = NULL;
++    HANDLE printer = NULL;
++    WCHAR buf[128];
++    LVITEMW item;
++
++    sel = SendMessageW( qw->list, LVM_GETNEXTITEM, -1, LVNI_SELECTED );
++
++    if (!OpenPrinterW( qw->printer, &printer, NULL )) goto done;
++    EnumJobsW( printer, 0, 0xffffffff, 2, NULL, 0, &needed, &count );
++    if (needed && (jobs = HeapAlloc( GetProcessHeap(), 0, needed )))
++    {
++        if (!EnumJobsW( printer, 0, 0xffffffff, 2, (BYTE *)jobs, needed, &needed, &count ))
++            count = 0;
++    }
++
++done:
++    SendMessageW( qw->list, LVM_DELETEALLITEMS, 0, 0 );
++
++    for (i = 0; i < count; i++)
++    {
++        memset( &item, 0, sizeof(item) );
++        item.mask = LVIF_TEXT | LVIF_PARAM;
++        item.iItem = i;
++        item.lParam = jobs[i].JobId;
++        item.pszText = jobs[i].pDocument && jobs[i].pDocument[0] ? jobs[i].pDocument : (WCHAR *)L"";
++        SendMessageW( qw->list, LVM_INSERTITEMW, 0, (LPARAM)&item );
++
++        status_text( &jobs[i], buf, ARRAY_SIZE(buf) );
++        item.mask = LVIF_TEXT;
++        item.iSubItem = 1;
++        item.pszText = buf;
++        SendMessageW( qw->list, LVM_SETITEMW, 0, (LPARAM)&item );
++
++        item.iSubItem = 2;
++        item.pszText = jobs[i].pUserName ? jobs[i].pUserName : (WCHAR *)L"";
++        SendMessageW( qw->list, LVM_SETITEMW, 0, (LPARAM)&item );
++
++        if (jobs[i].TotalPages)
++            swprintf( buf, ARRAY_SIZE(buf), L"%lu/%lu", jobs[i].PagesPrinted, jobs[i].TotalPages );
++        else
++            swprintf( buf, ARRAY_SIZE(buf), L"%lu", jobs[i].PagesPrinted );
++        item.iSubItem = 3;
++        item.pszText = buf;
++        SendMessageW( qw->list, LVM_SETITEMW, 0, (LPARAM)&item );
++
++        swprintf( buf, ARRAY_SIZE(buf), L"%lu KB", (jobs[i].Size + 1023) / 1024 );
++        item.iSubItem = 4;
++        item.pszText = buf;
++        SendMessageW( qw->list, LVM_SETITEMW, 0, (LPARAM)&item );
++    }
++
++    if (sel != (DWORD)-1 && sel < count)
++    {
++        memset( &item, 0, sizeof(item) );
++        item.mask = LVIF_STATE;
++        item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
++        item.state = LVIS_SELECTED | LVIS_FOCUSED;
++        SendMessageW( qw->list, LVM_SETITEMSTATE, sel, (LPARAM)&item );
++    }
++
++    HeapFree( GetProcessHeap(), 0, jobs );
++    if (printer) ClosePrinter( printer );
++}
++
++static void command_selected_job( struct queue_window *qw, DWORD command )
++{
++    DWORD sel = SendMessageW( qw->list, LVM_GETNEXTITEM, -1, LVNI_SELECTED );
++    HANDLE printer;
++    LVITEMW item;
++
++    if (sel == (DWORD)-1) return;
++
++    memset( &item, 0, sizeof(item) );
++    item.mask = LVIF_PARAM;
++    item.iItem = sel;
++    if (!SendMessageW( qw->list, LVM_GETITEMW, 0, (LPARAM)&item )) return;
++
++    if (!OpenPrinterW( qw->printer, &printer, NULL )) return;
++    SetJobW( printer, item.lParam, 0, NULL, command );
++    ClosePrinter( printer );
++
++    fill_list( qw );
++}
++
++static void show_job_menu( struct queue_window *qw, int x, int y )
++{
++    WCHAR pause[64], resume[64], cancel[64];
++    HMENU menu;
++
++    if (SendMessageW( qw->list, LVM_GETNEXTITEM, -1, LVNI_SELECTED ) == (DWORD)-1) return;
++    if (!(menu = CreatePopupMenu())) return;
++
++    load_string( IDS_MENU_PAUSE, pause, ARRAY_SIZE(pause), L"Pause" );
++    load_string( IDS_MENU_RESUME, resume, ARRAY_SIZE(resume), L"Resume" );
++    load_string( IDS_MENU_CANCEL, cancel, ARRAY_SIZE(cancel), L"Cancel" );
++    AppendMenuW( menu, MF_STRING, IDM_JOB_PAUSE, pause );
++    AppendMenuW( menu, MF_STRING, IDM_JOB_RESUME, resume );
++    AppendMenuW( menu, MF_SEPARATOR, 0, NULL );
++    AppendMenuW( menu, MF_STRING, IDM_JOB_CANCEL, cancel );
++
++    TrackPopupMenu( menu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, x, y, 0,
++                    GetParent( qw->list ), NULL );
++    DestroyMenu( menu );
++}
++
++static LRESULT CALLBACK queue_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    struct queue_window *qw = (void *)GetWindowLongPtrW( hwnd, GWLP_USERDATA );
++
++    switch (msg)
++    {
++    case WM_CREATE:
++    {
++        static const UINT columns[] = { IDS_COL_DOCUMENT, IDS_COL_STATUS, IDS_COL_OWNER,
++                                        IDS_COL_PAGES, IDS_COL_SIZE };
++        static const WCHAR *fallback[] = { L"Document", L"Status", L"Owner", L"Pages", L"Size" };
++        static const int widths[] = { 260, 150, 110, 80, 90 };
++        CREATESTRUCTW *cs = (CREATESTRUCTW *)lparam;
++        WCHAR text[64];
++        LVCOLUMNW col;
++        unsigned int i;
++
++        qw = cs->lpCreateParams;
++        SetWindowLongPtrW( hwnd, GWLP_USERDATA, (LONG_PTR)qw );
++
++        qw->list = CreateWindowExW( 0, WC_LISTVIEWW, NULL,
++                                    WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
++                                    LVS_SHOWSELALWAYS, 0, 0, 0, 0, hwnd, NULL,
++                                    queue_instance, NULL );
++        if (!qw->list) return -1;
++        SendMessageW( qw->list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT );
++
++        memset( &col, 0, sizeof(col) );
++        col.mask = LVCF_TEXT | LVCF_WIDTH;
++        for (i = 0; i < ARRAY_SIZE(columns); i++)
++        {
++            load_string( columns[i], text, ARRAY_SIZE(text), fallback[i] );
++            col.pszText = text;
++            col.cx = widths[i];
++            SendMessageW( qw->list, LVM_INSERTCOLUMNW, i, (LPARAM)&col );
++        }
++
++        fill_list( qw );
++        SetTimer( hwnd, QUEUE_REFRESH_TIMER, QUEUE_REFRESH_MS, NULL );
++        return 0;
++    }
++
++    case WM_SIZE:
++        if (qw) MoveWindow( qw->list, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE );
++        return 0;
++
++    case WM_TIMER:
++        if (wparam == QUEUE_REFRESH_TIMER && qw) fill_list( qw );
++        return 0;
++
++    case WM_CONTEXTMENU:
++        if (qw && (HWND)wparam == qw->list)
++        {
++            int x = (short)LOWORD(lparam), y = (short)HIWORD(lparam);
++
++            if (x == -1 && y == -1)  /* keyboard */
++            {
++                RECT r;
++                GetWindowRect( qw->list, &r );
++                x = r.left + 20;
++                y = r.top + 20;
++            }
++            show_job_menu( qw, x, y );
++        }
++        return 0;
++
++    case WM_COMMAND:
++        switch (LOWORD(wparam))
++        {
++        case IDM_JOB_PAUSE:  command_selected_job( qw, JOB_CONTROL_PAUSE ); return 0;
++        case IDM_JOB_RESUME: command_selected_job( qw, JOB_CONTROL_RESUME ); return 0;
++        case IDM_JOB_CANCEL: command_selected_job( qw, JOB_CONTROL_CANCEL ); return 0;
++        }
++        break;
++
++    case WM_DESTROY:
++        KillTimer( hwnd, QUEUE_REFRESH_TIMER );
++        PostQuitMessage( 0 );
++        return 0;
++    }
++
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static const WCHAR queue_class[] = L"PrintUIQueueWindow";
++
++static BOOL register_queue_class( void )
++{
++    WNDCLASSEXW wc = { sizeof(wc) };
++
++    if (GetClassInfoExW( queue_instance, queue_class, &wc )) return TRUE;
++
++    wc.lpfnWndProc = queue_proc;
++    wc.hInstance = queue_instance;
++    wc.hCursor = LoadCursorW( NULL, (const WCHAR *)IDC_ARROW );
++    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
++    wc.lpszClassName = queue_class;
++    return RegisterClassExW( &wc ) != 0;
++}
++
++/* Open the queue for a printer and pump it until the user closes it.  The
++ * caller is whoever wanted to show the queue, so this blocks on purpose. */
++BOOL printui_show_queue( const WCHAR *printer, int cmd_show )
++{
++    struct queue_window qw;
++    WCHAR title[256], fmt[128];
++    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
++    HWND hwnd;
++    MSG msg;
++
++    if (!printer || !printer[0]) return FALSE;
++
++    InitCommonControlsEx( &icc );
++    if (!register_queue_class()) return FALSE;
++
++    memset( &qw, 0, sizeof(qw) );
++    lstrcpynW( qw.printer, printer, ARRAY_SIZE(qw.printer) );
++
++    load_string( IDS_QUEUE_TITLE, fmt, ARRAY_SIZE(fmt), L"%s - Print queue" );
++    swprintf( title, ARRAY_SIZE(title), fmt, printer );
++
++    hwnd = CreateWindowExW( 0, queue_class, title, WS_OVERLAPPEDWINDOW,
++                            CW_USEDEFAULT, CW_USEDEFAULT, 720, 320,
++                            NULL, NULL, queue_instance, &qw );
++    if (!hwnd) return FALSE;
++
++    ShowWindow( hwnd, cmd_show ? cmd_show : SW_SHOW );
++    UpdateWindow( hwnd );
++
++    while (GetMessageW( &msg, NULL, 0, 0 ) > 0)
++    {
++        TranslateMessage( &msg );
++        DispatchMessageW( &msg );
++    }
++    return TRUE;
++}
++
++void printui_queue_init( HINSTANCE inst )
++{
++    queue_instance = inst;
++}
+diff --git a/dlls/winspool.drv/info.c b/dlls/winspool.drv/info.c
+index 6170dc7f90e..15bfe5e24a5 100644
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -4897,12 +4897,27 @@ BOOL WINAPI EnumJobsW(HANDLE hPrinter, DWORD FirstJob, DWORD NoJobs,
+ 		      DWORD Level, LPBYTE pJob, DWORD cbBuf, LPDWORD pcbNeeded,
+ 		      LPDWORD pcReturned)
+ {
+-    FIXME("(%p,first=%ld,no=%ld,level=%ld,job=%p,cb=%ld,%p,%p), stub!\n",
+-	hPrinter, FirstJob, NoJobs, Level, pJob, cbBuf, pcbNeeded, pcReturned
+-    );
+-    if(pcbNeeded) *pcbNeeded = 0;
+-    if(pcReturned) *pcReturned = 0;
+-    return FALSE;
++    HANDLE handle = get_backend_handle(hPrinter);
++
++    TRACE("(%p,first=%ld,no=%ld,level=%ld,job=%p,cb=%ld,%p,%p)\n",
++          hPrinter, FirstJob, NoJobs, Level, pJob, cbBuf, pcbNeeded, pcReturned);
++
++    if (!handle)
++    {
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++
++    if (!backend->fpEnumJobs)
++    {
++        FIXME("backend has no fpEnumJobs\n");
++        if (pcbNeeded) *pcbNeeded = 0;
++        if (pcReturned) *pcReturned = 0;
++        return FALSE;
++    }
++
++    return backend->fpEnumJobs(handle, FirstJob, NoJobs, Level, pJob, cbBuf,
++                               pcbNeeded, pcReturned);
+ }
+ 
+ /*****************************************************************************

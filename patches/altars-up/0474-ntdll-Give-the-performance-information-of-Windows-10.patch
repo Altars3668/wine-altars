@@ -1,0 +1,342 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 19:45:58 -0400
+Subject: [PATCH] ntdll: Give the performance information of Windows 10 and
+ later, and the power capabilities of the machine.
+
+SystemPerformanceInformation is 376 bytes since Windows 10; the 312 of
+the old structure are still taken, and any size between is filled as
+far as it goes (Windows 11, tools/startupgapsprobe misc3).  The new
+counters come from what Linux keeps: dirty pages and their threshold,
+shared memory, page tables, what can be made resident; the context
+switches, page faults and the kernel's memory as the pools are filled
+too, and GetPerformanceInfo with them.
+
+SystemPowerCapabilities reports the machine's buttons, lid, sleep states
+(deep sleep is S3, suspend to idle alone is modern standby), hibernation
+when it can resume, backlight, thermal zones, RTC wake alarm, UPS and
+spinning disks instead of an XP desktop's, and leaves no byte unset;
+SYSTEM_POWER_CAPABILITIES gets the fields Windows XP and 10 added.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 3cde59acb59..41809023dac 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -2605,6 +2605,7 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
+ 
+ #ifdef linux
+     {
++        unsigned long long locked = 0, reclaimable = 0, unreclaimable = 0, page_tables = 0, shared = 0;
+         FILE *fp;
+ 
+         if ((fp = fopen("/proc/meminfo", "r")))
+@@ -2628,10 +2629,56 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
+                     freeram += value * 1024;
+                 else if (sscanf(line, "MemAvailable: %llu", &value))
+                     mem_available = value * 1024;
++                else if (sscanf(line, "Unevictable: %llu", &value) == 1)
++                    locked = value * 1024;
++                else if (sscanf(line, "Shmem: %llu", &value) == 1)
++                    shared = value * 1024;
++                else if (sscanf(line, "SReclaimable: %llu", &value) == 1)
++                    reclaimable = value * 1024;
++                else if (sscanf(line, "SUnreclaim: %llu", &value) == 1 ||
++                         sscanf(line, "KernelStack: %llu", &value) == 1)
++                    unreclaimable += value * 1024;
++                else if (sscanf(line, "PageTables: %llu", &value) == 1)
++                    page_tables = value * 1024;
+             }
+             fclose(fp);
+             if (mem_available) freeram = mem_available;
+         }
++
++        /* the kernel's memory that can be given back stands for the paged pool, the rest for the nonpaged one */
++        info->PagedPoolUsage = reclaimable / page_size;
++        info->NonPagedPoolUsage = unreclaimable / page_size;
++        info->SharedCommittedPages = shared / page_size;
++        info->SystemPageTableCommittedPages = page_tables / page_size;
++        if (totalram > locked + unreclaimable + page_tables)
++            info->ResidentAvailablePages = (totalram - locked - unreclaimable - page_tables) / page_size;
++
++        if ((fp = fopen("/proc/vmstat", "r")))
++        {
++            unsigned long long value, host_page = get_host_page_size();
++            char line[64];
++
++            while (fgets(line, sizeof(line), fp))
++            {
++                if (sscanf(line, "nr_dirty %llu", &value) == 1)
++                    info->CcTotalDirtyPages = value * host_page / page_size;
++                else if (sscanf(line, "nr_dirty_threshold %llu", &value) == 1)
++                    info->CcDirtyPageThreshold = value * host_page / page_size;
++                else if (sscanf(line, "pgfault %llu", &value) == 1)
++                    info->PageFaults = value;
++            }
++            fclose(fp);
++        }
++
++        if ((fp = fopen("/proc/stat", "r")))
++        {
++            unsigned long long value;
++            char line[256];
++
++            while (fgets(line, sizeof(line), fp))
++                if (sscanf(line, "ctxt %llu", &value) == 1) info->ContextSwitches = value;
++            fclose(fp);
++        }
+     }
+ #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__NetBSD__) || \
+     defined(__OpenBSD__) || defined(__DragonFly__) || defined(__APPLE__)
+@@ -3389,20 +3436,17 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
+     case SystemPerformanceInformation:  /* 2 */
+     {
+         SYSTEM_PERFORMANCE_INFORMATION spi;
+-        static BOOL fixme_written = FALSE;
+ 
+         get_performance_info( &spi );
+-        len = sizeof(spi);
+-        if (size >= len)
++        /* the structure grew in Windows 10; any size from the old one up is filled as far as it goes */
++        len = min( size, sizeof(spi) );
++        if (len < offsetof( SYSTEM_PERFORMANCE_INFORMATION, CcTotalDirtyPages ))
+         {
+-            if (!info) ret = STATUS_ACCESS_VIOLATION;
+-            else memcpy( info, &spi, len);
+-        }
+-        else ret = STATUS_INFO_LENGTH_MISMATCH;
+-        if(!fixme_written) {
+-            FIXME("info_class SYSTEM_PERFORMANCE_INFORMATION\n");
+-            fixme_written = TRUE;
++            len = sizeof(spi);
++            ret = STATUS_INFO_LENGTH_MISMATCH;
+         }
++        else if (!info) ret = STATUS_ACCESS_VIOLATION;
++        else memcpy( info, &spi, len );
+         break;
+     }
+ 
+@@ -4681,6 +4725,135 @@ static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
+ 
+ #endif
+ 
++#ifdef linux
++
++/* whether the first line of a file lists a word, and whether that word is the one chosen ("[word]") */
++static BOOL sys_lists_word( const char *path, const char *word, BOOL *chosen )
++{
++    size_t len = strlen( word );
++    char line[256], *p = line;
++    BOOL ret = FALSE;
++    FILE *f;
++
++    if (chosen) *chosen = FALSE;
++    if (!(f = fopen( path, "r" ))) return FALSE;
++    if (!fgets( line, sizeof(line), f )) line[0] = 0;
++    fclose( f );
++    while (*p)
++    {
++        BOOL brackets = (*p == '[');
++        char *end;
++
++        if (brackets) p++;
++        end = p + strcspn( p, "] \n" );
++        if (end - p == len && !memcmp( p, word, len ))
++        {
++            ret = TRUE;
++            if (chosen) *chosen = brackets;
++        }
++        p = end + strspn( end, "] \n" );
++    }
++    return ret;
++}
++
++/* whether a directory holds an entry whose name starts with a prefix */
++static BOOL dir_has_entry( const char *path, const char *prefix )
++{
++    DIR *dir = opendir( path );
++    struct dirent *de;
++    BOOL ret = FALSE;
++
++    if (!dir) return FALSE;
++    while (!ret && (de = readdir( dir )))
++        ret = de->d_name[0] != '.' && !strncmp( de->d_name, prefix, strlen( prefix ) );
++    closedir( dir );
++    return ret;
++}
++
++static void fill_power_capabilities( SYSTEM_POWER_CAPABILITIES *caps )
++{
++    char line[256], s[16];
++    struct dirent *de;
++    DIR *dir;
++    FILE *f;
++
++    /* the buttons and the lid are input devices that the kernel names */
++    if ((f = fopen( "/proc/bus/input/devices", "r" )))
++    {
++        while (fgets( line, sizeof(line), f ))
++        {
++            if (!strcmp( line, "N: Name=\"Power Button\"\n" )) caps->PowerButtonPresent = TRUE;
++            else if (!strcmp( line, "N: Name=\"Sleep Button\"\n" )) caps->SleepButtonPresent = TRUE;
++            else if (!strcmp( line, "N: Name=\"Lid Switch\"\n" )) caps->LidPresent = TRUE;
++        }
++        fclose( f );
++    }
++
++    /* standby is S1 and deep sleep S3; with suspend to idle only the machine has modern standby instead */
++    caps->SystemS1 = sys_lists_word( "/sys/power/state", "standby", NULL );
++    caps->SystemS3 = sys_lists_word( "/sys/power/mem_sleep", "deep", NULL );
++    caps->AoAc = !caps->SystemS3 && sys_lists_word( "/sys/power/mem_sleep", "s2idle", NULL );
++    /* hibernation needs somewhere to resume from */
++    if (sys_lists_word( "/sys/power/state", "disk", NULL ) &&
++        (f = fopen( "/sys/power/resume", "r" )))
++    {
++        if (fgets( s, sizeof(s), f ) && strcmp( s, "0:0\n" )) caps->SystemS4 = TRUE;
++        fclose( f );
++    }
++    caps->SystemS5 = TRUE;
++    caps->HiberFilePresent = caps->SystemS4;
++    caps->HiberFileType = caps->SystemS4 ? 2 : 0; /* full */
++    caps->FullWake = TRUE;
++    caps->VideoDimPresent = dir_has_entry( "/sys/class/backlight", "" );
++    caps->ThermalControl = dir_has_entry( "/sys/class/thermal", "thermal_zone" );
++    caps->WakeAlarmPresent = !access( "/sys/class/rtc/rtc0/wakealarm", F_OK );
++
++    if ((dir = opendir( "/sys/class/power_supply" )))
++    {
++        char path[64];
++
++        while ((de = readdir( dir )))
++        {
++            if (de->d_name[0] == '.') continue;
++            if (snprintf( path, sizeof(path), "/sys/class/power_supply/%s", de->d_name ) >= sizeof(path)) continue;
++            if (get_sys_str( path, "type", s ) && !strcmp( s, "UPS\n" )) caps->UpsPresent = TRUE;
++        }
++        closedir( dir );
++    }
++
++    /* disks that spin */
++    if ((dir = opendir( "/sys/block" )))
++    {
++        char path[64];
++
++        while (!caps->DiskSpinDown && (de = readdir( dir )))
++        {
++            if (de->d_name[0] == '.') continue;
++            if (snprintf( path, sizeof(path), "/sys/block/%s/queue", de->d_name ) >= sizeof(path)) continue;
++            caps->DiskSpinDown = get_sys_int( path, "rotational" ) == 1;
++        }
++        closedir( dir );
++    }
++
++    if (caps->WakeAlarmPresent)
++    {
++        if (caps->SystemS4) caps->RtcWake = PowerSystemHibernate;
++        else if (caps->SystemS3) caps->RtcWake = PowerSystemSleeping3;
++        else if (caps->SystemS1) caps->RtcWake = PowerSystemSleeping1;
++    }
++}
++
++#else
++
++static void fill_power_capabilities( SYSTEM_POWER_CAPABILITIES *caps )
++{
++    caps->PowerButtonPresent = TRUE;
++    caps->SystemS5 = TRUE;
++    caps->FullWake = TRUE;
++}
++
++#endif
++
+ /******************************************************************************
+  *              NtPowerInformation  (NTDLL.@)
+  */
+@@ -4693,40 +4866,13 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input,
+     case SystemPowerCapabilities:
+     {
+         PSYSTEM_POWER_CAPABILITIES PowerCaps = output;
+-        FIXME("semi-stub: SystemPowerCapabilities\n");
++        SYSTEM_BATTERY_STATE battery = { 0 };
++
+         if (out_size < sizeof(SYSTEM_POWER_CAPABILITIES)) return STATUS_BUFFER_TOO_SMALL;
+-        /* FIXME: These values are based off a native XP desktop, should probably use APM/ACPI to get the 'real' values */
+-        PowerCaps->PowerButtonPresent = TRUE;
+-        PowerCaps->SleepButtonPresent = FALSE;
+-        PowerCaps->LidPresent = FALSE;
+-        PowerCaps->SystemS1 = TRUE;
+-        PowerCaps->SystemS2 = FALSE;
+-        PowerCaps->SystemS3 = FALSE;
+-        PowerCaps->SystemS4 = TRUE;
+-        PowerCaps->SystemS5 = TRUE;
+-        PowerCaps->HiberFilePresent = TRUE;
+-        PowerCaps->FullWake = TRUE;
+-        PowerCaps->VideoDimPresent = FALSE;
+-        PowerCaps->ApmPresent = FALSE;
+-        PowerCaps->UpsPresent = FALSE;
+-        PowerCaps->ThermalControl = FALSE;
+-        PowerCaps->ProcessorThrottle = FALSE;
+-        PowerCaps->ProcessorMinThrottle = 100;
+-        PowerCaps->ProcessorMaxThrottle = 100;
+-        PowerCaps->DiskSpinDown = TRUE;
+-        PowerCaps->SystemBatteriesPresent = FALSE;
+-        PowerCaps->BatteriesAreShortTerm = FALSE;
+-        PowerCaps->BatteryScale[0].Granularity = 0;
+-        PowerCaps->BatteryScale[0].Capacity = 0;
+-        PowerCaps->BatteryScale[1].Granularity = 0;
+-        PowerCaps->BatteryScale[1].Capacity = 0;
+-        PowerCaps->BatteryScale[2].Granularity = 0;
+-        PowerCaps->BatteryScale[2].Capacity = 0;
+-        PowerCaps->AcOnLineWake = PowerSystemUnspecified;
+-        PowerCaps->SoftLidWake = PowerSystemUnspecified;
+-        PowerCaps->RtcWake = PowerSystemSleeping1;
+-        PowerCaps->MinDeviceWakeState = PowerSystemUnspecified;
+-        PowerCaps->DefaultLowLatencyWake = PowerSystemUnspecified;
++        /* what the machine has; Windows 11 leaves processor throttling to processor power management */
++        memset( PowerCaps, 0, sizeof(*PowerCaps) );
++        fill_power_capabilities( PowerCaps );
++        if (!fill_battery_state( &battery )) PowerCaps->SystemBatteriesPresent = battery.BatteryPresent;
+         return STATUS_SUCCESS;
+     }
+ 
+diff --git a/include/winnt.h b/include/winnt.h
+index 61db9aa09fd..4306a5f5ccc 100644
+--- a/include/winnt.h
++++ b/include/winnt.h
+@@ -5931,9 +5931,14 @@ typedef struct {
+ 	BOOLEAN ProcessorThrottle;
+ 	UCHAR ProcessorMinThrottle;
+ 	UCHAR ProcessorMaxThrottle;
+-	UCHAR spare2[4];
++	BOOLEAN FastSystemS4;
++	BOOLEAN Hiberboot;
++	BOOLEAN WakeAlarmPresent;
++	BOOLEAN AoAc;
+ 	BOOLEAN DiskSpinDown;
+-	UCHAR spare3[8];
++	BYTE HiberFileType;
++	BOOLEAN AoAcConnectivitySupported;
++	BYTE spare3[6];
+ 	BOOLEAN SystemBatteriesPresent;
+ 	BOOLEAN BatteriesAreShortTerm;
+ 	BATTERY_REPORTING_SCALE BatteryScale[3];
+diff --git a/include/winternl.h b/include/winternl.h
+index 46445d93741..48b9a36367b 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -3011,6 +3011,14 @@ typedef struct _SYSTEM_PERFORMANCE_INFORMATION {
+     ULONG FirstLevelTbFills;
+     ULONG SecondLevelTbFills;
+     ULONG SystemCalls;
++    ULONGLONG CcTotalDirtyPages;
++    ULONGLONG CcDirtyPageThreshold;
++    LONGLONG ResidentAvailablePages;
++    ULONGLONG SharedCommittedPages;
++    ULONGLONG MdlPagesAllocated;
++    ULONGLONG PfnDatabaseCommittedPages;
++    ULONGLONG SystemPageTableCommittedPages;
++    ULONGLONG ContiguousPagesAllocated;
+ } SYSTEM_PERFORMANCE_INFORMATION, *PSYSTEM_PERFORMANCE_INFORMATION;
+ 
+ /* System Information Class 0x03 */

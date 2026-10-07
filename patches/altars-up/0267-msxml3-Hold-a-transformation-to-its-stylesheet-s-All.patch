@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 09:28:41 -0400
+Subject: [PATCH] msxml3: Hold a transformation to its stylesheet's
+ AllowXsltScript and AllowDocumentFunction.
+
+Both settings were kept but changed nothing.  Measured on Windows 11
+with tools/xsltsecprobe: MSXML 3 allows msxsl:script functions and
+document() unless the stylesheet document says otherwise, MSXML 6 only
+when it says so, and a transformation that calls one that is not
+allowed fails with E_FAIL.  A stylesheet's scripts are now bound only
+when they are allowed, and when document() is not, it is replaced by a
+function that stops the transformation.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index af765d60ceb..ac468cbb216 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -1864,7 +1864,8 @@ static HRESULT WINAPI domdoc_setProperty(IXMLDOMDocument3 *iface, BSTR p, VARIAN
+         else if (!wcsicmp(p, L"AllowDocumentFunction")) flag = &properties->allow_document_function;
+         else flag = &properties->use_inline_schema;
+         *flag = b == VARIANT_TRUE;
+-        FIXME("%s is kept, but not enforced.\n", debugstr_w(p));
++        if (flag != &properties->allow_xslt_script && flag != &properties->allow_document_function)
++            FIXME("%s is kept, but not enforced.\n", debugstr_w(p));
+         return S_OK;
+     }
+ 
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index b7348e1ffef..ee163ca9451 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -374,6 +374,7 @@ extern const WCHAR *msxsl_reserved_namespace(const WCHAR *prefix);
+ extern HRESULT msxsl_format_date(const WCHAR *value, const WCHAR *format, const WCHAR *language, BOOL time,
+         WCHAR **out);
+ extern void msxsl_register_xslt_functions(struct _xsltTransformContext *ctxt);
++extern void msxsl_disallow_document_function(struct _xsltTransformContext *ctxt);
+ extern HRESULT parse_xml_decl_body(const WCHAR *text, BSTR *version, BSTR *encoding, BSTR *standalone);
+ 
+ extern struct dtd * parser_dtd_addref(struct dtd *dtd);
+diff --git a/dlls/msxml3/msxsl.c b/dlls/msxml3/msxsl.c
+index 8b1bfae596c..43017f3c387 100644
+--- a/dlls/msxml3/msxsl.c
++++ b/dlls/msxml3/msxsl.c
+@@ -638,3 +638,17 @@ void msxsl_register_xslt_functions(xsltTransformContextPtr ctxt)
+         xsltRegisterExtFunction(ctxt, BAD_CAST functions[i].name, BAD_CAST "urn:schemas-microsoft-com:xslt",
+                 functions[i].func);
+ }
++
++static void xslt_document_disallowed(xmlXPathParserContextPtr ctxt, int nargs)
++{
++    xsltTransformError(xsltXPathGetTransformContext(ctxt), NULL, NULL,
++            "document() is not allowed: the stylesheet's AllowDocumentFunction is off\n");
++    xmlXPathSetError(ctxt, XPATH_INVALID_OPERAND);
++}
++
++/* with AllowDocumentFunction off, a call to document() stops the transformation */
++void msxsl_disallow_document_function(xsltTransformContextPtr ctxt)
++{
++    xmlXPathRegisterFunc(ctxt->xpathCtxt, BAD_CAST "document", NULL);
++    xmlXPathRegisterFunc(ctxt->xpathCtxt, BAD_CAST "document", xslt_document_disallowed);
++}
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index 660af29684c..992192f52e2 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -3255,7 +3255,12 @@ HRESULT node_transform_node_params(struct domnode *node, IXMLDOMNode *stylesheet
+ 
+         ctxt = xsltNewTransformContext(xsltSS, node_doc);
+ 
+-        node_transform_bind_scripts(ctxt, owner_doc, sheet_doc, &scripts);
++        /* the stylesheet's own AllowXsltScript and AllowDocumentFunction decide; without its
++         * scripts a call to one of their functions stops the transformation */
++        if (sheet_domdoc->properties->allow_xslt_script)
++            node_transform_bind_scripts(ctxt, owner_doc, sheet_doc, &scripts);
++        if (!sheet_domdoc->properties->allow_document_function)
++            msxsl_disallow_document_function(ctxt);
+         ctxt->userData = &scripts;
+         if (domdoc_version(node_get_doc(node)) >= MSXML4)
+             msxsl_register_xslt_functions(ctxt);
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index 09db82d3fac..e3553f97e58 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -6631,6 +6631,61 @@ static void test_xsl_script(void)
+ 
+     IXMLDOMDocument_Release(doc);
+     free_bstrs();
++
++    /* MSXML 3 allows scripts and document() unless told otherwise, MSXML 6 only when told to */
++    for (i = 0; i < 2; ++i)
++    {
++        static const char document_xsl[] =
++            "<xsl:stylesheet version='1.0' xmlns:xsl='http://www.w3.org/1999/XSL/Transform'>"
++            "<xsl:output method='text'/>"
++            "<xsl:template match='/'>[<xsl:value-of select=\"count(document('')/*/*)\"/>]</xsl:template>"
++            "</xsl:stylesheet>";
++        const GUID *clsid = i ? &CLSID_DOMDocument60 : &CLSID_DOMDocument30;
++        int setting, which;
++
++        if (!is_clsid_supported(clsid, &IID_IXMLDOMDocument2)) continue;
++
++        for (which = 0; which < 2; ++which)
++        {
++            for (setting = -1; setting <= 1; ++setting)
++            {
++                BOOL allowed = setting == -1 ? !i : setting;
++                VARIANT v;
++
++                winetest_push_context("%s, %s %d", i ? "6.0" : "3.0",
++                        which ? "AllowDocumentFunction" : "AllowXsltScript", setting);
++                doc = _create_object(clsid, "document", &IID_IXMLDOMDocument, __LINE__);
++                hr = IXMLDOMDocument_loadXML(doc, _bstr_("<r><a/></r>"), &b);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                style = _create_object(clsid, "stylesheet", &IID_IXMLDOMDocument, __LINE__);
++                hr = IXMLDOMDocument_loadXML(style, _bstr_(which ? document_xsl : stylesheets[0]), &b);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                if (setting != -1)
++                {
++                    IXMLDOMDocument2 *style2;
++
++                    IXMLDOMDocument_QueryInterface(style, &IID_IXMLDOMDocument2, (void **)&style2);
++                    V_VT(&v) = VT_BOOL;
++                    V_BOOL(&v) = setting ? VARIANT_TRUE : VARIANT_FALSE;
++                    hr = IXMLDOMDocument2_setProperty(style2,
++                            _bstr_(which ? "AllowDocumentFunction" : "AllowXsltScript"), v);
++                    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                    IXMLDOMDocument2_Release(style2);
++                }
++                str = NULL;
++                hr = IXMLDOMDocument_transformNode(doc, (IXMLDOMNode *)style, &str);
++                ok(hr == (allowed ? S_OK : E_FAIL), "Unexpected hr %#lx.\n", hr);
++                if (allowed)
++                    ok(str && !wcscmp(str, which ? L"[2]" : L"[scripted]"), "Unexpected result %s.\n",
++                            debugstr_w(str));
++                SysFreeString(str);
++                IXMLDOMDocument_Release(style);
++                IXMLDOMDocument_Release(doc);
++                winetest_pop_context();
++            }
++        }
++    }
++    free_bstrs();
+ }
+ 
+ static void test_cloneNode_prefix(void)

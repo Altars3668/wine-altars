@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:08:18 -0400
+Subject: [PATCH] wineboot: Start services.exe in session 0.
+
+Since Windows Vista services run in session 0, apart from the user's session, and programs rely on
+it: .NET's IsWindowsService(), of Microsoft.Extensions.Hosting.WindowsServices, tells a service from
+a program by its parent being services.exe in session 0, and a .NET service that finds otherwise
+runs as a console program and never answers the service manager, which then fails it with
+ERROR_SERVICE_REQUEST_TIMEOUT.  OfficePLUS's service, for one.
+
+services.exe gets the token of SYSTEM, which it stands in for, as far as that goes here: in session 0,
+and with SeTcbPrivilege enabled, which its services inherit to start programs in the user's session.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/process.c b/dlls/kernel32/tests/process.c
+index a3ab655ca50..e9370456d12 100644
+--- a/dlls/kernel32/tests/process.c
++++ b/dlls/kernel32/tests/process.c
+@@ -5562,7 +5562,6 @@ static void test_services_exe(void)
+     } while (spi->NextEntryOffset != 0);
+ 
+     ok(services_pid != 0, "services.exe not found\n");
+-    todo_wine
+     ok(services_session_id == 0, "got services.exe SessionId %lu\n", services_session_id);
+ }
+ 
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+index 0a88a981843..167b685f580 100644
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1443,7 +1443,7 @@ static int ProcessWindowsFileProtection(void)
+     return 1;
+ }
+ 
+-static BOOL create_native_process( const WCHAR *app, WCHAR *cmdline, BOOL inherit, DWORD flags,
++static BOOL create_native_process( HANDLE token, const WCHAR *app, WCHAR *cmdline, BOOL inherit, DWORD flags,
+                                    const WCHAR *curdir, PROCESS_INFORMATION *info )
+ {
+     struct _PROC_THREAD_ATTRIBUTE_LIST *list;
+@@ -1456,20 +1456,58 @@ static BOOL create_native_process( const WCHAR *app, WCHAR *cmdline, BOOL inheri
+     InitializeProcThreadAttributeList( list, 1, 0, &size );
+     UpdateProcThreadAttribute( list, 0, PROC_THREAD_ATTRIBUTE_MACHINE_TYPE,
+                                &machine, sizeof(machine), NULL, NULL );
+-    ret = CreateProcessW( app, cmdline, NULL, NULL, inherit,
+-                          EXTENDED_STARTUPINFO_PRESENT | flags, NULL, curdir, &si.StartupInfo, info );
++    ret = CreateProcessAsUserW( token, app, cmdline, NULL, NULL, inherit,
++                                EXTENDED_STARTUPINFO_PRESENT | flags, NULL, curdir, &si.StartupInfo, info );
+     free( list );
+     return ret;
+ }
+ 
++/* The token services.exe runs with: in session 0, the services' session, as on Windows since Vista, where
++ * .NET's IsWindowsService() for one tells a service from a program by its parent being services.exe in
++ * session 0; and with SeTcbPrivilege enabled, as for SYSTEM, which it stands in for, so that services can
++ * start processes in the user's session. */
++static HANDLE get_services_token(void)
++{
++    TOKEN_PRIVILEGES privs = { .PrivilegeCount = 1 };
++    HANDLE process_token, token;
++    DWORD session = 0;
++    BOOL ret;
++
++    if (!OpenProcessToken( GetCurrentProcess(), TOKEN_DUPLICATE, &process_token )) return NULL;
++    ret = DuplicateTokenEx( process_token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &token );
++    CloseHandle( process_token );
++    if (!ret) return NULL;
++
++    privs.Privileges[0].Luid.LowPart = SE_TCB_PRIVILEGE;
++    privs.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
++    if (!AdjustTokenPrivileges( token, FALSE, &privs, 0, NULL, NULL ) || GetLastError() == ERROR_NOT_ALL_ASSIGNED)
++    {
++        WINE_ERR( "cannot enable SeTcbPrivilege: error %lu\n", GetLastError() );
++        CloseHandle( token );
++        return NULL;
++    }
++    /* moving it to another session takes the privilege too, and this process does not have it enabled */
++    if (!(ret = ImpersonateLoggedOnUser( token ) && SetTokenInformation( token, TokenSessionId, &session, sizeof(session) )))
++        WINE_ERR( "cannot move the token to session 0: error %lu\n", GetLastError() );
++    RevertToSelf();
++    if (ret) return token;
++    CloseHandle( token );
++    return NULL;
++}
++
+ static BOOL start_services_process(void)
+ {
+     static const WCHAR svcctl_started_event[] = SVCCTL_STARTED_EVENT;
+     PROCESS_INFORMATION pi;
+-    HANDLE wait_handles[2];
++    HANDLE wait_handles[2], token;
++    BOOL ret;
+ 
+-    if (!create_native_process( L"C:\\windows\\system32\\services.exe", NULL,
+-                                TRUE, DETACHED_PROCESS, L"C:\\windows\\system32", &pi))
++    /* in this session if it cannot be moved, as before */
++    token = get_services_token();
++    ret = create_native_process( token, L"C:\\windows\\system32\\services.exe", NULL,
++                                 TRUE, DETACHED_PROCESS, L"C:\\windows\\system32", &pi );
++    if (token) CloseHandle( token );
++    if (!ret)
+     {
+         WINE_ERR("Couldn't start services.exe: error %lu\n", GetLastError());
+         return FALSE;
+@@ -1572,7 +1610,7 @@ static HANDLE start_rundll32( const WCHAR *inf_path, const WCHAR *install, WORD
+     swprintf( buffer, len, L"%s setupapi,InstallHinfSection %s 128 %s", app, install, inf_path );
+ 
+     if (machine == IMAGE_FILE_MACHINE_TARGET_HOST)
+-        ret = create_native_process( app, buffer, FALSE, 0, NULL, &pi );
++        ret = create_native_process( NULL, app, buffer, FALSE, 0, NULL, &pi );
+     else
+         ret = CreateProcessW( app, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi );
+ 
+@@ -1857,7 +1895,7 @@ int __cdecl main( int argc, char *argv[] )
+         wcscat( filename, L"\\wineboot.exe" );
+ 
+         Wow64DisableWow64FsRedirection( &redir );
+-        if (create_native_process( filename, GetCommandLineW(), FALSE, 0, NULL, &pi ))
++        if (create_native_process( NULL, filename, GetCommandLineW(), FALSE, 0, NULL, &pi ))
+         {
+             WINE_TRACE( "restarting %s\n", wine_dbgstr_w(filename) );
+             WaitForSingleObject( pi.hProcess, INFINITE );

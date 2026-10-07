@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 22:07:15 -0400
+Subject: [PATCH] ole32: Hold a global interface table entry's interface, and
+ marshal it for other apartments when they ask.
+
+The table marshaled every interface with MSHLFLAGS_TABLESTRONG when it
+was registered.  Windows 11 takes one reference and no stub: the
+apartment that registered the interface gets it back as it is, another
+apartment's first request marshals it in the registering apartment,
+CoDisconnectObject drops that stub but not the table's reference, and
+then the other apartments get CO_E_OBJNOTREG while the registering one
+still gets the interface; revoking releases both (tools/startupgapsprobe
+comrel).  The marshal is made through the apartment's IContextCallback.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ole32/git.c b/dlls/ole32/git.c
+index 4e432723914..031d99677b9 100644
+--- a/dlls/ole32/git.c
++++ b/dlls/ole32/git.c
+@@ -33,6 +33,7 @@
+ #include "winuser.h"
+ #include "objbase.h"
+ #include "ole2.h"
++#include "ctxtcall.h"
+ #include "winerror.h"
+ 
+ #include "compobj_private.h" 
+@@ -47,14 +48,22 @@ WINE_DEFAULT_DEBUG_CHANNEL(ole);
+  *
+  * This class implements IGlobalInterfaceTable and is a process-wide singleton
+  * used for marshalling interfaces between threading apartments using cookies.
++ *
++ * As Windows 11 does, an entry holds the interface itself, which the apartment that registered it gets back as it
++ * is, and is marshaled -- in that apartment -- only when another one first asks for it: registering takes one
++ * reference and no stub, CoDisconnectObject leaves that reference alone, and once the object is disconnected the
++ * other apartments get CO_E_OBJNOTREG while its own still gets the interface.
+  */
+ 
+ /* Each entry in the linked list of GIT entries */
+ typedef struct StdGITEntry
+ {
+   DWORD cookie;
+-  IID iid;         /* IID of the interface */
+-  IStream* stream; /* Holds the marshalled interface */
++  IID iid;                    /* IID of the interface */
++  IUnknown *object;           /* the interface as registered, held until it is revoked */
++  ULONG_PTR context;          /* the context token of the apartment that registered it */
++  IContextCallback *callback; /* that apartment's, to marshal and release it there */
++  IStream* stream;            /* marshaled for the other apartments, once one asked */
+ 
+   struct list entry;
+ } StdGITEntry;
+@@ -106,6 +115,66 @@ static StdGITEntry* StdGlobalInterfaceTable_FindEntry(StdGlobalInterfaceTableImp
+   return NULL;
+ }
+ 
++struct git_call
++{
++  IUnknown *object;
++  const IID *iid;
++  IStream *stream;
++};
++
++/* runs in the apartment that registered the interface */
++static HRESULT CALLBACK git_marshal(ComCallData *data)
++{
++  struct git_call *call = data->pUserDefined;
++  LARGE_INTEGER zero = {{0}};
++  HRESULT hr;
++
++  if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &call->stream))) return hr;
++  if (FAILED(hr = CoMarshalInterface(call->stream, call->iid, call->object, MSHCTX_INPROC, NULL, MSHLFLAGS_TABLESTRONG)))
++  {
++    IStream_Release(call->stream);
++    call->stream = NULL;
++    return hr;
++  }
++  IStream_Seek(call->stream, zero, STREAM_SEEK_SET, NULL);
++  return S_OK;
++}
++
++static HRESULT CALLBACK git_release(ComCallData *data)
++{
++  struct git_call *call = data->pUserDefined;
++
++  IUnknown_Release(call->object);
++  return S_OK;
++}
++
++static HRESULT git_call_in_apartment(StdGITEntry *entry, PFNCONTEXTCALL func, struct git_call *call)
++{
++  ULONG_PTR context;
++  ComCallData data;
++
++  data.dwDispid = 0;
++  data.dwReserved = 0;
++  data.pUserDefined = call;
++  if (SUCCEEDED(CoGetContextToken(&context)) && context == entry->context) return func(&data);
++  return IContextCallback_ContextCallback(entry->callback, func, &data, &IID_IGlobalInterfaceTable, 3, NULL);
++}
++
++static void free_entry(StdGITEntry *entry)
++{
++  struct git_call call = { entry->object };
++
++  if (entry->stream)
++  {
++    CoReleaseMarshalData(entry->stream);
++    IStream_Release(entry->stream);
++  }
++  /* released where it lives; an apartment that has gone takes no calls, and then it is released here */
++  if (FAILED(git_call_in_apartment(entry, git_release, &call))) IUnknown_Release(entry->object);
++  IContextCallback_Release(entry->callback);
++  free(entry);
++}
++
+ /***
+  * Here's the boring boilerplate stuff for IUnknown
+  */
+@@ -158,42 +227,33 @@ StdGlobalInterfaceTable_RegisterInterfaceInGlobal(
+                REFIID riid, DWORD* pdwCookie)
+ {
+   StdGlobalInterfaceTableImpl* const This = impl_from_IGlobalInterfaceTable(iface);
+-  IStream* stream = NULL;
++  IContextCallback *callback;
++  ULONG_PTR context;
+   HRESULT hres;
+   StdGITEntry* entry;
+-  LARGE_INTEGER zero;
+ 
+   TRACE("iface=%p, pUnk=%p, riid=%s, pdwCookie=0x%p\n", iface, pUnk, debugstr_guid(riid), pdwCookie);
+ 
+   if (pUnk == NULL) return E_INVALIDARG;
+-  
+-  /* marshal the interface */
+-  TRACE("About to marshal the interface\n");
+-
+-  hres = CreateStreamOnHGlobal(0, TRUE, &stream);
+-  if (hres != S_OK) return hres;
+-  hres = CoMarshalInterface(stream, riid, pUnk, MSHCTX_INPROC, NULL, MSHLFLAGS_TABLESTRONG);
+-  if (hres != S_OK)
+-  {
+-    IStream_Release(stream);
+-    return hres;
+-  }
+ 
+-  zero.QuadPart = 0;
+-  IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++  if (FAILED(hres = CoGetContextToken(&context))) return hres;
++  if (FAILED(hres = CoGetObjectContext(&IID_IContextCallback, (void **)&callback))) return hres;
+ 
+-  entry = malloc(sizeof(*entry));
++  entry = calloc(1, sizeof(*entry));
+   if (!entry)
+   {
+-      CoReleaseMarshalData(stream);
+-      IStream_Release(stream);
++      IContextCallback_Release(callback);
+       return E_OUTOFMEMORY;
+   }
+ 
++  IUnknown_AddRef(pUnk);
++  entry->object = pUnk;
++  entry->context = context;
++  entry->callback = callback;
++
+   EnterCriticalSection(&git_section);
+   
+   entry->iid = *riid;
+-  entry->stream = stream;
+   entry->cookie = This->nextCookie;
+   This->nextCookie++; /* inc the cookie count */
+ 
+@@ -215,7 +275,6 @@ StdGlobalInterfaceTable_RevokeInterfaceFromGlobal(
+ {
+   StdGlobalInterfaceTableImpl* This = impl_from_IGlobalInterfaceTable(iface);
+   StdGITEntry* entry;
+-  HRESULT hr;
+ 
+   TRACE("%p, %#lx.\n", iface, dwCookie);
+ 
+@@ -231,17 +290,8 @@ StdGlobalInterfaceTable_RevokeInterfaceFromGlobal(
+   list_remove(&entry->entry);
+ 
+   LeaveCriticalSection(&git_section);
+-  
+-  /* Free the stream */
+-  hr = CoReleaseMarshalData(entry->stream);
+-  if (hr != S_OK)
+-  {
+-    WARN("Failed to release marshal data, hr = %#lx\n", hr);
+-    return hr;
+-  }
+-  IStream_Release(entry->stream);
+ 
+-  free(entry);
++  free_entry(entry);
+   return S_OK;
+ }
+ 
+@@ -251,12 +301,16 @@ StdGlobalInterfaceTable_GetInterfaceFromGlobal(
+                REFIID riid, void **ppv)
+ {
+   StdGlobalInterfaceTableImpl* This = impl_from_IGlobalInterfaceTable(iface);
++  struct git_call call = { NULL };
+   StdGITEntry* entry;
++  ULONG_PTR context;
+   HRESULT hres;
+   IStream *stream;
+ 
+   TRACE("%#lx, %s, %p.\n", dwCookie, debugstr_guid(riid), ppv);
+ 
++  if (FAILED(hres = CoGetContextToken(&context))) return hres;
++
+   EnterCriticalSection(&git_section);
+ 
+   entry = StdGlobalInterfaceTable_FindEntry(This, dwCookie);
+@@ -268,6 +322,50 @@ StdGlobalInterfaceTable_GetInterfaceFromGlobal(
+ 
+   TRACE("entry=%p\n", entry);
+ 
++  /* the apartment that registered it gets the interface itself */
++  if (entry->context == context)
++  {
++    IUnknown *object = entry->object;
++
++    IUnknown_AddRef(object);
++    LeaveCriticalSection(&git_section);
++    hres = IUnknown_QueryInterface(object, riid, ppv);
++    IUnknown_Release(object);
++    return hres;
++  }
++
++  /* the others a proxy, marshaled in that apartment the first time one asks */
++  if (!entry->stream)
++  {
++    call.object = entry->object;
++    call.iid = &entry->iid;
++    IUnknown_AddRef(call.object);
++    LeaveCriticalSection(&git_section);
++    hres = git_call_in_apartment(entry, git_marshal, &call);
++    IUnknown_Release(call.object);
++    if (FAILED(hres))
++    {
++      WARN("Failed to marshal the interface, hr %#lx.\n", hres);
++      return hres;
++    }
++    EnterCriticalSection(&git_section);
++    if (!(entry = StdGlobalInterfaceTable_FindEntry(This, dwCookie)) || entry->stream)
++    {
++      /* revoked meanwhile, or marshaled by another apartment first */
++      LeaveCriticalSection(&git_section);
++      CoReleaseMarshalData(call.stream);
++      IStream_Release(call.stream);
++      if (!entry) return E_INVALIDARG;
++      EnterCriticalSection(&git_section);
++      if (!(entry = StdGlobalInterfaceTable_FindEntry(This, dwCookie)))
++      {
++        LeaveCriticalSection(&git_section);
++        return E_INVALIDARG;
++      }
++    }
++    else entry->stream = call.stream;
++  }
++
+   hres = IStream_Clone(entry->stream, &stream);
+ 
+   LeaveCriticalSection(&git_section);
+@@ -282,8 +380,9 @@ StdGlobalInterfaceTable_GetInterfaceFromGlobal(
+   IStream_Release(stream);
+ 
+   if (hres != S_OK) {
+-    WARN("Failed to unmarshal stream\n");
+-    return hres;
++    WARN("Failed to unmarshal stream, hr %#lx.\n", hres);
++    /* the object was disconnected */
++    return hres == CO_E_OBJNOTCONNECTED ? CO_E_OBJNOTREG : hres;
+   }
+ 
+   TRACE("ppv=%p\n", *ppv);
+@@ -335,10 +434,7 @@ void release_std_git(void)
+     LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &git->list, StdGITEntry, entry)
+     {
+         list_remove(&entry->entry);
+-
+-        CoReleaseMarshalData(entry->stream);
+-        IStream_Release(entry->stream);
+-        free(entry);
++        free_entry(entry);
+     }
+ 
+     free(git);
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index 76668b2420e..a0560f401c8 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -5270,6 +5270,82 @@ static DWORD CALLBACK get_global_interface_proc(LPVOID pv)
+ 	return hr;
+ }
+ 
++static struct ref_object git_object;
++static IGlobalInterfaceTable *git_table;
++static DWORD git_object_cookie;
++
++static DWORD CALLBACK git_other_apartment_proc(void *arg)
++{
++    HRESULT hr, expect = *(HRESULT *)arg;
++    IDropTarget *target = NULL;
++
++    CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    hr = IGlobalInterfaceTable_GetInterfaceFromGlobal(git_table, git_object_cookie, &IID_IDropTarget, (void **)&target);
++    ok(hr == expect, "got %#lx\n", hr);
++    if (target)
++    {
++        ok(target != &git_object.IDropTarget_iface, "got the object itself\n");
++        IDropTarget_Release(target);
++    }
++    CoUninitialize();
++    return 0;
++}
++
++static void git_from_other_apartment(HRESULT expect)
++{
++    HANDLE thread = CreateThread(NULL, 0, git_other_apartment_proc, &expect, 0, NULL);
++    MSG msg;
++
++    while (MsgWaitForMultipleObjects(1, &thread, FALSE, 10000, QS_ALLINPUT) == WAIT_OBJECT_0 + 1)
++        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
++    CloseHandle(thread);
++}
++
++/* the table holds the interface itself, and marshals it for another apartment when one asks */
++static void test_globalinterfacetable_disconnect(void)
++{
++    IDropTarget *target;
++    HRESULT hr;
++
++    init_ref_object(&git_object);
++    hr = CoCreateInstance(&CLSID_StdGlobalInterfaceTable, NULL, CLSCTX_INPROC_SERVER, &IID_IGlobalInterfaceTable,
++                          (void **)&git_table);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = IGlobalInterfaceTable_RegisterInterfaceInGlobal(git_table, (IUnknown *)&git_object.IDropTarget_iface,
++                                                         &IID_IDropTarget, &git_object_cookie);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(git_object.refs == 2, "got %ld references\n", git_object.refs);
++
++    hr = IGlobalInterfaceTable_GetInterfaceFromGlobal(git_table, git_object_cookie, &IID_IDropTarget, (void **)&target);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(target == &git_object.IDropTarget_iface, "got %p\n", target);
++    ok(git_object.refs == 3, "got %ld references\n", git_object.refs);
++    IDropTarget_Release(target);
++
++    git_from_other_apartment(S_OK);
++    ok(git_object.refs == 5, "got %ld references\n", git_object.refs);
++
++    /* a disconnect drops the stub, not what the table holds */
++    hr = CoDisconnectObject((IUnknown *)&git_object.IDropTarget_iface, 0);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(git_object.refs == 2, "got %ld references\n", git_object.refs);
++
++    hr = IGlobalInterfaceTable_GetInterfaceFromGlobal(git_table, git_object_cookie, &IID_IDropTarget, (void **)&target);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(target == &git_object.IDropTarget_iface, "got %p\n", target);
++    if (target) IDropTarget_Release(target);
++
++    git_from_other_apartment(CO_E_OBJNOTREG);
++    ok(git_object.refs == 2, "got %ld references\n", git_object.refs);
++
++    hr = IGlobalInterfaceTable_RevokeInterfaceFromGlobal(git_table, git_object_cookie);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(git_object.refs == 1, "got %ld references\n", git_object.refs);
++    hr = IGlobalInterfaceTable_RevokeInterfaceFromGlobal(git_table, git_object_cookie);
++    ok(hr == E_INVALIDARG, "got %#lx\n", hr);
++    IGlobalInterfaceTable_Release(git_table);
++}
++
+ static void test_globalinterfacetable(void)
+ {
+ 	HRESULT hr;
+@@ -5980,6 +6056,7 @@ START_TEST(marshal)
+     test_disconnect_after_call();
+ 
+     test_globalinterfacetable();
++    test_globalinterfacetable_disconnect();
+     test_manualresetevent();
+     test_crash_couninitialize();
+ 

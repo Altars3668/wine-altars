@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 15:56:16 -0400
+Subject: [PATCH] dcomp: bind interaction trackers independently by axis
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+(cherry picked from commit a0fe160b25d4812ad0d55f677cad35cb9f444c9c)
+
+diff --git a/dlls/dcomp/interaction.c b/dlls/dcomp/interaction.c
+index f7987f349ce..0a49073757b 100644
+--- a/dlls/dcomp/interaction.c
++++ b/dlls/dcomp/interaction.c
+@@ -163,6 +163,7 @@ struct tracker
+     IInteractionTracker5 IInteractionTracker5_iface;
+     IInteractionTrackerOwner *owner;
+     struct source_collection *sources;
++    struct tracker *bindings[32]; /* one partner per binding flag bit */
+     INT32 request_id;
+ 
+     Vector3 position, min_position, max_position, natural_resting_position, position_velocity;
+@@ -1703,9 +1704,12 @@ static void tracker_tell_owner( struct tracker *tracker, enum tracker_callback k
+     tracker_tell_owner_args( tracker, kind, request_id, NULL );
+ }
+ 
++static void tracker_follow_binding( struct tracker *tracker );
++
+ static void tracker_values_changed( struct tracker *tracker, INT32 request_id )
+ {
+     tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, request_id );
++    tracker_follow_binding( tracker );
+     compositor_changed( tracker->base.compositor );
+ }
+ 
+@@ -1751,6 +1755,57 @@ static void tracker_clamp( struct tracker *tracker, BOOL position_unclamped )
+     tracker->position.Z = clampf( tracker->position.Z, low.Z, max( low.Z, high.Z ) );
+ }
+ 
++/* Copy the axes one partner shares, without recursively notifying the source. */
++static void tracker_copy_bound_axes( struct tracker *tracker, struct tracker *other, unsigned int mode )
++{
++    Vector3 position = other->position, velocity = other->position_velocity, low, high;
++    float scale = other->scale, scale_velocity = other->scale_velocity, low_scale, high_scale;
++
++    tracker_bounds( other, &low, &high, &low_scale, &high_scale );
++    if (mode & InteractionBindingAxisModes_PositionX)
++    {
++        other->position.X = clampf( tracker->position.X, low.X, max( low.X, high.X ) );
++        other->position_velocity.X = tracker->position_velocity.X;
++        other->natural_resting_position.X = other->position.X;
++    }
++    if (mode & InteractionBindingAxisModes_PositionY)
++    {
++        other->position.Y = clampf( tracker->position.Y, low.Y, max( low.Y, high.Y ) );
++        other->position_velocity.Y = tracker->position_velocity.Y;
++        other->natural_resting_position.Y = other->position.Y;
++    }
++    if (mode & InteractionBindingAxisModes_Scale)
++    {
++        other->scale = clampf( tracker->scale, low_scale, max( low_scale, high_scale ) );
++        other->scale_velocity = tracker->scale_velocity;
++        other->natural_resting_scale = other->scale;
++    }
++    if (!memcmp( &position, &other->position, sizeof(position) ) &&
++        !memcmp( &velocity, &other->position_velocity, sizeof(velocity) ) &&
++        scale == other->scale && scale_velocity == other->scale_velocity) return;
++    tracker_tell_owner( other, CALLBACK_VALUES_CHANGED, 0 );
++    compositor_changed( other->base.compositor );
++}
++
++static void tracker_follow_binding( struct tracker *tracker )
++{
++    struct tracker *partners[3] = {0};
++    unsigned int i, j, k, count = 0, mode;
++    struct tracker *other;
++
++    for (i = 0; i < ARRAY_SIZE(partners); i++)
++    {
++        if (!(other = tracker->bindings[i])) continue;
++        for (j = 0; j < count; j++) if (partners[j] == other) break;
++        if (j != count) continue;
++        partners[count++] = other;
++        mode = 0;
++        for (k = 0; k < ARRAY_SIZE(partners); k++)
++            if (tracker->bindings[k] == other) mode |= 1u << k;
++        tracker_copy_bound_axes( tracker, other, mode );
++    }
++}
++
+ /* keeps the point center where it is on the screen while scale goes from old to new */
+ static void tracker_scale_about( struct tracker *tracker, float old, float new, Vector3 center )
+ {
+@@ -2089,10 +2144,14 @@ void trackers_frame( struct compositor *compositor )
+             tracker->natural_resting_position = tracker->position;
+             tracker->natural_resting_scale = tracker->scale;
+             tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, 0 );
++            tracker_follow_binding( tracker );
+             continue;
+         }
+         if (memcmp( &position, &tracker->position, sizeof(position) ) || scale != tracker->scale)
++        {
+             tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, tracker->motion_request );
++            tracker_follow_binding( tracker );
++        }
+         if (moving) continue;
+         if (tracker->state == TRACKER_INERTIA)
+         {
+@@ -2618,12 +2677,29 @@ static HRESULT tracker_query_interface( struct object *object, REFIID iid, void
+ static void tracker_stop_animations( struct tracker *tracker, BOOL keep_scale );
+ static void tracker_stop_inertia( struct tracker *tracker );
+ 
++/* Caller holds the compositor lock; bindings do not keep either tracker alive. */
++static void tracker_unbind_axis( struct tracker *tracker, unsigned int axis )
++{
++    struct tracker *other = tracker->bindings[axis];
++
++    tracker->bindings[axis] = NULL;
++    if (other && other->bindings[axis] == tracker) other->bindings[axis] = NULL;
++}
++
++static void tracker_unbind( struct tracker *tracker )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(tracker->bindings); i++) tracker_unbind_axis( tracker, i );
++}
++
+ static void tracker_destroy( struct object *object )
+ {
+     struct tracker *tracker = impl_from_tracker_object( object );
+     unsigned int i;
+ 
+     compositor_lock( tracker->base.compositor );
++    tracker_unbind( tracker );
+     tracker->sources->tracker = NULL;
+     list_remove( &tracker->compositor_entry );
+     tracker_stop_animations( tracker, FALSE );
+@@ -3482,19 +3558,46 @@ DEFINE_IINSPECTABLE( tracker_statics2, IInteractionTrackerStatics2, struct stati
+ 
+ static HRESULT WINAPI tracker_statics2_SetBindingMode( IInteractionTrackerStatics2 *iface, IInteractionTracker *boundTracker1, IInteractionTracker *boundTracker2, InteractionBindingAxisModes axisMode )
+ {
+-    FIXME( "iface %p, boundTracker1 %p, boundTracker2 %p, axisMode %#x, trackers are not bound.\n", iface,
+-           boundTracker1, boundTracker2, axisMode );
++    struct tracker *first = unsafe_impl_from_IInteractionTracker( boundTracker1 );
++    struct tracker *second = unsafe_impl_from_IInteractionTracker( boundTracker2 );
++    struct compositor *compositor;
++    unsigned int i, mode = axisMode;
++
++    TRACE( "iface %p, first %p, second %p, mode %#x.\n", iface, boundTracker1, boundTracker2, axisMode );
++    if (!first || !second || first == second) return E_INVALIDARG;
++    if (first->base.compositor != second->base.compositor) return E_INVALIDARG;
+ 
+-    if (!boundTracker1 || !boundTracker2) return E_INVALIDARG;
++    compositor = first->base.compositor;
++    compositor_lock( compositor );
++    for (i = 0; i < ARRAY_SIZE(first->bindings); i++)
++    {
++        if (mode & (1u << i))
++        {
++            if (first->bindings[i] == second && second->bindings[i] == first) continue;
++            tracker_unbind_axis( first, i );
++            tracker_unbind_axis( second, i );
++            first->bindings[i] = second;
++            second->bindings[i] = first;
++        }
++        else if (first->bindings[i] == second) tracker_unbind_axis( first, i );
++    }
++    compositor_unlock( compositor );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI tracker_statics2_GetBindingMode( IInteractionTrackerStatics2 *iface, IInteractionTracker *boundTracker1, IInteractionTracker *boundTracker2, InteractionBindingAxisModes *result )
+ {
+-    TRACE( "iface %p, boundTracker1 %p, boundTracker2 %p, result %p.\n", iface, boundTracker1, boundTracker2, result );
+-
+-    if (!boundTracker1 || !boundTracker2 || !result) return E_INVALIDARG;
+-    *result = InteractionBindingAxisModes_None;
++    struct tracker *first = unsafe_impl_from_IInteractionTracker( boundTracker1 );
++    struct tracker *second = unsafe_impl_from_IInteractionTracker( boundTracker2 );
++    unsigned int i, mode = 0;
++
++    TRACE( "iface %p, first %p, second %p, result %p.\n", iface, boundTracker1, boundTracker2, result );
++    if (!first || !second || !result) return E_INVALIDARG;
++    compositor_lock( first->base.compositor );
++    for (i = 0; i < ARRAY_SIZE(first->bindings); i++)
++        if (first->bindings[i] == second) mode |= 1u << i;
++    *result = mode;
++    compositor_unlock( first->base.compositor );
+     return S_OK;
+ }
+ 
+diff --git a/dlls/dcomp/tests/composition.c b/dlls/dcomp/tests/composition.c
+index 7ae656be4f9..0031de37d81 100644
+--- a/dlls/dcomp/tests/composition.c
++++ b/dlls/dcomp/tests/composition.c
+@@ -1845,6 +1845,142 @@ done:
+     if (queue) IDispatcherQueueController_Release( queue );
+ }
+ 
++static void test_tracker_binding(void)
++{
++    static const InteractionBindingAxisModes modes[] =
++    {
++        InteractionBindingAxisModes_PositionX, InteractionBindingAxisModes_PositionY,
++        InteractionBindingAxisModes_Scale, 7, InteractionBindingAxisModes_None,
++    };
++    IDispatcherQueueController *queue;
++    ICompositorController *controller;
++    IInteractionTrackerStatics *statics = NULL;
++    IInteractionTrackerStatics2 *statics2 = NULL;
++    IInteractionTracker *first = NULL, *second = NULL, *third = NULL;
++    ICompositor *compositor;
++    InteractionBindingAxisModes mode;
++    Vector3 position, peer_position, third_position;
++    FLOAT scale, peer_scale;
++    INT32 id;
++    HSTRING str;
++    unsigned int i;
++    HRESULT hr;
++
++    queue = create_queue( DQTAT_COM_STA );
++    if (!(controller = create_controller( &compositor ))) goto done;
++    str = hstring( L"Windows.UI.Composition.Interactions.InteractionTracker" );
++    hr = RoGetActivationFactory( str, &IID_IInteractionTrackerStatics, (void **)&statics );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto release;
++    hr = IInteractionTrackerStatics_QueryInterface( statics, &IID_IInteractionTrackerStatics2, (void **)&statics2 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto release;
++    hr = IInteractionTrackerStatics_Create( statics, compositor, &first );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto release;
++    hr = IInteractionTrackerStatics_Create( statics, compositor, &second );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto release;
++    hr = IInteractionTrackerStatics_Create( statics, compositor, &third );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto release;
++
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, first, second, &mode );
++    ok( hr == S_OK && mode == InteractionBindingAxisModes_None, "got hr %#lx, mode %#x.\n", hr, mode );
++    for (i = 0; i < ARRAY_SIZE(modes); ++i)
++    {
++        hr = IInteractionTrackerStatics2_SetBindingMode( statics2, first, second, modes[i] );
++        ok( hr == S_OK, "mode %#x got hr %#lx.\n", modes[i], hr );
++        mode = -1;
++        hr = IInteractionTrackerStatics2_GetBindingMode( statics2, first, second, &mode );
++        ok( hr == S_OK && mode == modes[i], "got hr %#lx, mode %#x, expected %#x.\n", hr, mode, modes[i] );
++    }
++    hr = IInteractionTrackerStatics2_SetBindingMode( statics2, first, second,
++                                                     InteractionBindingAxisModes_PositionX );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, second, first, &mode );
++    ok( hr == S_OK && mode == InteractionBindingAxisModes_PositionX, "got hr %#lx, mode %#x.\n", hr, mode );
++    hr = IInteractionTrackerStatics2_SetBindingMode( statics2, first, third, InteractionBindingAxisModes_None );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, first, second, &mode );
++    ok( hr == S_OK && mode == InteractionBindingAxisModes_PositionX, "got hr %#lx, mode %#x.\n", hr, mode );
++    hr = IInteractionTrackerStatics2_SetBindingMode( statics2, first, third, InteractionBindingAxisModes_PositionY );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, first, second, &mode );
++    ok( hr == S_OK && mode == InteractionBindingAxisModes_PositionX, "got hr %#lx, mode %#x.\n", hr, mode );
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, first, third, &mode );
++    ok( hr == S_OK && mode == InteractionBindingAxisModes_PositionY, "got hr %#lx, mode %#x.\n", hr, mode );
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, third, first, &mode );
++    ok( hr == S_OK && mode == InteractionBindingAxisModes_PositionY, "got hr %#lx, mode %#x.\n", hr, mode );
++    IInteractionTracker_put_MaxPosition( first, (Vector3){1000, 1000, 0} );
++    IInteractionTracker_put_MaxPosition( second, (Vector3){1000, 1000, 0} );
++    IInteractionTracker_put_MaxPosition( third, (Vector3){1000, 1000, 0} );
++    IInteractionTracker_TryUpdatePosition( second, (Vector3){70, 80, 0}, &id );
++    IInteractionTracker_TryUpdatePosition( third, (Vector3){50, 60, 0}, &id );
++    IInteractionTracker_TryUpdatePosition( first, (Vector3){10, 20, 0}, &id );
++    IInteractionTracker_get_Position( first, &position );
++    IInteractionTracker_get_Position( second, &peer_position );
++    IInteractionTracker_get_Position( third, &third_position );
++    if (position.X == 10.0f && position.Y == 20.0f)
++        ok( peer_position.X == 10.0f && peer_position.Y == 80.0f &&
++            third_position.X == 50.0f && third_position.Y == 20.0f,
++            "bound positions %f,%f and %f,%f.\n", peer_position.X, peer_position.Y,
++            third_position.X, third_position.Y );
++    else
++        win_skip( "trackers did not move in this desktop session.\n" );
++
++    IInteractionTrackerStatics2_SetBindingMode( statics2, first, third, InteractionBindingAxisModes_None );
++    IInteractionTracker_put_MaxPosition( first, (Vector3){1000, 1000, 0} );
++    IInteractionTracker_put_MaxPosition( second, (Vector3){1000, 1000, 0} );
++    IInteractionTracker_TryUpdatePosition( second, (Vector3){70, 80, 0}, &id );
++    IInteractionTracker_TryUpdatePosition( first, (Vector3){10, 20, 0}, &id );
++    IInteractionTrackerStatics2_SetBindingMode( statics2, first, second, InteractionBindingAxisModes_PositionX );
++    IInteractionTracker_TryUpdatePosition( first, (Vector3){30, 40, 0}, &id );
++    IInteractionTracker_get_Position( first, &position );
++    IInteractionTracker_get_Position( second, &peer_position );
++    if (position.X == 30.0f)
++        ok( peer_position.X == 30.0f && peer_position.Y == 80.0f,
++            "bound tracker position %f,%f.\n", peer_position.X, peer_position.Y );
++    else
++        win_skip( "tracker did not move in this desktop session.\n" );
++
++    IInteractionTracker_put_MaxScale( first, 4.0f );
++    IInteractionTracker_put_MaxScale( second, 4.0f );
++    IInteractionTrackerStatics2_SetBindingMode( statics2, first, second, InteractionBindingAxisModes_Scale );
++    IInteractionTracker_TryUpdateScale( first, 2.0f, (Vector3){0}, &id );
++    IInteractionTracker_get_Scale( first, &scale );
++    IInteractionTracker_get_Scale( second, &peer_scale );
++    if (scale == 2.0f)
++        ok( peer_scale == 2.0f, "bound tracker scale %f.\n", peer_scale );
++    else
++        win_skip( "tracker did not scale in this desktop session.\n" );
++
++    /* Unknown axis bits are accepted, but have no documented motion to test. */
++    hr = IInteractionTrackerStatics2_SetBindingMode( statics2, first, second, 8 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    mode = -1;
++    hr = IInteractionTrackerStatics2_GetBindingMode( statics2, first, second, &mode );
++    ok( hr == S_OK && mode == 8, "got hr %#lx, mode %#x.\n", hr, mode );
++
++release:
++    if (third) IInteractionTracker_Release( third );
++    if (second) IInteractionTracker_Release( second );
++    if (first) IInteractionTracker_Release( first );
++    if (statics2) IInteractionTrackerStatics2_Release( statics2 );
++    if (statics) IInteractionTrackerStatics_Release( statics );
++    ICompositor_Release( compositor );
++    ICompositorController_Release( controller );
++done:
++    if (queue) IDispatcherQueueController_Release( queue );
++}
++
+ START_TEST(composition)
+ {
+     IDispatcherQueueController *queue;
+@@ -1861,6 +1997,7 @@ START_TEST(composition)
+     test_drop_shadow();
+     test_redirect_visual();
+     test_interactions();
++    test_tracker_binding();
+     test_tracker_motion();
+     RoUninitialize();
+ }

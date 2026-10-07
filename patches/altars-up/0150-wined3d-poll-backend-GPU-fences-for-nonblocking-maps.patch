@@ -1,0 +1,470 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 00:02:14 -0400
+Subject: [PATCH] wined3d: poll backend GPU fences for nonblocking maps
+
+Propagate busy Map results without claiming a mapping, track Vulkan host-read barriers across retries, and cover retry and data integrity with D3D11 tests.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+(cherry picked from commit c95e723c36c8564df98ca9176a24e1c47ba96c83)
+
+diff --git a/dlls/d3d11/tests/d3d11.c b/dlls/d3d11/tests/d3d11.c
+index 67406b6ee23..26efad8988b 100644
+--- a/dlls/d3d11/tests/d3d11.c
++++ b/dlls/d3d11/tests/d3d11.c
+@@ -15595,12 +15595,15 @@ static void test_map_do_not_wait(void)
+ {
+     D3D11_TEXTURE2D_DESC texture_desc = {0};
+     D3D11_BUFFER_DESC buffer_desc = {0};
++    D3D11_SUBRESOURCE_DATA data = {0};
+     D3D11_MAPPED_SUBRESOURCE mapped;
+     ID3D11DeviceContext *context;
+-    ID3D11Texture2D *texture;
++    ID3D11Texture2D *texture, *source, *staging;
++    DWORD pixels[64 * 64];
+     ID3D11Buffer *buffer;
+     ID3D11Device *device;
+     HRESULT hr;
++    unsigned int i;
+ 
+     if (!(device = create_device(NULL)))
+     {
+@@ -15653,6 +15656,58 @@ static void test_map_do_not_wait(void)
+         if (SUCCEEDED(hr)) ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)texture, 0);
+         ID3D11Texture2D_Release(texture);
+     }
++
++    for (i = 0; i < ARRAY_SIZE(pixels); ++i)
++        pixels[i] = 0x12345678;
++    data.pSysMem = pixels;
++    data.SysMemPitch = sizeof(pixels[0]) * texture_desc.Width;
++    texture_desc.Usage = D3D11_USAGE_DEFAULT;
++    texture_desc.CPUAccessFlags = 0;
++    hr = ID3D11Device_CreateTexture2D(device, &texture_desc, &data, &source);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        texture_desc.Usage = D3D11_USAGE_STAGING;
++        texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL, &staging);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging, (ID3D11Resource *)source);
++            ID3D11DeviceContext_Flush(context);
++            mapped.pData = (void *)0xdeadbeef;
++            hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ,
++                                        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
++            ok(hr == S_OK || hr == DXGI_ERROR_WAS_STILL_DRAWING, "Got hr %#lx.\n", hr);
++            for (i = 0; i < 4 && hr == DXGI_ERROR_WAS_STILL_DRAWING; ++i)
++            {
++                ok(!mapped.pData, "Got data %p after busy.\n", mapped.pData);
++                Sleep(1);
++                mapped.pData = (void *)0xdeadbeef;
++                hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ,
++                                            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
++                ok(hr == S_OK || hr == DXGI_ERROR_WAS_STILL_DRAWING, "Retry returned %#lx.\n", hr);
++            }
++            if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
++            {
++                ok(!mapped.pData, "Got data %p after busy.\n", mapped.pData);
++                hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped);
++                ok(hr == S_OK, "Blocking map returned %#lx after busy.\n", hr);
++            }
++            if (SUCCEEDED(hr))
++            {
++                ok(mapped.pData && *(DWORD *)mapped.pData == pixels[0], "Got data %p.\n", mapped.pData);
++                ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
++            }
++            mapped.pData = (void *)0xdeadbeef;
++            hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ,
++                                        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
++            ok(hr == S_OK && mapped.pData, "Idle map returned %#lx, data %p.\n", hr, mapped.pData);
++            if (SUCCEEDED(hr)) ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
++            ID3D11Texture2D_Release(staging);
++        }
++        ID3D11Texture2D_Release(source);
++    }
+     ID3D11DeviceContext_Release(context);
+     ID3D11Device_Release(device);
+ }
+diff --git a/dlls/wined3d/adapter_gl.c b/dlls/wined3d/adapter_gl.c
+index 75c5dafa4a9..64d1d5943ee 100644
+--- a/dlls/wined3d/adapter_gl.c
++++ b/dlls/wined3d/adapter_gl.c
+@@ -4329,9 +4329,9 @@ static void adapter_gl_uninit_3d(struct wined3d_device *device)
+ }
+ 
+ static void *adapter_gl_map_bo_address(struct wined3d_context *context,
+-        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags)
++        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags, HRESULT *hr)
+ {
+-    return wined3d_context_gl_map_bo_address(wined3d_context_gl(context), data, size, map_flags);
++    return wined3d_context_gl_map_bo_address_hr(wined3d_context_gl(context), data, size, map_flags, hr);
+ }
+ 
+ static void adapter_gl_unmap_bo_address(struct wined3d_context *context,
+diff --git a/dlls/wined3d/adapter_vk.c b/dlls/wined3d/adapter_vk.c
+index 3e349247899..4a3f5223afb 100644
+--- a/dlls/wined3d/adapter_vk.c
++++ b/dlls/wined3d/adapter_vk.c
+@@ -902,7 +902,7 @@ VkPipelineStageFlags vk_pipeline_stage_mask_from_buffer_usage(VkBufferUsageFlags
+ }
+ 
+ static void *adapter_vk_map_bo_address(struct wined3d_context *context,
+-        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags)
++        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags, HRESULT *hr)
+ {
+     struct wined3d_context_vk *context_vk = wined3d_context_vk(context);
+     const struct wined3d_vk_info *vk_info;
+@@ -912,8 +912,13 @@ static void *adapter_vk_map_bo_address(struct wined3d_context *context,
+     struct wined3d_bo_user *bo_user;
+     struct wined3d_bo_vk *bo, tmp;
+     VkMappedMemoryRange range;
++    HRESULT result;
+     void *map_ptr;
++    VkResult vr;
++    SIZE_T i;
+ 
++    if (!hr) hr = &result;
++    *hr = S_OK;
+     if (!data->buffer_object)
+         return data->addr;
+     bo = wined3d_bo_vk(data->buffer_object);
+@@ -947,11 +952,12 @@ static void *adapter_vk_map_bo_address(struct wined3d_context *context,
+ 
+     if (map_flags & WINED3D_MAP_READ)
+     {
+-        if (!bo->host_synced)
++        if (!bo->host_synced && bo->command_buffer_id != bo->host_read_barrier_id)
+         {
+             if (!(vk_command_buffer = wined3d_context_vk_get_command_buffer(context_vk)))
+             {
+                 ERR("Failed to get command buffer.\n");
++                *hr = E_OUTOFMEMORY;
+                 return NULL;
+             }
+ 
+@@ -970,30 +976,55 @@ static void *adapter_vk_map_bo_address(struct wined3d_context *context,
+                     VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &vk_barrier, 0, NULL));
+ 
+             wined3d_context_vk_reference_bo(context_vk, bo);
+-        }
+-
+-        if (!bo->b.coherent)
+-        {
+-            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+-            range.pNext = NULL;
+-            range.memory = bo->vk_memory;
+-            range.offset = bo->b.memory_offset + (uintptr_t)data->addr;
+-            range.size = size;
+-            VK_CALL(vkInvalidateMappedMemoryRanges(device_vk->vk_device, 1, &range));
++            bo->host_read_barrier_id = bo->command_buffer_id;
+         }
+     }
+ 
+     if (bo->command_buffer_id == context_vk->current_command_buffer.id)
+         wined3d_context_vk_submit_command_buffer(context_vk, 0, NULL, NULL, 0, NULL);
++
++    if ((map_flags & WINED3D_MAP_DONOTWAIT)
++            && bo->command_buffer_id > context_vk->completed_command_buffer_id)
++    {
++        for (i = 0; i < context_vk->submitted.buffer_count; ++i)
++        {
++            if (context_vk->submitted.buffers[i].id != bo->command_buffer_id)
++                continue;
++            vr = VK_CALL(vkGetFenceStatus(device_vk->vk_device, context_vk->submitted.buffers[i].vk_fence));
++            if (vr != VK_SUCCESS)
++            {
++                TRACE("Nonblocking map of bo %p got GPU fence status %s.\n", bo, wined3d_debug_vkresult(vr));
++                *hr = vr == VK_NOT_READY ? DXGI_ERROR_WAS_STILL_DRAWING : E_FAIL;
++                return NULL;
++            }
++            break;
++        }
++        if (i == context_vk->submitted.buffer_count)
++        {
++            *hr = DXGI_ERROR_WAS_STILL_DRAWING;
++            return NULL;
++        }
++    }
+     wined3d_context_vk_wait_command_buffer(context_vk, bo->command_buffer_id);
+ 
+ map:
+     if (!(map_ptr = wined3d_bo_vk_map(bo, context_vk)))
+     {
+         ERR("Failed to map bo.\n");
++        *hr = E_OUTOFMEMORY;
+         return NULL;
+     }
+ 
++    if ((map_flags & WINED3D_MAP_READ) && !bo->b.coherent)
++    {
++        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++        range.pNext = NULL;
++        range.memory = bo->vk_memory;
++        range.offset = bo->b.memory_offset + (uintptr_t)data->addr;
++        range.size = size;
++        VK_CALL(vkInvalidateMappedMemoryRanges(device_vk->vk_device, 1, &range));
++    }
++
+     return (uint8_t *)map_ptr + bo->b.memory_offset + (uintptr_t)data->addr;
+ }
+ 
+@@ -1162,8 +1193,8 @@ void adapter_vk_copy_bo_address(struct wined3d_context *context,
+         return;
+     }
+ 
+-    src_ptr = adapter_vk_map_bo_address(context, src, size, WINED3D_MAP_READ);
+-    dst_ptr = adapter_vk_map_bo_address(context, dst, size, map_flags);
++    src_ptr = adapter_vk_map_bo_address(context, src, size, WINED3D_MAP_READ, NULL);
++    dst_ptr = adapter_vk_map_bo_address(context, dst, size, map_flags, NULL);
+ 
+     for (i = 0; i < range_count; ++i)
+         memcpy(dst_ptr + ranges[i].offset, src_ptr + ranges[i].offset, ranges[i].size);
+diff --git a/dlls/wined3d/buffer.c b/dlls/wined3d/buffer.c
+index 5e1f0dedee0..e27b3a592e9 100644
+--- a/dlls/wined3d/buffer.c
++++ b/dlls/wined3d/buffer.c
+@@ -567,6 +567,7 @@ static HRESULT buffer_resource_sub_resource_map(struct wined3d_resource *resourc
+     struct wined3d_bo_address addr;
+     uint8_t *base;
+     LONG count;
++    HRESULT hr;
+ 
+     TRACE("resource %p, sub_resource_idx %u, map_ptr %p, box %s, flags %#x.\n",
+             resource, sub_resource_idx, map_ptr, debug_box(box), flags);
+@@ -609,6 +610,7 @@ static HRESULT buffer_resource_sub_resource_map(struct wined3d_resource *resourc
+         {
+             if (!wined3d_buffer_prepare_location(buffer, context, WINED3D_LOCATION_BUFFER))
+             {
++                --resource->map_count;
+                 context_release(context);
+                 return E_OUTOFMEMORY;
+             }
+@@ -633,7 +635,13 @@ static HRESULT buffer_resource_sub_resource_map(struct wined3d_resource *resourc
+         {
+             addr.buffer_object = buffer->buffer_object;
+             addr.addr = 0;
+-            buffer->map_ptr = wined3d_context_map_bo_address(context, &addr, resource->size, flags);
++            buffer->map_ptr = wined3d_context_map_bo_address_hr(context, &addr, resource->size, flags, &hr);
++            if (FAILED(hr) || (!buffer->map_ptr && !resource->heap_memory))
++            {
++                --resource->map_count;
++                context_release(context);
++                return FAILED(hr) ? hr : E_OUTOFMEMORY;
++            }
+ 
+             /* We are accessing buffer->resource.client from the CS thread,
+              * but it's safe because the client thread will wait for the
+diff --git a/dlls/wined3d/context_gl.c b/dlls/wined3d/context_gl.c
+index e5b41ffc783..58267796d0b 100644
+--- a/dlls/wined3d/context_gl.c
++++ b/dlls/wined3d/context_gl.c
+@@ -2754,7 +2754,8 @@ static void wined3d_allocator_chunk_gl_unmap(struct wined3d_allocator_chunk_gl *
+     wined3d_allocator_chunk_gl_unlock(chunk_gl);
+ }
+ 
+-static void *wined3d_bo_gl_map(struct wined3d_bo_gl *bo, struct wined3d_context_gl *context_gl, uint32_t flags)
++static void *wined3d_bo_gl_map(struct wined3d_bo_gl *bo, struct wined3d_context_gl *context_gl,
++        uint32_t flags, HRESULT *hr)
+ {
+     struct wined3d_device_gl *device_gl = wined3d_device_gl(context_gl->c.device);
+     const struct wined3d_gl_info *gl_info;
+@@ -2783,6 +2784,23 @@ static void *wined3d_bo_gl_map(struct wined3d_bo_gl *bo, struct wined3d_context_
+         ERR("Failed to create new buffer object.\n");
+     }
+ 
++    if ((flags & WINED3D_MAP_DONOTWAIT) && context_gl->c.d3d_info->fences
++            && bo->command_fence_id > device_gl->completed_fence_id)
++    {
++        if (bo->command_fence_id == device_gl->current_fence_id)
++            wined3d_context_gl_submit_command_fence(context_gl);
++        /* Without a flush, repeated zero-time fence polls may never observe progress. */
++        context_gl->gl_info->gl_ops.gl.p_glFlush();
++        wined3d_context_gl_poll_fences(context_gl);
++        if (bo->command_fence_id > device_gl->completed_fence_id)
++        {
++            TRACE("Nonblocking map of bo %p still waiting for GPU fence 0x%s.\n",
++                    bo, wine_dbgstr_longlong(bo->command_fence_id));
++            *hr = DXGI_ERROR_WAS_STILL_DRAWING;
++            return NULL;
++        }
++    }
++
+     if (context_gl->c.d3d_info->fences)
+     {
+         if (bo->command_fence_id == device_gl->current_fence_id)
+@@ -2889,24 +2907,37 @@ static void wined3d_bo_gl_unmap(struct wined3d_bo_gl *bo, struct wined3d_context
+     adapter_adjust_mapped_memory(context_gl->c.device->adapter, -bo->size);
+ }
+ 
+-void *wined3d_context_gl_map_bo_address(struct wined3d_context_gl *context_gl,
+-        const struct wined3d_bo_address *data, size_t size, uint32_t flags)
++void *wined3d_context_gl_map_bo_address_hr(struct wined3d_context_gl *context_gl,
++        const struct wined3d_bo_address *data, size_t size, uint32_t flags, HRESULT *hr)
+ {
+     struct wined3d_bo *bo;
++    HRESULT result;
+     void *map_ptr;
+ 
++    if (!hr) hr = &result;
++    *hr = S_OK;
+     if (!(bo = data->buffer_object))
+         return data->addr;
+ 
+-    if (!(map_ptr = wined3d_bo_gl_map(wined3d_bo_gl(bo), context_gl, flags)))
++    if (!(map_ptr = wined3d_bo_gl_map(wined3d_bo_gl(bo), context_gl, flags, hr)))
+     {
+-        ERR("Failed to map bo.\n");
++        if (SUCCEEDED(*hr))
++        {
++            ERR("Failed to map bo.\n");
++            *hr = E_OUTOFMEMORY;
++        }
+         return NULL;
+     }
+ 
+     return (uint8_t *)map_ptr + bo->buffer_offset + (uintptr_t)data->addr;
+ }
+ 
++void *wined3d_context_gl_map_bo_address(struct wined3d_context_gl *context_gl,
++        const struct wined3d_bo_address *data, size_t size, uint32_t flags)
++{
++    return wined3d_context_gl_map_bo_address_hr(context_gl, data, size, flags, NULL);
++}
++
+ static void flush_bo_ranges(struct wined3d_context_gl *context_gl, const struct wined3d_const_bo_address *data,
+         unsigned int range_count, const struct wined3d_range *ranges)
+ {
+diff --git a/dlls/wined3d/context_vk.c b/dlls/wined3d/context_vk.c
+index 704d75572ec..77519c28a33 100644
+--- a/dlls/wined3d/context_vk.c
++++ b/dlls/wined3d/context_vk.c
+@@ -532,6 +532,7 @@ static bool wined3d_context_vk_create_slab_bo(struct wined3d_context_vk *context
+     bo->size = size;
+     list_init(&bo->b.users);
+     bo->command_buffer_id = 0;
++    bo->host_read_barrier_id = 0;
+     bo->host_synced = false;
+ 
+     TRACE("Using buffer 0x%s, memory 0x%s, offset 0x%s for bo %p.\n",
+@@ -614,6 +615,7 @@ BOOL wined3d_context_vk_create_bo(struct wined3d_context_vk *context_vk, VkDevic
+     bo->b.coherent = !!(bo->memory_type & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+     list_init(&bo->b.users);
+     bo->command_buffer_id = 0;
++    bo->host_read_barrier_id = 0;
+     bo->slab = NULL;
+     bo->host_synced = false;
+ 
+diff --git a/dlls/wined3d/directx.c b/dlls/wined3d/directx.c
+index 8b0f340eb0f..088bc383b9c 100644
+--- a/dlls/wined3d/directx.c
++++ b/dlls/wined3d/directx.c
+@@ -2964,14 +2964,16 @@ static void adapter_no3d_uninit_3d(struct wined3d_device *device)
+ }
+ 
+ static void *adapter_no3d_map_bo_address(struct wined3d_context *context,
+-        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags)
++        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags, HRESULT *hr)
+ {
+     if (data->buffer_object)
+     {
+         ERR("Unsupported buffer object %p.\n", data->buffer_object);
++        if (hr) *hr = E_INVALIDARG;
+         return NULL;
+     }
+ 
++    if (hr) *hr = S_OK;
+     return data->addr;
+ }
+ 
+diff --git a/dlls/wined3d/texture.c b/dlls/wined3d/texture.c
+index 4ada3c3c8af..6d74f240c81 100644
+--- a/dlls/wined3d/texture.c
++++ b/dlls/wined3d/texture.c
+@@ -1161,6 +1161,7 @@ static HRESULT texture_resource_sub_resource_map(struct wined3d_resource *resour
+     unsigned int texture_level;
+     BYTE *base_memory;
+     BOOL ret = TRUE;
++    HRESULT hr;
+ 
+     TRACE("resource %p, sub_resource_idx %u, map_ptr %p, box %s, flags %#x.\n",
+             resource, sub_resource_idx, map_ptr, debug_box(box), flags);
+@@ -1218,6 +1219,14 @@ static HRESULT texture_resource_sub_resource_map(struct wined3d_resource *resour
+         return E_OUTOFMEMORY;
+     }
+ 
++    wined3d_texture_get_bo_address(texture, sub_resource_idx, &data, resource->map_binding);
++    base_memory = wined3d_context_map_bo_address_hr(context, &data, sub_resource->size, flags, &hr);
++    if (FAILED(hr) || !base_memory)
++    {
++        context_release(context);
++        return FAILED(hr) ? hr : E_OUTOFMEMORY;
++    }
++
+     /* We only record dirty regions for the top-most level. */
+     if (texture->dirty_regions && flags & WINED3D_MAP_WRITE
+             && !(flags & WINED3D_MAP_NO_DIRTY_UPDATE) && !texture_level)
+@@ -1238,8 +1247,6 @@ static HRESULT texture_resource_sub_resource_map(struct wined3d_resource *resour
+         }
+     }
+ 
+-    wined3d_texture_get_bo_address(texture, sub_resource_idx, &data, resource->map_binding);
+-    base_memory = wined3d_context_map_bo_address(context, &data, sub_resource->size, flags);
+     sub_resource->map_flags = flags;
+     TRACE("Base memory pointer %p.\n", base_memory);
+ 
+diff --git a/dlls/wined3d/wined3d_gl.h b/dlls/wined3d/wined3d_gl.h
+index c9c7118c59e..51b80f2eac1 100644
+--- a/dlls/wined3d/wined3d_gl.h
++++ b/dlls/wined3d/wined3d_gl.h
+@@ -774,6 +774,8 @@ const unsigned int *wined3d_context_gl_get_tex_unit_mapping(const struct wined3d
+ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wined3d_swapchain_gl *swapchain_gl);
+ void *wined3d_context_gl_map_bo_address(struct wined3d_context_gl *context_gl,
+         const struct wined3d_bo_address *data, size_t size, uint32_t flags);
++void *wined3d_context_gl_map_bo_address_hr(struct wined3d_context_gl *context_gl,
++        const struct wined3d_bo_address *data, size_t size, uint32_t flags, HRESULT *hr);
+ struct wined3d_context_gl *wined3d_context_gl_reacquire(struct wined3d_context_gl *context_gl);
+ void wined3d_context_gl_release(struct wined3d_context_gl *context_gl);
+ BOOL wined3d_context_gl_set_current(struct wined3d_context_gl *context_gl);
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index e6652192c70..8ff5cd1de1b 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -2520,7 +2520,7 @@ struct wined3d_adapter_ops
+     HRESULT (*adapter_init_3d)(struct wined3d_device *device);
+     void (*adapter_uninit_3d)(struct wined3d_device *device);
+     void *(*adapter_map_bo_address)(struct wined3d_context *context,
+-            const struct wined3d_bo_address *data, size_t size, uint32_t map_flags);
++            const struct wined3d_bo_address *data, size_t size, uint32_t map_flags, HRESULT *hr);
+     void (*adapter_unmap_bo_address)(struct wined3d_context *context, const struct wined3d_bo_address *data,
+             unsigned int range_count, const struct wined3d_range *ranges);
+     void (*adapter_copy_bo_address)(struct wined3d_context *context,
+@@ -4891,7 +4891,13 @@ static inline float wined3d_get_float_state(const struct wined3d_state *state, e
+ static inline void *wined3d_context_map_bo_address(struct wined3d_context *context,
+         const struct wined3d_bo_address *data, size_t size, uint32_t map_flags)
+ {
+-    return context->device->adapter->adapter_ops->adapter_map_bo_address(context, data, size, map_flags);
++    return context->device->adapter->adapter_ops->adapter_map_bo_address(context, data, size, map_flags, NULL);
++}
++
++static inline void *wined3d_context_map_bo_address_hr(struct wined3d_context *context,
++        const struct wined3d_bo_address *data, size_t size, uint32_t map_flags, HRESULT *hr)
++{
++    return context->device->adapter->adapter_ops->adapter_map_bo_address(context, data, size, map_flags, hr);
+ }
+ 
+ static inline void wined3d_context_unmap_bo_address(struct wined3d_context *context,
+diff --git a/dlls/wined3d/wined3d_vk.h b/dlls/wined3d/wined3d_vk.h
+index 74a4f5ccc75..330ab1f7a54 100644
+--- a/dlls/wined3d/wined3d_vk.h
++++ b/dlls/wined3d/wined3d_vk.h
+@@ -342,6 +342,7 @@ struct wined3d_bo_vk
+     VkMemoryPropertyFlags memory_type;
+ 
+     uint64_t command_buffer_id;
++    uint64_t host_read_barrier_id;
+     bool host_synced;
+ };
+ 

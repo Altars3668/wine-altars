@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 09:21:30 -0400
+Subject: [PATCH] win32u: move windows off a monitor that has gone onto one
+ that is still there.
+
+gnome-remote-desktop hands a session from one client to another by taking
+its virtual monitor down, switching the physical ones back on, adding a new
+virtual monitor as primary beside them and dropping the physical ones again.
+The window manager moves windows onto the physical monitor on the way, and
+when that monitor goes they are left with positions on no monitor at all:
+the X windows are unmapped, and Word's documents were nowhere to be seen
+while Word itself thought them on show.  Windows moves the windows of a
+monitor that is unplugged onto one that remains.
+
+After a display change, a visible top-level window that was on one of the
+old monitors and is on none of the new ones is now moved, in its own thread,
+to the same place on the nearest monitor's work area as it had on its own,
+and made smaller if it no longer fits.  A window that was off the screen
+before the change was put there on purpose and stays.  For a maximized
+window the restored position moves, and the window is maximized again.
+
+Maximizing again after a display change also forgets where the window was
+last maximized.  That position is kept whenever GetWindowPlacement() is
+asked, which Office does often, and is taken over the monitor's own: a
+maximized document left on the vanished monitor went back to it every time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7de4d8680bee1975cc9bf64da3e24edfd3e51199)
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index b5395bfdfb3..588c0f5f8d9 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2263,7 +2263,11 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+         return 0;
+     }
+     case WM_WINE_UPDATEWINDOWSTATE:
+-        if (wparam) fit_window_to_display( hwnd );
++        if (wparam)
++        {
++            POINT old_origin = { (short)LOWORD( lparam ), (short)HIWORD( lparam ) };
++            fit_window_to_display( hwnd, wparam, old_origin );
++        }
+         update_window_state( hwnd );
+         return 0;
+     case WM_WINE_DISPLAYMODECHANGED:
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 05384404b56..cdb0b70b3d2 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -4853,6 +4853,9 @@ struct display_snapshot
+     UINT count;
+     RECT monitor[16];
+     RECT work[16];
++    /* the same, in system DPI, which is how windows are placed against them */
++    RECT placed_monitor[16];
++    RECT placed_work[16];
+ };
+ 
+ static void get_display_snapshot( struct display_snapshot *snapshot )
+@@ -4864,10 +4867,15 @@ static void get_display_snapshot( struct display_snapshot *snapshot )
+ 
+     LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
+     {
++        MONITORINFO info = {.cbSize = sizeof(info)};
++
+         if (!is_monitor_active( monitor ) || monitor->is_clone) continue;
+         if (snapshot->count == ARRAY_SIZE(snapshot->monitor)) break;
+-        snapshot->monitor[snapshot->count] = monitor_get_rect( monitor, 0, MDT_RAW_DPI );
++        snapshot->monitor[snapshot->count] = monitor_get_rect( monitor, no_dpi, MDT_RAW_DPI );
+         snapshot->work[snapshot->count] = monitor->rc_work;
++        monitor_get_info( monitor, &info, (struct ratio){ system_dpi, 1 } );
++        snapshot->placed_monitor[snapshot->count] = info.rcMonitor;
++        snapshot->placed_work[snapshot->count] = info.rcWork;
+         snapshot->count++;
+     }
+ 
+@@ -4949,7 +4957,7 @@ static void display_mode_changed( BOOL broadcast )
+         NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_CLIPCURSOR, SET_CURSOR_FSCLIP, 0 );
+     }
+ 
+-    fit_windows_to_display();
++    fit_windows_to_display( before.placed_monitor, before.placed_work, before.count );
+ }
+ 
+ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmode,
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 00d4596cf4a..9305cc942e2 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -324,8 +324,11 @@ extern void set_window_normal_placement( HWND hwnd, RECT rect );
+ extern BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y );
+ extern UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits );
+ extern void update_window_state( HWND hwnd );
+-extern void fit_window_to_display( HWND hwnd );
+-extern void fit_windows_to_display(void);
++/* how fit_window_to_display() puts a window right after a display change */
++#define FIT_MAXIMIZED 0x1  /* maximize it again, against the monitor it is on now */
++#define FIT_RESCUE    0x2  /* its monitor has gone: move it onto one that is there */
++extern void fit_window_to_display( HWND hwnd, UINT how, POINT old_origin );
++extern void fit_windows_to_display( const RECT *old_monitors, const RECT *old_work, UINT old_count );
+ extern HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest );
+ extern HWND get_shell_window(void);
+ extern HWND get_progman_window(void);
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 7acce6952a1..4915bb3fa83 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4972,35 +4972,132 @@ void update_window_state( HWND hwnd )
+  * of a screen that is gone.  A program that lays itself out from its window,
+  * as Office does, stays in that frame until it is restored and maximized by
+  * hand.  Asking it again for its maximized size, through WM_GETMINMAXINFO as
+- * maximizing does, gets the answer the new screen gives. */
+-void fit_window_to_display( HWND hwnd )
++ * maximizing does, gets the answer the new screen gives.
++ *
++ * A window whose monitor has gone altogether is moved onto one that is still
++ * there, as Windows does when a monitor is unplugged: to the same place on
++ * the nearest monitor's work area as it had on its own, made smaller if it no
++ * longer fits.  Left where it was it is on no screen at all, and the X window
++ * is unmapped with it -- a program that thinks its window is on show and a
++ * user who cannot find it.  For a maximized window it is the restored
++ * position that moves, or restoring it would put it back off the screen.
++ * old_origin is where the work area of its old monitor began, in system DPI. */
++static void move_onto_display( HWND hwnd, DWORD style, POINT old_origin )
++{
++    POINT from = map_dpi_point( old_origin, (struct ratio){ get_system_dpi(), 1 }, get_thread_dpi() );
++    MONITORINFO info;
++    int width, height, x, y;
++    RECT rect, work;
++    WND *win;
++
++    /* Read straight from the window: GetWindowPlacement() would record where
++     * a maximized window is now, off the screen, as where to maximize it. */
++    if (style & WS_MAXIMIZE)
++    {
++        if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
++        rect = map_dpi_rect( win->normal_rect, get_dpi_for_window( hwnd ), get_thread_dpi() );
++        release_win_ptr( win );
++    }
++    else if (!get_window_rect( hwnd, &rect, get_thread_dpi() )) return;
++
++    info = monitor_info_from_rect( rect, get_thread_dpi() );
++    work = info.rcWork;
++    if (IsRectEmpty( &work )) return;
++    width = min( rect.right - rect.left, work.right - work.left );
++    height = min( rect.bottom - rect.top, work.bottom - work.top );
++    x = max( work.left, min( work.left + rect.left - from.x, work.right - width ));
++    y = max( work.top, min( work.top + rect.top - from.y, work.bottom - height ));
++    TRACE( "%p off every monitor at %s, moved to (%d,%d) %dx%d\n", hwnd, wine_dbgstr_rect(&rect),
++           x, y, width, height );
++    SetRect( &rect, x, y, x + width, y + height );
++
++    if (style & WS_MAXIMIZE)
++    {
++        if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
++        win->normal_rect = rect_thread_to_win_dpi( hwnd, rect );
++        release_win_ptr( win );
++    }
++    else NtUserSetWindowPos( hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER );
++}
++
++void fit_window_to_display( HWND hwnd, UINT how, POINT old_origin )
+ {
+     DWORD style = get_window_long( hwnd, GWL_STYLE );
+     MINMAXINFO minmax;
+     UINT context;
++    WND *win;
+ 
+-    if ((style & (WS_CHILD | WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE)) != (WS_VISIBLE | WS_MAXIMIZE)) return;
++    if ((style & (WS_CHILD | WS_VISIBLE | WS_MINIMIZE)) != WS_VISIBLE) return;
+ 
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
+-    minmax = get_min_max_info( hwnd );
+-    TRACE( "%p maximized again at (%d,%d) %dx%d\n", hwnd, minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
+-           minmax.ptMaxSize.x, minmax.ptMaxSize.y );
+-    /* The window manager may well have resized the window already, so its
+-     * size need not change -- but the frame has: a program that works its
+-     * client area out from the monitor, as Office's own frame does, did so
+-     * against the old one, and only a new WM_NCCALCSIZE makes it look again. */
+-    NtUserSetWindowPos( hwnd, 0, minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
+-                        minmax.ptMaxSize.x, minmax.ptMaxSize.y,
+-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED );
++
++    if (how & FIT_RESCUE) move_onto_display( hwnd, style, old_origin );
++
++    if (style & WS_MAXIMIZE)
++    {
++        /* Where it was last maximized is on the old configuration's terms,
++         * and a recorded position is taken over the monitor's own -- off the
++         * screen, once that monitor is gone: Office asks for its placement
++         * often enough that one is nearly always there. */
++        if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++        {
++            win->max_pos.x = win->max_pos.y = -1;
++            release_win_ptr( win );
++        }
++        minmax = get_min_max_info( hwnd );
++        TRACE( "%p maximized again at (%d,%d) %dx%d\n", hwnd, minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
++               minmax.ptMaxSize.x, minmax.ptMaxSize.y );
++        /* The window manager may well have resized the window already, so its
++         * size need not change -- but the frame has: a program that works its
++         * client area out from the monitor, as Office's own frame does, did so
++         * against the old one, and only a new WM_NCCALCSIZE makes it look again. */
++        NtUserSetWindowPos( hwnd, 0, minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
++                            minmax.ptMaxSize.x, minmax.ptMaxSize.y,
++                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED );
++    }
+     set_thread_dpi_awareness_context( context );
+ }
+ 
++/* Whether a window that no monitor shows was on one of the monitors before
++ * the change, and where that one's work area began.  One that was on none of
++ * them was put off the screen on purpose, and stays there. */
++static BOOL moved_off_display( HWND hwnd, const RECT *old_monitors, const RECT *old_work,
++                               UINT old_count, POINT *old_origin )
++{
++    struct ratio dpi = { get_system_dpi(), 1 };
++    UINT i, best = old_count;
++    LONGLONG area, best_area = 0;
++    RECT rect, overlap;
++
++    if (monitor_from_window( hwnd, MONITOR_DEFAULTTONULL, dpi )) return FALSE;
++    if (!get_window_rect( hwnd, &rect, dpi )) return FALSE;
++
++    for (i = 0; i < old_count; i++)
++    {
++        if (!intersect_rect( &overlap, &rect, &old_monitors[i] )) continue;
++        area = (LONGLONG)(overlap.right - overlap.left) * (overlap.bottom - overlap.top);
++        if (area > best_area)
++        {
++            best_area = area;
++            best = i;
++        }
++    }
++    if (best == old_count) return FALSE;
++
++    old_origin->x = old_work[best].left;
++    old_origin->y = old_work[best].top;
++    return TRUE;
++}
++
+ /* Each window is put right in its own thread, which is where its window
+- * procedure answers WM_GETMINMAXINFO. */
+-void fit_windows_to_display(void)
++ * procedure answers WM_GETMINMAXINFO.  The monitors it may have been on are
++ * those of the configuration before the change, in system DPI. */
++void fit_windows_to_display( const RECT *old_monitors, const RECT *old_work, UINT old_count )
+ {
++    POINT origin = {0};
+     DWORD style;
+     HWND *list;
++    UINT how;
+     int i;
+ 
+     if (!(list = list_window_children( get_desktop_window() ))) return;
+@@ -5008,10 +5105,14 @@ void fit_windows_to_display(void)
+     for (i = 0; list[i]; i++)
+     {
+         style = get_window_long( list[i], GWL_STYLE );
+-        if ((style & (WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE)) != (WS_VISIBLE | WS_MAXIMIZE)) continue;
++        if ((style & (WS_VISIBLE | WS_MINIMIZE)) != WS_VISIBLE) continue;
++
++        how = (style & WS_MAXIMIZE) ? FIT_MAXIMIZED : 0;
++        if (moved_off_display( list[i], old_monitors, old_work, old_count, &origin )) how |= FIT_RESCUE;
++        if (!how) continue;
+ 
+-        if (is_current_thread_window( list[i] )) fit_window_to_display( list[i] );
+-        else NtUserPostMessage( list[i], WM_WINE_UPDATEWINDOWSTATE, TRUE, 0 );
++        if (is_current_thread_window( list[i] )) fit_window_to_display( list[i], how, origin );
++        else NtUserPostMessage( list[i], WM_WINE_UPDATEWINDOWSTATE, how, MAKELPARAM( origin.x, origin.y ));
+     }
+ 
+     free( list );

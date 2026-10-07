@@ -1,0 +1,665 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 16:49:15 -0400
+Subject: [PATCH] webservices: Honour an SSL transport security binding, from a
+ security description or an SSL binding template.
+
+WS_SECURITY_BINDING_TYPE is numbered from 1, as in the SDK; WS_SSL_TRANSPORT_SECURITY_BINDING and the certificate
+credentials are declared.  An HTTP channel with an SSL transport binding gives its requests the certificate
+failures to ignore and the client certificate, found in a store by subject name or thumbprint or asked of the
+caller's callback, and its session the secure protocols not disallowed.  WsCreateServiceProxyFromTemplate builds
+that binding from the policy description and the template, a property given in both being E_INVALIDARG.
+
+As on Windows 11 build 29671, an SSL binding on a channel that is not HTTP is E_INVALIDARG, WsOpenChannel asks the
+certificate callback for the endpoint address with no via, failing if it fails, and a service proxy's channel
+does not ask before its first call.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/webservices/Makefile.in b/dlls/webservices/Makefile.in
+index e3ede5c4e37..fdfd3fcc505 100644
+--- a/dlls/webservices/Makefile.in
++++ b/dlls/webservices/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = webservices.dll
+ IMPORTLIB = webservices
+-IMPORTS   = winhttp rpcrt4 user32 ws2_32
++IMPORTS   = winhttp rpcrt4 user32 ws2_32 crypt32
+ 
+ VER_FILEDESCRIPTION_STR = "Wine Web Services"
+ VER_PRODUCTVERSION      = 10,0,14393,0
+diff --git a/dlls/webservices/channel.c b/dlls/webservices/channel.c
+index a7564f1a352..73b109565c1 100644
+--- a/dlls/webservices/channel.c
++++ b/dlls/webservices/channel.c
+@@ -21,6 +21,7 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winuser.h"
++#include "wincrypt.h"
+ #include "rpc.h"
+ #include "webservices.h"
+ 
+@@ -230,6 +231,20 @@ struct channel
+             SOCKET socket;
+         } udp;
+     } u;
++    struct
++    {
++        BOOL                ssl;            /* an SSL transport binding: what follows is for it */
++        DWORD               ignore_flags;   /* the WinHTTP flags of the certificate failures to ignore */
++        DWORD               protocols;      /* the secure protocols allowed, 0 for WinHTTP's own choice */
++        WS_CERT_CREDENTIAL_TYPE cert_type;  /* the client certificate, if there is one */
++        ULONG               store_location;
++        WCHAR              *store_name;
++        WCHAR              *cert_name;      /* a subject name, or a thumbprint */
++        WS_GET_CERT_CALLBACK get_cert;
++        void               *get_cert_state;
++        const CERT_CONTEXT *cert;
++        BOOL                defer_cert;     /* found for the first request, not when the channel opens */
++    } security;
+     char                   *read_buf;
+     ULONG                   read_buflen;
+     ULONG                   read_size;
+@@ -386,6 +401,10 @@ static void free_channel( struct channel *channel )
+     abort_channel( channel );
+     reset_channel( channel );
+ 
++    free( channel->security.store_name );
++    free( channel->security.cert_name );
++    if (channel->security.cert) CertFreeCertificateContext( channel->security.cert );
++
+     WsFreeWriter( channel->writer );
+     WsFreeReader( channel->reader );
+ 
+@@ -564,6 +583,149 @@ static HRESULT create_channel( WS_CHANNEL_TYPE type, WS_CHANNEL_BINDING binding,
+     return S_OK;
+ }
+ 
++static WCHAR *dup_ws_string( const WS_STRING *str )
++{
++    WCHAR *ret;
++
++    if (!(ret = malloc( (str->length + 1) * sizeof(WCHAR) ))) return NULL;
++    memcpy( ret, str->chars, str->length * sizeof(WCHAR) );
++    ret[str->length] = 0;
++    return ret;
++}
++
++/* SP_PROT_* flags of the client side, each TLS version and SSL 3 */
++static const struct { DWORD sp_prot; DWORD winhttp; } secure_protocols[] =
++{
++    { 0x00000020, WINHTTP_FLAG_SECURE_PROTOCOL_SSL3 },
++    { 0x00000080, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 },
++    { 0x00000200, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 },
++    { 0x00000800, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 },
++    { 0x00002000, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3 },
++};
++
++/* What an SSL transport binding asks of the channel's requests: certificate failures to ignore, protocols not to
++ * use, and the certificate to present. */
++static HRESULT set_ssl_binding( struct channel *channel, const WS_SSL_TRANSPORT_SECURITY_BINDING *ssl )
++{
++    const WS_CERT_CREDENTIAL *cred = ssl->localCertCredential;
++    ULONG i, j;
++
++    channel->security.ssl = TRUE;
++    for (i = 0; i < ssl->binding.propertyCount; i++)
++    {
++        const WS_SECURITY_BINDING_PROPERTY *prop = &ssl->binding.properties[i];
++
++        switch (prop->id)
++        {
++        case WS_SECURITY_BINDING_PROPERTY_CERT_FAILURES_TO_IGNORE:
++        {
++            ULONG failures;
++
++            if (prop->valueSize != sizeof(failures) || !prop->value) return E_INVALIDARG;
++            failures = *(const ULONG *)prop->value;
++            if (failures & WS_CERT_FAILURE_CN_MISMATCH) channel->security.ignore_flags |= SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
++            if (failures & WS_CERT_FAILURE_INVALID_DATE) channel->security.ignore_flags |= SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
++            if (failures & WS_CERT_FAILURE_UNTRUSTED_ROOT) channel->security.ignore_flags |= SECURITY_FLAG_IGNORE_UNKNOWN_CA;
++            if (failures & WS_CERT_FAILURE_WRONG_USAGE) channel->security.ignore_flags |= SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
++            break;
++        }
++        case WS_SECURITY_BINDING_PROPERTY_DISABLE_CERT_REVOCATION_CHECK:
++            /* the requests do not check revocation to begin with */
++            if (prop->valueSize != sizeof(BOOL) || !prop->value) return E_INVALIDARG;
++            break;
++
++        case WS_SECURITY_BINDING_PROPERTY_DISALLOWED_SECURE_PROTOCOLS:
++        {
++            ULONG disallowed;
++
++            if (prop->valueSize != sizeof(disallowed) || !prop->value) return E_INVALIDARG;
++            disallowed = *(const ULONG *)prop->value;
++            channel->security.protocols = 0;
++            for (j = 0; j < ARRAY_SIZE(secure_protocols); j++)
++                if (!(disallowed & secure_protocols[j].sp_prot))
++                    channel->security.protocols |= secure_protocols[j].winhttp;
++            break;
++        }
++        default:
++            FIXME( "SSL binding property %u not supported\n", prop->id );
++            break;
++        }
++    }
++
++    if (!cred) return S_OK;
++    channel->security.cert_type = cred->credentialType;
++    switch (cred->credentialType)
++    {
++    case WS_SUBJECT_NAME_CERT_CREDENTIAL_TYPE:
++    {
++        const WS_SUBJECT_NAME_CERT_CREDENTIAL *subject = (const WS_SUBJECT_NAME_CERT_CREDENTIAL *)cred;
++
++        channel->security.store_location = subject->storeLocation;
++        if (!(channel->security.store_name = dup_ws_string( &subject->storeName )) ||
++            !(channel->security.cert_name = dup_ws_string( &subject->subjectName ))) return E_OUTOFMEMORY;
++        break;
++    }
++    case WS_THUMBPRINT_CERT_CREDENTIAL_TYPE:
++    {
++        const WS_THUMBPRINT_CERT_CREDENTIAL *thumbprint = (const WS_THUMBPRINT_CERT_CREDENTIAL *)cred;
++
++        channel->security.store_location = thumbprint->storeLocation;
++        if (!(channel->security.store_name = dup_ws_string( &thumbprint->storeName )) ||
++            !(channel->security.cert_name = dup_ws_string( &thumbprint->thumbprint ))) return E_OUTOFMEMORY;
++        break;
++    }
++    case WS_CUSTOM_CERT_CREDENTIAL_TYPE:
++    {
++        const WS_CUSTOM_CERT_CREDENTIAL *custom = (const WS_CUSTOM_CERT_CREDENTIAL *)cred;
++
++        if (!custom->getCertCallback) return E_INVALIDARG;
++        channel->security.get_cert = custom->getCertCallback;
++        channel->security.get_cert_state = custom->getCertCallbackState;
++        break;
++    }
++    default:
++        return E_INVALIDARG;
++    }
++    return S_OK;
++}
++
++static HRESULT set_security_description( struct channel *channel, const WS_SECURITY_DESCRIPTION *desc )
++{
++    HRESULT hr;
++    ULONG i;
++
++    for (i = 0; i < desc->securityBindingCount; i++)
++    {
++        const WS_SECURITY_BINDING *binding = desc->securityBindings[i];
++
++        switch (binding->bindingType)
++        {
++        case WS_SSL_TRANSPORT_SECURITY_BINDING_TYPE:
++            if (channel->binding != WS_HTTP_CHANNEL_BINDING) return E_INVALIDARG;
++            if ((hr = set_ssl_binding( channel, (const WS_SSL_TRANSPORT_SECURITY_BINDING *)binding )) != S_OK)
++                return hr;
++            break;
++
++        default:
++            FIXME( "security binding type %u not supported\n", binding->bindingType );
++            break;
++        }
++    }
++    /* what they say is about message security, or about what the transport does anyway */
++    for (i = 0; i < desc->propertyCount; i++) TRACE( "security property %u\n", desc->properties[i].id );
++    return S_OK;
++}
++
++/* a service proxy's channel finds its client certificate for the first call, not when it opens */
++void channel_defer_client_cert( WS_CHANNEL *handle )
++{
++    struct channel *channel = (struct channel *)handle;
++
++    EnterCriticalSection( &channel->cs );
++    if (channel->magic == CHANNEL_MAGIC) channel->security.defer_cert = TRUE;
++    LeaveCriticalSection( &channel->cs );
++}
++
+ /**************************************************************************
+  *          WsCreateChannel		[webservices.@]
+  */
+@@ -576,7 +738,6 @@ HRESULT WINAPI WsCreateChannel( WS_CHANNEL_TYPE type, WS_CHANNEL_BINDING binding
+     HRESULT hr;
+ 
+     TRACE( "%u %u %p %lu %p %p %p\n", type, binding, properties, count, desc, handle, error );
+-    if (desc) FIXME( "ignoring security description\n" );
+ 
+     if (!handle) return E_INVALIDARG;
+ 
+@@ -594,6 +755,11 @@ HRESULT WINAPI WsCreateChannel( WS_CHANNEL_TYPE type, WS_CHANNEL_BINDING binding
+     }
+ 
+     if ((hr = create_channel( type, binding, properties, count, &channel )) != S_OK) return hr;
++    if (desc && (hr = set_security_description( channel, desc )) != S_OK)
++    {
++        free_channel( channel );
++        return hr;
++    }
+ 
+     TRACE( "created %p\n", channel );
+     *handle = (WS_CHANNEL *)channel;
+@@ -1027,6 +1193,51 @@ error:
+     return hr;
+ }
+ 
++/* the certificate a client presents, from a store by its subject or thumbprint, or from the caller's callback */
++static HRESULT get_client_cert( struct channel *channel )
++{
++    const CERT_CONTEXT *cert = NULL;
++    HCERTSTORE store;
++    HRESULT hr;
++
++    if (!channel->security.cert_type || channel->security.cert) return S_OK;
++    if (channel->security.cert_type == WS_CUSTOM_CERT_CREDENTIAL_TYPE)
++    {
++        if ((hr = channel->security.get_cert( channel->security.get_cert_state, &channel->addr, NULL, &cert,
++                                              NULL )) != S_OK) return hr;
++        if (!cert) return E_INVALIDARG;
++        channel->security.cert = cert;
++        return S_OK;
++    }
++
++    if (!(store = CertOpenStore( CERT_STORE_PROV_SYSTEM_W, 0, 0, channel->security.store_location |
++                                 CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG,
++                                 channel->security.store_name )))
++        return HRESULT_FROM_WIN32( GetLastError() );
++    if (channel->security.cert_type == WS_SUBJECT_NAME_CERT_CREDENTIAL_TYPE)
++        cert = CertFindCertificateInStore( store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_SUBJECT_STR_W,
++                                           channel->security.cert_name, NULL );
++    else
++    {
++        BYTE hash[20];
++        CRYPT_HASH_BLOB blob = { 0, hash };
++        DWORD size = sizeof(hash);
++
++        /* the thumbprint is the hash in hexadecimal, spaces as they may be */
++        if (CryptStringToBinaryW( channel->security.cert_name, 0, CRYPT_STRING_HEX, hash, &size, NULL, NULL ))
++        {
++            blob.cbData = size;
++            cert = CertFindCertificateInStore( store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_SHA1_HASH,
++                                               &blob, NULL );
++        }
++    }
++    if (cert) hr = S_OK;
++    else if ((hr = HRESULT_FROM_WIN32( GetLastError() )) == S_OK) hr = CRYPT_E_NOT_FOUND;
++    CertCloseStore( store, 0 );
++    if (cert) channel->security.cert = cert;
++    return hr;
++}
++
+ static HRESULT open_channel_http( struct channel *channel )
+ {
+     HINTERNET ses = NULL, con = NULL;
+@@ -1071,6 +1282,15 @@ static HRESULT open_channel_http( struct channel *channel )
+         goto done;
+     }
+ 
++    if (channel->security.protocols &&
++        !WinHttpSetOption( ses, WINHTTP_OPTION_SECURE_PROTOCOLS, &channel->security.protocols,
++                           sizeof(channel->security.protocols) ))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        goto done;
++    }
++    if (!channel->security.defer_cert && (hr = get_client_cert( channel )) != S_OK) goto done;
++
+     channel->u.http.session = ses;
+     channel->u.http.connect = con;
+ 
+@@ -1525,9 +1745,26 @@ static HRESULT send_sized_envelope( struct channel *channel, BYTE *data, ULONG l
+ 
+ static HRESULT open_http_request( struct channel *channel, HINTERNET *req )
+ {
+-    if ((*req = WinHttpOpenRequest( channel->u.http.connect, L"POST", channel->u.http.path,
+-                                    NULL, NULL, NULL, channel->u.http.flags ))) return S_OK;
+-    return HRESULT_FROM_WIN32( GetLastError() );
++    HRESULT hr;
++
++    if ((hr = get_client_cert( channel )) != S_OK) return hr;
++    if (!(*req = WinHttpOpenRequest( channel->u.http.connect, L"POST", channel->u.http.path,
++                                     NULL, NULL, NULL, channel->u.http.flags )))
++        return HRESULT_FROM_WIN32( GetLastError() );
++
++    if ((channel->security.ignore_flags &&
++         !WinHttpSetOption( *req, WINHTTP_OPTION_SECURITY_FLAGS, &channel->security.ignore_flags,
++                            sizeof(channel->security.ignore_flags) )) ||
++        (channel->security.cert &&
++         !WinHttpSetOption( *req, WINHTTP_OPTION_CLIENT_CERT_CONTEXT, (void *)channel->security.cert,
++                            sizeof(CERT_CONTEXT) )))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        WinHttpCloseHandle( *req );
++        *req = NULL;
++        return hr;
++    }
++    return S_OK;
+ }
+ 
+ static HRESULT send_message_bytes( struct channel *channel, WS_MESSAGE *msg )
+diff --git a/dlls/webservices/proxy.c b/dlls/webservices/proxy.c
+index 409e078faf6..cefb7decc54 100644
+--- a/dlls/webservices/proxy.c
++++ b/dlls/webservices/proxy.c
+@@ -109,6 +109,7 @@ static HRESULT create_proxy( WS_CHANNEL *channel, const WS_PROXY_PROPERTY *prope
+     }
+ 
+     proxy->channel = channel;
++    channel_defer_client_cert( channel );
+ 
+     *handle = (WS_SERVICE_PROXY *)proxy;
+     return S_OK;
+@@ -149,6 +150,35 @@ HRESULT WINAPI WsCreateServiceProxy( const WS_CHANNEL_TYPE type, const WS_CHANNE
+ /**************************************************************************
+  *          WsCreateServiceProxyFromTemplate		[webservices.@]
+  */
++/* Properties of the description and of the template together; one given in both is an error, as with channel
++ * properties. */
++static HRESULT merge_props( const void *desc_props, ULONG desc_count, const void *value_props, ULONG value_count,
++                            ULONG prop_size, void **ret, ULONG *ret_count )
++{
++    const BYTE *desc_ptr = desc_props, *value_ptr = value_props;
++    BYTE *props;
++    ULONG i, j;
++
++    *ret_count = 0;
++    if (!(props = malloc( max( desc_count + value_count, 1 ) * prop_size ))) return E_OUTOFMEMORY;
++    for (i = 0; i < desc_count; i++) memcpy( props + (*ret_count)++ * prop_size, desc_ptr + i * prop_size, prop_size );
++    for (i = 0; i < value_count; i++)
++    {
++        /* each property begins with its id */
++        for (j = 0; j < desc_count; j++)
++        {
++            if (*(const ULONG *)(desc_ptr + j * prop_size) == *(const ULONG *)(value_ptr + i * prop_size))
++            {
++                free( props );
++                return E_INVALIDARG;
++            }
++        }
++        memcpy( props + (*ret_count)++ * prop_size, value_ptr + i * prop_size, prop_size );
++    }
++    *ret = props;
++    return S_OK;
++}
++
+ HRESULT WINAPI WsCreateServiceProxyFromTemplate( WS_CHANNEL_TYPE channel_type,
+                                                  const WS_PROXY_PROPERTY *properties, const ULONG count,
+                                                  WS_BINDING_TEMPLATE_TYPE type, void *value, ULONG size,
+@@ -156,12 +186,18 @@ HRESULT WINAPI WsCreateServiceProxyFromTemplate( WS_CHANNEL_TYPE channel_type,
+                                                  WS_ERROR *error )
+ {
+     const WS_CHANNEL_PROPERTIES *value_props = NULL, *desc_props;
++    WS_SECURITY_DESCRIPTION security, *security_desc = NULL;
++    WS_SSL_TRANSPORT_SECURITY_BINDING ssl;
++    WS_SECURITY_BINDING *bindings[1];
+     WS_CHANNEL_PROPERTY *channel_props;
+-    ULONG channel_props_count, i, j;
++    ULONG channel_props_count;
+     WS_CHANNEL_BINDING binding;
+     WS_CHANNEL *channel;
+     HRESULT hr;
+ 
++    memset( &security, 0, sizeof(security) );
++    memset( &ssl, 0, sizeof(ssl) );
++
+     TRACE( "%u %p %lu %u %p %lu %p %lu %p %p\n", channel_type, properties, count, type, value, size, desc,
+            desc_size, handle, error );
+ 
+@@ -192,11 +228,34 @@ HRESULT WINAPI WsCreateServiceProxyFromTemplate( WS_CHANNEL_TYPE channel_type,
+     }
+     case WS_HTTP_SSL_BINDING_TEMPLATE_TYPE:
+     {
++        const WS_HTTP_SSL_POLICY_DESCRIPTION *policy = desc;
+         WS_HTTP_SSL_BINDING_TEMPLATE *https = value;
++
+         if (https) value_props = &https->channelProperties;
+-        desc_props = &((const WS_HTTP_SSL_POLICY_DESCRIPTION *)desc)->channelProperties;
+-        FIXME( "ignoring security properties\n" );
++        desc_props = &policy->channelProperties;
+         binding = WS_HTTP_CHANNEL_BINDING;
++
++        /* an SSL transport binding, with the security properties of both and the certificate of the template */
++        ssl.binding.bindingType = WS_SSL_TRANSPORT_SECURITY_BINDING_TYPE;
++        if ((hr = merge_props( policy->sslTransportSecurityBinding.securityBindingProperties.properties,
++                               policy->sslTransportSecurityBinding.securityBindingProperties.propertyCount,
++                               https ? https->sslTransportSecurityBinding.securityBindingProperties.properties : NULL,
++                               https ? https->sslTransportSecurityBinding.securityBindingProperties.propertyCount : 0,
++                               sizeof(WS_SECURITY_BINDING_PROPERTY), (void **)&ssl.binding.properties,
++                               &ssl.binding.propertyCount )) != S_OK) return hr;
++        if ((hr = merge_props( policy->securityProperties.properties, policy->securityProperties.propertyCount,
++                               https ? https->securityProperties.properties : NULL,
++                               https ? https->securityProperties.propertyCount : 0, sizeof(WS_SECURITY_PROPERTY),
++                               (void **)&security.properties, &security.propertyCount )) != S_OK)
++        {
++            free( ssl.binding.properties );
++            return hr;
++        }
++        if (https) ssl.localCertCredential = https->sslTransportSecurityBinding.localCertCredential;
++        bindings[0] = &ssl.binding;
++        security.securityBindings = bindings;
++        security.securityBindingCount = 1;
++        security_desc = &security;
+         break;
+     }
+     case WS_TCP_BINDING_TEMPLATE_TYPE:
+@@ -215,25 +274,17 @@ HRESULT WINAPI WsCreateServiceProxyFromTemplate( WS_CHANNEL_TYPE channel_type,
+     /* The description, generated from the service's metadata, sets what the service requires -- envelope and
+      * addressing version, encoding; the template value adds the rest.  A property may come from one or the
+      * other, not both. */
+-    channel_props_count = desc_props->propertyCount + (value_props ? value_props->propertyCount : 0);
+-    if (!(channel_props = malloc( max( channel_props_count, 1 ) * sizeof(*channel_props) ))) return E_OUTOFMEMORY;
+-    channel_props_count = 0;
+-    for (i = 0; i < desc_props->propertyCount; i++) channel_props[channel_props_count++] = desc_props->properties[i];
+-    for (i = 0; value_props && i < value_props->propertyCount; i++)
++    hr = merge_props( desc_props->properties, desc_props->propertyCount, value_props ? value_props->properties : NULL,
++                      value_props ? value_props->propertyCount : 0, sizeof(WS_CHANNEL_PROPERTY),
++                      (void **)&channel_props, &channel_props_count );
++    if (hr == S_OK)
+     {
+-        for (j = 0; j < desc_props->propertyCount; j++)
+-        {
+-            if (desc_props->properties[j].id == value_props->properties[i].id)
+-            {
+-                free( channel_props );
+-                return E_INVALIDARG;
+-            }
+-        }
+-        channel_props[channel_props_count++] = value_props->properties[i];
++        hr = WsCreateChannel( channel_type, binding, channel_props, channel_props_count, security_desc, &channel,
++                              NULL );
++        free( channel_props );
+     }
+-
+-    hr = WsCreateChannel( channel_type, binding, channel_props, channel_props_count, NULL, &channel, NULL );
+-    free( channel_props );
++    free( ssl.binding.properties );
++    free( security.properties );
+     if (hr != S_OK) return hr;
+ 
+     if ((hr = create_proxy( channel, properties, count, handle )) != S_OK)
+diff --git a/dlls/webservices/tests/proxy.c b/dlls/webservices/tests/proxy.c
+index 37fcd57f8c4..fd9c9797442 100644
+--- a/dlls/webservices/tests/proxy.c
++++ b/dlls/webservices/tests/proxy.c
+@@ -1137,6 +1137,80 @@ static DWORD CALLBACK server_proc( void *arg )
+     return 0;
+ }
+ 
++static int cert_asked;
++
++static HRESULT CALLBACK get_cert( void *state, const WS_ENDPOINT_ADDRESS *address, const WS_STRING *via,
++                                  const struct _CERT_CONTEXT **cert, WS_ERROR *error )
++{
++    cert_asked++;
++    ok( !via, "via set\n" );
++    *cert = NULL;
++    return E_FAIL;
++}
++
++/* An SSL transport binding: on an HTTP channel only, with the client certificate asked for when the channel
++ * opens, but a service proxy's not before its first call. */
++static void test_ssl_binding(void)
++{
++    ULONG failures = WS_CERT_FAILURE_CN_MISMATCH | WS_CERT_FAILURE_INVALID_DATE;
++    WS_SECURITY_BINDING_PROPERTY prop = { WS_SECURITY_BINDING_PROPERTY_CERT_FAILURES_TO_IGNORE, &failures,
++                                          sizeof(failures) };
++    WS_CUSTOM_CERT_CREDENTIAL custom = { { WS_CUSTOM_CERT_CREDENTIAL_TYPE }, get_cert };
++    WS_SSL_TRANSPORT_SECURITY_BINDING ssl = { { WS_SSL_TRANSPORT_SECURITY_BINDING_TYPE, &prop, 1 } };
++    WS_SECURITY_BINDING *bindings[] = { &ssl.binding };
++    WS_SECURITY_DESCRIPTION desc = { bindings, 1 };
++    WS_HTTP_SSL_POLICY_DESCRIPTION policy;
++    WS_HTTP_SSL_BINDING_TEMPLATE templ;
++    WS_ENDPOINT_ADDRESS addr;
++    WS_SERVICE_PROXY *proxy;
++    WS_CHANNEL *channel;
++    HRESULT hr;
++
++    hr = WsCreateChannel( WS_CHANNEL_TYPE_REQUEST, WS_HTTP_CHANNEL_BINDING, NULL, 0, &desc, &channel, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    WsFreeChannel( channel );
++    hr = WsCreateChannel( WS_CHANNEL_TYPE_REQUEST, WS_TCP_CHANNEL_BINDING, NULL, 0, &desc, &channel, NULL );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++
++    memset( &addr, 0, sizeof(addr) );
++    addr.url.chars  = (WCHAR *)L"https://localhost:1/";
++    addr.url.length = wcslen( addr.url.chars );
++    ssl.binding.propertyCount = 0;
++    ssl.localCertCredential = &custom.credential;
++    hr = WsCreateChannel( WS_CHANNEL_TYPE_REQUEST, WS_HTTP_CHANNEL_BINDING, NULL, 0, &desc, &channel, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    cert_asked = 0;
++    hr = WsOpenChannel( channel, &addr, NULL, NULL );
++    ok( hr == E_FAIL, "got %#lx\n", hr );
++    ok( cert_asked == 1, "asked %d times\n", cert_asked );
++    WsFreeChannel( channel );
++
++    hr = WsCreateServiceProxy( WS_CHANNEL_TYPE_REQUEST, WS_HTTP_CHANNEL_BINDING, &desc, NULL, 0, NULL, 0, &proxy,
++                               NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    cert_asked = 0;
++    hr = WsOpenServiceProxy( proxy, &addr, NULL, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !cert_asked, "asked %d times\n", cert_asked );
++    WsCloseServiceProxy( proxy, NULL, NULL );
++    WsFreeServiceProxy( proxy );
++
++    /* a binding property both in the policy and in the template is an error */
++    memset( &policy, 0, sizeof(policy) );
++    memset( &templ, 0, sizeof(templ) );
++    policy.sslTransportSecurityBinding.securityBindingProperties.properties = &prop;
++    policy.sslTransportSecurityBinding.securityBindingProperties.propertyCount = 1;
++    hr = WsCreateServiceProxyFromTemplate( WS_CHANNEL_TYPE_REQUEST, NULL, 0, WS_HTTP_SSL_BINDING_TEMPLATE_TYPE,
++                                           &templ, sizeof(templ), &policy, sizeof(policy), &proxy, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    WsFreeServiceProxy( proxy );
++    templ.sslTransportSecurityBinding.securityBindingProperties.properties = &prop;
++    templ.sslTransportSecurityBinding.securityBindingProperties.propertyCount = 1;
++    hr = WsCreateServiceProxyFromTemplate( WS_CHANNEL_TYPE_REQUEST, NULL, 0, WS_HTTP_SSL_BINDING_TEMPLATE_TYPE,
++                                           &templ, sizeof(templ), &policy, sizeof(policy), &proxy, NULL );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++}
++
+ START_TEST(proxy)
+ {
+     WS_XML_STRING test1 = {9, (BYTE *)"req_test1"};
+@@ -1149,6 +1223,7 @@ START_TEST(proxy)
+     test_WsCreateServiceProxyFromTemplate();
+     test_WsOpenServiceProxy();
+     test_WsResetServiceProxy();
++    test_ssl_binding();
+ 
+     info.port  = 7533;
+     info.event = CreateEventW( NULL, 0, 0, NULL );
+diff --git a/dlls/webservices/webservices_private.h b/dlls/webservices/webservices_private.h
+index 3f70e3c6c7f..e0351ce62e6 100644
+--- a/dlls/webservices/webservices_private.h
++++ b/dlls/webservices/webservices_private.h
+@@ -36,6 +36,7 @@ struct xmlbuf
+ extern HINSTANCE webservices_instance;
+ 
+ void add_error_string( WS_ERROR *, UINT, const WCHAR *, const WCHAR *, const WCHAR * );
++void channel_defer_client_cert( WS_CHANNEL * );
+ const WCHAR *format_error_number( ULONG, WCHAR *, ULONG );
+ 
+ void *ws_alloc( WS_HEAP *, SIZE_T );
+diff --git a/include/webservices.h b/include/webservices.h
+index d44db966234..0cf25b922ee 100644
+--- a/include/webservices.h
++++ b/include/webservices.h
+@@ -902,15 +902,15 @@ typedef enum {
+ } WS_CHANNEL_BINDING;
+ 
+ typedef enum {
+-    WS_SSL_TRANSPORT_SECURITY_BINDING_TYPE,
+-    WS_TCP_SSPI_TRANSPORT_SECURITY_BINDING_TYPE,
+-    WS_HTTP_HEADER_AUTH_SECURITY_BINDING_TYPE,
+-    WS_USERNAME_MESSAGE_SECURITY_BINDING_TYPE,
+-    WS_KERBEROS_APREQ_MESSAGE_SECURITY_BINDING_TYPE,
+-    WS_XML_TOKEN_MESSAGE_SECURITY_BINDING_TYPE,
+-    WS_SAML_MESSAGE_SECURITY_BINDING_TYPE,
+-    WS_SECURITY_CONTEXT_MESSAGE_SECURITY_BINDING_TYPE,
+-    WS_NAMEDPIPE_SSPI_TRANSPORT_SECURITY_BINDING_TYPE
++    WS_SSL_TRANSPORT_SECURITY_BINDING_TYPE              = 1,
++    WS_TCP_SSPI_TRANSPORT_SECURITY_BINDING_TYPE         = 2,
++    WS_HTTP_HEADER_AUTH_SECURITY_BINDING_TYPE           = 3,
++    WS_USERNAME_MESSAGE_SECURITY_BINDING_TYPE           = 4,
++    WS_KERBEROS_APREQ_MESSAGE_SECURITY_BINDING_TYPE     = 5,
++    WS_XML_TOKEN_MESSAGE_SECURITY_BINDING_TYPE          = 6,
++    WS_SAML_MESSAGE_SECURITY_BINDING_TYPE               = 7,
++    WS_SECURITY_CONTEXT_MESSAGE_SECURITY_BINDING_TYPE   = 8,
++    WS_NAMEDPIPE_SSPI_TRANSPORT_SECURITY_BINDING_TYPE   = 9
+ } WS_SECURITY_BINDING_TYPE;
+ 
+ typedef enum {
+@@ -1021,6 +1021,48 @@ struct _WS_SSL_TRANSPORT_SECURITY_BINDING_TEMPLATE {
+     WS_CERT_CREDENTIAL *localCertCredential;
+ };
+ 
++typedef struct _WS_SSL_TRANSPORT_SECURITY_BINDING {
++    WS_SECURITY_BINDING binding;
++    WS_CERT_CREDENTIAL *localCertCredential;
++} WS_SSL_TRANSPORT_SECURITY_BINDING;
++
++typedef struct _WS_SUBJECT_NAME_CERT_CREDENTIAL {
++    WS_CERT_CREDENTIAL credential;
++    ULONG storeLocation;
++    WS_STRING storeName;
++    WS_STRING subjectName;
++} WS_SUBJECT_NAME_CERT_CREDENTIAL;
++
++typedef struct _WS_THUMBPRINT_CERT_CREDENTIAL {
++    WS_CERT_CREDENTIAL credential;
++    ULONG storeLocation;
++    WS_STRING storeName;
++    WS_STRING thumbprint;
++} WS_THUMBPRINT_CERT_CREDENTIAL;
++
++struct _CERT_CONTEXT;
++struct _SecPkgContext_IssuerListInfoEx;
++
++typedef HRESULT (CALLBACK *WS_GET_CERT_CALLBACK)(void *, const WS_ENDPOINT_ADDRESS *, const WS_STRING *,
++                                                const struct _CERT_CONTEXT **, WS_ERROR *);
++typedef void (CALLBACK *WS_CERT_ISSUER_LIST_NOTIFICATION_CALLBACK)(void *,
++                                                                  const struct _SecPkgContext_IssuerListInfoEx *,
++                                                                  WS_ERROR *);
++
++typedef struct _WS_CUSTOM_CERT_CREDENTIAL {
++    WS_CERT_CREDENTIAL credential;
++    WS_GET_CERT_CALLBACK getCertCallback;
++    void *getCertCallbackState;
++    WS_CERT_ISSUER_LIST_NOTIFICATION_CALLBACK certIssuerListNotificationCallback;
++    void *certIssuerListNotificationCallbackState;
++} WS_CUSTOM_CERT_CREDENTIAL;
++
++#define WS_CERT_FAILURE_CN_MISMATCH         0x01
++#define WS_CERT_FAILURE_INVALID_DATE        0x02
++#define WS_CERT_FAILURE_UNTRUSTED_ROOT      0x04
++#define WS_CERT_FAILURE_WRONG_USAGE         0x08
++#define WS_CERT_FAILURE_REVOCATION_OFFLINE  0x10
++
+ struct _WS_HTTP_BINDING_TEMPLATE {
+     WS_CHANNEL_PROPERTIES channelProperties;
+ };

@@ -1,0 +1,689 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 06:43:14 -0400
+Subject: [PATCH] dcomp: Draw visuals into the buffers of captures of them.
+
+Windows.Graphics.Capture captures a composition visual through
+IWineCompositionVisualCapture, which a visual now offers: its size as
+laid out, and a capture that, on every frame the compositor draws from
+then on, draws the visual and what is in it into a buffer the capture's
+sink gives, as a redirect visual draws its source, on the device the
+capture is for, with a Direct2D context of its own.  The first frame is
+queued at the start; with every buffer in use there is none.
+
+The drawing is no longer tied to window targets: what a frame is drawn
+with is the render's own.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/dcomp/Makefile.in b/dlls/dcomp/Makefile.in
+index ace1b8f09f9..7309ba52c52 100644
+--- a/dlls/dcomp/Makefile.in
++++ b/dlls/dcomp/Makefile.in
+@@ -6,6 +6,7 @@ VER_PRODUCTVERSION = 10,0,14393,0
+ SOURCES = \
+ 	animation.c \
+ 	brush.c \
++	capture.c \
+ 	classes.idl \
+ 	clip.c \
+ 	compositor.c \
+diff --git a/dlls/dcomp/capture.c b/dlls/dcomp/capture.c
+new file mode 100644
+index 00000000000..57ebff5280a
+--- /dev/null
++++ b/dlls/dcomp/capture.c
+@@ -0,0 +1,130 @@
++/*
++ * Captures of composition visuals, for Windows.Graphics.Capture
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
++
++static inline struct capture *impl_from_IUnknown( IUnknown *iface )
++{
++    return CONTAINING_RECORD( iface, struct capture, IUnknown_iface );
++}
++
++static HRESULT WINAPI capture_QueryInterface( IUnknown *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ))
++    {
++        IUnknown_AddRef( iface );
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI capture_AddRef( IUnknown *iface )
++{
++    struct capture *capture = impl_from_IUnknown( iface );
++    ULONG ref = InterlockedIncrement( &capture->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++/* the frame being drawn holds the compositor's lock, so a capture that goes is not in one */
++static ULONG WINAPI capture_Release( IUnknown *iface )
++{
++    struct capture *capture = impl_from_IUnknown( iface );
++    ULONG ref = InterlockedDecrement( &capture->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        compositor_lock( capture->compositor );
++        list_remove( &capture->entry );
++        compositor_unlock( capture->compositor );
++        IWineCompositionCaptureSink_Release( capture->sink );
++        if (capture->sources) ID2D1DeviceContext_Release( capture->sources );
++        ID2D1DeviceContext_Release( capture->context );
++        ID3D11Device_Release( capture->device );
++        object_release( &capture->visual->base );
++        free( capture );
++    }
++    return ref;
++}
++
++static const IUnknownVtbl capture_vtbl =
++{
++    capture_QueryInterface,
++    capture_AddRef,
++    capture_Release,
++};
++
++HRESULT capture_start( struct visual *visual, ID3D11Device *device, IWineCompositionCaptureSink *sink, IUnknown **out )
++{
++    static const D2D1_CREATION_PROPERTIES props = {D2D1_THREADING_MODE_MULTI_THREADED};
++    struct compositor *compositor = visual->base.compositor;
++    ID2D1DeviceContext *context;
++    struct capture *capture;
++    IDXGIDevice *dxgi;
++    ID2D1Device *d2d;
++    HRESULT hr;
++
++    TRACE( "visual %p, device %p, sink %p, out %p.\n", visual, device, sink, out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!device || !sink) return E_INVALIDARG;
++
++    /* a Direct2D device of the capture's own, on its Direct3D device */
++    if (FAILED(hr = ID3D11Device_QueryInterface( device, &IID_IDXGIDevice, (void **)&dxgi ))) return hr;
++    hr = D2D1CreateDevice( dxgi, &props, &d2d );
++    IDXGIDevice_Release( dxgi );
++    if (FAILED(hr)) return hr;
++    hr = ID2D1Device_CreateDeviceContext( d2d, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &context );
++    ID2D1Device_Release( d2d );
++    if (FAILED(hr)) return hr;
++
++    if (!(capture = calloc( 1, sizeof(*capture) )))
++    {
++        ID2D1DeviceContext_Release( context );
++        return E_OUTOFMEMORY;
++    }
++    capture->IUnknown_iface.lpVtbl = &capture_vtbl;
++    capture->ref = 1;
++    capture->compositor = compositor;
++    capture->visual = visual;
++    object_addref( &visual->base );
++    capture->device = device;
++    ID3D11Device_AddRef( device );
++    capture->context = context;
++    capture->sink = sink;
++    IWineCompositionCaptureSink_AddRef( sink );
++
++    compositor_lock( compositor );
++    list_add_tail( compositor_captures( compositor ), &capture->entry );
++    compositor_unlock( compositor );
++    compositor_queue_frame( compositor );
++
++    *out = &capture->IUnknown_iface;
++    return S_OK;
++}
+diff --git a/dlls/dcomp/compositor.c b/dlls/dcomp/compositor.c
+index b88d9c79bcb..552528f2ace 100644
+--- a/dlls/dcomp/compositor.c
++++ b/dlls/dcomp/compositor.c
+@@ -60,6 +60,7 @@ struct compositor
+     struct list commit_needed;
+     UINT64 next_token;
+ 
++    struct list captures;       /* of visuals, drawn after the targets */
+     struct list running;        /* key frame animations running */
+     struct list batches;        /* open ones */
+     struct list trackers;
+@@ -103,6 +104,11 @@ struct list *compositor_targets( struct compositor *compositor )
+     return &compositor->targets;
+ }
+ 
++struct list *compositor_captures( struct compositor *compositor )
++{
++    return &compositor->captures;
++}
++
+ struct list *compositor_running( struct compositor *compositor )
+ {
+     return &compositor->running;
+@@ -161,6 +167,7 @@ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+     struct graphics_device **devices = NULL;
+     unsigned int count = 0, size = 0, i;
+     BOOL need_default = FALSE;
++    struct capture *capture;
+     struct target *target;
+     ID3D11Device *d3d;
+     ID2D1Device *d2d;
+@@ -173,6 +180,8 @@ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+         if (!target->device && !render_tree_device( target->root )) need_default = TRUE;
+         if (FAILED(render_tree_devices( target->root, &devices, &count, &size ))) break;
+     }
++    LIST_FOR_EACH_ENTRY( capture, &compositor->captures, struct capture, entry )
++        if (FAILED(render_tree_devices( capture->visual, &devices, &count, &size ))) break;
+     for (i = 0; i < count; i++) ICompositionGraphicsDevice_AddRef( &devices[i]->ICompositionGraphicsDevice_iface );
+     compositor_unlock( compositor );
+ 
+@@ -200,6 +209,11 @@ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+         HRESULT ret = render_target( compositor, target );
+         if (FAILED(ret) && SUCCEEDED(hr)) hr = ret;
+     }
++    LIST_FOR_EACH_ENTRY( capture, &compositor->captures, struct capture, entry )
++    {
++        HRESULT ret = render_capture( compositor, capture );
++        if (FAILED(ret) && SUCCEEDED(hr)) hr = ret;
++    }
+     compositor->locked = NULL;
+     compositor->locked_count = 0;
+     if (frames_wanted( compositor )) compositor_request_frames( compositor );
+@@ -492,12 +506,13 @@ static void compositor_queue_work( struct compositor *compositor )
+ }
+ 
+ /*
+- * A swapchain a surface of the compositor shows has presented: the targets
+- * are drawn again, as they stand, on the compositor's thread, as Windows shows
+- * what a swapchain presents without a commit.  Called on the thread that
+- * presented, without the compositor's lock, which that thread may not take.
++ * Draws the targets and captures again soon, as they stand, on the
++ * compositor's thread, without a commit: for what a swapchain presents, which
++ * Windows shows without one, and for the first frame of a capture.  Called
++ * from any thread, with or without the compositor's lock (a presenting thread
++ * may not take it).
+  */
+-void compositor_presented( struct compositor *compositor )
++void compositor_queue_frame( struct compositor *compositor )
+ {
+     boolean queued = FALSE;
+     struct work *work;
+@@ -1734,6 +1749,7 @@ HRESULT compositor_create( BOOL manual, struct compositor **out )
+     /* as on Windows, a new compositor has its first commit to make */
+     compositor->changed = TRUE;
+     list_init( &compositor->targets );
++    list_init( &compositor->captures );
+     list_init( &compositor->commit_needed );
+     list_init( &compositor->running );
+     list_init( &compositor->batches );
+diff --git a/dlls/dcomp/private.h b/dlls/dcomp/private.h
+index d4fd6993a0c..953ea3edc79 100644
+--- a/dlls/dcomp/private.h
++++ b/dlls/dcomp/private.h
+@@ -61,6 +61,7 @@
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
++#include "wine/winecomposition.h"
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+@@ -296,7 +297,8 @@ extern struct list *compositor_running( struct compositor *compositor );
+ extern struct list *compositor_batches( struct compositor *compositor );
+ extern struct list *compositor_trackers( struct compositor *compositor );
+ extern void compositor_changed( struct compositor *compositor );
+-extern void compositor_presented( struct compositor *compositor );
++extern void compositor_queue_frame( struct compositor *compositor );
++extern struct list *compositor_captures( struct compositor *compositor );
+ extern void compositor_set_controller( struct compositor *compositor, ICompositorController *controller );
+ extern HRESULT compositor_add_commit_needed( struct compositor *compositor,
+                                              ITypedEventHandler_CompositorController_IInspectable *handler,
+@@ -350,6 +352,7 @@ struct visual
+     ISpriteVisual ISpriteVisual_iface;
+     ISpriteVisual2 ISpriteVisual2_iface;
+     IRedirectVisual IRedirectVisual_iface;
++    IWineCompositionVisualCapture IWineCompositionVisualCapture_iface;
+     enum visual_kind kind;
+ 
+     struct visual *parent;
+@@ -372,6 +375,7 @@ struct visual
+ };
+ 
+ extern void visual_get_state( struct visual *visual, struct visual_state *state );
++extern Vector2 visual_layout_size( struct visual *visual );
+ extern HRESULT visual_create( struct compositor *compositor, enum visual_kind kind, struct visual **out );
+ extern struct visual *unsafe_impl_from_IVisual( IVisual *iface );
+ extern void visual_detach_all( struct visual *visual );
+@@ -603,8 +607,30 @@ extern BOOL modifier_parts( IUnknown *iface, enum modifier_kind *kind, IComposit
+ extern void trackers_frame( struct compositor *compositor );
+ extern BOOL trackers_moving( struct compositor *compositor );
+ 
++/*
++ * Captures of visuals (Windows.Graphics.Capture): after the targets, each
++ * frame draws the visual into a buffer the sink gives, on the device the
++ * capture is for, with a Direct2D context of the capture's own.
++ */
++struct capture
++{
++    IUnknown IUnknown_iface;        /* releasing it stops the capture */
++    LONG ref;
++    struct list entry;              /* in the compositor's captures */
++    struct compositor *compositor;
++    struct visual *visual;
++    ID3D11Device *device;
++    ID2D1DeviceContext *context;
++    ID2D1DeviceContext *sources;    /* what effect sources are drawn with */
++    IWineCompositionCaptureSink *sink;
++};
++
++extern HRESULT capture_start( struct visual *visual, ID3D11Device *device, IWineCompositionCaptureSink *sink,
++                              IUnknown **out );
++
+ /* rendering */
+ extern HRESULT render_target( struct compositor *compositor, struct target *target );
++extern HRESULT render_capture( struct compositor *compositor, struct capture *capture );
+ extern struct graphics_device *render_tree_device( struct visual *visual );
+ extern BOOL compositor_device_locked( struct compositor *compositor, struct graphics_device *device );
+ extern HRESULT render_tree_devices( struct visual *visual, struct graphics_device ***devices, unsigned int *count,
+diff --git a/dlls/dcomp/render.c b/dlls/dcomp/render.c
+index 5cdaa387284..ee67792a740 100644
+--- a/dlls/dcomp/render.c
++++ b/dlls/dcomp/render.c
+@@ -371,11 +371,13 @@ static void visual_transform( const struct visual_state *visual, Vector2 size, V
+     matrix_translate( out, x, y, z );
+ }
+ 
++/* a frame being drawn, of a window target or of a capture */
+ struct render
+ {
+-    struct target *target;
+     struct compositor *compositor;
++    ID3D11Device *device;               /* what it is drawn with, and surfaces on other devices brought over to */
+     ID2D1DeviceContext *context;
++    ID2D1DeviceContext **sources;       /* the context effect sources are drawn with, made on first use */
+     ID2D1SolidColorBrush *solid;
+     unsigned int redirects;     /* redirect visuals being drawn */
+ };
+@@ -462,7 +464,7 @@ static BOOL render_source( struct render *render, ICompositionSurface *iface, st
+         return FALSE;
+     }
+ 
+-    if (swapchain_surface_texture( iface, render->target->device, &texture, &props.pixelFormat.alphaMode ) != S_OK)
++    if (swapchain_surface_texture( iface, render->device, &texture, &props.pixelFormat.alphaMode ) != S_OK)
+         return FALSE;
+     ID3D11Texture2D_GetDesc( texture, &desc );
+     props.pixelFormat.format = desc.Format;
+@@ -529,13 +531,13 @@ static void draw_surface_part( struct render *render, const struct source *sourc
+         props.dpiX = props.dpiY = 96.0f;
+         /* one on another device is brought over to the target's, if the frame holds that device too; a surface
+          * that came into the tree after the frame took its locks waits for the next */
+-        if (surface->device->d3d_device != render->target->device &&
++        if (surface->device->d3d_device != render->device &&
+             !compositor_device_locked( render->compositor, surface->device ))
+         {
+             compositor_changed( render->compositor );
+             continue;
+         }
+-        if (FAILED(hr = tile_texture( surface, tile, render->target->device, &texture )))
++        if (FAILED(hr = tile_texture( surface, tile, render->device, &texture )))
+         {
+             WARN( "failed to bring a tile of surface %p over, hr %#lx.\n", surface, hr );
+             continue;
+@@ -710,7 +712,6 @@ static ID2D1Image *draw_effect_source( void *data, struct brush *source )
+     static const D2D1_COLOR_F clear = {0.0f, 0.0f, 0.0f, 0.0f};
+     struct effect_draw *draw = data;
+     struct render inner = *draw->render;
+-    struct target *target = inner.target;
+     struct brush_state state;
+     ID2D1Bitmap1 *bitmap;
+     ID2D1Device *device;
+@@ -722,28 +723,28 @@ static ID2D1Image *draw_effect_source( void *data, struct brush *source )
+         FIXME( "an effect brush drawing from effect brush %p is not drawn.\n", source );
+         return NULL;
+     }
+-    /* a context of its own, so the target's clips and state stay as they are */
+-    if (!target->sources)
++    /* a context of its own, so the frame's clips and state stay as they are */
++    if (!*inner.sources)
+     {
+-        ID2D1DeviceContext_GetDevice( target->context, &device );
+-        hr = ID2D1Device_CreateDeviceContext( device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &target->sources );
++        ID2D1DeviceContext_GetDevice( draw->render->context, &device );
++        hr = ID2D1Device_CreateDeviceContext( device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, inner.sources );
+         ID2D1Device_Release( device );
+         if (FAILED(hr))
+         {
+             WARN( "failed to create a context for effect sources, hr %#lx.\n", hr );
+-            target->sources = NULL;
++            *inner.sources = NULL;
+             return NULL;
+         }
+     }
+     pixels.width = ceilf( draw->size.X );
+     pixels.height = ceilf( draw->size.Y );
+-    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap( target->sources, pixels, NULL, 0, &props, &bitmap )))
++    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap( *inner.sources, pixels, NULL, 0, &props, &bitmap )))
+     {
+         WARN( "failed to create a bitmap for an effect source, hr %#lx.\n", hr );
+         return NULL;
+     }
+ 
+-    inner.context = target->sources;
++    inner.context = *inner.sources;
+     inner.solid = NULL;
+     ID2D1DeviceContext_SetTarget( inner.context, (ID2D1Image *)bitmap );
+     ID2D1DeviceContext_SetDpi( inner.context, 96.0f, 96.0f );
+@@ -898,7 +899,7 @@ HRESULT render_target( struct compositor *compositor, struct target *target )
+ {
+     static const D2D1_COLOR_F clear = {0.0f, 0.0f, 0.0f, 0.0f};
+     struct graphics_device *device = NULL;
+-    struct render render = {target, compositor};
++    struct render render = {compositor};
+     D2D1_BITMAP_PROPERTIES1 props = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE}, 96.0f, 96.0f,
+                                      D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW};
+     ID2D1Bitmap1 *backbuffer;
+@@ -938,7 +939,9 @@ HRESULT render_target( struct compositor *compositor, struct target *target )
+     IDXGISurface_Release( surface );
+     if (FAILED(hr)) goto done;
+ 
++    render.device = target->device;
+     render.context = target->context;
++    render.sources = &target->sources;
+     ID2D1DeviceContext_SetTarget( render.context, (ID2D1Image *)backbuffer );
+     ID2D1DeviceContext_SetDpi( render.context, 96.0f, 96.0f );
+     ID2D1DeviceContext_BeginDraw( render.context );
+@@ -959,3 +962,69 @@ done:
+     ID3D11Device_Release( d3d );
+     return hr;
+ }
++
++/*
++ * Draws a captured visual into the next buffer its capture has, as a redirect
++ * visual draws its source: at its own origin, its own transform left out.
++ * With every buffer in use there is no frame.  Called with the compositor
++ * locked, and the devices of the visual's tree.
++ */
++HRESULT render_capture( struct compositor *compositor, struct capture *capture )
++{
++    static const D2D1_COLOR_F clear = {0.0f, 0.0f, 0.0f, 0.0f};
++    D2D1_BITMAP_PROPERTIES1 props = {{DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED}, 96.0f, 96.0f,
++                                     D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW};
++    struct render render = {compositor, capture->device, capture->context, &capture->sources};
++    Vector2 size, parent_size = {0.0f, 0.0f};
++    LARGE_INTEGER counter, frequency;
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Texture2D *texture;
++    ID2D1Bitmap1 *bitmap;
++    IDXGISurface *surface;
++    LONGLONG time;
++    matrix identity;
++    HRESULT hr;
++
++    if (IWineCompositionCaptureSink_get_buffer( capture->sink, &texture ) != S_OK) return S_OK;
++    ID3D11Texture2D_GetDesc( texture, &desc );
++    props.pixelFormat.format = desc.Format;
++    if (SUCCEEDED(hr = ID3D11Texture2D_QueryInterface( texture, &IID_IDXGISurface, (void **)&surface )))
++    {
++        hr = ID2D1DeviceContext_CreateBitmapFromDxgiSurface( capture->context, surface, &props, &bitmap );
++        IDXGISurface_Release( surface );
++    }
++    if (FAILED(hr))
++    {
++        WARN( "failed to draw into a buffer of capture %p, format %#x, hr %#lx.\n", capture, desc.Format, hr );
++        ID3D11Texture2D_Release( texture );
++        return hr;
++    }
++
++    if (capture->visual->parent) parent_size = visual_layout_size( capture->visual->parent );
++    size = visual_layout_size( capture->visual );
++
++    ID2D1DeviceContext_SetTarget( capture->context, (ID2D1Image *)bitmap );
++    ID2D1DeviceContext_SetDpi( capture->context, 96.0f, 96.0f );
++    ID2D1DeviceContext_BeginDraw( capture->context );
++    ID2D1DeviceContext_Clear( capture->context, &clear );
++    matrix_identity( &identity );
++    draw_visual( &render, capture->visual, &identity, 1.0f, parent_size, TRUE );
++    hr = ID2D1DeviceContext_EndDraw( capture->context, NULL, NULL );
++    ID2D1DeviceContext_SetTarget( capture->context, NULL );
++    ID2D1Bitmap1_Release( bitmap );
++    if (render.solid) ID2D1SolidColorBrush_Release( render.solid );
++
++    if (FAILED(hr)) WARN( "drawing capture %p failed, hr %#lx.\n", capture, hr );
++    else
++    {
++        QueryPerformanceCounter( &counter );
++        QueryPerformanceFrequency( &frequency );
++        time = counter.QuadPart / frequency.QuadPart * 10000000 +
++               counter.QuadPart % frequency.QuadPart * 10000000 / frequency.QuadPart;
++        IWineCompositionCaptureSink_frame_drawn( capture->sink, texture,
++                                                 min( size.X > 0.0f ? ceilf( size.X ) : 0, desc.Width ),
++                                                 min( size.Y > 0.0f ? ceilf( size.Y ) : 0, desc.Height ), time );
++    }
++    ID3D11Texture2D_Release( texture );
++    return hr;
++}
+diff --git a/dlls/dcomp/swapchain.c b/dlls/dcomp/swapchain.c
+index b8bdedf02e1..4dd7dddc055 100644
+--- a/dlls/dcomp/swapchain.c
++++ b/dlls/dcomp/swapchain.c
+@@ -63,7 +63,7 @@ static HRESULT swapchain_query_interface( struct object *object, REFIID iid, voi
+ static void WINAPI swapchain_presented( void *context )
+ {
+     struct swapchain_surface *surface = context;
+-    compositor_presented( surface->base.compositor );
++    compositor_queue_frame( surface->base.compositor );
+ }
+ 
+ /* called with the compositor locked */
+diff --git a/dlls/dcomp/visual.c b/dlls/dcomp/visual.c
+index ac903c60fda..8321253bd54 100644
+--- a/dlls/dcomp/visual.c
++++ b/dlls/dcomp/visual.c
+@@ -18,6 +18,8 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
++
+ #include "private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+@@ -47,6 +49,7 @@ static HRESULT visual_query_interface( struct object *object, REFIID iid, void *
+     else if (visual->kind == VISUAL_SPRITE && IsEqualGUID( iid, &IID_ISpriteVisual )) *out = &visual->ISpriteVisual_iface;
+     else if (visual->kind == VISUAL_SPRITE && IsEqualGUID( iid, &IID_ISpriteVisual2 )) *out = &visual->ISpriteVisual2_iface;
+     else if (visual->kind == VISUAL_REDIRECT && IsEqualGUID( iid, &IID_IRedirectVisual )) *out = &visual->IRedirectVisual_iface;
++    else if (IsEqualGUID( iid, &IID_IWineCompositionVisualCapture )) *out = &visual->IWineCompositionVisualCapture_iface;
+     else return object_query_interface( object, iid, out );
+     IUnknown_AddRef( (IUnknown *)*out );
+     return S_OK;
+@@ -1384,6 +1387,82 @@ struct visual *unsafe_impl_from_IVisual( IVisual *iface )
+     return impl_from_IVisual( iface );
+ }
+ 
++/* the size a visual is laid out at, its own and its share of its parent's; called with the compositor locked */
++Vector2 visual_layout_size( struct visual *visual )
++{
++    struct visual_state state;
++    Vector2 parent = {0.0f, 0.0f}, size;
++    RECT client;
++
++    if (visual->parent) parent = visual_layout_size( visual->parent );
++    else if (visual->root_of && visual->root_of->hwnd && GetClientRect( visual->root_of->hwnd, &client ))
++    {
++        parent.X = client.right;
++        parent.Y = client.bottom;
++    }
++    visual_get_state( visual, &state );
++    size.X = state.size.X + state.relative_size.X * parent.X;
++    size.Y = state.size.Y + state.relative_size.Y * parent.Y;
++    return size;
++}
++
++/*** what Windows.Graphics.Capture takes of a visual ***/
++
++static inline struct visual *impl_from_IWineCompositionVisualCapture( IWineCompositionVisualCapture *iface )
++{
++    return CONTAINING_RECORD( iface, struct visual, IWineCompositionVisualCapture_iface );
++}
++
++static HRESULT WINAPI visual_capture_QueryInterface( IWineCompositionVisualCapture *iface, REFIID iid, void **out )
++{
++    struct visual *visual = impl_from_IWineCompositionVisualCapture( iface );
++    return IInspectable_QueryInterface( object_inspectable( &visual->base ), iid, out );
++}
++
++static ULONG WINAPI visual_capture_AddRef( IWineCompositionVisualCapture *iface )
++{
++    struct visual *visual = impl_from_IWineCompositionVisualCapture( iface );
++    return object_addref( &visual->base );
++}
++
++static ULONG WINAPI visual_capture_Release( IWineCompositionVisualCapture *iface )
++{
++    struct visual *visual = impl_from_IWineCompositionVisualCapture( iface );
++    return object_release( &visual->base );
++}
++
++static HRESULT WINAPI visual_capture_get_size( IWineCompositionVisualCapture *iface, UINT *width, UINT *height )
++{
++    struct visual *visual = impl_from_IWineCompositionVisualCapture( iface );
++    Vector2 size;
++
++    TRACE( "iface %p, width %p, height %p.\n", iface, width, height );
++
++    compositor_lock( visual->base.compositor );
++    size = visual_layout_size( visual );
++    compositor_unlock( visual->base.compositor );
++    *width = size.X > 0.0f ? ceilf( size.X ) : 0;
++    *height = size.Y > 0.0f ? ceilf( size.Y ) : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI visual_capture_start( IWineCompositionVisualCapture *iface, ID3D11Device *device,
++                                            IWineCompositionCaptureSink *sink, IUnknown **capture )
++{
++    struct visual *visual = impl_from_IWineCompositionVisualCapture( iface );
++    return capture_start( visual, device, sink, capture );
++}
++
++static const struct IWineCompositionVisualCaptureVtbl visual_capture_vtbl =
++{
++    visual_capture_QueryInterface,
++    visual_capture_AddRef,
++    visual_capture_Release,
++    /* IWineCompositionVisualCapture methods */
++    visual_capture_get_size,
++    visual_capture_start,
++};
++
+ HRESULT visual_create( struct compositor *compositor, enum visual_kind kind, struct visual **out )
+ {
+     struct visual *visual;
+@@ -1399,6 +1478,7 @@ HRESULT visual_create( struct compositor *compositor, enum visual_kind kind, str
+     visual->ISpriteVisual_iface.lpVtbl = &sprite_vtbl;
+     visual->ISpriteVisual2_iface.lpVtbl = &sprite2_vtbl;
+     visual->IRedirectVisual_iface.lpVtbl = &redirect_vtbl;
++    visual->IWineCompositionVisualCapture_iface.lpVtbl = &visual_capture_vtbl;
+     visual->kind = kind;
+     list_init( &visual->children );
+ 
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 7b8cd299cf0..f475d00744b 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1166,6 +1166,7 @@ SOURCES = \
+ 	wine/winebth.h \
+ 	wine/wined3d.h \
+ 	wine/winedmo.h \
++	wine/winecomposition.idl \
+ 	wine/winedxgi.idl \
+ 	wine/wingdi16.h \
+ 	wine/winnet16.h \
+diff --git a/include/wine/winecomposition.idl b/include/wine/winecomposition.idl
+new file mode 100644
+index 00000000000..bbbf4f63c50
+--- /dev/null
++++ b/include/wine/winecomposition.idl
+@@ -0,0 +1,54 @@
++/*
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep header
++
++import "unknwn.idl";
++import "d3d11.idl";
++
++/*
++ * What captures a composition visual (Windows.Graphics.Capture) gives the
++ * composition: the texture to draw each frame into, and a call once it is
++ * drawn.  Both are called on the compositor's thread with its lock held.
++ */
++[
++    object,
++    local,
++    uuid(8e3e8546-236a-4150-b1f5-7fd71ac83d2c)
++]
++interface IWineCompositionCaptureSink : IUnknown
++{
++    /* S_FALSE, and no texture, while every buffer is in use */
++    HRESULT get_buffer([out] ID3D11Texture2D **texture);
++    /* the size is of what was drawn, the time in 100 ns units from the performance counter */
++    void frame_drawn([in] ID3D11Texture2D *texture, [in] UINT width, [in] UINT height, [in] LONGLONG time);
++}
++
++/* What a visual of Wine's composition offers a capture of it. */
++[
++    object,
++    local,
++    uuid(2c5bfbc8-6db9-45d9-b0d8-47ffb816c2c9)
++]
++interface IWineCompositionVisualCapture : IUnknown
++{
++    HRESULT get_size([out] UINT *width, [out] UINT *height);
++    /* Draws the visual, and what is in it, into the sink's buffers on every frame the compositor draws from
++     * now on, the first one soon.  Releasing the object returned stops it. */
++    HRESULT start([in] ID3D11Device *device, [in] IWineCompositionCaptureSink *sink, [out] IUnknown **capture);
++}

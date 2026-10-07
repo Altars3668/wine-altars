@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 16:35:43 -0400
+Subject: [PATCH] wineps.drv: print both sides on a printer that has no
+ duplexer.
+
+Windows offers "print on both sides (manually)" on printers without a duplexer,
+and the prompt that follows is the printer's own: it prints one side, then stops
+at its panel asking for the paper back and waits for the button. That is not a
+dialog on the screen -- it is the second half of the job arriving through the
+manual feeder, which is what makes the printer ask.
+
+Wine made it unaskable at four separate points, each of which dropped the
+request a little further along:
+
+  DeviceCapabilities(DC_DUPLEX)  returned 0 with no *Duplex in the ppd, so
+                                 applications stopped offering it at all
+  the default DEVMODE            never set DM_DUPLEX, so nothing carried
+  PSDRV_MergeDevmodes            discarded dmDuplex unless the ppd had a
+                                 duplexer
+  the property sheet             hid the control entirely
+
+All four now treat "no duplexer" as "do it by hand" rather than "cannot".
+The combo offers None / Manually, flip on long edge / Manually, flip on short
+edge, in DMDUP_SIMPLEX, _VERTICAL, _HORIZONTAL order.
+
+PrintDocumentOnPrintProcessor does the work, in two passes over the same spool
+file. CUPS' page-set filter picks the halves, so both passes send the same pages
+and only the job ticket differs -- nothing in the rendering path has to know.
+The second pass sets the DEVMODE's input slot to the manual feeder, and the
+printer takes it from there. Where a ppd has no manual feeder there is nothing
+to hold the job, so that case asks on screen instead.
+
+Measured, with the port redirected to a command so no paper was used:
+
+  %!PS-Adobe-3.0                      <- first document
+  %cupsJobTicket: media=A4
+  %cupsJobTicket: page-set=odd
+  %!PS-Adobe-3.0                      <- second document
+  %cupsJobTicket: media=A4
+  %cupsJobTicket: page-set=even
+  %%BeginFeature: *InputSlot Manual
+  <</MediaPosition 12>>setpagedevice
+
+against an HP LaserJet Tank MFP 1005w whose ppd -- HP's own, compiled by CUPS --
+has no *Duplex keyword anywhere and does have *InputSlot Manual.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit c82024de5a1e7981e3607eb4356e6133c6095e80)
+
+diff --git a/dlls/wineps.drv/driver.c b/dlls/wineps.drv/driver.c
+index 8bd80f8ba17..c264e06c399 100644
+--- a/dlls/wineps.drv/driver.c
++++ b/dlls/wineps.drv/driver.c
+@@ -185,7 +185,11 @@ void PSDRV_MergeDevmodes( PSDRV_DEVMODE *dm1, const DEVMODEW *dm2, PRINTERINFO *
+        dm1->dmPublic.dmPrintQuality = dm2->dmPrintQuality;
+    if (dm2->dmFields & DM_COLOR )
+        dm1->dmPublic.dmColor = dm2->dmColor;
+-   if (dm2->dmFields & DM_DUPLEX && pi->ppd->DefaultDuplex && pi->ppd->DefaultDuplex->WinDuplex != 0)
++   /* Take a duplex request whether or not the printer has a duplexer: without
++    * one the print processor does it by hand, sending the second side through
++    * the manual feeder.  Dropping it here is what used to make that request
++    * vanish between the application asking and the driver printing. */
++   if (dm2->dmFields & DM_DUPLEX)
+        dm1->dmPublic.dmDuplex = dm2->dmDuplex;
+    if (dm2->dmFields & DM_YRESOLUTION )
+        dm1->dmPublic.dmYResolution = dm2->dmYResolution;
+@@ -271,8 +275,26 @@ static INT_PTR CALLBACK PSDRV_PaperDlgProc(HWND hwnd, UINT msg,
+ 
+     if (list_empty( &di->pi->ppd->Duplexes ))
+     {
+-        ShowWindow(GetDlgItem(hwnd, IDD_DUPLEX), SW_HIDE);
+-        ShowWindow(GetDlgItem(hwnd, IDD_DUPLEX_NAME), SW_HIDE);
++        /* No duplexer.  Windows still offers to print both sides by hand on
++         * such a printer, and so does this: the print processor sends one
++         * side, then sends the other through the manual feeder so the printer
++         * asks for the paper on its own panel and waits for the button.
++         * Hiding this control is what used to make that impossible to ask for.
++         * The entries are in DMDUP_SIMPLEX, _VERTICAL, _HORIZONTAL order, so
++         * the index is the value less DMDUP_SIMPLEX. */
++        WCHAR buf[64];
++        int k;
++
++        LoadStringW(PSDRV_hInstance, IDS_DUPLEX_NONE, buf, ARRAY_SIZE(buf));
++        SendDlgItemMessageW(hwnd, IDD_DUPLEX, CB_INSERTSTRING, 0, (LPARAM)buf);
++        LoadStringW(PSDRV_hInstance, IDS_DUPLEX_MANUAL_LONG, buf, ARRAY_SIZE(buf));
++        SendDlgItemMessageW(hwnd, IDD_DUPLEX, CB_INSERTSTRING, 1, (LPARAM)buf);
++        LoadStringW(PSDRV_hInstance, IDS_DUPLEX_MANUAL_SHORT, buf, ARRAY_SIZE(buf));
++        SendDlgItemMessageW(hwnd, IDD_DUPLEX, CB_INSERTSTRING, 2, (LPARAM)buf);
++
++        k = di->pi->Devmode->dmPublic.dmDuplex;
++        if (k < DMDUP_SIMPLEX || k > DMDUP_HORIZONTAL) k = DMDUP_SIMPLEX;
++        SendDlgItemMessageA(hwnd, IDD_DUPLEX, CB_SETCURSEL, k - DMDUP_SIMPLEX, 0);
+     }
+     else
+     {
+@@ -459,15 +481,25 @@ static INT_PTR CALLBACK PSDRV_PaperDlgProc(HWND hwnd, UINT msg,
+     case IDD_DUPLEX:
+       if(HIWORD(wParam) == CBN_SELCHANGE) {
+ 	Cursel = SendDlgItemMessageA(hwnd, LOWORD(wParam), CB_GETCURSEL, 0, 0);
+-        i = 0;
+-        LIST_FOR_EACH_ENTRY( duplex, &di->pi->ppd->Duplexes, DUPLEX, entry )
+-        {
+-            if (i >= Cursel) break;
+-            i++;
+-        }
+-        TRACE("Setting duplex to item %d Winduplex = %d\n", Cursel, duplex->WinDuplex);
+-        di->dlgdm->dmPublic.dmDuplex = duplex->WinDuplex;
+-        di->dlgdm->dmPublic.dmFields |= DM_DUPLEX;
++          if (list_empty( &di->pi->ppd->Duplexes ))
++          {
++              /* The manual entries, in DMDUP_* order. */
++              di->dlgdm->dmPublic.dmDuplex = DMDUP_SIMPLEX + Cursel;
++              TRACE("Setting manual duplex to item %d, dmDuplex = %d\n",
++                    Cursel, di->dlgdm->dmPublic.dmDuplex);
++          }
++          else
++          {
++              i = 0;
++              LIST_FOR_EACH_ENTRY( duplex, &di->pi->ppd->Duplexes, DUPLEX, entry )
++              {
++                  if (i >= Cursel) break;
++                  i++;
++              }
++              TRACE("Setting duplex to item %d Winduplex = %d\n", Cursel, duplex->WinDuplex);
++              di->dlgdm->dmPublic.dmDuplex = duplex->WinDuplex;
++          }
++          di->dlgdm->dmPublic.dmFields |= DM_DUPLEX;
+         SendMessageW(GetParent(hwnd), PSM_CHANGED, 0, 0);
+       }
+       break;
+@@ -799,9 +831,13 @@ DWORD WINAPI DrvDeviceCapabilities(HANDLE printer, WCHAR *device_name, WORD capa
+     break;
+ 
+   case DC_DUPLEX:
+-    ret = 0;
+-    if(pi->ppd->DefaultDuplex && pi->ppd->DefaultDuplex->WinDuplex != 0)
+-      ret = 1;
++    /* A printer without a duplexer can still print both sides: the print
++     * processor sends the odd pages, asks for the stack to go back in the
++     * other way up, and sends the even ones.  Reporting 0 here is what stops
++     * applications from offering it at all, so report 1 either way -- the
++     * difference between doing it in the hardware and doing it by hand shows
++     * up in the names the property sheet offers, not here. */
++    ret = 1;
+     TRACE("DC_DUPLEX: returning %ld\n", ret);
+     break;
+ 
+diff --git a/dlls/wineps.drv/init.c b/dlls/wineps.drv/init.c
+index 6f9f8e2918e..ad192889527 100644
+--- a/dlls/wineps.drv/init.c
++++ b/dlls/wineps.drv/init.c
+@@ -756,7 +756,13 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+        WinDuplex == 0 is a special case which means that the ppd has a
+        *DefaultDuplex: NotCapable entry.  In this case we'll try not to confuse
+        apps and set dmDuplex to DMDUP_SIMPLEX but leave the DM_DUPLEX clear.
+-       PSDRV_WriteHeader understands this and copes. */
++       PSDRV_WriteHeader understands this and copes.
++
++       A ppd with no *Duplex at all is a different case and gets the bit: the
++       printer has no duplexer, but the print processor can still print both
++       sides by hand, sending the second one through the manual feeder.  With
++       the bit clear the request never survives as far as the DEVMODE the
++       processor is handed, and there is no way to ask for it. */
+     pi->Devmode->dmPublic.dmFields &= ~DM_DUPLEX;
+     if(pi->ppd->DefaultDuplex) {
+         pi->Devmode->dmPublic.dmDuplex = pi->ppd->DefaultDuplex->WinDuplex;
+@@ -765,6 +771,10 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+         else
+             pi->Devmode->dmPublic.dmDuplex = DMDUP_SIMPLEX;
+     }
++    else if (list_empty( &pi->ppd->Duplexes )) {
++        pi->Devmode->dmPublic.dmDuplex = DMDUP_SIMPLEX;
++        pi->Devmode->dmPublic.dmFields |= DM_DUPLEX;
++    }
+ 
+     set_devmode( hPrinter, pi->Devmode );
+ 
+diff --git a/dlls/wineps.drv/printproc.c b/dlls/wineps.drv/printproc.c
+index 91e4f651d4b..4ac67b17f89 100644
+--- a/dlls/wineps.drv/printproc.c
++++ b/dlls/wineps.drv/printproc.c
+@@ -29,6 +29,7 @@
+ #include <usp10.h>
+ 
+ #include "psdrv.h"
++#include "psdlg.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -3000,10 +3001,39 @@ HANDLE WINAPI OpenPrintProcessor(WCHAR *port, PRINTPROCESSOROPENDATA *open_data)
+     return (HANDLE)data;
+ }
+ 
+-BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
++/* The slot a printer asks for paper through.  PPDs spell it several ways:
++ * Wine maps a "*ManualFeed True" entry to DMBIN_MANUAL, while a plain
++ * "*InputSlot Manual" gets a generated bin number like any other tray, so the
++ * name has to be looked at too. */
++static INPUTSLOT *find_manual_slot(PPD *ppd)
+ {
+-    struct pp_data *data = get_handle_data(pp);
+-    DEVMODEW *devmode = NULL;
++    INPUTSLOT *slot;
++
++    if (!ppd) return NULL;
++
++    LIST_FOR_EACH_ENTRY(slot, &ppd->InputSlots, INPUTSLOT, entry)
++    {
++        if (slot->WinBin == DMBIN_MANUAL)
++            return slot;
++        if (slot->Name && !_strnicmp(slot->Name, "Manual", 6))
++            return slot;
++    }
++    return NULL;
++}
++
++/* Print the spooled document once, optionally asking CUPS for only one half of
++ * its pages.  Manual duplex runs this twice.
++ *
++ * Selecting the half is left to CUPS' page-set filter rather than done here:
++ * both passes send exactly the same pages, and only the job ticket differs, so
++ * nothing in the rendering path has to know about it. */
++static BOOL print_pass(struct pp_data *data, WCHAR *doc_name, const char *page_set,
++                       BOOL manual_feed)
++{
++    DEVMODEW *dm = &data->ctx->Devmode->dmPublic;
++    DWORD saved_source = dm->dmDefaultSource;
++    DWORD saved_fields = dm->dmFields;
++    BOOL pass_ret;
+     emfspool_header header;
+     LARGE_INTEGER pos, cur;
+     record_hdr record;
+@@ -3012,28 +3042,25 @@ BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
+     BOOL ret;
+     DWORD r;
+ 
+-    TRACE("%p, %s\n", pp, debugstr_w(doc_name));
+-
+-    if (!data)
++    if (!OpenPrinterW(doc_name, &spool_data, NULL))
+         return FALSE;
+ 
+-    spool_data = GdiGetSpoolFileHandle(data->port,
+-            &data->ctx->Devmode->dmPublic, doc_name);
+-    GdiGetDevmodeForPage(spool_data, 1, &devmode, NULL);
+-    if (devmode && devmode->dmFields & DM_COPIES)
+-    {
+-        data->ctx->Devmode->dmPublic.dmFields |= DM_COPIES;
+-        data->ctx->Devmode->dmPublic.dmCopies = devmode->dmCopies;
+-    }
+-    if (devmode && devmode->dmFields & DM_COLLATE)
++    data->ctx->job.page_set = page_set;
++
++    /* The second side goes through the manual feeder.  That is what makes the
++     * printer itself stop and ask for the paper on its own panel, and wait for
++     * the button, which is how this works on Windows -- the prompt belongs to
++     * the printer, not to a dialog on the screen. */
++    if (manual_feed)
+     {
+-        data->ctx->Devmode->dmPublic.dmFields |= DM_COLLATE;
+-        data->ctx->Devmode->dmPublic.dmCollate = devmode->dmCollate;
+-    }
+-    GdiDeleteSpoolFileHandle(spool_data);
++        INPUTSLOT *slot = find_manual_slot(data->ctx->pi->ppd);
+ 
+-    if (!OpenPrinterW(doc_name, &spool_data, NULL))
+-        return FALSE;
++        if (slot)
++        {
++            dm->dmDefaultSource = slot->WinBin;
++            dm->dmFields |= DM_DEFAULTSOURCE;
++        }
++    }
+ 
+     info.pDocName = data->doc_name;
+     info.pOutputFile = data->out_file;
+@@ -3164,9 +3191,101 @@ cleanup:
+ 
+     HeapFree(GetProcessHeap(), 0, data->ctx->job.doc_name);
+     ClosePrinter(spool_data);
+-    return EndDocPrinter(data->hport) && ret;
++    pass_ret = EndDocPrinter(data->hport) && ret;
++    data->ctx->job.page_set = NULL;
++    dm->dmDefaultSource = saved_source;
++    dm->dmFields = saved_fields;
++    return pass_ret;
++}
++
++/* Duplex on a printer that cannot do it by itself.
++ *
++ * Windows printers that lack a duplexer are still offered "print on both sides
++ * (manually)": one side is printed, the stack goes back in the tray the other
++ * way up, and a prompt waits for the person to say it is ready.  Here the PPD
++ * has no *Duplex at all, so a request for it would otherwise be dropped on the
++ * floor -- DeviceCapabilities says the printer cannot, applications stop
++ * offering it, and there is no way to print both sides at all.
++ *
++ * This runs in the application's process, because that is where localspl
++ * schedules the job from, so the prompt belongs to the application the way the
++ * one on Windows does. */
++static BOOL manual_duplex_wanted(struct pp_data *data)
++{
++    const DEVMODEW *dm = &data->ctx->Devmode->dmPublic;
++
++    if (!(dm->dmFields & DM_DUPLEX) || dm->dmDuplex == DMDUP_SIMPLEX)
++        return FALSE;
++    /* A printer with a duplexer does it for us. */
++    return !data->ctx->pi || !data->ctx->pi->ppd ||
++           list_empty(&data->ctx->pi->ppd->Duplexes);
++}
++
++/* Say on screen what a printer with no manual feeder cannot say for itself. */
++static BOOL ask_to_reinsert_paper(void)
++{
++    WCHAR text[512], caption[128];
++
++    if (!LoadStringW(PSDRV_hInstance, IDS_MANUAL_DUPLEX_TEXT, text, ARRAY_SIZE(text)))
++        lstrcpyW(text, L"The first side has been printed.\n\n"
++                       L"Put the printed sheets back in the tray with the other side "
++                       L"up, then continue.");
++    if (!LoadStringW(PSDRV_hInstance, IDS_MANUAL_DUPLEX_CAPTION, caption, ARRAY_SIZE(caption)))
++        lstrcpyW(caption, L"Manual duplex");
++
++    return MessageBoxW(NULL, text, caption, MB_OKCANCEL | MB_ICONINFORMATION |
++                       MB_SETFOREGROUND | MB_TOPMOST) == IDOK;
+ }
+ 
++BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
++{
++    struct pp_data *data = get_handle_data(pp);
++    DEVMODEW *devmode = NULL;
++    HANDLE spool_data;
++    BOOL manual_feeder;
++
++    TRACE("%p, %s\n", pp, debugstr_w(doc_name));
++
++    if (!data)
++        return FALSE;
++
++    spool_data = GdiGetSpoolFileHandle(data->port,
++            &data->ctx->Devmode->dmPublic, doc_name);
++    GdiGetDevmodeForPage(spool_data, 1, &devmode, NULL);
++    if (devmode && devmode->dmFields & DM_COPIES)
++    {
++        data->ctx->Devmode->dmPublic.dmFields |= DM_COPIES;
++        data->ctx->Devmode->dmPublic.dmCopies = devmode->dmCopies;
++    }
++    if (devmode && devmode->dmFields & DM_COLLATE)
++    {
++        data->ctx->Devmode->dmPublic.dmFields |= DM_COLLATE;
++        data->ctx->Devmode->dmPublic.dmCollate = devmode->dmCollate;
++    }
++    GdiDeleteSpoolFileHandle(spool_data);
++
++    if (!manual_duplex_wanted(data))
++        return print_pass(data, doc_name, NULL, FALSE);
++
++    manual_feeder = find_manual_slot(data->ctx->pi->ppd) != NULL;
++    TRACE("manual duplex: odd pages first, second side %s\n",
++          manual_feeder ? "through the manual feeder" : "after a prompt");
++
++    if (!print_pass(data, doc_name, "odd", FALSE))
++        return FALSE;
++
++    /* With a manual feeder both jobs go out together: the printer prints the
++     * first side, then holds the second job at its own "load paper" prompt
++     * until the button is pressed.  Without one there is nothing to hold the
++     * job, so ask here instead. */
++    if (!manual_feeder && !ask_to_reinsert_paper())
++    {
++        TRACE("manual duplex: cancelled before the second side\n");
++        return TRUE;   /* the first side did print */
++    }
++
++    return print_pass(data, doc_name, "even", manual_feeder);
++}
+ BOOL WINAPI ControlPrintProcessor(HANDLE pp, DWORD cmd)
+ {
+     FIXME("%p, %ld\n", pp, cmd);
+diff --git a/dlls/wineps.drv/ps.c b/dlls/wineps.drv/ps.c
+index 7a8feeaedb8..5538b876272 100644
+--- a/dlls/wineps.drv/ps.c
++++ b/dlls/wineps.drv/ps.c
+@@ -50,6 +50,7 @@ static const char *cups_duplexes[3] =
+ static const char cups_collate_false[] = "%cupsJobTicket: collate=false\n";
+ static const char cups_collate_true[] = "%cupsJobTicket: collate=true\n";
+ static const char cups_ap_d_inputslot[] = "%cupsJobTicket: AP_D_InputSlot=\n"; /* intentionally empty value */
++static const char cups_page_set[] = "%cupsJobTicket: page-set=";
+ 
+ static const char psheader[] = /* title */
+ "%%%%Creator: Wine PostScript Driver\n"
+@@ -392,6 +393,13 @@ static void write_cups_job_ticket( print_ctx *ctx, const struct ticket_info *inf
+         }
+     }
+ 
++    if (ctx->job.page_set)
++    {
++        len = snprintf( buf, sizeof(buf), "%s%s\n", cups_page_set, ctx->job.page_set );
++        if (len > 0 && len < sizeof(buf))
++            write_spool( ctx, buf, len );
++    }
++
+     if (!(ctx->Devmode->dmPublic.dmFields & DM_DEFAULTSOURCE) ||
+         ctx->Devmode->dmPublic.dmDefaultSource == DMBIN_AUTO)
+         write_spool( ctx, cups_ap_d_inputslot, sizeof(cups_ap_d_inputslot) - 1 );
+diff --git a/dlls/wineps.drv/psdlg.h b/dlls/wineps.drv/psdlg.h
+index b5be402fc90..3976c6dc8c0 100644
+--- a/dlls/wineps.drv/psdlg.h
++++ b/dlls/wineps.drv/psdlg.h
+@@ -41,5 +41,10 @@
+ #define IDS_DPI 1000
+ #define IDS_COLOR 1001
+ #define IDS_MONOCHROME 1002
++#define IDS_MANUAL_DUPLEX_CAPTION 1003
++#define IDS_MANUAL_DUPLEX_TEXT 1004
++#define IDS_DUPLEX_NONE 1007
++#define IDS_DUPLEX_MANUAL_LONG 1005
++#define IDS_DUPLEX_MANUAL_SHORT 1006
+ 
+ #endif /* __WINE_PSDLG_H */
+diff --git a/dlls/wineps.drv/psdrv.h b/dlls/wineps.drv/psdrv.h
+index 4fe5db78e22..b3df1633d3b 100644
+--- a/dlls/wineps.drv/psdrv.h
++++ b/dlls/wineps.drv/psdrv.h
+@@ -336,6 +336,11 @@ typedef struct {
+     enum passthrough    passthrough_state;
+     BYTE                data[4096];
+     int                 data_cnt;
++    /* Which half of a manual duplex job this pass is printing: "odd", "even",
++     * or NULL for an ordinary one-pass job.  CUPS' page-set filter does the
++     * selecting, so both passes send the same pages and only the ticket
++     * differs. */
++    const char          *page_set;
+ } JOB;
+ 
+ typedef struct
+diff --git a/dlls/wineps.drv/wineps.rc b/dlls/wineps.drv/wineps.rc
+index 5cd4167e8da..86aa80bafbb 100644
+--- a/dlls/wineps.drv/wineps.rc
++++ b/dlls/wineps.drv/wineps.rc
+@@ -71,4 +71,9 @@ STRINGTABLE
+  IDS_DPI "#msgctxt#unit: dots/inch#dpi"
+  IDS_COLOR "Color"
+  IDS_MONOCHROME "Black and White"
++ IDS_MANUAL_DUPLEX_CAPTION "Manual duplex"
++ IDS_MANUAL_DUPLEX_TEXT "The first side has been printed.\n\nPut the printed sheets back in the tray with the other side up, then continue."
++ IDS_DUPLEX_NONE "None"
++ IDS_DUPLEX_MANUAL_LONG "Manually, flip on long edge"
++ IDS_DUPLEX_MANUAL_SHORT "Manually, flip on short edge"
+ }

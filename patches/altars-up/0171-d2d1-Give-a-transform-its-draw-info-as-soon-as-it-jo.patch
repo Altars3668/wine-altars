@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 18:11:08 -0400
+Subject: [PATCH] d2d1: Give a transform its draw info as soon as it joins the
+ graph.
+
+SetDrawInfo came after Initialize returned.  Office's own effects set
+their pixel shader on the draw info inside Initialize, straight after
+SetSingleTransformNode: gfx.dll's glow effect calls SetSingleTransformNode
+with its transform, loads its shader and calls SetPixelShader through the
+draw info its SetDrawInfo stored, which it could only do if Windows had
+called SetDrawInfo by then; here the draw info was still NULL and
+PowerPoint crashed applying a glow.  A draw transform now gets its draw
+info when it is added to the graph; a failure is reported when the effect
+is drawn, as the documentation says.
+
+The test checks the call inside Initialize, following what gfx.dll does
+on Windows; the order was not measured there directly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 89b2615c0640ccdfa391d46a82e6bb8df1153d74)
+
+diff --git a/dlls/d2d1/effect.c b/dlls/d2d1/effect.c
+index 6478bc24a18..f7618a969b2 100644
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -625,10 +625,13 @@ static struct d2d_transform_node * d2d_transform_graph_get_node(const struct d2d
+     return NULL;
+ }
+ 
++static HRESULT d2d_transform_node_initialize(struct d2d_transform_node *node);
++
+ static HRESULT d2d_transform_graph_add_node(struct d2d_transform_graph *graph,
+         ID2D1TransformNode *object)
+ {
+     struct d2d_transform_node *node;
++    HRESULT hr;
+ 
+     if (!(node = calloc(1, sizeof(*node))))
+         return E_OUTOFMEMORY;
+@@ -643,6 +646,11 @@ static HRESULT d2d_transform_graph_add_node(struct d2d_transform_graph *graph,
+     ID2D1TransformNode_AddRef(node->object);
+     list_add_tail(&graph->nodes, &node->entry);
+ 
++    /* A transform has its draw info as soon as it is in the graph: effects set their shaders on it straight
++     * after, still in Initialize.  What goes wrong here is reported when the effect is drawn. */
++    if (FAILED(hr = d2d_transform_node_initialize(node)))
++        WARN("Failed to initialize node %p, hr %#lx.\n", node, hr);
++
+     return S_OK;
+ }
+ 
+@@ -4683,36 +4691,44 @@ static bool d2d_transform_node_needs_render_info(const struct d2d_transform_node
+     return false;
+ }
+ 
+-static HRESULT d2d_effect_transform_graph_initialize_nodes(struct d2d_transform_graph *graph)
++static HRESULT d2d_transform_node_initialize(struct d2d_transform_node *node)
+ {
+     ID2D1DrawTransform *draw_transform;
+-    struct d2d_transform_node *node;
+     HRESULT hr;
+ 
+-    LIST_FOR_EACH_ENTRY(node, &graph->nodes, struct d2d_transform_node, entry)
++    if (node->render_info || !d2d_transform_node_needs_render_info(node))
++        return S_OK;
++
++    if (FAILED(hr = d2d_effect_render_info_create(node->input_count, &node->render_info)))
++        return hr;
++
++    if (FAILED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1DrawTransform, (void **)&draw_transform)))
++    {
++        FIXME("Unsupported node %p.\n", node);
++        return E_NOTIMPL;
++    }
++    hr = ID2D1DrawTransform_SetDrawInfo(draw_transform, &node->render_info->ID2D1DrawInfo_iface);
++    ID2D1DrawTransform_Release(draw_transform);
++    if (FAILED(hr))
+     {
+-        /* what was added since the last time is all there is to do */
+-        if (node->render_info || !d2d_transform_node_needs_render_info(node))
+-            continue;
++        /* tried again, and reported, when the effect is drawn */
++        ID2D1DrawInfo_Release(&node->render_info->ID2D1DrawInfo_iface);
++        node->render_info = NULL;
++    }
++    return hr;
++}
+ 
+-        if (FAILED(hr = d2d_effect_render_info_create(node->input_count, &node->render_info)))
+-            return hr;
++static HRESULT d2d_effect_transform_graph_initialize_nodes(struct d2d_transform_graph *graph)
++{
++    struct d2d_transform_node *node;
++    HRESULT hr;
+ 
+-        if (SUCCEEDED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1DrawTransform,
+-                (void **)&draw_transform)))
+-        {
+-            hr = ID2D1DrawTransform_SetDrawInfo(draw_transform, &node->render_info->ID2D1DrawInfo_iface);
+-            ID2D1DrawTransform_Release(draw_transform);
+-            if (FAILED(hr))
+-            {
+-                WARN("Failed to set draw info, hr %#lx.\n", hr);
+-                return hr;
+-            }
+-        }
+-        else
++    LIST_FOR_EACH_ENTRY(node, &graph->nodes, struct d2d_transform_node, entry)
++    {
++        if (FAILED(hr = d2d_transform_node_initialize(node)))
+         {
+-            FIXME("Unsupported node %p.\n", node);
+-            return E_NOTIMPL;
++            WARN("Failed to set draw info, hr %#lx.\n", hr);
++            return hr;
+         }
+     }
+ 
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index 1ebbdc831b3..cbd9e803214 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -507,6 +507,7 @@ struct effect_impl
+     const GUID *vertex_buffer;
+     const GUID *vertex_shader;
+     const GUID *pixel_shader;
++    unsigned int draw_info_count;
+ };
+ 
+ static void queue_d3d1x_test(void (*test)(BOOL d3d11), BOOL d3d11)
+@@ -16690,12 +16691,18 @@ static HRESULT STDMETHODCALLTYPE ps_effect_impl_Initialize(ID2D1EffectImpl *ifac
+         ID2D1EffectContext *context, ID2D1TransformGraph *graph)
+ {
+     struct effect_impl *effect_impl = impl_from_ID2D1EffectImpl(iface);
++    HRESULT hr;
+ 
+     effect_impl->effect_context = context;
+     ID2D1EffectContext_AddRef(effect_impl->effect_context);
+ 
+-    return ID2D1TransformGraph_SetSingleTransformNode(graph,
++    hr = ID2D1TransformGraph_SetSingleTransformNode(graph,
+             (ID2D1TransformNode *)&effect_impl->ID2D1DrawTransform_iface);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    /* The transform has its draw info as soon as it is in the graph, while Initialize still runs. */
++    ok(effect_impl->draw_info_count == 1, "Got %u calls to SetDrawInfo.\n", effect_impl->draw_info_count);
++
++    return hr;
+ }
+ 
+ static const ID2D1EffectImplVtbl custom_effect_impl_vtbl =
+@@ -16771,6 +16778,7 @@ static HRESULT STDMETHODCALLTYPE effect_impl_draw_transform_SetDrawInfo(ID2D1Dra
+     HRESULT hr = S_OK;
+     ULONG refcount;
+ 
++    ++effect_impl->draw_info_count;
+     check_interface(info, &IID_IUnknown, TRUE);
+     check_interface(info, &IID_ID2D1RenderInfo, TRUE);
+     check_interface(info, &IID_ID2D1EffectContext, FALSE);

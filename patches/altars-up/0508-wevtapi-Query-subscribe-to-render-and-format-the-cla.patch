@@ -1,0 +1,4822 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 00:02:13 -0400
+Subject: [PATCH] wevtapi: Query, subscribe to, render and format the classic
+ event logs.
+
+Everything but a few functions was a stub.  The API now works over the
+classic logs advapi32 keeps, as Windows 11 does it (tools/startupgapsprobe
+evtapi, evtquery, evtlimits, evtsub, evtrender, evtmsg):
+
+- Queries of channels, files and structured queries with Suppress, with
+  the XPath the event log takes: band(), timediff(), !=, positions and
+  position(); a position is the element there when compared, only the
+  first element is looked at when testing whether there is one; a
+  string is compared with a number as one only if it is a number all
+  through; at most 24 parentheses, 21 predicates and 23 operands of
+  "and" or "or".  Windows' results for a position compared with != < >
+  contradict themselves and are not copied.
+- Subscriptions: the events there already are there for EvtNext at once
+  and do not set the signal, EvtNext never waits, asking again after it
+  said there are no more is an invalid operation, the signal is the
+  caller's to reset, a callback is called on the subscription's thread.
+- Rendering of the event XML and of the system, user and path contexts,
+  with Windows' layout: each value's data from the next multiple of 8,
+  the strings of a classic event an array (the user context still
+  leaves room for its table), the whole buffer cleared, render paths a
+  tree in which an element already there cannot be added again.
+- Formatting of messages, levels, tasks and keywords in the publisher's
+  language or the user's, with the terminators Windows gives each, and
+  of the XML with its RenderingInfo; bookmarks, log information,
+  clearing and exporting logs, channels and their configuration.
+
+What is not the same: classic records have no process and thread ids,
+so Execution has 0 for both; log files are .evt.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/wevtapi/Makefile.in b/dlls/wevtapi/Makefile.in
+index 7214a203056..75251b23c6e 100644
+--- a/dlls/wevtapi/Makefile.in
++++ b/dlls/wevtapi/Makefile.in
+@@ -1,5 +1,8 @@
+ MODULE    = wevtapi.dll
+ IMPORTLIB = wevtapi
++IMPORTS   = advapi32
+ 
+ SOURCES = \
+-	main.c
++	event.c \
++	main.c \
++	wevtapi.mc
+diff --git a/dlls/wevtapi/event.c b/dlls/wevtapi/event.c
+new file mode 100644
+index 00000000000..592ba07552e
+--- /dev/null
++++ b/dlls/wevtapi/event.c
+@@ -0,0 +1,1328 @@
++/*
++ * Events of the classic logs as XML, and the XPath that selects them
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "wevtapi_private.h"
++#include "winternl.h"
++#include "sddl.h"
++#include <stdio.h>
++
++
++WCHAR *strdupW( const WCHAR *str )
++{
++    WCHAR *ret;
++
++    if (!str) return NULL;
++    if ((ret = malloc( (wcslen( str ) + 1) * sizeof(WCHAR) ))) wcscpy( ret, str );
++    return ret;
++}
++
++/* the keywords Windows gives the events of the classic logs, and their audits */
++#define KEYWORD_CLASSIC        0x0080000000000000ull
++#define KEYWORD_AUDIT_SUCCESS  0x0020000000000000ull
++#define KEYWORD_AUDIT_FAILURE  0x0010000000000000ull
++
++static WCHAR *format_number( ULONGLONG value, BOOL hex )
++{
++    WCHAR buffer[32];
++
++    swprintf( buffer, ARRAY_SIZE(buffer), hex ? L"0x%I64x" : L"%I64u", value );
++    return strdupW( buffer );
++}
++
++static WCHAR *format_system_time( DWORD seconds )
++{
++    LARGE_INTEGER time;
++    TIME_FIELDS tf;
++    WCHAR buffer[40];
++
++    RtlSecondsSince1970ToTime( seconds, &time );
++    RtlTimeToTimeFields( &time, &tf );
++    swprintf( buffer, ARRAY_SIZE(buffer), L"%04u-%02u-%02uT%02u:%02u:%02u.%07uZ", tf.Year, tf.Month, tf.Day,
++              tf.Hour, tf.Minute, tf.Second, (unsigned int)(time.QuadPart % 10000000) );
++    return strdupW( buffer );
++}
++
++BOOL parse_system_time( const WCHAR *text, FILETIME *ft )
++{
++    TIME_FIELDS tf = { 0 };
++    LARGE_INTEGER time;
++    unsigned int year, month, day, hour = 0, minute = 0, second = 0;
++    ULONGLONG fraction = 0, scale = 10000000;
++    const WCHAR *p;
++
++    if (!text || swscanf( text, L"%4u-%2u-%2u", &year, &month, &day ) != 3) return FALSE;
++    if ((p = wcschr( text, 'T' ))) swscanf( p + 1, L"%2u:%2u:%2u", &hour, &minute, &second );
++    if (p && (p = wcschr( p, '.' )))
++        for (p++; *p >= '0' && *p <= '9'; p++)
++        {
++            if (scale > 1)
++            {
++                scale /= 10;
++                fraction += (*p - '0') * scale;
++            }
++        }
++    tf.Year = year;
++    tf.Month = month;
++    tf.Day = day;
++    tf.Hour = hour;
++    tf.Minute = minute;
++    tf.Second = second;
++    if (!RtlTimeFieldsToTime( &tf, &time )) return FALSE;
++    time.QuadPart += fraction;
++    ft->dwLowDateTime = time.u.LowPart;
++    ft->dwHighDateTime = time.u.HighPart;
++    return TRUE;
++}
++
++ULONGLONG node_number( const WCHAR *text )
++{
++    if (!text) return 0;
++    while (*text == ' ') text++;
++    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) return wcstoull( text + 2, NULL, 16 );
++    return wcstoull( text, NULL, 10 );
++}
++
++/* whether a string is a number all through, decimal or 0x hexadecimal: "10.00." compares with 10 as a string */
++static BOOL string_number( const WCHAR *text, LONGLONG *number )
++{
++    WCHAR *end;
++
++    while (*text == ' ') text++;
++    if (!*text) return FALSE;
++    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
++    {
++        if (!text[2]) return FALSE;
++        *number = wcstoull( text + 2, &end, 16 );
++    }
++    else *number = wcstoll( text, &end, 10 );
++    while (*end == ' ') end++;
++    return !*end;
++}
++
++static struct node *add_child( struct node *parent, const WCHAR *name, WCHAR *text, unsigned int type )
++{
++    struct node *node = &parent->children[parent->child_count++];
++
++    memset( node, 0, sizeof(*node) );
++    node->name = name;
++    node->text = text;
++    node->type = type;
++    return node;
++}
++
++static void add_attr( struct node *node, const WCHAR *name, WCHAR *value, unsigned int type )
++{
++    node->attr_names[node->attr_count] = name;
++    node->attr_values[node->attr_count++] = value;
++    if (node->attr_count == 1) node->attr_type = type;
++}
++
++static void free_node_contents( struct node *node )
++{
++    unsigned int i;
++
++    for (i = 0; i < node->attr_count; i++) free( node->attr_values[i] );
++    for (i = 0; i < node->child_count; i++) free_node_contents( &node->children[i] );
++    free( node->children );
++    free( node->text );
++}
++
++void free_node( struct node *root )
++{
++    if (!root) return;
++    free_node_contents( root );
++    free( root );
++}
++
++/* The tree of an event, as Windows 11 renders those of the classic logs: the System element with the provider,
++ * the event ID and its qualifiers, version, level, task (the category), opcode, the classic keyword, the time,
++ * the record number, the process, the channel, the computer and the user; then EventData, a Data element for each
++ * string and Binary for the data. */
++struct node *build_event_tree( const struct event *event )
++{
++    const EVENTLOGRECORD *rec = event->record;
++    const WCHAR *source = (const WCHAR *)(rec + 1), *computer = source + wcslen( source ) + 1;
++    const WCHAR *str = (const WCHAR *)((const BYTE *)rec + rec->StringOffset);
++    struct node *root, *system, *data, *node;
++    ULONGLONG keywords = KEYWORD_CLASSIC;
++    unsigned int level, i;
++    WCHAR *sid = NULL;
++
++    if (!(root = calloc( 1, sizeof(*root) ))) return NULL;
++    root->name = L"Event";
++    root->children = calloc( 2, sizeof(*root->children) );
++    system = add_child( root, L"System", NULL, EvtVarTypeNull );
++    data = add_child( root, L"EventData", NULL, EvtVarTypeNull );
++    system->children = calloc( 14, sizeof(*system->children) );
++    data->children = calloc( rec->NumStrings + 1, sizeof(*data->children) );
++
++    switch (rec->EventType)
++    {
++    case EVENTLOG_ERROR_TYPE:   level = 2; break;
++    case EVENTLOG_WARNING_TYPE: level = 3; break;
++    case EVENTLOG_AUDIT_SUCCESS: level = 0; keywords |= KEYWORD_AUDIT_SUCCESS; break;
++    case EVENTLOG_AUDIT_FAILURE: level = 0; keywords |= KEYWORD_AUDIT_FAILURE; break;
++    default:                    level = 4; break;
++    }
++
++    node = add_child( system, L"Provider", NULL, EvtVarTypeNull );
++    add_attr( node, L"Name", strdupW( source ), EvtVarTypeString );
++    node = add_child( system, L"EventID", format_number( rec->EventID & 0xffff, FALSE ), EvtVarTypeUInt16 );
++    add_attr( node, L"Qualifiers", format_number( rec->EventID >> 16, FALSE ), EvtVarTypeUInt16 );
++    add_child( system, L"Version", strdupW( L"0" ), EvtVarTypeByte );
++    add_child( system, L"Level", format_number( level, FALSE ), EvtVarTypeByte );
++    add_child( system, L"Task", format_number( rec->EventCategory, FALSE ), EvtVarTypeUInt16 );
++    add_child( system, L"Opcode", strdupW( L"0" ), EvtVarTypeByte );
++    add_child( system, L"Keywords", format_number( keywords, TRUE ), EvtVarTypeHexInt64 );
++    node = add_child( system, L"TimeCreated", NULL, EvtVarTypeNull );
++    add_attr( node, L"SystemTime", format_system_time( rec->TimeGenerated ), EvtVarTypeFileTime );
++    add_child( system, L"EventRecordID", format_number( rec->RecordNumber, FALSE ), EvtVarTypeUInt64 );
++    add_child( system, L"Correlation", NULL, EvtVarTypeNull );
++    node = add_child( system, L"Execution", NULL, EvtVarTypeNull );
++    add_attr( node, L"ProcessID", strdupW( L"0" ), EvtVarTypeUInt32 );
++    add_attr( node, L"ThreadID", strdupW( L"0" ), EvtVarTypeUInt32 );
++    add_child( system, L"Channel", strdupW( event->channel ), EvtVarTypeString );
++    add_child( system, L"Computer", strdupW( computer ), EvtVarTypeString );
++    node = add_child( system, L"Security", NULL, EvtVarTypeNull );
++    if (rec->UserSidLength && ConvertSidToStringSidW( (PSID)((const BYTE *)rec + rec->UserSidOffset), &sid ))
++    {
++        add_attr( node, L"UserID", strdupW( sid ), EvtVarTypeSid );
++        LocalFree( sid );
++    }
++
++    for (i = 0; i < rec->NumStrings; i++)
++    {
++        add_child( data, L"Data", strdupW( str ), EvtVarTypeString )->array_item = TRUE;
++        str += wcslen( str ) + 1;
++    }
++    if (rec->DataLength)
++    {
++        const BYTE *bytes = (const BYTE *)rec + rec->DataOffset;
++        WCHAR *hex = malloc( (rec->DataLength * 2 + 1) * sizeof(WCHAR) );
++        DWORD j;
++
++        if (hex)
++        {
++            for (j = 0; j < rec->DataLength; j++) swprintf( hex + j * 2, 3, L"%02X", bytes[j] );
++            hex[rec->DataLength * 2] = 0;
++        }
++        add_child( data, L"Binary", hex, EvtVarTypeBinary );
++    }
++    return root;
++}
++
++struct strbuf
++{
++    WCHAR *data;
++    size_t len, size;
++};
++
++static void append( struct strbuf *buf, const WCHAR *str, size_t len )
++{
++    if (buf->len + len + 1 > buf->size)
++    {
++        size_t size = max( buf->size * 2, buf->len + len + 256 );
++        WCHAR *data = realloc( buf->data, size * sizeof(WCHAR) );
++        if (!data) return;
++        buf->data = data;
++        buf->size = size;
++    }
++    memcpy( buf->data + buf->len, str, len * sizeof(WCHAR) );
++    buf->len += len;
++    buf->data[buf->len] = 0;
++}
++
++static void append_str( struct strbuf *buf, const WCHAR *str )
++{
++    append( buf, str, wcslen( str ) );
++}
++
++static void append_escaped( struct strbuf *buf, const WCHAR *str, BOOL attr )
++{
++    for (; *str; str++)
++    {
++        switch (*str)
++        {
++        case '&': append_str( buf, L"&amp;" ); break;
++        case '<': append_str( buf, L"&lt;" ); break;
++        case '>': append_str( buf, L"&gt;" ); break;
++        case '\'': if (attr) { append_str( buf, L"&apos;" ); break; } /* fall through */
++        default: append( buf, str, 1 ); break;
++        }
++    }
++}
++
++/* an element, with what is in it; one with neither text nor elements is an empty element */
++/* a string as XML text */
++WCHAR *escape_xml( const WCHAR *str )
++{
++    struct strbuf buf = { 0 };
++
++    append( &buf, L"", 0 );
++    append_escaped( &buf, str, FALSE );
++    return buf.data;
++}
++
++static void write_element( struct strbuf *buf, const struct node *node )
++{
++    unsigned int i;
++
++    append_str( buf, L"<" );
++    append_str( buf, node->name );
++    for (i = 0; i < node->attr_count; i++)
++    {
++        append_str( buf, L" " );
++        append_str( buf, node->attr_names[i] );
++        append_str( buf, L"='" );
++        append_escaped( buf, node->attr_values[i] ? node->attr_values[i] : L"", TRUE );
++        append_str( buf, L"'" );
++    }
++    if (!node->text && !node->child_count)
++    {
++        append_str( buf, L"/>" );
++        return;
++    }
++    append_str( buf, L">" );
++    if (node->text) append_escaped( buf, node->text, FALSE );
++    for (i = 0; i < node->child_count; i++) write_element( buf, &node->children[i] );
++    append_str( buf, L"</" );
++    append_str( buf, node->name );
++    append_str( buf, L">" );
++}
++
++WCHAR *write_event_xml( const struct node *tree, const WCHAR *rendering )
++{
++    struct strbuf buf = { 0 };
++    unsigned int i;
++
++    append_str( &buf, L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>" );
++    for (i = 0; i < tree->child_count; i++) write_element( &buf, &tree->children[i] );
++    if (rendering) append_str( &buf, rendering );
++    append_str( &buf, L"</Event>" );
++    return buf.data;
++}
++
++/*
++ * The XPath the event log takes: a path to the events -- "*" or Event, then System, EventData... -- with
++ * predicates of comparisons (=, !=, <, <=, >, >=) joined by "and" and "or", of paths, attributes, strings and
++ * numbers, the functions timediff() and band(), and positions, [2] or [position()=2].  not() and the rest of XPath
++ * are invalid queries, as on Windows 11.
++ *
++ * Positions are what Windows 11 makes of them.  Compared, Data[4]='Multiprocessor Free' is the fourth Data; as a
++ * test of whether there is one, only the first is looked at, so EventData[Data[1]] holds and EventData[Data[2]]
++ * never does.  Windows' answers for a position compared with != < <= > >= follow no rule there is (Data[3]>29670
++ * false and Data[3]>29671 true for the same event) and are not copied; those compare the element the position
++ * names.
++ */
++
++enum expr_type
++{
++    EXPR_PATH,
++    EXPR_STRING,
++    EXPR_NUMBER,
++    EXPR_OR,
++    EXPR_AND,
++    EXPR_COMPARE,
++    EXPR_TIMEDIFF,
++    EXPR_BAND,
++    EXPR_POSITION,
++};
++
++enum compare_op { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE };
++
++struct step
++{
++    WCHAR *name;                /* NULL for any element */
++    struct expr **preds;
++    unsigned int pred_count;
++    BOOL positional;            /* whether there is a position, [n] or position() */
++    BOOL has_position;
++    unsigned int position;      /* [n], 1-based; [0] is no element */
++};
++
++struct expr
++{
++    enum expr_type type;
++    enum compare_op op;
++    struct step *steps;
++    unsigned int step_count;
++    WCHAR *attr;                /* the attribute a path ends with */
++    WCHAR *string;
++    LONGLONG number;
++    struct expr *left, *right;
++    struct expr **args;         /* what "and" or "or" joins */
++    unsigned int arg_count;
++};
++
++struct xpath
++{
++    struct expr *expr;
++};
++
++struct parser
++{
++    const WCHAR *p;
++    BOOL error;
++    BOOL render_path;
++    BOOL position;              /* whether position() was seen */
++    unsigned int depth;         /* of parentheses, predicates and functions, which no query reaches */
++    unsigned int parens;
++    unsigned int preds;
++};
++
++/* How far a query may go on Windows 11: 24 parentheses within each other, 21 predicates, 23 operands joined by
++ * "and" or by "or". */
++#define MAX_DEPTH    64
++#define MAX_PARENS   24
++#define MAX_PREDS    21
++#define MAX_OPERANDS 23
++
++static void free_expr( struct expr *expr )
++{
++    unsigned int i, j;
++
++    if (!expr) return;
++    for (i = 0; i < expr->step_count; i++)
++    {
++        for (j = 0; j < expr->steps[i].pred_count; j++) free_expr( expr->steps[i].preds[j] );
++        free( expr->steps[i].preds );
++        free( expr->steps[i].name );
++    }
++    free( expr->steps );
++    free( expr->attr );
++    free( expr->string );
++    free_expr( expr->left );
++    free_expr( expr->right );
++    for (i = 0; i < expr->arg_count; i++) free_expr( expr->args[i] );
++    free( expr->args );
++    free( expr );
++}
++
++static void skip_space( struct parser *parser )
++{
++    while (*parser->p == ' ' || *parser->p == '\t' || *parser->p == '\r' || *parser->p == '\n') parser->p++;
++}
++
++static BOOL is_name_char( WCHAR c, BOOL first )
++{
++    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c > 0x7f) return TRUE;
++    return !first && ((c >= '0' && c <= '9') || c == '-' || c == '.' || c == ':');
++}
++
++static WCHAR *parse_name( struct parser *parser )
++{
++    const WCHAR *start = parser->p;
++    WCHAR *ret;
++
++    if (!is_name_char( *parser->p, TRUE )) return NULL;
++    while (is_name_char( *parser->p, FALSE )) parser->p++;
++    if (!(ret = malloc( (parser->p - start + 1) * sizeof(WCHAR) ))) return NULL;
++    memcpy( ret, start, (parser->p - start) * sizeof(WCHAR) );
++    ret[parser->p - start] = 0;
++    return ret;
++}
++
++static BOOL keyword( struct parser *parser, const WCHAR *word )
++{
++    size_t len = wcslen( word );
++
++    skip_space( parser );
++    if (wcsncmp( parser->p, word, len ) || is_name_char( parser->p[len], FALSE )) return FALSE;
++    parser->p += len;
++    return TRUE;
++}
++
++static BOOL token( struct parser *parser, WCHAR c )
++{
++    skip_space( parser );
++    if (*parser->p != c) return FALSE;
++    parser->p++;
++    return TRUE;
++}
++
++static struct expr *new_expr( enum expr_type type )
++{
++    struct expr *expr = calloc( 1, sizeof(*expr) );
++    if (expr) expr->type = type;
++    return expr;
++}
++
++static struct expr *parse_expr( struct parser *parser );
++
++/* steps, each with its predicates, and an attribute after the last one */
++static struct expr *parse_path( struct parser *parser )
++{
++    struct expr *expr = new_expr( EXPR_PATH );
++
++    if (!expr) goto error;
++    skip_space( parser );
++    for (;;)
++    {
++        struct step *step, *steps;
++
++        skip_space( parser );
++        if (*parser->p == '@')
++        {
++            parser->p++;
++            if (!(expr->attr = parse_name( parser ))) goto error;
++            break;
++        }
++        if (!(steps = realloc( expr->steps, (expr->step_count + 1) * sizeof(*steps) ))) goto error;
++        expr->steps = steps;
++        step = &expr->steps[expr->step_count++];
++        memset( step, 0, sizeof(*step) );
++        if (*parser->p == '*') parser->p++;
++        else if (!(step->name = parse_name( parser ))) goto error;
++
++        while (token( parser, '[' ))
++        {
++            struct expr **preds, *pred;
++            BOOL position = parser->position;
++
++            skip_space( parser );
++            if (*parser->p >= '0' && *parser->p <= '9')
++            {
++                if (parser->render_path) goto error;
++                step->position = wcstoul( parser->p, (WCHAR **)&parser->p, 10 );
++                step->has_position = step->positional = TRUE;
++                if (!token( parser, ']' )) goto error;
++                continue;
++            }
++            if (parser->preds >= MAX_PREDS) goto error;
++            parser->position = FALSE;
++            parser->preds++;
++            pred = parse_expr( parser );
++            parser->preds--;
++            if (parser->position) step->positional = TRUE;
++            parser->position = position;
++            if (!pred) goto error;
++            if (!(preds = realloc( step->preds, (step->pred_count + 1) * sizeof(*preds) )))
++            {
++                free_expr( pred );
++                goto error;
++            }
++            step->preds = preds;
++            step->preds[step->pred_count++] = pred;
++            if (!token( parser, ']' )) goto error;
++        }
++        skip_space( parser );
++        if (*parser->p != '/') break;
++        parser->p++;
++    }
++    return expr;
++
++error:
++    free_expr( expr );
++    parser->error = TRUE;
++    return NULL;
++}
++
++static struct expr *parse_value_inner( struct parser *parser );
++
++static struct expr *parse_value( struct parser *parser )
++{
++    struct expr *expr;
++
++    if (parser->depth >= MAX_DEPTH)
++    {
++        parser->error = TRUE;
++        return NULL;
++    }
++    parser->depth++;
++    expr = parse_value_inner( parser );
++    parser->depth--;
++    return expr;
++}
++
++static struct expr *parse_value_inner( struct parser *parser )
++{
++    struct expr *expr;
++
++    skip_space( parser );
++    if (*parser->p == '(')
++    {
++        if (parser->parens >= MAX_PARENS) goto error;
++        parser->p++;
++        parser->parens++;
++        expr = parse_expr( parser );
++        parser->parens--;
++        if (!expr || !token( parser, ')' ))
++        {
++            free_expr( expr );
++            parser->error = TRUE;
++            return NULL;
++        }
++        return expr;
++    }
++    if (*parser->p == '\'' || *parser->p == '"')
++    {
++        WCHAR quote = *parser->p++;
++        const WCHAR *end = wcschr( parser->p, quote );
++
++        if (!end || !(expr = new_expr( EXPR_STRING ))) goto error;
++        if (!(expr->string = malloc( (end - parser->p + 1) * sizeof(WCHAR) )))
++        {
++            free_expr( expr );
++            goto error;
++        }
++        memcpy( expr->string, parser->p, (end - parser->p) * sizeof(WCHAR) );
++        expr->string[end - parser->p] = 0;
++        parser->p = end + 1;
++        return expr;
++    }
++    if ((*parser->p >= '0' && *parser->p <= '9') || *parser->p == '-')
++    {
++        if (!(expr = new_expr( EXPR_NUMBER ))) goto error;
++        if (parser->p[0] == '0' && (parser->p[1] == 'x' || parser->p[1] == 'X'))
++            expr->number = wcstoull( parser->p + 2, (WCHAR **)&parser->p, 16 );
++        else
++            expr->number = wcstoll( parser->p, (WCHAR **)&parser->p, 10 );
++        return expr;
++    }
++    if (!wcsncmp( parser->p, L"timediff", 8 ))
++    {
++        const WCHAR *save = parser->p;
++
++        parser->p += 8;
++        if (token( parser, '(' ))
++        {
++            /* of a path */
++            if (!(expr = new_expr( EXPR_TIMEDIFF ))) goto error;
++            if (!(expr->left = parse_value( parser )) || expr->left->type != EXPR_PATH || !token( parser, ')' ))
++            {
++                free_expr( expr );
++                goto error;
++            }
++            return expr;
++        }
++        parser->p = save;
++    }
++    if (!wcsncmp( parser->p, L"position", 8 ) && !parser->render_path)
++    {
++        const WCHAR *save = parser->p;
++
++        parser->p += 8;
++        if (token( parser, '(' ))
++        {
++            if (!token( parser, ')' ) || !(expr = new_expr( EXPR_POSITION ))) goto error;
++            parser->position = TRUE;
++            return expr;
++        }
++        parser->p = save;
++    }
++    if (!wcsncmp( parser->p, L"band", 4 ))
++    {
++        const WCHAR *save = parser->p;
++
++        parser->p += 4;
++        if (token( parser, '(' ))
++        {
++            /* of paths and numbers, not of another band() */
++            if (!(expr = new_expr( EXPR_BAND ))) goto error;
++            if (!(expr->left = parse_value( parser )) || (expr->left->type != EXPR_PATH && expr->left->type != EXPR_NUMBER) ||
++                !token( parser, ',' ) || !(expr->right = parse_value( parser )) ||
++                (expr->right->type != EXPR_PATH && expr->right->type != EXPR_NUMBER) || !token( parser, ')' ))
++            {
++                free_expr( expr );
++                goto error;
++            }
++            return expr;
++        }
++        parser->p = save;
++    }
++    if (*parser->p == '@' || *parser->p == '*' || is_name_char( *parser->p, TRUE ))
++    {
++        /* a name followed by "(" is a function this XPath has not got */
++        const WCHAR *p = parser->p;
++        while (is_name_char( *p, FALSE )) p++;
++        while (*p == ' ') p++;
++        if (*p == '(') goto error;
++        return parse_path( parser );
++    }
++
++error:
++    parser->error = TRUE;
++    return NULL;
++}
++
++static struct expr *parse_compare( struct parser *parser )
++{
++    struct expr *left, *expr;
++    enum compare_op op;
++
++    if (!(left = parse_value( parser ))) return NULL;
++    skip_space( parser );
++    if (parser->p[0] == '=') { op = OP_EQ; parser->p += 1; }
++    else if (parser->p[0] == '!' && parser->p[1] == '=') { op = OP_NE; parser->p += 2; }
++    else if (parser->p[0] == '<' && parser->p[1] == '=') { op = OP_LE; parser->p += 2; }
++    else if (parser->p[0] == '>' && parser->p[1] == '=') { op = OP_GE; parser->p += 2; }
++    else if (parser->p[0] == '<') { op = OP_LT; parser->p += 1; }
++    else if (parser->p[0] == '>') { op = OP_GT; parser->p += 1; }
++    else return left;
++
++    if (!(expr = new_expr( EXPR_COMPARE )))
++    {
++        free_expr( left );
++        parser->error = TRUE;
++        return NULL;
++    }
++    expr->op = op;
++    expr->left = left;
++    if (!(expr->right = parse_value( parser )))
++    {
++        free_expr( expr );
++        return NULL;
++    }
++    return expr;
++}
++
++/* operands joined by "and", or by "or", as one expression */
++static struct expr *parse_joined( struct parser *parser, enum expr_type type )
++{
++    struct expr *operand, *expr, **args;
++
++    if (!(operand = type == EXPR_AND ? parse_compare( parser ) : parse_joined( parser, EXPR_AND ))) return NULL;
++    if (!keyword( parser, type == EXPR_AND ? L"and" : L"or" )) return operand;
++    if (!(expr = new_expr( type )) || !(expr->args = malloc( sizeof(*expr->args) )))
++    {
++        free( expr );
++        free_expr( operand );
++        parser->error = TRUE;
++        return NULL;
++    }
++    expr->args[expr->arg_count++] = operand;
++    do
++    {
++        if (expr->arg_count >= MAX_OPERANDS)
++        {
++            free_expr( expr );
++            parser->error = TRUE;
++            return NULL;
++        }
++        if (!(operand = type == EXPR_AND ? parse_compare( parser ) : parse_joined( parser, EXPR_AND )))
++        {
++            free_expr( expr );
++            return NULL;
++        }
++        if (!(args = realloc( expr->args, (expr->arg_count + 1) * sizeof(*args) )))
++        {
++            free_expr( operand );
++            free_expr( expr );
++            parser->error = TRUE;
++            return NULL;
++        }
++        expr->args = args;
++        expr->args[expr->arg_count++] = operand;
++    } while (keyword( parser, type == EXPR_AND ? L"and" : L"or" ));
++    return expr;
++}
++
++static struct expr *parse_expr( struct parser *parser )
++{
++    struct expr *expr;
++
++    if (parser->depth >= MAX_DEPTH)
++    {
++        parser->error = TRUE;
++        return NULL;
++    }
++    parser->depth++;
++    expr = parse_joined( parser, EXPR_OR );
++    parser->depth--;
++    return expr;
++}
++
++/* A query selects events with a path, a render context names a value with one starting at Event, with no
++ * positions; NULL for what is not XPath this takes. */
++struct xpath *parse_xpath( const WCHAR *text, BOOL render_path )
++{
++    struct parser parser = { text, FALSE, render_path, FALSE, 0, 0, 0 };
++    struct xpath *xpath;
++    struct expr *expr;
++
++    if (!text || !(expr = parse_path( &parser ))) return NULL;
++    skip_space( &parser );
++    if (parser.error || *parser.p || (render_path && (!expr->step_count || !expr->steps[0].name ||
++        wcscmp( expr->steps[0].name, L"Event" ))))
++    {
++        free_expr( expr );
++        return NULL;
++    }
++    if (!(xpath = malloc( sizeof(*xpath) )))
++    {
++        free_expr( expr );
++        return NULL;
++    }
++    xpath->expr = expr;
++    return xpath;
++}
++
++/* How a render path goes with one before it in a context: Windows 11 keeps them as one tree, where an element
++ * already there, as a path of its own or on the way to one, cannot be added again, and an attribute added again
++ * gives nothing. */
++enum path_relation render_path_relation( const struct xpath *earlier, const struct xpath *later )
++{
++    const struct expr *a = earlier->expr, *b = later->expr;
++    unsigned int i;
++
++    if (b->step_count > a->step_count) return PATH_UNRELATED;
++    for (i = 0; i < b->step_count; i++)
++    {
++        if (a->steps[i].pred_count || b->steps[i].pred_count) return PATH_UNRELATED;
++        if (!a->steps[i].name || !b->steps[i].name || wcscmp( a->steps[i].name, b->steps[i].name ))
++            return PATH_UNRELATED;
++    }
++    if (!b->attr) return PATH_CONFLICT;
++    if (b->step_count == a->step_count && a->attr && !wcscmp( a->attr, b->attr )) return PATH_SAME_ATTRIBUTE;
++    return PATH_UNRELATED;
++}
++
++void free_xpath( struct xpath *xpath )
++{
++    if (!xpath) return;
++    free_expr( xpath->expr );
++    free( xpath );
++}
++
++/* what an expression gives: elements or attributes of the tree, a string, a number, or true or false */
++struct value
++{
++    enum { VALUE_NODES, VALUE_STRING, VALUE_NUMBER, VALUE_BOOL } type;
++    const struct node *nodes[64];
++    const WCHAR *attrs[64];
++    unsigned int attr_types[64];
++    unsigned int count;
++    const WCHAR *string;
++    LONGLONG number;
++    BOOL boolean;
++    BOOL number_valid;
++};
++
++static BOOL eval( const struct expr *expr, const struct node *context, unsigned int position, struct value *value );
++static void eval_path( const struct expr *expr, const struct node *context, BOOL exists, struct value *value );
++
++/* whether the predicates hold for the element at the position; a path among them is a test of whether there is
++ * such an element */
++static BOOL eval_predicates( const struct step *step, const struct node *node, unsigned int position )
++{
++    unsigned int i;
++    struct value value;
++
++    for (i = 0; i < step->pred_count; i++)
++    {
++        if (step->preds[i]->type == EXPR_PATH) eval_path( step->preds[i], node, TRUE, &value );
++        else if (!eval( step->preds[i], node, position, &value )) return FALSE;
++        switch (value.type)
++        {
++        case VALUE_NODES: if (!value.count) return FALSE; break;
++        case VALUE_STRING: if (!value.string || !value.string[0]) return FALSE; break;
++        case VALUE_NUMBER: if (!value.number_valid || !value.number) return FALSE; break;
++        case VALUE_BOOL: if (!value.boolean) return FALSE; break;
++        }
++    }
++    return TRUE;
++}
++
++/* the elements, or attributes, a path selects; testing whether there are any, Windows looks only at the first
++ * element of a step with a position */
++static void eval_path( const struct expr *expr, const struct node *context, BOOL exists, struct value *value )
++{
++    const struct node *current[64], *next[64];
++    unsigned int count = 1, next_count, i, j, k, index, matches;
++
++    value->type = VALUE_NODES;
++    value->count = 0;
++    current[0] = context;
++    for (i = 0; i < expr->step_count; i++)
++    {
++        const struct step *step = &expr->steps[i];
++
++        next_count = 0;
++        for (j = 0; j < count; j++)
++        {
++            index = matches = 0;
++            for (k = 0; k < current[j]->child_count && next_count < ARRAY_SIZE(next); k++)
++            {
++                const struct node *child = &current[j]->children[k];
++
++                if (step->name && wcscmp( step->name, child->name )) continue;
++                if (exists && step->positional && index) break;
++                if (!eval_predicates( step, child, ++index )) continue;
++                if (step->has_position && ++matches != step->position) continue;
++                next[next_count++] = child;
++            }
++        }
++        memcpy( current, next, next_count * sizeof(*next) );
++        count = next_count;
++    }
++    for (i = 0; i < count && value->count < ARRAY_SIZE(value->nodes); i++)
++    {
++        if (expr->attr)
++        {
++            for (j = 0; j < current[i]->attr_count; j++)
++            {
++                if (wcscmp( current[i]->attr_names[j], expr->attr )) continue;
++                value->nodes[value->count] = current[i];
++                value->attrs[value->count] = current[i]->attr_values[j];
++                value->attr_types[value->count++] = j ? EvtVarTypeUInt32 : current[i]->attr_type;
++            }
++        }
++        else
++        {
++            value->nodes[value->count] = current[i];
++            value->attrs[value->count++] = NULL;
++        }
++    }
++}
++
++static const WCHAR *value_string( const struct value *value, unsigned int i )
++{
++    if (value->type == VALUE_STRING) return value->string;
++    if (value->attrs[i]) return value->attrs[i];
++    return value->nodes[i]->text ? value->nodes[i]->text : L"";
++}
++
++static BOOL eval( const struct expr *expr, const struct node *context, unsigned int position, struct value *value )
++{
++    struct value left, right;
++    unsigned int i, j;
++
++    memset( value, 0, sizeof(*value) );
++    switch (expr->type)
++    {
++    case EXPR_PATH:
++        eval_path( expr, context, FALSE, value );
++        return TRUE;
++
++    case EXPR_POSITION:
++        value->type = VALUE_NUMBER;
++        value->number = position;
++        value->number_valid = TRUE;
++        return TRUE;
++
++    case EXPR_STRING:
++        value->type = VALUE_STRING;
++        value->string = expr->string;
++        return TRUE;
++
++    case EXPR_NUMBER:
++        value->type = VALUE_NUMBER;
++        value->number = expr->number;
++        value->number_valid = TRUE;
++        return TRUE;
++
++    case EXPR_OR:
++    case EXPR_AND:
++    {
++        struct step step = { 0 };
++        BOOL r = expr->type == EXPR_AND;
++
++        /* each operand as a predicate, until one decides */
++        step.pred_count = 1;
++        for (i = 0; i < expr->arg_count && r == (expr->type == EXPR_AND); i++)
++        {
++            step.preds = &expr->args[i];
++            r = eval_predicates( &step, context, position );
++        }
++        value->type = VALUE_BOOL;
++        value->boolean = r;
++        return TRUE;
++    }
++
++    case EXPR_TIMEDIFF:
++    {
++        FILETIME ft, now;
++
++        value->type = VALUE_NUMBER;
++        if (!eval( expr->left, context, position, &left ) || left.type != VALUE_NODES || !left.count ||
++            !parse_system_time( value_string( &left, 0 ), &ft ))
++            return TRUE;
++        GetSystemTimeAsFileTime( &now );
++        value->number = ((LONGLONG)(((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) -
++                         (LONGLONG)(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime)) / 10000;
++        value->number_valid = TRUE;
++        return TRUE;
++    }
++
++    case EXPR_BAND:
++    {
++        ULONGLONG a, b;
++
++        value->type = VALUE_NUMBER;
++        if (!eval( expr->left, context, position, &left ) || !eval( expr->right, context, position, &right ))
++            return TRUE;
++        a = left.type == VALUE_NUMBER ? left.number : left.count || left.type == VALUE_STRING ?
++            node_number( value_string( &left, 0 ) ) : 0;
++        b = right.type == VALUE_NUMBER ? right.number : right.count || right.type == VALUE_STRING ?
++            node_number( value_string( &right, 0 ) ) : 0;
++        value->number = a & b;
++        value->number_valid = TRUE;
++        return TRUE;
++    }
++
++    case EXPR_COMPARE:
++    {
++        BOOL numeric, result = FALSE;
++        unsigned int left_count, right_count;
++
++        if (!eval( expr->left, context, position, &left ) || !eval( expr->right, context, position, &right ))
++            return FALSE;
++        numeric = left.type == VALUE_NUMBER || right.type == VALUE_NUMBER;
++        left_count = left.type == VALUE_NODES ? left.count : 1;
++        right_count = right.type == VALUE_NODES ? right.count : 1;
++        for (i = 0; i < left_count && !result; i++)
++        {
++            for (j = 0; j < right_count && !result; j++)
++            {
++                const WCHAR *sa = NULL, *sb = NULL;
++                WCHAR bufa[24], bufb[24];
++                LONGLONG a = 0, b = 0;
++                int cmp;
++
++                /* with a number, what is a number all through is compared as one, the rest as strings */
++                if (left.type == VALUE_NUMBER) { if (!left.number_valid) continue; a = left.number; }
++                else if (!numeric || !string_number( value_string( &left, i ), &a )) sa = value_string( &left, i );
++                if (right.type == VALUE_NUMBER) { if (!right.number_valid) continue; b = right.number; }
++                else if (!numeric || !string_number( value_string( &right, j ), &b )) sb = value_string( &right, j );
++                if (!sa && !sb) cmp = a < b ? -1 : a > b;
++                else
++                {
++                    FILETIME fa, fb;
++
++                    if (!sa)
++                    {
++                        swprintf( bufa, ARRAY_SIZE(bufa), L"%I64d", a );
++                        sa = bufa;
++                    }
++                    if (!sb)
++                    {
++                        swprintf( bufb, ARRAY_SIZE(bufb), L"%I64d", b );
++                        sb = bufb;
++                    }
++                    if (!numeric && parse_system_time( sa, &fa ) && parse_system_time( sb, &fb ))
++                        cmp = CompareFileTime( &fa, &fb );
++                    else
++                        cmp = wcsicmp( sa, sb );
++                }
++                switch (expr->op)
++                {
++                case OP_EQ: result = !cmp; break;
++                case OP_NE: result = !!cmp; break;
++                case OP_LT: result = cmp < 0; break;
++                case OP_LE: result = cmp <= 0; break;
++                case OP_GT: result = cmp > 0; break;
++                case OP_GE: result = cmp >= 0; break;
++                }
++            }
++        }
++        value->type = VALUE_BOOL;
++        value->boolean = result;
++        return TRUE;
++    }
++    }
++    return FALSE;
++}
++
++/* whether a query's path selects the event */
++BOOL match_xpath( const struct xpath *xpath, const struct node *tree )
++{
++    struct node root = { 0 };
++    struct value value;
++
++    root.name = L"";
++    root.children = (struct node *)tree;
++    root.child_count = 1;
++    if (!eval( xpath->expr, &root, 1, &value )) return FALSE;
++    return value.type == VALUE_NODES && value.count;
++}
++
++/* the element, or the attribute of it, a render path names */
++const struct node *select_xpath( const struct xpath *xpath, const struct node *tree, const WCHAR **attr,
++                                 unsigned int *attr_type )
++{
++    struct node root = { 0 };
++    struct value value;
++
++    root.name = L"";
++    root.children = (struct node *)tree;
++    root.child_count = 1;
++    *attr = NULL;
++    if (!eval( xpath->expr, &root, 1, &value ) || value.type != VALUE_NODES || !value.count) return NULL;
++    *attr = value.attrs[0];
++    *attr_type = value.attr_types[0];
++    if (xpath->expr->attr && !value.attrs[0]) return NULL;
++    return value.nodes[0];
++}
++
++/*
++ * Structured queries: <QueryList><Query Id='0' Path='...'><Select Path='...'>XPath</Select>
++ * <Suppress Path='...'>XPath</Suppress></Query>...</QueryList>.  A Select or Suppress without a path takes its
++ * query's, a query without one the path passed to EvtQuery; what a Suppress selects is left out of the events of
++ * its query's Selects of the same path.
++ */
++
++static void xml_skip_space( const WCHAR **p )
++{
++    while (**p == ' ' || **p == '\t' || **p == '\r' || **p == '\n') (*p)++;
++}
++
++static WCHAR *xml_decode( const WCHAR *start, const WCHAR *end )
++{
++    WCHAR *ret = malloc( (end - start + 1) * sizeof(WCHAR) ), *out = ret;
++
++    if (!ret) return NULL;
++    while (start < end)
++    {
++        if (*start == '&')
++        {
++            static const struct { const WCHAR *name; WCHAR c; } entities[] =
++            {
++                { L"&lt;", '<' }, { L"&gt;", '>' }, { L"&amp;", '&' }, { L"&quot;", '"' }, { L"&apos;", '\'' },
++            };
++            unsigned int i;
++
++            for (i = 0; i < ARRAY_SIZE(entities); i++)
++            {
++                size_t len = wcslen( entities[i].name );
++                if (end - start >= len && !wcsncmp( start, entities[i].name, len ))
++                {
++                    *out++ = entities[i].c;
++                    start += len;
++                    break;
++                }
++            }
++            if (i < ARRAY_SIZE(entities)) continue;
++            if (start[1] == '#')
++            {
++                const WCHAR *semi = wcschr( start, ';' );
++                if (semi && semi < end)
++                {
++                    *out++ = start[2] == 'x' ? wcstoul( start + 3, NULL, 16 ) : wcstoul( start + 2, NULL, 10 );
++                    start = semi + 1;
++                    continue;
++                }
++            }
++        }
++        *out++ = *start++;
++    }
++    *out = 0;
++    return ret;
++}
++
++/* an element's name and the value of its Path attribute; the name is NULL at a closing tag */
++static BOOL xml_tag( const WCHAR **p, WCHAR *name, size_t name_size, WCHAR **path, BOOL *closing, BOOL *empty )
++{
++    size_t len = 0;
++
++    *path = NULL;
++    *closing = *empty = FALSE;
++    xml_skip_space( p );
++    if (**p != '<') return FALSE;
++    (*p)++;
++    if (**p == '?' || **p == '!')
++    {
++        const WCHAR *end = wcschr( *p, '>' );
++        if (!end) return FALSE;
++        *p = end + 1;
++        return xml_tag( p, name, name_size, path, closing, empty );
++    }
++    if (**p == '/')
++    {
++        *closing = TRUE;
++        (*p)++;
++    }
++    while (is_name_char( **p, FALSE ) && len < name_size - 1) name[len++] = *(*p)++;
++    name[len] = 0;
++    for (;;)
++    {
++        WCHAR attr[32], quote;
++        const WCHAR *value_end;
++        size_t alen = 0;
++
++        xml_skip_space( p );
++        if (**p == '/' && (*p)[1] == '>')
++        {
++            *empty = TRUE;
++            *p += 2;
++            return TRUE;
++        }
++        if (**p == '>')
++        {
++            (*p)++;
++            return TRUE;
++        }
++        while (is_name_char( **p, FALSE ) && alen < ARRAY_SIZE(attr) - 1) attr[alen++] = *(*p)++;
++        attr[alen] = 0;
++        if (!alen) return FALSE;
++        xml_skip_space( p );
++        if (**p != '=') return FALSE;
++        (*p)++;
++        xml_skip_space( p );
++        quote = **p;
++        if (quote != '\'' && quote != '"') return FALSE;
++        (*p)++;
++        if (!(value_end = wcschr( *p, quote ))) return FALSE;
++        if (!wcscmp( attr, L"Path" ))
++        {
++            free( *path );
++            *path = xml_decode( *p, value_end );
++        }
++        *p = value_end + 1;
++    }
++}
++
++static struct query_source *add_source( struct query_source **sources, unsigned int *count, const WCHAR *path,
++                                        unsigned int first )
++{
++    struct query_source *array, *source;
++    unsigned int i;
++    BOOL file = FALSE;
++
++    if (!wcsnicmp( path, L"file://", 7 ))
++    {
++        path += 7;
++        file = TRUE;
++    }
++    for (i = first; i < *count; i++)
++        if (!wcsicmp( (*sources)[i].path, path ) && (*sources)[i].file == file) return &(*sources)[i];
++    if (!(array = realloc( *sources, (*count + 1) * sizeof(*array) ))) return NULL;
++    *sources = array;
++    source = &array[(*count)++];
++    memset( source, 0, sizeof(*source) );
++    source->path = strdupW( path );
++    source->file = file;
++    return source;
++}
++
++static BOOL add_xpath( struct xpath ***array, unsigned int *count, struct xpath *xpath )
++{
++    struct xpath **new_array = realloc( *array, (*count + 1) * sizeof(*new_array) );
++
++    if (!new_array) return FALSE;
++    *array = new_array;
++    new_array[(*count)++] = xpath;
++    return TRUE;
++}
++
++void free_query_sources( struct query_source *sources, unsigned int count )
++{
++    unsigned int i, j;
++
++    for (i = 0; i < count; i++)
++    {
++        for (j = 0; j < sources[i].select_count; j++) free_xpath( sources[i].selects[j] );
++        for (j = 0; j < sources[i].suppress_count; j++) free_xpath( sources[i].suppresses[j] );
++        free( sources[i].selects );
++        free( sources[i].suppresses );
++        free( sources[i].path );
++    }
++    free( sources );
++}
++
++BOOL parse_structured_query( const WCHAR *text, const WCHAR *default_path, struct query_source **sources,
++                             unsigned int *count )
++{
++    const WCHAR *p = text;
++    WCHAR name[32], *path, *query_path = NULL;
++    BOOL closing, empty;
++    unsigned int query_first = 0;
++    DWORD error = ERROR_EVT_INVALID_QUERY;
++
++    *sources = NULL;
++    *count = 0;
++    if (!xml_tag( &p, name, ARRAY_SIZE(name), &path, &closing, &empty ) || closing || wcscmp( name, L"QueryList" ))
++        goto error;
++    free( path );
++    for (;;)
++    {
++        if (!xml_tag( &p, name, ARRAY_SIZE(name), &path, &closing, &empty )) goto error;
++        if (closing && !wcscmp( name, L"QueryList" )) break;
++        if (closing && !wcscmp( name, L"Query" ))
++        {
++            free( query_path );
++            query_path = NULL;
++            free( path );
++            continue;
++        }
++        if (!closing && !wcscmp( name, L"Query" ))
++        {
++            free( query_path );
++            query_path = path;
++            query_first = *count;
++            continue;
++        }
++        if (!closing && (!wcscmp( name, L"Select" ) || !wcscmp( name, L"Suppress" )))
++        {
++            BOOL select = !wcscmp( name, L"Select" );
++            const WCHAR *source_path = path ? path : query_path ? query_path : default_path;
++            const WCHAR *end = empty ? p : wcschr( p, '<' );
++            struct query_source *source;
++            struct xpath *xpath;
++            WCHAR *xpath_text;
++
++            if (!source_path)
++            {
++                free( path );
++                error = ERROR_EVT_INVALID_CHANNEL_PATH;
++                goto error;
++            }
++            if (!end || !(xpath_text = xml_decode( p, end )))
++            {
++                free( path );
++                goto error;
++            }
++            p = end;
++            xpath = parse_xpath( xpath_text, FALSE );
++            free( xpath_text );
++            if (!xpath || !(source = add_source( sources, count, source_path, query_first )))
++            {
++                free_xpath( xpath );
++                free( path );
++                goto error;
++            }
++            free( path );
++            if (!(select ? add_xpath( &source->selects, &source->select_count, xpath )
++                         : add_xpath( &source->suppresses, &source->suppress_count, xpath )))
++            {
++                free_xpath( xpath );
++                goto error;
++            }
++            if (!empty && (!xml_tag( &p, name, ARRAY_SIZE(name), &path, &closing, &empty ) || !closing))
++            {
++                free( path );
++                goto error;
++            }
++            free( path );
++            continue;
++        }
++        free( path );
++        goto error;
++    }
++    free( query_path );
++    return TRUE;
++
++error:
++    free( query_path );
++    free_query_sources( *sources, *count );
++    *sources = NULL;
++    *count = 0;
++    SetLastError( error );
++    return FALSE;
++}
+diff --git a/dlls/wevtapi/main.c b/dlls/wevtapi/main.c
+index d1260789092..f9c477cabbf 100644
+--- a/dlls/wevtapi/main.c
++++ b/dlls/wevtapi/main.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright 2012 Austin English
+  * Copyright 2012 André Hentschel
++ * Copyright 2026 the Wine Altars project
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -17,149 +18,2289 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
+-#include <stdarg.h>
++/*
++ * The logs are the classic ones advapi32 keeps: a query reads them with ReadEventLog and gives what its XPath
++ * selects, rendered as Windows 11 renders the events of a classic log (event.c); a subscription follows a log with
++ * NotifyChangeEventLog; the messages come from the message files the sources name in the registry.
++ */
+ 
+-#include "windef.h"
+-#include "winbase.h"
+-#include "winevt.h"
++#include "wevtapi_private.h"
++#include "sddl.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wevtapi);
+ 
+-static const WCHAR log_pathW[] = L"C:\\windows\\temp\\evt.log";
++static const WCHAR eventlog_key[] = L"SYSTEM\\CurrentControlSet\\Services\\EventLog";
+ 
+-EVT_HANDLE WINAPI EvtOpenSession(EVT_LOGIN_CLASS login_class, void *login, DWORD timeout, DWORD flags)
++static HINSTANCE instance;
++
++BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
+ {
+-    FIXME("(%u %p %lu %lu) stub\n", login_class, login, timeout, flags);
+-    return NULL;
++    if (reason == DLL_PROCESS_ATTACH)
++    {
++        instance = inst;
++        DisableThreadLibraryCalls( inst );
++    }
++    return TRUE;
++}
++
++static struct list objects = LIST_INIT( objects );
++static CRITICAL_SECTION objects_cs;
++static CRITICAL_SECTION_DEBUG objects_cs_debug =
++{
++    0, 0, &objects_cs,
++    { &objects_cs_debug.ProcessLocksList, &objects_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": objects_cs") }
++};
++static CRITICAL_SECTION objects_cs = { &objects_cs_debug, -1, 0, 0, 0, 0 };
++
++void *alloc_object( enum object_type type, size_t size, void (*destroy)( struct object *obj ) )
++{
++    struct object *obj;
++
++    if (!(obj = calloc( 1, size )))
++    {
++        SetLastError( ERROR_OUTOFMEMORY );
++        return NULL;
++    }
++    obj->type = type;
++    obj->destroy = destroy;
++    return obj;
++}
++
++EVT_HANDLE add_object( struct object *obj )
++{
++    EnterCriticalSection( &objects_cs );
++    list_add_tail( &objects, &obj->entry );
++    LeaveCriticalSection( &objects_cs );
++    return obj;
+ }
+ 
+-EVT_HANDLE WINAPI EvtOpenLog(EVT_HANDLE session, const WCHAR *path, DWORD flags)
++struct object *get_object( EVT_HANDLE handle, enum object_type type )
+ {
+-    FIXME("(%p %s %lu) stub\n", session, debugstr_w(path), flags);
++    struct object *obj;
++
++    EnterCriticalSection( &objects_cs );
++    LIST_FOR_EACH_ENTRY( obj, &objects, struct object, entry )
++    {
++        if (obj != handle) continue;
++        LeaveCriticalSection( &objects_cs );
++        if (obj->type == type) return obj;
++        SetLastError( ERROR_INVALID_HANDLE );
++        return NULL;
++    }
++    LeaveCriticalSection( &objects_cs );
++    SetLastError( ERROR_INVALID_HANDLE );
+     return NULL;
+ }
+ 
+-BOOL WINAPI EvtGetChannelConfigProperty(EVT_HANDLE ChannelConfig,
+-                                        EVT_CHANNEL_CONFIG_PROPERTY_ID PropertyId,
+-                                        DWORD Flags,
+-                                        DWORD PropertyValueBufferSize,
+-                                        PEVT_VARIANT PropertyValueBuffer,
+-                                        DWORD *PropertyValueBufferUsed)
++void release_object( struct object *obj )
++{
++}
++
++static void destroy_object( struct object *obj )
+ {
+-    FIXME("(%p %i %lu %lu %p %p) stub\n", ChannelConfig, PropertyId, Flags, PropertyValueBufferSize,
+-          PropertyValueBuffer, PropertyValueBufferUsed);
++    if (obj->destroy) obj->destroy( obj );
++    free( obj );
++}
++
++/* the classic log of that name in any case, and the name as the registry has it */
++BOOL classic_log_exists( const WCHAR *name, WCHAR **canonical )
++{
++    WCHAR key_name[256];
++    DWORD i, len;
++    HKEY key;
++    BOOL ret = FALSE;
+ 
+-    switch (PropertyId)
++    if (canonical) *canonical = NULL;
++    if (!name || !name[0] || RegOpenKeyExW( HKEY_LOCAL_MACHINE, eventlog_key, 0, KEY_READ, &key )) return FALSE;
++    for (i = 0; !ret && (len = ARRAY_SIZE(key_name), !RegEnumKeyExW( key, i, key_name, &len, NULL, NULL, NULL, NULL )); i++)
+     {
+-    case EvtChannelLoggingConfigLogFilePath:
+-        *PropertyValueBufferUsed = sizeof(log_pathW) + sizeof(EVT_VARIANT);
++        if (wcsicmp( key_name, name )) continue;
++        if (canonical) *canonical = strdupW( key_name );
++        ret = TRUE;
++    }
++    RegCloseKey( key );
++    return ret;
++}
++
++/* the file advapi32 keeps a classic log in */
++static WCHAR *log_file_path( const WCHAR *log )
++{
++    WCHAR *path = malloc( (MAX_PATH + wcslen( log ) + 32) * sizeof(WCHAR) );
++    UINT len;
+ 
+-        if (PropertyValueBufferSize < sizeof(log_pathW) + sizeof(EVT_VARIANT) || !PropertyValueBuffer)
++    if (!path) return NULL;
++    len = GetSystemDirectoryW( path, MAX_PATH );
++    swprintf( path + len, wcslen( log ) + 32, L"\\winevt\\Logs\\%s.evt", log );
++    return path;
++}
++
++static struct event *impl_from_event( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct event, obj );
++}
++
++static void destroy_event( struct object *obj )
++{
++    struct event *event = impl_from_event( obj );
++
++    free( event->record );
++    free( event->channel );
++}
++
++struct event *create_event( const EVENTLOGRECORD *record, const WCHAR *channel )
++{
++    struct event *event;
++
++    if (!(event = alloc_object( OBJECT_EVENT, sizeof(*event), destroy_event ))) return NULL;
++    if (!(event->record = malloc( record->Length )) || !(event->channel = strdupW( channel )))
++    {
++        destroy_object( &event->obj );
++        SetLastError( ERROR_OUTOFMEMORY );
++        return NULL;
++    }
++    memcpy( event->record, record, record->Length );
++    return event;
++}
++
++/* whether a source of a query selects the event, and none of its suppressions does */
++static BOOL source_selects( const struct query_source *source, const struct event *event )
++{
++    struct node *tree;
++    BOOL ret = FALSE;
++    unsigned int i;
++
++    if (!(tree = build_event_tree( event ))) return FALSE;
++    for (i = 0; i < source->select_count && !ret; i++) ret = match_xpath( source->selects[i], tree );
++    for (i = 0; i < source->suppress_count && ret; i++) ret = !match_xpath( source->suppresses[i], tree );
++    free_node( tree );
++    return ret;
++}
++
++/* a log a query or subscription reads, record after record */
++struct reader
++{
++    HANDLE log;
++    WCHAR *channel;
++    BYTE *buffer;
++    DWORD size, used, pos;
++};
++
++static void close_reader( struct reader *reader )
++{
++    if (reader->log) CloseEventLog( reader->log );
++    free( reader->buffer );
++    free( reader->channel );
++    memset( reader, 0, sizeof(*reader) );
++}
++
++static BOOL open_reader( struct reader *reader, const struct query_source *source, BOOL file )
++{
++    memset( reader, 0, sizeof(*reader) );
++    if (file || source->file)
++    {
++        reader->log = OpenBackupEventLogW( NULL, source->path );
++        reader->channel = strdupW( source->path );
++    }
++    else
++    {
++        WCHAR *canonical;
++
++        if (!classic_log_exists( source->path, &canonical ))
+         {
+-            SetLastError(ERROR_INSUFFICIENT_BUFFER);
++            SetLastError( ERROR_EVT_CHANNEL_NOT_FOUND );
+             return FALSE;
+         }
++        reader->log = OpenEventLogW( NULL, canonical );
++        reader->channel = canonical;
++    }
++    if (!reader->log)
++    {
++        free( reader->channel );
++        reader->channel = NULL;
++        return FALSE;
++    }
++    return TRUE;
++}
+ 
+-        PropertyValueBuffer->StringVal = (LPWSTR)(PropertyValueBuffer + 1);
+-        wcscpy((LPWSTR)PropertyValueBuffer->StringVal, log_pathW);
+-        PropertyValueBuffer->Type = EvtVarTypeString;
+-        return TRUE;
++/* the next record, read in the direction asked for; NULL at the end */
++static const EVENTLOGRECORD *read_record( struct reader *reader, DWORD flags, DWORD offset )
++{
++    const EVENTLOGRECORD *record;
++    DWORD read, needed;
+ 
+-    default:
+-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-        break;
++    if (reader->pos >= reader->used || offset)
++    {
++        if (!reader->buffer)
++        {
++            reader->size = 0x10000;
++            if (!(reader->buffer = malloc( reader->size ))) return NULL;
++        }
++        while (!ReadEventLogW( reader->log, flags, offset, reader->buffer, reader->size, &read, &needed ))
++        {
++            BYTE *buffer;
++
++            if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !(buffer = realloc( reader->buffer, needed )))
++                return NULL;
++            reader->buffer = buffer;
++            reader->size = needed;
++        }
++        reader->used = read;
++        reader->pos = 0;
+     }
++    record = (const EVENTLOGRECORD *)(reader->buffer + reader->pos);
++    reader->pos += record->Length;
++    return record;
++}
+ 
+-    return FALSE;
++/*
++ * Queries
++ */
++
++struct query
++{
++    struct object obj;
++    struct query_source *sources;
++    unsigned int source_count;
++    unsigned int current;
++    BOOL file;
++    DWORD direction;
++    struct reader reader;
++    BOOL opened;
++};
++
++static struct query *impl_from_query( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct query, obj );
+ }
+ 
+-BOOL WINAPI EvtSetChannelConfigProperty(EVT_HANDLE ChannelConfig,
+-                                        EVT_CHANNEL_CONFIG_PROPERTY_ID PropertyId,
+-                                        DWORD Flags,
+-                                        PEVT_VARIANT PropertyValue)
++static void destroy_query( struct object *obj )
+ {
+-    FIXME("(%p %i %lu %p) stub\n", ChannelConfig, PropertyId, Flags, PropertyValue);
+-    return TRUE;
++    struct query *query = impl_from_query( obj );
++
++    close_reader( &query->reader );
++    free_query_sources( query->sources, query->source_count );
+ }
+ 
+-EVT_HANDLE WINAPI EvtSubscribe(EVT_HANDLE Session, HANDLE SignalEvent, LPCWSTR ChannelPath,
+-                               LPCWSTR Query, EVT_HANDLE Bookmark, PVOID context,
+-                               EVT_SUBSCRIBE_CALLBACK Callback, DWORD Flags)
++/* the next event the query selects, or NULL */
++static struct event *next_event( struct query *query )
+ {
+-    FIXME("(%p %p %s %s %p %p %p %lu) stub\n", Session, SignalEvent, debugstr_w(ChannelPath),
+-          debugstr_w(Query), Bookmark, context, Callback, Flags);
++    while (query->current < query->source_count)
++    {
++        const struct query_source *source = &query->sources[query->current];
++        const EVENTLOGRECORD *record;
++        struct event *event;
++
++        if (!query->opened)
++        {
++            if (!open_reader( &query->reader, source, query->file ))
++            {
++                query->current++;
++                continue;
++            }
++            query->opened = TRUE;
++        }
++        while ((record = read_record( &query->reader, EVENTLOG_SEQUENTIAL_READ | query->direction, 0 )))
++        {
++            if (!(event = create_event( record, query->reader.channel ))) return NULL;
++            if (source_selects( source, event )) return event;
++            destroy_object( &event->obj );
++        }
++        close_reader( &query->reader );
++        query->opened = FALSE;
++        query->current++;
++    }
+     return NULL;
+ }
+ 
+-EVT_HANDLE WINAPI EvtOpenChannelEnum(EVT_HANDLE session, DWORD flags)
++/* the sources of a query: those of a structured one, or the path with the XPath */
++static BOOL query_sources( const WCHAR *path, const WCHAR *text, struct query_source **sources, unsigned int *count )
+ {
+-    FIXME("(%p %lu) stub\n", session, flags);
+-    return NULL;
++    const WCHAR *p = text;
++    struct xpath *xpath;
++
++    while (p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
++    if (p && *p == '<') return parse_structured_query( p, path, sources, count );
++    if (!path)
++    {
++        SetLastError( ERROR_EVT_INVALID_CHANNEL_PATH );
++        return FALSE;
++    }
++    if (!(xpath = parse_xpath( text && text[0] ? text : L"*", FALSE )))
++    {
++        SetLastError( ERROR_EVT_INVALID_QUERY );
++        return FALSE;
++    }
++    if (!(*sources = calloc( 1, sizeof(**sources) )) || !((*sources)->selects = malloc( sizeof(xpath) )))
++    {
++        free( *sources );
++        free_xpath( xpath );
++        SetLastError( ERROR_OUTOFMEMORY );
++        return FALSE;
++    }
++    (*sources)->path = strdupW( path );
++    (*sources)->selects[0] = xpath;
++    (*sources)->select_count = 1;
++    *count = 1;
++    return TRUE;
+ }
+ 
+-BOOL WINAPI EvtNextChannelPath(EVT_HANDLE channel_enum, DWORD buffer_len, WCHAR *buffer, DWORD *used)
++/* that the logs of a query are there: an unknown channel or a missing file fails the query */
++static BOOL check_sources( const struct query_source *sources, unsigned int count, BOOL file )
+ {
+-    FIXME("(%p %lu %p %p) stub\n", channel_enum, buffer_len, buffer, used);
+-    return FALSE;
++    unsigned int i;
++
++    for (i = 0; i < count; i++)
++    {
++        if (file || sources[i].file)
++        {
++            if (GetFileAttributesW( sources[i].path ) == INVALID_FILE_ATTRIBUTES) return FALSE;
++        }
++        else if (!classic_log_exists( sources[i].path, NULL ))
++        {
++            SetLastError( ERROR_EVT_CHANNEL_NOT_FOUND );
++            return FALSE;
++        }
++    }
++    return TRUE;
++}
++
++EVT_HANDLE WINAPI EvtQuery( EVT_HANDLE session, const WCHAR *path, const WCHAR *text, DWORD flags )
++{
++    DWORD path_flags = flags & (EvtQueryChannelPath | EvtQueryFilePath);
++    DWORD direction = flags & (EvtQueryForwardDirection | EvtQueryReverseDirection);
++    struct query *query;
++
++    TRACE( "%p, %s, %s, %#lx\n", session, debugstr_w(path), debugstr_w(text), flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return NULL;
++    if (path_flags == (EvtQueryChannelPath | EvtQueryFilePath) ||
++        direction == (EvtQueryForwardDirection | EvtQueryReverseDirection) ||
++        (flags & ~(EvtQueryChannelPath | EvtQueryFilePath | EvtQueryForwardDirection | EvtQueryReverseDirection |
++                   EvtQueryTolerateQueryErrors)))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++
++    if (!(query = alloc_object( OBJECT_QUERY, sizeof(*query), destroy_query ))) return NULL;
++    query->file = path_flags == EvtQueryFilePath;
++    query->direction = direction == EvtQueryReverseDirection ? EVENTLOG_BACKWARDS_READ : EVENTLOG_FORWARDS_READ;
++    if (!query_sources( path, text, &query->sources, &query->source_count ) ||
++        !check_sources( query->sources, query->source_count, query->file ))
++    {
++        DWORD error = GetLastError();
++        destroy_object( &query->obj );
++        SetLastError( error );
++        return NULL;
++    }
++    return add_object( &query->obj );
++}
++
++/*
++ * Subscriptions
++ */
++
++struct subscription
++{
++    struct object obj;
++    struct query_source *sources;
++    unsigned int source_count;
++    struct reader reader;
++    EVT_SUBSCRIBE_CALLBACK callback;
++    void *context;
++    HANDLE signal;
++    HANDLE changed;
++    HANDLE stop;
++    HANDLE thread;
++    DWORD next;                 /* the next record to look at */
++    CRITICAL_SECTION cs;
++    struct event **pending;     /* what EvtNext gives, for a subscription without a callback */
++    unsigned int pending_count;
++    BOOL exhausted;             /* EvtNext said there were no more */
++};
++
++static struct subscription *impl_from_subscription( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct subscription, obj );
++}
++
++static void destroy_subscription( struct object *obj )
++{
++    struct subscription *sub = impl_from_subscription( obj );
++    unsigned int i;
++
++    if (sub->thread)
++    {
++        SetEvent( sub->stop );
++        WaitForSingleObject( sub->thread, INFINITE );
++        CloseHandle( sub->thread );
++    }
++    if (sub->stop) CloseHandle( sub->stop );
++    if (sub->changed) CloseHandle( sub->changed );
++    close_reader( &sub->reader );
++    for (i = 0; i < sub->pending_count; i++) destroy_object( &sub->pending[i]->obj );
++    free( sub->pending );
++    free_query_sources( sub->sources, sub->source_count );
++    DeleteCriticalSection( &sub->cs );
++}
++
++/* gives the records written since last time, as they are selected; those there are when a subscription without
++ * a callback starts are for EvtNext at once, and do not set its signal */
++static void deliver_new( struct subscription *sub, BOOL notify )
++{
++    DWORD count = 0, oldest = 0;
++    const EVENTLOGRECORD *record;
++
++    GetNumberOfEventLogRecords( sub->reader.log, &count );
++    GetOldestEventLogRecord( sub->reader.log, &oldest );
++    if (!count) return;
++    if (sub->next < oldest) sub->next = oldest;
++    while (sub->next < oldest + count &&
++           (record = read_record( &sub->reader, EVENTLOG_SEEK_READ | EVENTLOG_FORWARDS_READ, sub->next )))
++    {
++        struct event *event;
++
++        sub->reader.pos = sub->reader.used;     /* one record at a time, by its number */
++        sub->next = record->RecordNumber + 1;
++        if (!(event = create_event( record, sub->reader.channel ))) continue;
++        if (!source_selects( &sub->sources[0], event ))
++        {
++            destroy_object( &event->obj );
++            continue;
++        }
++        if (sub->callback)
++        {
++            EVT_HANDLE handle = add_object( &event->obj );
++            sub->callback( EvtSubscribeActionDeliver, sub->context, handle );
++            EvtClose( handle );
++        }
++        else
++        {
++            struct event **pending;
++
++            EnterCriticalSection( &sub->cs );
++            if ((pending = realloc( sub->pending, (sub->pending_count + 1) * sizeof(*pending) )))
++            {
++                sub->pending = pending;
++                sub->pending[sub->pending_count++] = event;
++                sub->exhausted = FALSE;
++            }
++            else destroy_object( &event->obj );
++            LeaveCriticalSection( &sub->cs );
++            if (notify) SetEvent( sub->signal );
++        }
++    }
+ }
+ 
+-EVT_HANDLE WINAPI EvtOpenChannelConfig(EVT_HANDLE Session, LPCWSTR ChannelPath, DWORD Flags)
++static DWORD CALLBACK subscription_thread( void *arg )
+ {
+-    FIXME("(%p %s %lu) stub\n", Session, debugstr_w(ChannelPath), Flags);
+-    return (EVT_HANDLE)0xdeadbeef;
++    struct subscription *sub = arg;
++    HANDLE handles[2] = { sub->stop, sub->changed };
++
++    deliver_new( sub, TRUE );
++    while (WaitForMultipleObjects( 2, handles, FALSE, INFINITE ) == WAIT_OBJECT_0 + 1)
++        deliver_new( sub, TRUE );
++    return 0;
+ }
+ 
+-EVT_HANDLE WINAPI EvtQuery(EVT_HANDLE session, const WCHAR *path, const WCHAR *query, DWORD flags)
++EVT_HANDLE WINAPI EvtSubscribe( EVT_HANDLE session, HANDLE signal, const WCHAR *path, const WCHAR *text,
++                                EVT_HANDLE bookmark, void *context, EVT_SUBSCRIBE_CALLBACK callback, DWORD flags )
+ {
+-    FIXME("(%p %s %s %lu) stub\n", session, debugstr_w(path), debugstr_w(query), flags);
++    DWORD how = flags & 3, count = 0, oldest = 0;
++    struct subscription *sub;
++
++    TRACE( "%p, %p, %s, %s, %p, %p, %p, %#lx\n", session, signal, debugstr_w(path), debugstr_w(text), bookmark,
++           context, callback, flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return NULL;
++    if (!how || (how == EvtSubscribeStartAfterBookmark && !bookmark) || !signal == !callback)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!(sub = alloc_object( OBJECT_SUBSCRIPTION, sizeof(*sub), destroy_subscription ))) return NULL;
++    InitializeCriticalSection( &sub->cs );
++    sub->callback = callback;
++    sub->context = context;
++    sub->signal = signal;
++    if (!query_sources( path, text, &sub->sources, &sub->source_count ) ||
++        !check_sources( sub->sources, sub->source_count, FALSE ) ||
++        !open_reader( &sub->reader, &sub->sources[0], FALSE ))
++        goto error;
++    if (sub->source_count > 1) FIXME( "only the first of %u logs is followed\n", sub->source_count );
++
++    GetNumberOfEventLogRecords( sub->reader.log, &count );
++    GetOldestEventLogRecord( sub->reader.log, &oldest );
++    switch (how)
++    {
++    case EvtSubscribeToFutureEvents:
++        sub->next = oldest + count;
++        break;
++    case EvtSubscribeStartAtOldestRecord:
++        sub->next = oldest;
++        break;
++    case EvtSubscribeStartAfterBookmark:
++    {
++        DWORD used, props;
++        WCHAR xml[512];
++        const WCHAR *id;
++
++        if (!EvtRender( NULL, bookmark, EvtRenderBookmark, sizeof(xml), xml, &used, &props )) goto error;
++        id = wcsstr( xml, L"RecordId='" );
++        sub->next = id ? wcstoul( id + 10, NULL, 10 ) + 1 : oldest;
++        break;
++    }
++    }
++
++    if (!(sub->changed = CreateEventW( NULL, FALSE, FALSE, NULL )) || !(sub->stop = CreateEventW( NULL, TRUE, FALSE, NULL )) ||
++        !NotifyChangeEventLog( sub->reader.log, sub->changed ))
++        goto error;
++    /* a callback is called on the subscription's thread, from the start */
++    if (!callback) deliver_new( sub, FALSE );
++    if (!(sub->thread = CreateThread( NULL, 0, subscription_thread, sub, 0, NULL ))) goto error;
++    return add_object( &sub->obj );
++
++error:
++    {
++        DWORD error = GetLastError();
++        destroy_object( &sub->obj );
++        SetLastError( error );
++    }
+     return NULL;
+ }
+ 
+-BOOL WINAPI EvtSaveChannelConfig(EVT_HANDLE channel, DWORD flags)
++BOOL WINAPI EvtNext( EVT_HANDLE handle, DWORD count, EVT_HANDLE *events, DWORD timeout, DWORD flags, DWORD *returned )
+ {
+-    FIXME("(%p,%08lx) stub\n", channel, flags);
++    struct object *obj;
++    DWORD n = 0;
++
++    TRACE( "%p, %lu, %p, %lu, %#lx, %p\n", handle, count, events, timeout, flags, returned );
++
++    if (!events || !returned)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    *returned = 0;
++    if ((obj = get_object( handle, OBJECT_QUERY )))
++    {
++        struct query *query = impl_from_query( obj );
++        struct event *event;
++
++        while (n < count && (event = next_event( query ))) events[n++] = add_object( &event->obj );
++    }
++    else if ((obj = get_object( handle, OBJECT_SUBSCRIPTION )))
++    {
++        struct subscription *sub = impl_from_subscription( obj );
++        DWORD error = ERROR_NO_MORE_ITEMS;
++
++        /* what there is, at once, whatever the timeout; once it has said there are no more, asking again before
++         * more come is an invalid operation; the signal is the caller's to reset */
++        if (sub->callback)
++        {
++            SetLastError( ERROR_INVALID_HANDLE );
++            return FALSE;
++        }
++        EnterCriticalSection( &sub->cs );
++        while (n < count && n < sub->pending_count) events[n] = add_object( &sub->pending[n]->obj ), n++;
++        memmove( sub->pending, sub->pending + n, (sub->pending_count - n) * sizeof(*sub->pending) );
++        sub->pending_count -= n;
++        if (!n)
++        {
++            if (sub->exhausted) error = ERROR_INVALID_OPERATION;
++            sub->exhausted = TRUE;
++        }
++        LeaveCriticalSection( &sub->cs );
++        if (!n)
++        {
++            SetLastError( error );
++            return FALSE;
++        }
++    }
++    else return FALSE;
++
++    if (!n)
++    {
++        SetLastError( ERROR_NO_MORE_ITEMS );
++        return FALSE;
++    }
++    *returned = n;
+     return TRUE;
+ }
+ 
+-BOOL WINAPI EvtClose(EVT_HANDLE handle)
++BOOL WINAPI EvtSeek( EVT_HANDLE handle, LONGLONG position, EVT_HANDLE bookmark, DWORD timeout, DWORD flags )
+ {
+-    FIXME("(%p) stub\n", handle);
++    struct object *obj;
++    struct query *query;
++    struct event *event;
++    LONGLONG i;
++
++    TRACE( "%p, %s, %p, %lu, %#lx\n", handle, wine_dbgstr_longlong(position), bookmark, timeout, flags );
++
++    if (!(obj = get_object( handle, OBJECT_QUERY ))) return FALSE;
++    query = impl_from_query( obj );
++    switch (flags & 7)
++    {
++    case EvtSeekRelativeToFirst:
++        close_reader( &query->reader );
++        query->opened = FALSE;
++        query->current = 0;
++        break;
++    case EvtSeekRelativeToCurrent:
++        break;
++    default:
++        FIXME( "seek %#lx not supported\n", flags );
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++    if (position < 0)
++    {
++        FIXME( "seeking back not supported\n" );
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++    for (i = 0; i < position; i++)
++    {
++        if (!(event = next_event( query ))) break;
++        destroy_object( &event->obj );
++    }
+     return TRUE;
+ }
+ 
+-BOOL WINAPI EvtNext(EVT_HANDLE result_set, DWORD size, EVT_HANDLE *array, DWORD timeout, DWORD flags, DWORD *ret_count)
++/*
++ * Rendering
++ */
++
++struct context
+ {
+-    FIXME("(%p %lu %p %lu %#lx %p) stub!\n", result_set, size, array, timeout, flags, ret_count);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    struct object obj;
++    DWORD flags;
++    struct xpath **paths;
++    BOOL *repeated;             /* an attribute a path before has, which renders as nothing */
++    unsigned int path_count;
++};
++
++static struct context *impl_from_context( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct context, obj );
+ }
+ 
+-BOOL WINAPI EvtExportLog(EVT_HANDLE session, const WCHAR *path, const WCHAR *query, const WCHAR *file, DWORD flags)
++static void destroy_context( struct object *obj )
+ {
+-    FIXME("(%p %s %s %s %#lx) stub!\n", session, debugstr_w(path), debugstr_w(query), debugstr_w(file), flags);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    struct context *context = impl_from_context( obj );
++    unsigned int i;
++
++    for (i = 0; i < context->path_count; i++) free_xpath( context->paths[i] );
++    free( context->paths );
++    free( context->repeated );
++}
++
++EVT_HANDLE WINAPI EvtCreateRenderContext( DWORD count, const WCHAR **paths, DWORD flags )
++{
++    struct context *context;
++    unsigned int i, j;
++
++    TRACE( "%lu, %p, %#lx\n", count, paths, flags );
++
++    if (flags > EvtRenderContextUser || (flags == EvtRenderContextValues && count && !paths))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!(context = alloc_object( OBJECT_CONTEXT, sizeof(*context), destroy_context ))) return NULL;
++    context->flags = flags;
++    if (flags == EvtRenderContextValues && count)
++    {
++        if (!(context->paths = calloc( count, sizeof(*context->paths) )) ||
++            !(context->repeated = calloc( count, sizeof(*context->repeated) )))
++        {
++            destroy_object( &context->obj );
++            SetLastError( ERROR_OUTOFMEMORY );
++            return NULL;
++        }
++        for (i = 0; i < count; i++)
++        {
++            if (!(context->paths[i] = parse_xpath( paths[i], TRUE )))
++            {
++                context->path_count = i;
++                destroy_object( &context->obj );
++                SetLastError( ERROR_EVT_INVALID_QUERY );
++                return NULL;
++            }
++            context->path_count = i + 1;
++            for (j = 0; j < i; j++)
++            {
++                switch (render_path_relation( context->paths[j], context->paths[i] ))
++                {
++                case PATH_CONFLICT:
++                    destroy_object( &context->obj );
++                    SetLastError( ERROR_INVALID_PARAMETER );
++                    return NULL;
++                case PATH_SAME_ATTRIBUTE:
++                    context->repeated[i] = TRUE;
++                    break;
++                case PATH_UNRELATED:
++                    break;
++                }
++            }
++        }
++    }
++    return add_object( &context->obj );
++}
++
++/* a value rendered, and what it points to */
++struct rendered
++{
++    EVT_VARIANT var;
++    const void *data;
++    DWORD size;
++    const struct node *items;   /* the strings of a classic event, as an array */
++    unsigned int item_count;
++    BOOL packed;                /* one of them as a value of its own */
++};
++
++static BOOL hex_to_binary( const WCHAR *hex, BYTE **data, DWORD *size )
++{
++    DWORD len = wcslen( hex ) / 2, i;
++
++    if (!(*data = malloc( max( len, 1 ) ))) return FALSE;
++    for (i = 0; i < len; i++)
++    {
++        WCHAR byte[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
++        (*data)[i] = wcstoul( byte, NULL, 16 );
++    }
++    *size = len;
++    return TRUE;
++}
++
++/* a value of the tree as the type its element or attribute has; strings count their characters, with the
++ * terminator when they are the event's own data */
++static void render_value( struct rendered *out, unsigned int type, const WCHAR *text, BOOL count_nul, void **owned )
++{
++    memset( out, 0, sizeof(*out) );
++    if (!text)
++    {
++        out->var.Type = EvtVarTypeNull;
++        return;
++    }
++    out->var.Type = type;
++    switch (type)
++    {
++    case EvtVarTypeString:
++        out->data = text;
++        out->size = (wcslen( text ) + 1) * sizeof(WCHAR);
++        out->var.Count = wcslen( text ) + (count_nul ? 1 : 0);
++        break;
++    case EvtVarTypeByte: out->var.ByteVal = node_number( text ); break;
++    case EvtVarTypeUInt16: out->var.UInt16Val = node_number( text ); break;
++    case EvtVarTypeUInt32: out->var.UInt32Val = node_number( text ); break;
++    case EvtVarTypeUInt64:
++    case EvtVarTypeHexInt64: out->var.UInt64Val = node_number( text ); break;
++    case EvtVarTypeFileTime:
++    {
++        FILETIME ft;
++        if (parse_system_time( text, &ft ))
++            out->var.FileTimeVal = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
++        break;
++    }
++    case EvtVarTypeSid:
++    {
++        PSID sid;
++        if (ConvertStringSidToSidW( text, &sid ))
++        {
++            *owned = sid;
++            out->data = sid;
++            out->size = GetLengthSid( sid );
++        }
++        else out->var.Type = EvtVarTypeNull;
++        break;
++    }
++    case EvtVarTypeBinary:
++    {
++        BYTE *data;
++        DWORD size;
++        if (hex_to_binary( text, &data, &size ))
++        {
++            *owned = data;
++            out->data = data;
++            out->size = size;
++            out->var.Count = size;
++        }
++        else out->var.Type = EvtVarTypeNull;
++        break;
++    }
++    default:
++        out->var.Type = EvtVarTypeNull;
++        break;
++    }
+ }
+ 
+-EVT_HANDLE WINAPI EvtCreateBookmark(const WCHAR *bookmark_xml)
++static const struct node *find_child( const struct node *node, const WCHAR *name )
+ {
+-    FIXME("(%s) stub!\n", debugstr_w(bookmark_xml));
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++    unsigned int i;
++
++    for (i = 0; node && i < node->child_count; i++)
++        if (!wcscmp( node->children[i].name, name )) return &node->children[i];
+     return NULL;
+ }
+ 
+-EVT_HANDLE WINAPI EvtCreateRenderContext(DWORD pathcount, const WCHAR **paths, DWORD flags)
++static const WCHAR *find_attr( const struct node *node, const WCHAR *name )
+ {
+-    FIXME("(%lu %p %#lx) stub!\n", pathcount, paths, flags);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++    unsigned int i;
++
++    for (i = 0; node && i < node->attr_count; i++)
++        if (!wcscmp( node->attr_names[i], name )) return node->attr_values[i];
+     return NULL;
+ }
+ 
+-BOOL WINAPI EvtRender(EVT_HANDLE context, EVT_HANDLE fragment, DWORD flags, DWORD buffer_size, void *buffer,
+-                      DWORD *buffer_used, DWORD *property_count)
++/* Where Windows 11 puts the values' data: each value's from the next multiple of 8 after the variants, and the size
++ * a multiple of 8 too; an array a table of pointers and its strings after it.  The strings of a classic event, as
++ * values of their own, are still put as the array they are: after a table of them, one after the other. */
++static DWORD layout_values( struct rendered *values, unsigned int count, BYTE *buffer )
+ {
+-    FIXME("(%p %p %#lx %lu %p %p %p) stub!\n", context, fragment, flags, buffer_size, buffer, buffer_used, property_count);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    DWORD offset = count * sizeof(EVT_VARIANT), table = 0;
++    unsigned int i, j, packed = 0;
++    WCHAR **strings = NULL;
++
++    for (i = 0; i < count; i++) if (values[i].packed) packed++;
++    if (packed)
++    {
++        table = offset;
++        offset += packed * sizeof(WCHAR *);
++        if (buffer) strings = (WCHAR **)(buffer + table);
++        packed = 0;
++    }
++    for (i = 0; i < count; i++)
++    {
++        struct rendered *value = &values[i];
++        EVT_VARIANT *var = buffer ? (EVT_VARIANT *)buffer + i : NULL;
++
++        if (var) *var = value->var;
++        if (value->items)
++        {
++            WCHAR **array;
++
++            offset = (offset + 7) & ~7;
++            array = buffer ? (WCHAR **)(buffer + offset) : NULL;
++            if (var) var->StringArr = array;
++            offset += value->item_count * sizeof(WCHAR *);
++            for (j = 0; j < value->item_count; j++)
++            {
++                const WCHAR *text = value->items[j].text ? value->items[j].text : L"";
++                DWORD bytes = (wcslen( text ) + 1) * sizeof(WCHAR);
++
++                if (buffer)
++                {
++                    array[j] = (WCHAR *)(buffer + offset);
++                    memcpy( buffer + offset, text, bytes );
++                }
++                offset += bytes;
++            }
++        }
++        else if (value->data)
++        {
++            if (!value->packed) offset = (offset + 7) & ~7;
++            if (buffer)
++            {
++                memcpy( buffer + offset, value->data, value->size );
++                switch (var->Type)
++                {
++                case EvtVarTypeString: var->StringVal = (WCHAR *)(buffer + offset); break;
++                case EvtVarTypeSid: var->SidVal = buffer + offset; break;
++                case EvtVarTypeBinary: var->BinaryVal = buffer + offset; break;
++                }
++                if (value->packed) strings[packed] = (WCHAR *)(buffer + offset);
++            }
++            if (value->packed) packed++;
++            offset += value->size;
++        }
++    }
++    return (offset + 7) & ~7;
++}
++
++static BOOL render_values( struct context *context, struct event *event, DWORD size, void *buffer, DWORD *used,
++                           DWORD *count )
++{
++    const struct node *data_node = NULL;
++    struct rendered *values;
++    unsigned int n = 0, i, limit;
++    void **owned;
++    struct node *tree;
++    DWORD total;
++    BOOL ret = FALSE;
++
++    if (!(tree = build_event_tree( event ))) return FALSE;
++    if (context->flags == EvtRenderContextSystem) limit = EvtSystemPropertyIdEND;
++    else if (context->flags == EvtRenderContextUser)
++        limit = (data_node = find_child( tree, L"EventData" )) ? data_node->child_count : 0;
++    else limit = context->path_count;
++    values = calloc( max( limit, 1 ), sizeof(*values) );
++    owned = calloc( max( limit, 1 ), sizeof(*owned) );
++    if (!values || !owned)
++    {
++        free( values );
++        free( owned );
++        free_node( tree );
++        SetLastError( ERROR_OUTOFMEMORY );
++        return FALSE;
++    }
++    if (context->flags == EvtRenderContextSystem)
++    {
++        const struct node *system = find_child( tree, L"System" );
++        const struct node *node;
++        static const struct { const WCHAR *element, *attr; } props[EvtSystemPropertyIdEND] =
++        {
++            { L"Provider", L"Name" }, { NULL }, { L"EventID" }, { L"EventID", L"Qualifiers" }, { L"Level" },
++            { L"Task" }, { L"Opcode" }, { L"Keywords" }, { L"TimeCreated", L"SystemTime" }, { L"EventRecordID" },
++            { NULL }, { NULL }, { L"Execution", L"ProcessID" }, { L"Execution", L"ThreadID" }, { L"Channel" },
++            { L"Computer" }, { L"Security", L"UserID" }, { L"Version" },
++        };
++
++        for (i = 0; i < EvtSystemPropertyIdEND; i++)
++        {
++            unsigned int type;
++            const WCHAR *text = NULL;
++
++            if (props[i].element && (node = find_child( system, props[i].element )))
++            {
++                if (props[i].attr)
++                {
++                    text = find_attr( node, props[i].attr );
++                    type = !wcscmp( props[i].attr, L"Qualifiers" ) ? EvtVarTypeUInt16 :
++                           !wcscmp( props[i].attr, L"SystemTime" ) ? EvtVarTypeFileTime :
++                           !wcscmp( props[i].attr, L"UserID" ) ? EvtVarTypeSid :
++                           !wcscmp( props[i].attr, L"Name" ) ? EvtVarTypeString : EvtVarTypeUInt32;
++                }
++                else
++                {
++                    text = node->text;
++                    type = node->type;
++                }
++            }
++            render_value( &values[n], text ? type : EvtVarTypeNull, text, FALSE, &owned[n] );
++            n++;
++        }
++    }
++    else if (context->flags == EvtRenderContextUser)
++    {
++        for (i = 0; i < limit; i++, n++)
++        {
++            render_value( &values[n], data_node->children[i].type, data_node->children[i].text, TRUE, &owned[n] );
++            values[n].packed = data_node->children[i].array_item;
++        }
++    }
++    else
++    {
++        for (i = 0; i < limit; i++, n++)
++        {
++            const WCHAR *attr;
++            unsigned int attr_type = EvtVarTypeNull;
++            const struct node *node = select_xpath( context->paths[i], tree, &attr, &attr_type );
++
++            if (!node || context->repeated[i]) render_value( &values[n], EvtVarTypeNull, NULL, FALSE, &owned[n] );
++            else if (attr) render_value( &values[n], attr_type, attr, FALSE, &owned[n] );
++            else if (node->array_item)
++            {
++                /* the strings of a classic event are an array substitution, all of it */
++                const struct node *parent = find_child( tree, L"EventData" );
++
++                memset( &values[n], 0, sizeof(values[n]) );
++                values[n].var.Type = EvtVarTypeString | EVT_VARIANT_TYPE_ARRAY;
++                values[n].items = parent->children;
++                while (values[n].item_count < parent->child_count && parent->children[values[n].item_count].array_item)
++                    values[n].item_count++;
++                values[n].var.Count = values[n].item_count;
++            }
++            else render_value( &values[n], node->type, node->text, FALSE, &owned[n] );
++        }
++    }
++
++    total = layout_values( values, n, NULL );
++    *used = total;
++    *count = n;
++    if (size < total || !buffer)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        goto done;
++    }
++    /* the whole buffer, as Windows clears it */
++    memset( buffer, 0, size );
++    layout_values( values, n, buffer );
++    ret = TRUE;
++
++done:
++    for (i = 0; i < n; i++)
++    {
++        if (values[i].var.Type == EvtVarTypeSid && owned[i]) LocalFree( owned[i] );
++        else free( owned[i] );
++    }
++    free( owned );
++    free( values );
++    free_node( tree );
++    return ret;
++}
++
++static BOOL copy_string( const WCHAR *str, DWORD size, void *buffer, DWORD *used )
++{
++    DWORD bytes = (wcslen( str ) + 1) * sizeof(WCHAR);
++
++    *used = bytes;
++    if (size < bytes || !buffer)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    memcpy( buffer, str, bytes );
++    return TRUE;
++}
++
++/*
++ * Bookmarks
++ */
++
++struct bookmark
++{
++    struct object obj;
++    WCHAR *channel;
++    ULONGLONG record;
++};
++
++static struct bookmark *impl_from_bookmark( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct bookmark, obj );
++}
++
++static void destroy_bookmark( struct object *obj )
++{
++    free( impl_from_bookmark( obj )->channel );
++}
++
++EVT_HANDLE WINAPI EvtCreateBookmark( const WCHAR *xml )
++{
++    struct bookmark *bookmark;
++    const WCHAR *p;
++
++    TRACE( "%s\n", debugstr_w(xml) );
++
++    if (!(bookmark = alloc_object( OBJECT_BOOKMARK, sizeof(*bookmark), destroy_bookmark ))) return NULL;
++    if (xml)
++    {
++        if (!wcsstr( xml, L"<BookmarkList" ))
++        {
++            destroy_object( &bookmark->obj );
++            SetLastError( ERROR_EVT_INVALID_QUERY );
++            return NULL;
++        }
++        if ((p = wcsstr( xml, L"Channel=" )))
++        {
++            WCHAR quote = p[8];
++            const WCHAR *end = wcschr( p + 9, quote );
++
++            if (end && (bookmark->channel = malloc( (end - p - 8) * sizeof(WCHAR) )))
++            {
++                memcpy( bookmark->channel, p + 9, (end - p - 9) * sizeof(WCHAR) );
++                bookmark->channel[end - p - 9] = 0;
++            }
++        }
++        if ((p = wcsstr( xml, L"RecordId=" ))) bookmark->record = wcstoull( p + 10, NULL, 10 );
++    }
++    return add_object( &bookmark->obj );
++}
++
++BOOL WINAPI EvtUpdateBookmark( EVT_HANDLE handle, EVT_HANDLE event_handle )
++{
++    struct bookmark *bookmark;
++    struct object *obj;
++    struct event *event;
++
++    TRACE( "%p, %p\n", handle, event_handle );
++
++    if (!(obj = get_object( handle, OBJECT_BOOKMARK ))) return FALSE;
++    bookmark = impl_from_bookmark( obj );
++    if (!(obj = get_object( event_handle, OBJECT_EVENT ))) return FALSE;
++    event = impl_from_event( obj );
++    free( bookmark->channel );
++    bookmark->channel = strdupW( event->channel );
++    bookmark->record = event->record->RecordNumber;
++    return TRUE;
++}
++
++BOOL WINAPI EvtRender( EVT_HANDLE context, EVT_HANDLE fragment, DWORD flags, DWORD size, void *buffer, DWORD *used,
++                       DWORD *count )
++{
++    struct object *obj;
++
++    TRACE( "%p, %p, %#lx, %lu, %p, %p, %p\n", context, fragment, flags, size, buffer, used, count );
++
++    if (!used || !count)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    switch (flags)
++    {
++    case EvtRenderEventXml:
++    {
++        struct node *tree;
++        WCHAR *xml;
++        BOOL ret;
++
++        if (!(obj = get_object( fragment, OBJECT_EVENT ))) return FALSE;
++        if (!(tree = build_event_tree( impl_from_event( obj ) ))) return FALSE;
++        xml = write_event_xml( tree, NULL );
++        free_node( tree );
++        if (!xml)
++        {
++            SetLastError( ERROR_OUTOFMEMORY );
++            return FALSE;
++        }
++        *count = 1;
++        ret = copy_string( xml, size, buffer, used );
++        free( xml );
++        return ret;
++    }
++    case EvtRenderBookmark:
++    {
++        struct bookmark *bookmark;
++        WCHAR *xml;
++        size_t len;
++        BOOL ret;
++
++        if (!(obj = get_object( fragment, OBJECT_BOOKMARK ))) return FALSE;
++        bookmark = impl_from_bookmark( obj );
++        len = 128 + (bookmark->channel ? wcslen( bookmark->channel ) : 0);
++        if (!(xml = malloc( len * sizeof(WCHAR) ))) return FALSE;
++        if (bookmark->channel)
++            swprintf( xml, len, L"<BookmarkList>\r\n  <Bookmark Channel='%s' RecordId='%I64u' IsCurrent='true'/>\r\n"
++                      L"</BookmarkList>", bookmark->channel, bookmark->record );
++        else
++            wcscpy( xml, L"<BookmarkList>\r\n</BookmarkList>" );
++        *count = 1;
++        ret = copy_string( xml, size, buffer, used );
++        free( xml );
++        return ret;
++    }
++    case EvtRenderEventValues:
++    {
++        struct object *event_obj;
++
++        if (!context || !(obj = get_object( context, OBJECT_CONTEXT )))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        if (!(event_obj = get_object( fragment, OBJECT_EVENT ))) return FALSE;
++        return render_values( impl_from_context( obj ), impl_from_event( event_obj ), size, buffer, used, count );
++    }
++    }
++    SetLastError( ERROR_INVALID_PARAMETER );
++    return FALSE;
++}
++
++BOOL WINAPI EvtClose( EVT_HANDLE handle )
++{
++    struct object *obj;
++
++    TRACE( "%p\n", handle );
++
++    EnterCriticalSection( &objects_cs );
++    LIST_FOR_EACH_ENTRY( obj, &objects, struct object, entry )
++    {
++        if (obj != handle) continue;
++        list_remove( &obj->entry );
++        LeaveCriticalSection( &objects_cs );
++        destroy_object( obj );
++        return TRUE;
++    }
++    LeaveCriticalSection( &objects_cs );
++    SetLastError( ERROR_INVALID_HANDLE );
++    return FALSE;
++}
++
++BOOL WINAPI EvtCancel( EVT_HANDLE handle )
++{
++    TRACE( "%p\n", handle );
++    return TRUE;
++}
++
++BOOL WINAPI EvtGetExtendedStatus( DWORD size, WCHAR *buffer, DWORD *used )
++{
++    TRACE( "%lu, %p, %p\n", size, buffer, used );
++
++    *used = 1;
++    if (!size || !buffer)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    buffer[0] = 0;
++    return TRUE;
++}
++
++BOOL WINAPI EvtGetEventInfo( EVT_HANDLE handle, EVT_EVENT_PROPERTY_ID id, DWORD size, EVT_VARIANT *buffer, DWORD *used )
++{
++    struct object *obj;
++    struct event *event;
++    DWORD bytes;
++
++    TRACE( "%p, %u, %lu, %p, %p\n", handle, id, size, buffer, used );
++
++    if (!(obj = get_object( handle, OBJECT_EVENT ))) return FALSE;
++    event = impl_from_event( obj );
++    switch (id)
++    {
++    case EvtEventPath:
++        bytes = sizeof(EVT_VARIANT) + (wcslen( event->channel ) + 1) * sizeof(WCHAR);
++        *used = bytes;
++        if (size < bytes || !buffer)
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        buffer->Type = EvtVarTypeString;
++        buffer->Count = 0;
++        buffer->StringVal = (WCHAR *)(buffer + 1);
++        wcscpy( (WCHAR *)(buffer + 1), event->channel );
++        return TRUE;
++    case EvtEventQueryIDs:
++        *used = sizeof(EVT_VARIANT) + sizeof(DWORD);
++        if (size < *used || !buffer)
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        buffer->Type = EvtVarTypeUInt32 | EVT_VARIANT_TYPE_ARRAY;
++        buffer->Count = 1;
++        buffer->UInt32Arr = (UINT32 *)(buffer + 1);
++        buffer->UInt32Arr[0] = 0;
++        return TRUE;
++    default:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++}
++
++BOOL WINAPI EvtGetQueryInfo( EVT_HANDLE handle, EVT_QUERY_PROPERTY_ID id, DWORD size, EVT_VARIANT *buffer, DWORD *used )
++{
++    struct object *obj;
++    struct query *query;
++    unsigned int i;
++    DWORD bytes;
++
++    TRACE( "%p, %u, %lu, %p, %p\n", handle, id, size, buffer, used );
++
++    if (!(obj = get_object( handle, OBJECT_QUERY ))) return FALSE;
++    query = impl_from_query( obj );
++    switch (id)
++    {
++    case EvtQueryNames:
++    {
++        WCHAR **names, *str;
++
++        bytes = sizeof(EVT_VARIANT) + query->source_count * sizeof(WCHAR *);
++        for (i = 0; i < query->source_count; i++) bytes += (wcslen( query->sources[i].path ) + 1) * sizeof(WCHAR);
++        *used = bytes;
++        if (size < bytes || !buffer)
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        buffer->Type = EvtVarTypeString | EVT_VARIANT_TYPE_ARRAY;
++        buffer->Count = query->source_count;
++        names = (WCHAR **)(buffer + 1);
++        str = (WCHAR *)(names + query->source_count);
++        buffer->StringArr = names;
++        for (i = 0; i < query->source_count; i++)
++        {
++            names[i] = str;
++            wcscpy( str, query->sources[i].path );
++            str += wcslen( str ) + 1;
++        }
++        return TRUE;
++    }
++    case EvtQueryStatuses:
++        bytes = sizeof(EVT_VARIANT) + query->source_count * sizeof(UINT32);
++        *used = bytes;
++        if (size < bytes || !buffer)
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        buffer->Type = EvtVarTypeUInt32 | EVT_VARIANT_TYPE_ARRAY;
++        buffer->Count = query->source_count;
++        buffer->UInt32Arr = (UINT32 *)(buffer + 1);
++        memset( buffer->UInt32Arr, 0, query->source_count * sizeof(UINT32) );
++        return TRUE;
++    default:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++}
++
++/*
++ * Sessions
++ */
++
++EVT_HANDLE WINAPI EvtOpenSession( EVT_LOGIN_CLASS login_class, void *login, DWORD timeout, DWORD flags )
++{
++    EVT_RPC_LOGIN *rpc = login;
++    WCHAR name[MAX_COMPUTERNAME_LENGTH * 8 + 1];
++    DWORD size = ARRAY_SIZE(name);
++    struct object *obj;
++
++    TRACE( "%u, %p, %lu, %#lx\n", login_class, login, timeout, flags );
++
++    if (login_class != EvtRpcLogin || !rpc)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (rpc->Server && rpc->Server[0] && wcsicmp( rpc->Server, L"localhost" ) && wcscmp( rpc->Server, L"." ) &&
++        (!GetComputerNameExW( ComputerNameDnsHostname, name, &size ) || wcsicmp( rpc->Server, name )))
++    {
++        FIXME( "remote server %s not supported\n", debugstr_w(rpc->Server) );
++        SetLastError( RPC_S_SERVER_UNAVAILABLE );
++        return NULL;
++    }
++    if (!(obj = alloc_object( OBJECT_SESSION, sizeof(*obj), NULL ))) return NULL;
++    return add_object( obj );
++}
++
++/*
++ * Logs
++ */
++
++struct log
++{
++    struct object obj;
++    WCHAR *path;                /* the channel, or the file */
++    BOOL file;
++};
++
++static struct log *impl_from_log( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct log, obj );
++}
++
++static void destroy_log( struct object *obj )
++{
++    free( impl_from_log( obj )->path );
++}
++
++EVT_HANDLE WINAPI EvtOpenLog( EVT_HANDLE session, const WCHAR *path, DWORD flags )
++{
++    struct log *log;
++    WCHAR *canonical = NULL;
++
++    TRACE( "%p, %s, %#lx\n", session, debugstr_w(path), flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return NULL;
++    if (!path || (flags != EvtOpenChannelPath && flags != EvtOpenFilePath))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (flags == EvtOpenChannelPath && !classic_log_exists( path, &canonical ))
++    {
++        SetLastError( ERROR_EVT_CHANNEL_NOT_FOUND );
++        return NULL;
++    }
++    if (flags == EvtOpenFilePath && GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES) return NULL;
++    if (!(log = alloc_object( OBJECT_LOG, sizeof(*log), destroy_log )))
++    {
++        free( canonical );
++        return NULL;
++    }
++    log->file = flags == EvtOpenFilePath;
++    log->path = canonical ? canonical : strdupW( path );
++    SetLastError( ERROR_SUCCESS );
++    return add_object( &log->obj );
++}
++
++BOOL WINAPI EvtGetLogInfo( EVT_HANDLE handle, EVT_LOG_PROPERTY_ID id, DWORD size, EVT_VARIANT *value, DWORD *used )
++{
++    WIN32_FILE_ATTRIBUTE_DATA attrs;
++    struct object *obj;
++    struct log *log;
++    WCHAR *file;
++    HANDLE classic;
++    DWORD number = 0;
++    BOOL ret;
++
++    TRACE( "%p, %u, %lu, %p, %p\n", handle, id, size, value, used );
++
++    if (!(obj = get_object( handle, OBJECT_LOG ))) return FALSE;
++    log = impl_from_log( obj );
++    *used = sizeof(EVT_VARIANT);
++    if (size < sizeof(EVT_VARIANT) || !value)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    memset( value, 0, sizeof(*value) );
++    switch (id)
++    {
++    case EvtLogCreationTime:
++    case EvtLogLastAccessTime:
++    case EvtLogLastWriteTime:
++    case EvtLogFileSize:
++    case EvtLogAttributes:
++        file = log->file ? strdupW( log->path ) : log_file_path( log->path );
++        ret = file && GetFileAttributesExW( file, GetFileExInfoStandard, &attrs );
++        free( file );
++        if (!ret) memset( &attrs, 0, sizeof(attrs) );
++        switch (id)
++        {
++        case EvtLogCreationTime:
++            value->Type = EvtVarTypeFileTime;
++            value->FileTimeVal = ((ULONGLONG)attrs.ftCreationTime.dwHighDateTime << 32) | attrs.ftCreationTime.dwLowDateTime;
++            break;
++        case EvtLogLastAccessTime:
++            value->Type = EvtVarTypeFileTime;
++            value->FileTimeVal = ((ULONGLONG)attrs.ftLastAccessTime.dwHighDateTime << 32) | attrs.ftLastAccessTime.dwLowDateTime;
++            break;
++        case EvtLogLastWriteTime:
++            value->Type = EvtVarTypeFileTime;
++            value->FileTimeVal = ((ULONGLONG)attrs.ftLastWriteTime.dwHighDateTime << 32) | attrs.ftLastWriteTime.dwLowDateTime;
++            break;
++        case EvtLogFileSize:
++            value->Type = EvtVarTypeUInt64;
++            value->UInt64Val = ((ULONGLONG)attrs.nFileSizeHigh << 32) | attrs.nFileSizeLow;
++            break;
++        default:
++            value->Type = EvtVarTypeUInt32;
++            value->UInt32Val = attrs.dwFileAttributes;
++            break;
++        }
++        return TRUE;
++    case EvtLogNumberOfLogRecords:
++    case EvtLogOldestRecordNumber:
++        classic = log->file ? OpenBackupEventLogW( NULL, log->path ) : OpenEventLogW( NULL, log->path );
++        if (!classic) return FALSE;
++        ret = id == EvtLogNumberOfLogRecords ? GetNumberOfEventLogRecords( classic, &number )
++                                             : GetOldestEventLogRecord( classic, &number );
++        CloseEventLog( classic );
++        value->Type = EvtVarTypeUInt64;
++        value->UInt64Val = number;
++        return ret;
++    case EvtLogFull:
++        value->Type = EvtVarTypeBoolean;
++        value->BooleanVal = FALSE;
++        return TRUE;
++    default:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++}
++
++BOOL WINAPI EvtClearLog( EVT_HANDLE session, const WCHAR *channel, const WCHAR *target, DWORD flags )
++{
++    WCHAR *canonical;
++    HANDLE log;
++    BOOL ret;
++
++    TRACE( "%p, %s, %s, %#lx\n", session, debugstr_w(channel), debugstr_w(target), flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return FALSE;
++    if (!classic_log_exists( channel, &canonical ))
++    {
++        SetLastError( ERROR_EVT_CHANNEL_NOT_FOUND );
++        return FALSE;
++    }
++    log = OpenEventLogW( NULL, canonical );
++    free( canonical );
++    if (!log) return FALSE;
++    ret = ClearEventLogW( log, target );
++    CloseEventLog( log );
++    return ret;
++}
++
++/* writes the events a query selects to a file in the classic format, as advapi32 keeps logs and backups */
++BOOL WINAPI EvtExportLog( EVT_HANDLE session, const WCHAR *path, const WCHAR *text, const WCHAR *target, DWORD flags )
++{
++    static const DWORD eof_marks[4] = { 0x11111111, 0x22222222, 0x33333333, 0x44444444 };
++    DWORD header[12] = { 0x30, 0x654c664c, 1, 1, 0x30, 0x30, 1, 1, 20971520, 0, 0, 0x30 }, eof[10];
++    EVT_HANDLE query, events[16];
++    DWORD returned, done, i, first = 0, last = 0;
++    HANDLE file;
++    BOOL ret = TRUE;
++
++    TRACE( "%p, %s, %s, %s, %#lx\n", session, debugstr_w(path), debugstr_w(text), debugstr_w(target), flags );
++
++    if (!target)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(query = EvtQuery( session, path, text, (flags & EvtExportLogFilePath ? EvtQueryFilePath : EvtQueryChannelPath) |
++                            (flags & EvtExportLogTolerateQueryErrors ? EvtQueryTolerateQueryErrors : 0) )))
++        return FALSE;
++    file = CreateFileW( target, GENERIC_WRITE, 0, NULL, flags & EvtExportLogOverwrite ? CREATE_ALWAYS : CREATE_NEW,
++                        FILE_ATTRIBUTE_NORMAL, NULL );
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        EvtClose( query );
++        return FALSE;
++    }
++    SetFilePointer( file, sizeof(header), NULL, FILE_BEGIN );
++    while (ret && EvtNext( query, ARRAY_SIZE(events), events, INFINITE, 0, &returned ))
++    {
++        for (i = 0; i < returned; i++)
++        {
++            struct event *event = impl_from_event( get_object( events[i], OBJECT_EVENT ) );
++
++            if (ret && !WriteFile( file, event->record, event->record->Length, &done, NULL )) ret = FALSE;
++            if (!first) first = event->record->RecordNumber;
++            last = event->record->RecordNumber;
++            header[5] += event->record->Length;
++            EvtClose( events[i] );
++        }
++    }
++    EvtClose( query );
++    if (first)
++    {
++        header[6] = last + 1;
++        header[7] = first;
++    }
++    eof[0] = eof[9] = sizeof(eof);
++    memcpy( eof + 1, eof_marks, sizeof(eof_marks) );
++    eof[5] = header[4];
++    eof[6] = header[5];
++    eof[7] = header[6];
++    eof[8] = header[7];
++    if (ret) ret = WriteFile( file, eof, sizeof(eof), &done, NULL ) &&
++                   SetFilePointer( file, 0, NULL, FILE_BEGIN ) == 0 && WriteFile( file, header, sizeof(header), &done, NULL );
++    CloseHandle( file );
++    if (!ret) DeleteFileW( target );
++    return ret;
++}
++
++BOOL WINAPI EvtArchiveExportedLog( EVT_HANDLE session, const WCHAR *path, LCID locale, DWORD flags )
++{
++    TRACE( "%p, %s, %#lx, %#lx\n", session, debugstr_w(path), locale, flags );
++
++    /* the classic format has its messages in the message files */
++    if (GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES) return FALSE;
++    return TRUE;
++}
++
++/*
++ * Channels
++ */
++
++struct channel_enum
++{
++    struct object obj;
++    WCHAR **names;
++    unsigned int count, pos;
++};
++
++static struct channel_enum *impl_from_channel_enum( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct channel_enum, obj );
++}
++
++static void destroy_channel_enum( struct object *obj )
++{
++    struct channel_enum *channels = impl_from_channel_enum( obj );
++    unsigned int i;
++
++    for (i = 0; i < channels->count; i++) free( channels->names[i] );
++    free( channels->names );
++}
++
++static void add_channels( struct channel_enum *channels, HKEY root, const WCHAR *path )
++{
++    WCHAR name[256];
++    DWORD i, len;
++    HKEY key;
++
++    if (RegOpenKeyExW( root, path, 0, KEY_READ, &key )) return;
++    for (i = 0; len = ARRAY_SIZE(name), !RegEnumKeyExW( key, i, name, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        WCHAR **names;
++        unsigned int j;
++
++        for (j = 0; j < channels->count; j++) if (!wcsicmp( channels->names[j], name )) break;
++        if (j < channels->count) continue;
++        if (!(names = realloc( channels->names, (channels->count + 1) * sizeof(*names) ))) break;
++        channels->names = names;
++        channels->names[channels->count++] = strdupW( name );
++    }
++    RegCloseKey( key );
++}
++
++EVT_HANDLE WINAPI EvtOpenChannelEnum( EVT_HANDLE session, DWORD flags )
++{
++    struct channel_enum *channels;
++
++    TRACE( "%p, %#lx\n", session, flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return NULL;
++    if (!(channels = alloc_object( OBJECT_CHANNEL_ENUM, sizeof(*channels), destroy_channel_enum ))) return NULL;
++    add_channels( channels, HKEY_LOCAL_MACHINE, eventlog_key );
++    add_channels( channels, HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\WINEVT\\Channels" );
++    return add_object( &channels->obj );
++}
++
++BOOL WINAPI EvtNextChannelPath( EVT_HANDLE handle, DWORD size, WCHAR *buffer, DWORD *used )
++{
++    struct channel_enum *channels;
++    struct object *obj;
++    const WCHAR *name;
++
++    TRACE( "%p, %lu, %p, %p\n", handle, size, buffer, used );
++
++    if (!(obj = get_object( handle, OBJECT_CHANNEL_ENUM ))) return FALSE;
++    channels = impl_from_channel_enum( obj );
++    if (channels->pos >= channels->count)
++    {
++        SetLastError( ERROR_NO_MORE_ITEMS );
++        return FALSE;
++    }
++    name = channels->names[channels->pos];
++    *used = wcslen( name ) + 1;
++    if (size < *used || !buffer)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    wcscpy( buffer, name );
++    channels->pos++;
++    return TRUE;
++}
++
++struct channel_config
++{
++    struct object obj;
++    WCHAR *name;
++    BOOL retention, retention_set;
++    BOOL auto_backup, auto_backup_set;
++    ULONGLONG max_size;
++    BOOL max_size_set;
++};
++
++static struct channel_config *impl_from_channel_config( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct channel_config, obj );
++}
++
++static void destroy_channel_config( struct object *obj )
++{
++    free( impl_from_channel_config( obj )->name );
++}
++
++static DWORD channel_dword( const WCHAR *name, const WCHAR *value, DWORD def )
++{
++    WCHAR path[ARRAY_SIZE(eventlog_key) + 260];
++    DWORD data = def, size = sizeof(data), type;
++    HKEY key;
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", eventlog_key, name );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return def;
++    if (RegQueryValueExW( key, value, NULL, &type, (BYTE *)&data, &size ) || type != REG_DWORD) data = def;
++    RegCloseKey( key );
++    return data;
++}
++
++EVT_HANDLE WINAPI EvtOpenChannelConfig( EVT_HANDLE session, const WCHAR *path, DWORD flags )
++{
++    struct channel_config *config;
++    WCHAR *canonical;
++
++    TRACE( "%p, %s, %#lx\n", session, debugstr_w(path), flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return NULL;
++    if (!classic_log_exists( path, &canonical ))
++    {
++        SetLastError( ERROR_EVT_CHANNEL_NOT_FOUND );
++        return NULL;
++    }
++    if (!(config = alloc_object( OBJECT_CHANNEL_CONFIG, sizeof(*config), destroy_channel_config )))
++    {
++        free( canonical );
++        return NULL;
++    }
++    config->name = canonical;
++    return add_object( &config->obj );
++}
++
++static BOOL set_variant_string( EVT_VARIANT *value, const WCHAR *str, DWORD size, DWORD *used )
++{
++    DWORD bytes = sizeof(EVT_VARIANT) + (wcslen( str ) + 1) * sizeof(WCHAR);
++
++    *used = bytes;
++    if (size < bytes || !value)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    value->StringVal = (WCHAR *)(value + 1);
++    wcscpy( (WCHAR *)(value + 1), str );
++    value->Type = EvtVarTypeString;
++    return TRUE;
++}
++
++/* what Windows 11 gives the Application log: a classic log, enabled, an administrative channel of its own,
++ * its file, its size and whether it keeps or overwrites its records */
++BOOL WINAPI EvtGetChannelConfigProperty( EVT_HANDLE handle, EVT_CHANNEL_CONFIG_PROPERTY_ID id, DWORD flags,
++                                         DWORD size, EVT_VARIANT *value, DWORD *used )
++{
++    static const WCHAR access[] = L"O:BAG:SYD:(A;;0x2;;;S-1-15-2-1)(A;;0x2;;;S-1-15-3-1024-3153509613-960666767-"
++                                  L"3724611135-2725662640-12138253-543910227-1950414635-4190290187)(A;;0xf0007;;;SY)"
++                                  L"(A;;0x7;;;BA)(A;;0x7;;;SO)(A;;0x3;;;IU)(A;;0x3;;;SU)(A;;0x3;;;S-1-5-3)(A;;0x3;;;S-1-5-33)"
++                                  L"(A;;0x1;;;S-1-5-32-573)";
++    struct channel_config *config;
++    struct object *obj;
++
++    TRACE( "%p, %u, %#lx, %lu, %p, %p\n", handle, id, flags, size, value, used );
++
++    if (!(obj = get_object( handle, OBJECT_CHANNEL_CONFIG ))) return FALSE;
++    config = impl_from_channel_config( obj );
++    if (!used)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    switch (id)
++    {
++    case EvtChannelConfigOwningPublisher:
++        return set_variant_string( value, L"", size, used );
++    case EvtChannelConfigAccess:
++        return set_variant_string( value, access, size, used );
++    case EvtChannelLoggingConfigLogFilePath:
++    {
++        WCHAR path[MAX_PATH + 64];
++        swprintf( path, ARRAY_SIZE(path), L"%%SystemRoot%%\\System32\\Winevt\\Logs\\%s.evt", config->name );
++        return set_variant_string( value, path, size, used );
++    }
++    default:
++        break;
++    }
++
++    *used = sizeof(EVT_VARIANT);
++    if (size < sizeof(EVT_VARIANT) || !value)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    switch (id)
++    {
++    case EvtChannelConfigEnabled:
++    case EvtChannelConfigClassicEventlog:
++        value->Type = EvtVarTypeBoolean;
++        value->BooleanVal = TRUE;
++        return TRUE;
++    case EvtChannelConfigIsolation:
++    case EvtChannelConfigType:
++        value->Type = EvtVarTypeUInt32;
++        value->UInt32Val = 0;
++        return TRUE;
++    case EvtChannelLoggingConfigRetention:
++        value->Type = EvtVarTypeBoolean;
++        value->BooleanVal = config->retention_set ? config->retention : !!channel_dword( config->name, L"Retention", 0 );
++        return TRUE;
++    case EvtChannelLoggingConfigAutoBackup:
++        value->Type = EvtVarTypeBoolean;
++        value->BooleanVal = config->auto_backup_set ? config->auto_backup
++                                                    : !!channel_dword( config->name, L"AutoBackupLogFiles", 0 );
++        return TRUE;
++    case EvtChannelLoggingConfigMaxSize:
++        value->Type = EvtVarTypeUInt64;
++        value->UInt64Val = config->max_size_set ? config->max_size : channel_dword( config->name, L"MaxSize", 20971520 );
++        return TRUE;
++    default:
++        FIXME( "property %u not supported\n", id );
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++}
++
++BOOL WINAPI EvtSetChannelConfigProperty( EVT_HANDLE handle, EVT_CHANNEL_CONFIG_PROPERTY_ID id, DWORD flags,
++                                         EVT_VARIANT *value )
++{
++    struct channel_config *config;
++    struct object *obj;
++
++    TRACE( "%p, %u, %#lx, %p\n", handle, id, flags, value );
++
++    if (!(obj = get_object( handle, OBJECT_CHANNEL_CONFIG ))) return FALSE;
++    config = impl_from_channel_config( obj );
++    if (!value)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    switch (id)
++    {
++    case EvtChannelLoggingConfigRetention:
++        config->retention = value->BooleanVal;
++        config->retention_set = TRUE;
++        return TRUE;
++    case EvtChannelLoggingConfigAutoBackup:
++        config->auto_backup = value->BooleanVal;
++        config->auto_backup_set = TRUE;
++        return TRUE;
++    case EvtChannelLoggingConfigMaxSize:
++        config->max_size = value->UInt64Val;
++        config->max_size_set = TRUE;
++        return TRUE;
++    default:
++        FIXME( "property %u not supported\n", id );
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++}
++
++BOOL WINAPI EvtSaveChannelConfig( EVT_HANDLE handle, DWORD flags )
++{
++    WCHAR path[ARRAY_SIZE(eventlog_key) + 260];
++    struct channel_config *config;
++    struct object *obj;
++    DWORD data;
++    HKEY key;
++    LSTATUS status;
++
++    TRACE( "%p, %#lx\n", handle, flags );
++
++    if (!(obj = get_object( handle, OBJECT_CHANNEL_CONFIG ))) return FALSE;
++    config = impl_from_channel_config( obj );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", eventlog_key, config->name );
++    if ((status = RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_SET_VALUE, &key )))
++    {
++        SetLastError( status );
++        return FALSE;
++    }
++    if (config->retention_set)
++    {
++        data = config->retention ? 0xffffffff : 0;
++        RegSetValueExW( key, L"Retention", 0, REG_DWORD, (BYTE *)&data, sizeof(data) );
++    }
++    if (config->auto_backup_set)
++    {
++        data = config->auto_backup;
++        RegSetValueExW( key, L"AutoBackupLogFiles", 0, REG_DWORD, (BYTE *)&data, sizeof(data) );
++    }
++    if (config->max_size_set)
++    {
++        data = min( config->max_size, 0xffffffff );
++        RegSetValueExW( key, L"MaxSize", 0, REG_DWORD, (BYTE *)&data, sizeof(data) );
++    }
++    RegCloseKey( key );
++    return TRUE;
++}
++
++/*
++ * Messages
++ */
++
++struct publisher
++{
++    struct object obj;
++    WCHAR *name;
++    WCHAR *event_files;         /* the message files, separated by semicolons */
++    WCHAR *category_files;
++    LCID locale;
++};
++
++static struct publisher *impl_from_publisher( struct object *obj )
++{
++    return CONTAINING_RECORD( obj, struct publisher, obj );
++}
++
++static void destroy_publisher( struct object *obj )
++{
++    struct publisher *publisher = impl_from_publisher( obj );
++
++    free( publisher->name );
++    free( publisher->event_files );
++    free( publisher->category_files );
++}
++
++static WCHAR *query_expanded( HKEY key, const WCHAR *name )
++{
++    WCHAR *value, *expanded;
++    DWORD size = 0, type, len;
++
++    if (RegQueryValueExW( key, name, NULL, &type, NULL, &size ) || (type != REG_SZ && type != REG_EXPAND_SZ)) return NULL;
++    if (!(value = malloc( size + sizeof(WCHAR) ))) return NULL;
++    if (RegQueryValueExW( key, name, NULL, &type, (BYTE *)value, &size ))
++    {
++        free( value );
++        return NULL;
++    }
++    value[size / sizeof(WCHAR)] = 0;
++    len = ExpandEnvironmentStringsW( value, NULL, 0 );
++    if ((expanded = malloc( len * sizeof(WCHAR) ))) ExpandEnvironmentStringsW( value, expanded, len );
++    free( value );
++    return expanded;
++}
++
++/* the publisher of a classic source: its key under the log it writes to */
++EVT_HANDLE WINAPI EvtOpenPublisherMetadata( EVT_HANDLE session, const WCHAR *id, const WCHAR *logfile, LCID locale,
++                                            DWORD flags )
++{
++    WCHAR name[256];
++    struct publisher *publisher;
++    HKEY key, log_key, source_key = NULL;
++    DWORD i, len;
++
++    TRACE( "%p, %s, %s, %#lx, %#lx\n", session, debugstr_w(id), debugstr_w(logfile), locale, flags );
++
++    if (session && !get_object( session, OBJECT_SESSION )) return NULL;
++    if (!id)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, eventlog_key, 0, KEY_READ, &key ))
++    {
++        for (i = 0; !source_key && (len = ARRAY_SIZE(name), !RegEnumKeyExW( key, i, name, &len, NULL, NULL, NULL, NULL )); i++)
++        {
++            if (RegOpenKeyExW( key, name, 0, KEY_READ, &log_key )) continue;
++            if (RegOpenKeyExW( log_key, id, 0, KEY_READ, &source_key )) source_key = NULL;
++            RegCloseKey( log_key );
++        }
++        RegCloseKey( key );
++    }
++    if (!source_key)
++    {
++        SetLastError( ERROR_FILE_NOT_FOUND );
++        return NULL;
++    }
++    if (!(publisher = alloc_object( OBJECT_PUBLISHER, sizeof(*publisher), destroy_publisher )))
++    {
++        RegCloseKey( source_key );
++        return NULL;
++    }
++    publisher->name = strdupW( id );
++    publisher->event_files = query_expanded( source_key, L"EventMessageFile" );
++    publisher->category_files = query_expanded( source_key, L"CategoryMessageFile" );
++    publisher->locale = locale;
++    RegCloseKey( source_key );
++    SetLastError( ERROR_SUCCESS );
++    return add_object( &publisher->obj );
++}
++
++/* the messages of wevtapi.mc */
++#define MSG_LEVEL_CRITICAL         1
++#define MSG_LEVEL_ERROR            2
++#define MSG_LEVEL_WARNING          3
++#define MSG_LEVEL_INFORMATION      4
++#define MSG_LEVEL_VERBOSE          5
++#define MSG_TASK_NONE              16
++#define MSG_KEYWORD_CLASSIC        32
++#define MSG_KEYWORD_AUDIT_SUCCESS  33
++#define MSG_KEYWORD_AUDIT_FAILURE  34
++
++/* the language messages are given in: the publisher's locale's, or the user's */
++static LANGID message_lang( const struct publisher *publisher )
++{
++    if (publisher && publisher->locale) return LANGIDFROMLCID( publisher->locale );
++    return GetUserDefaultUILanguage();
++}
++
++/* a message of a module in the language, or as it has it, its insertions filled in and the line end after it
++ * taken off */
++static WCHAR *format_module( HMODULE module, DWORD id, LANGID lang, const WCHAR **args )
++{
++    DWORD flags = FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ALLOCATE_BUFFER |
++                  (args ? FORMAT_MESSAGE_ARGUMENT_ARRAY : FORMAT_MESSAGE_IGNORE_INSERTS);
++    WCHAR *text = NULL, *message;
++    size_t len;
++
++    if (!FormatMessageW( flags, module, id, lang, (WCHAR *)&text, 0, (va_list *)args ) &&
++        (!lang || !FormatMessageW( flags, module, id, 0, (WCHAR *)&text, 0, (va_list *)args )))
++        return NULL;
++    len = wcslen( text );
++    while (len && (text[len - 1] == '\r' || text[len - 1] == '\n')) text[--len] = 0;
++    message = strdupW( text );
++    LocalFree( text );
++    return message;
++}
++
++/* a message of one of the files */
++static WCHAR *format_from_files( const WCHAR *files, DWORD id, LANGID lang, const WCHAR **args )
++{
++    WCHAR *list, *file, *next, *message = NULL;
++
++    if (!files || !(list = strdupW( files ))) return NULL;
++    for (file = list; file && !message; file = next)
++    {
++        HMODULE module;
++
++        if ((next = wcschr( file, ';' ))) *next++ = 0;
++        if (!file[0]) continue;
++        if (!(module = LoadLibraryExW( file, NULL, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE ))) continue;
++        message = format_module( module, id, lang, args );
++        FreeLibrary( module );
++    }
++    free( list );
++    return message;
++}
++
++static WCHAR *level_name( unsigned int level, LANGID lang )
++{
++    switch (level)
++    {
++    case 1: return format_module( instance, MSG_LEVEL_CRITICAL, lang, NULL );
++    case 2: return format_module( instance, MSG_LEVEL_ERROR, lang, NULL );
++    case 3: return format_module( instance, MSG_LEVEL_WARNING, lang, NULL );
++    case 5: return format_module( instance, MSG_LEVEL_VERBOSE, lang, NULL );
++    default: return format_module( instance, MSG_LEVEL_INFORMATION, lang, NULL );
++    }
++}
++
++/* copies a message with the terminators Windows gives each kind: two after a message, a level or a task, three
++ * after the keywords */
++static BOOL copy_message( const WCHAR *message, unsigned int nuls, DWORD size, WCHAR *buffer, DWORD *used )
++{
++    DWORD len = wcslen( message );
++
++    *used = len + nuls;
++    if (size < *used || !buffer)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    memcpy( buffer, message, len * sizeof(WCHAR) );
++    memset( buffer + len, 0, nuls * sizeof(WCHAR) );
++    return TRUE;
++}
++
++/* the insertions a message takes: the strings passed, or the event's own; one the event has not got is empty
++ * (FormatMessage would read past them otherwise) */
++#define MAX_INSERTS 100
++
++static WCHAR *event_message( struct publisher *publisher, struct event *event, DWORD count, EVT_VARIANT *values )
++{
++    const WCHAR **args, *str;
++    WCHAR *message;
++    DWORD i;
++
++    if (!(args = calloc( MAX_INSERTS, sizeof(*args) ))) return NULL;
++    for (i = 0; i < MAX_INSERTS; i++) args[i] = L"";
++    if (count && values)
++    {
++        for (i = 0; i < count && i < MAX_INSERTS; i++)
++            args[i] = values[i].Type == EvtVarTypeString && values[i].StringVal ? values[i].StringVal : L"";
++    }
++    else
++    {
++        str = (const WCHAR *)((const BYTE *)event->record + event->record->StringOffset);
++        for (i = 0; i < event->record->NumStrings && i < MAX_INSERTS; i++)
++        {
++            args[i] = str;
++            str += wcslen( str ) + 1;
++        }
++    }
++    message = format_from_files( publisher ? publisher->event_files : NULL, event->record->EventID,
++                                 message_lang( publisher ), args );
++    free( args );
++    return message;
++}
++
++static WCHAR *task_message( struct publisher *publisher, struct event *event )
++{
++    WCHAR buffer[16], *message;
++
++    if (!event->record->EventCategory) return format_module( instance, MSG_TASK_NONE, message_lang( publisher ), NULL );
++    if (publisher && (message = format_from_files( publisher->category_files, event->record->EventCategory,
++                                                   message_lang( publisher ), NULL )))
++        return message;
++    swprintf( buffer, ARRAY_SIZE(buffer), L"(%u)", event->record->EventCategory );
++    return strdupW( buffer );
++}
++
++static WCHAR *keyword_message( struct publisher *publisher, struct event *event )
++{
++    switch (event->record->EventType)
++    {
++    case EVENTLOG_AUDIT_SUCCESS: return format_module( instance, MSG_KEYWORD_AUDIT_SUCCESS, message_lang( publisher ), NULL );
++    case EVENTLOG_AUDIT_FAILURE: return format_module( instance, MSG_KEYWORD_AUDIT_FAILURE, message_lang( publisher ), NULL );
++    default: return format_module( instance, MSG_KEYWORD_CLASSIC, message_lang( publisher ), NULL );
++    }
++}
++
++static unsigned int event_level( struct event *event )
++{
++    switch (event->record->EventType)
++    {
++    case EVENTLOG_ERROR_TYPE: return 2;
++    case EVENTLOG_WARNING_TYPE: return 3;
++    default: return 4;
++    }
++}
++
++/* the rendering Windows 11 adds to the event's XML: the message, if there is one, the level, task and keywords,
++ * in the language of the culture it names */
++static WCHAR *rendering_info( struct publisher *publisher, struct event *event, DWORD count, EVT_VARIANT *values )
++{
++    WCHAR *parts[4] = { NULL }, *message, *rendering = NULL, culture[LOCALE_NAME_MAX_LENGTH];
++    unsigned int i;
++
++    if (!LCIDToLocaleName( MAKELCID( message_lang( publisher ), SORT_DEFAULT ), culture, ARRAY_SIZE(culture), 0 ))
++        wcscpy( culture, L"en-US" );
++    if (publisher && (message = event_message( publisher, event, count, values )))
++    {
++        parts[0] = escape_xml( message );
++        free( message );
++    }
++    if ((message = level_name( event_level( event ), message_lang( publisher ) )))
++    {
++        parts[1] = escape_xml( message );
++        free( message );
++    }
++    if ((message = task_message( publisher, event )))
++    {
++        parts[2] = escape_xml( message );
++        free( message );
++    }
++    if ((message = keyword_message( publisher, event )))
++    {
++        parts[3] = escape_xml( message );
++        free( message );
++    }
++    if (parts[1] && parts[2] && parts[3])
++    {
++        size_t len = 256 + wcslen( culture ) + (parts[0] ? wcslen( parts[0] ) : 0) + wcslen( parts[1] ) +
++                     wcslen( parts[2] ) + wcslen( parts[3] );
++
++        if ((rendering = malloc( len * sizeof(WCHAR) )))
++            swprintf( rendering, len, L"<RenderingInfo Culture='%s'>%s%s%s<Level>%s</Level><Task>%s</Task>"
++                      L"<Keywords><Keyword>%s</Keyword></Keywords></RenderingInfo>", culture,
++                      parts[0] ? L"<Message>" : L"", parts[0] ? parts[0] : L"", parts[0] ? L"</Message>" : L"",
++                      parts[1], parts[2], parts[3] );
++    }
++    for (i = 0; i < ARRAY_SIZE(parts); i++) free( parts[i] );
++    return rendering;
++}
++
++BOOL WINAPI EvtFormatMessage( EVT_HANDLE publisher_handle, EVT_HANDLE event_handle, DWORD id, DWORD count,
++                              EVT_VARIANT *values, DWORD flags, DWORD size, WCHAR *buffer, DWORD *used )
++{
++    struct publisher *publisher = NULL;
++    struct event *event = NULL;
++    struct object *obj;
++    WCHAR *message = NULL;
++    unsigned int nuls = 2;
++    BOOL ret;
++
++    TRACE( "%p, %p, %#lx, %lu, %p, %#lx, %lu, %p, %p\n", publisher_handle, event_handle, id, count, values, flags,
++           size, buffer, used );
++
++    if (!used)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    *used = 0;
++    if (publisher_handle)
++    {
++        if (!(obj = get_object( publisher_handle, OBJECT_PUBLISHER ))) return FALSE;
++        publisher = impl_from_publisher( obj );
++    }
++    if (event_handle)
++    {
++        if (!(obj = get_object( event_handle, OBJECT_EVENT ))) return FALSE;
++        event = impl_from_event( obj );
++    }
++    if (flags != EvtFormatMessageId && !event)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    switch (flags)
++    {
++    case EvtFormatMessageEvent:
++        if (!publisher || !(message = event_message( publisher, event, count, values )))
++        {
++            SetLastError( ERROR_EVT_MESSAGE_NOT_FOUND );
++            return FALSE;
++        }
++        break;
++    case EvtFormatMessageLevel:
++        message = level_name( event_level( event ), message_lang( publisher ) );
++        break;
++    case EvtFormatMessageTask:
++        message = task_message( publisher, event );
++        break;
++    case EvtFormatMessageKeyword:
++        message = keyword_message( publisher, event );
++        nuls = 3;
++        break;
++    case EvtFormatMessageId:
++        if (!publisher || !(message = format_from_files( publisher->event_files, id, message_lang( publisher ), NULL )))
++        {
++            SetLastError( ERROR_EVT_MESSAGE_ID_NOT_FOUND );
++            return FALSE;
++        }
++        break;
++    case EvtFormatMessageXml:
++    {
++        WCHAR *rendering = rendering_info( publisher, event, count, values );
++        struct node *tree;
++
++        if (rendering && (tree = build_event_tree( event )))
++        {
++            message = write_event_xml( tree, rendering );
++            free_node( tree );
++        }
++        free( rendering );
++        nuls = 1;
++        break;
++    }
++    case EvtFormatMessageOpcode:
++    case EvtFormatMessageChannel:
++    case EvtFormatMessageProvider:
++        /* a classic event has none of these */
++        SetLastError( ERROR_EVT_MESSAGE_ID_NOT_FOUND );
++        return FALSE;
++    default:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!message)
++    {
++        SetLastError( ERROR_OUTOFMEMORY );
++        return FALSE;
++    }
++    ret = copy_message( message, nuls, size, buffer, used );
++    free( message );
++    return ret;
++}
++
++BOOL WINAPI EvtGetPublisherMetadataProperty( EVT_HANDLE handle, EVT_PUBLISHER_METADATA_PROPERTY_ID id, DWORD flags,
++                                             DWORD size, EVT_VARIANT *value, DWORD *used )
++{
++    struct publisher *publisher;
++    struct object *obj;
++
++    TRACE( "%p, %u, %#lx, %lu, %p, %p\n", handle, id, flags, size, value, used );
++
++    if (!(obj = get_object( handle, OBJECT_PUBLISHER ))) return FALSE;
++    publisher = impl_from_publisher( obj );
++    switch (id)
++    {
++    case EvtPublisherMetadataMessageFilePath:
++    case EvtPublisherMetadataResourceFilePath:
++        return set_variant_string( value, publisher->event_files ? publisher->event_files : L"", size, used );
++    case EvtPublisherMetadataPublisherGuid:
++        *used = sizeof(EVT_VARIANT);
++        if (size < sizeof(EVT_VARIANT) || !value)
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        memset( value, 0, sizeof(*value) );
++        value->Type = EvtVarTypeNull;
++        return TRUE;
++    default:
++        FIXME( "property %u not supported\n", id );
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
+ }
+diff --git a/dlls/wevtapi/tests/wevtapi.c b/dlls/wevtapi/tests/wevtapi.c
+index f304ce988d1..a94e7a60d4b 100644
+--- a/dlls/wevtapi/tests/wevtapi.c
++++ b/dlls/wevtapi/tests/wevtapi.c
+@@ -17,9 +17,12 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdio.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winerror.h"
++#include "winnls.h"
+ #include "winevt.h"
+ #include "wine/test.h"
+ 
+@@ -66,7 +69,563 @@ static void test_EvtGetChannelConfigProperty(void)
+     RegCloseKey(key);
+ }
+ 
++static DWORD query_count(const WCHAR *path, const WCHAR *text, DWORD flags)
++{
++    EVT_HANDLE results, events[16];
++    DWORD returned, total = 0, i;
++
++    if (!(results = EvtQuery(NULL, path, text, flags))) return ~0u;
++    while (EvtNext(results, ARRAY_SIZE(events), events, INFINITE, 0, &returned))
++    {
++        total += returned;
++        for (i = 0; i < returned; i++) EvtClose(events[i]);
++    }
++    ok(GetLastError() == ERROR_NO_MORE_ITEMS, "got %lu\n", GetLastError());
++    EvtClose(results);
++    return total;
++}
++
++static EVT_HANDLE first_event(const WCHAR *text)
++{
++    EVT_HANDLE results, event = NULL;
++    DWORD returned;
++
++    results = EvtQuery(NULL, L"System", text, EvtQueryChannelPath | EvtQueryReverseDirection);
++    ok(results != NULL, "EvtQuery error %lu\n", GetLastError());
++    if (!results) return NULL;
++    if (!EvtNext(results, 1, &event, INFINITE, 0, &returned)) event = NULL;
++    EvtClose(results);
++    return event;
++}
++
++/* the event log service writes these to the System log as it starts */
++static const WCHAR started[] = L"*[System[Provider[@Name='EventLog'] and EventID=6005]]";
++static const WCHAR version[] = L"*[System[Provider[@Name='EventLog'] and EventID=6009]]";
++
++static void test_EvtQuery(void)
++{
++    static const struct
++    {
++        const WCHAR *path, *text;
++        DWORD flags, error;
++    }
++    errors[] =
++    {
++        { L"System", L"*[System[EventID=", EvtQueryChannelPath, ERROR_EVT_INVALID_QUERY },
++        { L"System", L"*[System[foo(EventID)]]", EvtQueryChannelPath, ERROR_EVT_INVALID_QUERY },
++        { L"System", L"*[System[EventID=6005 and not(Level=2)]]", EvtQueryChannelPath, ERROR_EVT_INVALID_QUERY },
++        { L"wine-no-such-log", L"*", EvtQueryChannelPath, ERROR_EVT_CHANNEL_NOT_FOUND },
++        { L"C:\\wine-no-such-file.evtx", L"*", EvtQueryFilePath, ERROR_FILE_NOT_FOUND },
++        { L"System", L"*", EvtQueryChannelPath | EvtQueryFilePath, ERROR_INVALID_PARAMETER },
++        { NULL, L"*[System[EventID=6005]]", EvtQueryChannelPath, ERROR_EVT_INVALID_CHANNEL_PATH },
++    };
++    static const WCHAR *matching[] =
++    {
++        L"*[System[EventID[@Qualifiers='32768']=6005]]",
++        L"Event/System[EventID=6005]",
++        L"*[System[EventID=6005 and TimeCreated[timediff(@SystemTime) <= 3153600000000]]]",
++        L"*[System[EventID=6005 and TimeCreated[@SystemTime>='2000-01-01T00:00:00.000Z']]]",
++        L"*[System[EventID=6005 and band(Keywords,36028797018963968)]]",
++        L"*[System[EventID=6005 and Level!=2]]",
++        L"*[System[EventID=6005 and (Level=4 or Level=2)]]",
++    };
++    static WCHAR text[1024];
++    EVT_HANDLE results, events[2];
++    DWORD returned, count, i;
++    BOOL ret;
++
++    count = query_count(L"System", started, EvtQueryChannelPath);
++    if (!count || count == ~0u)
++    {
++        skip("no EventLog events in the System log\n");
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(errors); i++)
++    {
++        SetLastError(0xdeadbeef);
++        results = EvtQuery(NULL, errors[i].path, errors[i].text, errors[i].flags);
++        ok(!results, "%lu: got a query\n", i);
++        ok(GetLastError() == errors[i].error, "%lu: got %lu\n", i, GetLastError());
++        if (results) EvtClose(results);
++    }
++    for (i = 0; i < ARRAY_SIZE(matching); i++)
++        ok(query_count(L"System", matching[i], EvtQueryChannelPath) == count, "%lu: wrong count\n", i);
++    ok(!query_count(L"System", L"*[System[EventID=6005 and TimeCreated[timediff(@SystemTime) <= 1]]]",
++                    EvtQueryChannelPath), "got events from the last millisecond\n");
++    count = query_count(L"System", version, EvtQueryChannelPath);
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data='Multiprocessor Free' or "
++                   L"Data='Uniprocessor Free']]", EvtQueryChannelPath) == count, "wrong count\n");
++    /* compared, a position is the element there; tested for, only the first element is */
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data[4]='Multiprocessor Free' or "
++                   L"Data[4]='Uniprocessor Free']]", EvtQueryChannelPath) == count, "wrong count\n");
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data[position()=4]='Multiprocessor Free' or "
++                   L"Data[position()=4]='Uniprocessor Free']]", EvtQueryChannelPath) == count, "wrong count\n");
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data[3]='']]", EvtQueryChannelPath) == count,
++       "wrong count\n");
++    ok(!query_count(L"System", L"*[System[EventID=6009] and EventData[Data[3]='Multiprocessor Free']]",
++                    EvtQueryChannelPath), "wrong count\n");
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data[1]]]", EvtQueryChannelPath) == count,
++       "wrong count\n");
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data[2] or Data[1]]]", EvtQueryChannelPath) == count,
++       "wrong count\n");
++    ok(!query_count(L"System", L"*[System[EventID=6009] and EventData[Data[2]]]", EvtQueryChannelPath),
++       "wrong count\n");
++    ok(!query_count(L"System", L"*[System[EventID=6009] and EventData/Data[2]]", EvtQueryChannelPath), "wrong count\n");
++    ok(!query_count(L"System", L"*[System[EventID=6009] and EventData[Data[position()>1]]]", EvtQueryChannelPath),
++       "wrong count\n");
++    ok(!query_count(L"System", L"*[System[EventID=6009] and EventData[Data[0]]]", EvtQueryChannelPath),
++       "wrong count\n");
++    /* how far a query may go: 24 parentheses, 21 predicates, 23 operands of "or" or of "and"; band() of no
++     * band() */
++    for (i = 0; i < 4; i++)
++    {
++        static const unsigned int limits[] = { 24, 21, 23, 23 };
++        unsigned int n, j;
++        WCHAR *p = text;
++
++        for (n = limits[i]; n <= limits[i] + 1; n++)
++        {
++            p = text;
++            switch (i)
++            {
++            case 0:
++                p += swprintf(p, 32, L"*[System[");
++                for (j = 0; j < n; j++) *p++ = '(';
++                p += swprintf(p, 32, L"EventID=6005");
++                for (j = 0; j < n; j++) *p++ = ')';
++                wcscpy(p, L"]]");
++                break;
++            case 1:
++                *p++ = '*';
++                for (j = 0; j < n; j++) p += swprintf(p, 32, L"[System");
++                for (j = 0; j < n; j++) *p++ = ']';
++                *p = 0;
++                break;
++            case 2:
++            case 3:
++                p += swprintf(p, 32, L"*[System[");
++                for (j = 1; j < n; j++) p += swprintf(p, 32, i == 2 ? L"EventID=%u or " : L"EventID!=%u and ", 100000 + j);
++                wcscpy(p, L"EventID=6005]]");
++                break;
++            }
++            SetLastError(0xdeadbeef);
++            results = EvtQuery(NULL, L"System", text, EvtQueryChannelPath);
++            if (n == limits[i]) ok(results != NULL, "%lu, %u: EvtQuery error %lu\n", i, n, GetLastError());
++            else ok(!results && GetLastError() == ERROR_EVT_INVALID_QUERY, "%lu, %u: got %p, error %lu\n", i, n, results,
++                    GetLastError());
++            if (results) EvtClose(results);
++        }
++    }
++    SetLastError(0xdeadbeef);
++    results = EvtQuery(NULL, L"System", L"*[System[band(band(Keywords,36028797018963968),36028797018963968)]]",
++                       EvtQueryChannelPath);
++    ok(!results && GetLastError() == ERROR_EVT_INVALID_QUERY, "got %p, error %lu\n", results, GetLastError());
++
++    /* compared with a number, "10.00." is not 10 */
++    ok(!query_count(L"System", L"*[System[EventID=6009] and EventData[Data[1]=10]]", EvtQueryChannelPath),
++       "wrong count\n");
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data[5]=0]]", EvtQueryChannelPath) == count,
++       "wrong count\n");
++    ok(query_count(L"System", L"*[System[EventID=6009] and EventData[Data>1000]]", EvtQueryChannelPath) == count,
++       "wrong count\n");
++
++    /* structured queries, a Suppress leaving out what its Select took */
++    ok(query_count(NULL, L"<QueryList><Query Id='0' Path='System'><Select>*[System[EventID=6005]]</Select></Query>"
++                   L"</QueryList>", EvtQueryChannelPath) == count, "wrong count\n");
++    ok(!query_count(NULL, L"<QueryList><Query Id='0'><Select Path='System'>*[System[EventID=6005]]</Select>"
++                    L"<Suppress Path='System'>*[System[Level=4]]</Suppress></Query></QueryList>", EvtQueryChannelPath),
++       "the Suppress let events through\n");
++
++    results = EvtQuery(NULL, L"System", started, EvtQueryChannelPath);
++    SetLastError(0xdeadbeef);
++    returned = 0xdeadbeef;
++    ret = EvtNext(results, 0, events, INFINITE, 0, &returned);
++    ok(!ret, "EvtNext succeeded\n");
++    ok(GetLastError() == ERROR_NO_MORE_ITEMS, "got %lu\n", GetLastError());
++    ok(!returned, "got %lu\n", returned);
++    EvtClose(results);
++}
++
++static void test_EvtRender(void)
++{
++    static const WCHAR start[] = L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
++                                 L"<Provider Name='EventLog'/><EventID Qualifiers='32768'>6005</EventID><Version>0"
++                                 L"</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>"
++                                 L"0x80000000000000</Keywords><TimeCreated SystemTime='";
++    static const BYTE system_types[EvtSystemPropertyIdEND] =
++    {
++        EvtVarTypeString, EvtVarTypeNull, EvtVarTypeUInt16, EvtVarTypeUInt16, EvtVarTypeByte, EvtVarTypeUInt16,
++        EvtVarTypeByte, EvtVarTypeHexInt64, EvtVarTypeFileTime, EvtVarTypeUInt64, EvtVarTypeNull, EvtVarTypeNull,
++        EvtVarTypeUInt32, EvtVarTypeUInt32, EvtVarTypeString, EvtVarTypeString, EvtVarTypeNull, EvtVarTypeByte,
++    };
++    static const WCHAR *paths[] =
++    {
++        L"Event/System/Provider/@Name", L"Event/System/EventID", L"Event/System/Level", L"Event/System/Nothing",
++    };
++    EVT_HANDLE event, context;
++    DWORD used, count, i;
++    EVT_VARIANT *values;
++    WCHAR tiny[8], *xml;
++    BOOL ret;
++
++    if (!(event = first_event(started)))
++    {
++        skip("no EventLog started event\n");
++        return;
++    }
++
++    used = count = 0xdeadbeef;
++    SetLastError(0xdeadbeef);
++    ret = EvtRender(NULL, event, EvtRenderEventXml, sizeof(tiny), tiny, &used, &count);
++    ok(!ret, "EvtRender succeeded\n");
++    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
++    ok(used > sizeof(start), "got %lu\n", used);
++    xml = malloc(used);
++    ret = EvtRender(NULL, event, EvtRenderEventXml, used, xml, &used, &count);
++    ok(ret, "EvtRender error %lu\n", GetLastError());
++    ok(!wcsncmp(xml, start, wcslen(start)), "got %s\n", wine_dbgstr_w(xml));
++    ok(wcsstr(xml, L"<Channel>System</Channel>") != NULL, "got %s\n", wine_dbgstr_w(xml));
++    ok(wcsstr(xml, L"<Security/></System><EventData><Binary>") != NULL, "got %s\n", wine_dbgstr_w(xml));
++    ok(used == (wcslen(xml) + 1) * sizeof(WCHAR), "got %lu\n", used);
++    free(xml);
++
++    SetLastError(0xdeadbeef);
++    ret = EvtRender(NULL, event, EvtRenderEventValues, 0, NULL, &used, &count);
++    ok(!ret, "EvtRender succeeded\n");
++    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got %lu\n", GetLastError());
++
++    context = EvtCreateRenderContext(0, NULL, EvtRenderContextSystem);
++    ok(context != NULL, "EvtCreateRenderContext error %lu\n", GetLastError());
++    used = 0;
++    ret = EvtRender(context, event, EvtRenderEventValues, 0, NULL, &used, &count);
++    ok(!ret && GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %d, error %lu\n", ret, GetLastError());
++    values = malloc(used);
++    ret = EvtRender(context, event, EvtRenderEventValues, used, values, &used, &count);
++    ok(ret, "EvtRender error %lu\n", GetLastError());
++    ok(count == EvtSystemPropertyIdEND, "got %lu\n", count);
++    for (i = 0; i < count && i < EvtSystemPropertyIdEND; i++)
++        ok(values[i].Type == system_types[i], "%lu: got type %lu\n", i, values[i].Type);
++    ok(values[EvtSystemEventID].UInt16Val == 6005, "got %u\n", values[EvtSystemEventID].UInt16Val);
++    ok(values[EvtSystemQualifiers].UInt16Val == 0x8000, "got %#x\n", values[EvtSystemQualifiers].UInt16Val);
++    ok(values[EvtSystemLevel].ByteVal == 4, "got %u\n", values[EvtSystemLevel].ByteVal);
++    ok(values[EvtSystemKeywords].UInt64Val == 0x80000000000000, "got %s\n",
++       wine_dbgstr_longlong(values[EvtSystemKeywords].UInt64Val));
++    ok(!wcscmp(values[EvtSystemProviderName].StringVal, L"EventLog"), "got %s\n",
++       wine_dbgstr_w(values[EvtSystemProviderName].StringVal));
++    ok(!wcscmp(values[EvtSystemChannel].StringVal, L"System"), "got %s\n", wine_dbgstr_w(values[EvtSystemChannel].StringVal));
++    free(values);
++    EvtClose(context);
++
++    /* the values a path names, strings counted without their terminator */
++    context = EvtCreateRenderContext(ARRAY_SIZE(paths), paths, EvtRenderContextValues);
++    ok(context != NULL, "EvtCreateRenderContext error %lu\n", GetLastError());
++    used = 0;
++    EvtRender(context, event, EvtRenderEventValues, 0, NULL, &used, &count);
++    values = malloc(used);
++    ret = EvtRender(context, event, EvtRenderEventValues, used, values, &used, &count);
++    ok(ret, "EvtRender error %lu\n", GetLastError());
++    ok(count == ARRAY_SIZE(paths), "got %lu\n", count);
++    ok(values[0].Type == EvtVarTypeString && values[0].Count == 8, "got type %lu count %lu\n", values[0].Type, values[0].Count);
++    ok(values[1].Type == EvtVarTypeUInt16 && values[1].UInt16Val == 6005, "got type %lu\n", values[1].Type);
++    ok(values[2].Type == EvtVarTypeByte, "got type %lu\n", values[2].Type);
++    ok(values[3].Type == EvtVarTypeNull, "got type %lu\n", values[3].Type);
++    free(values);
++    EvtClose(context);
++
++    SetLastError(0xdeadbeef);
++    context = EvtCreateRenderContext(1, (const WCHAR *[]){ L"Event/EventData/Data[1]" }, EvtRenderContextValues);
++    ok(!context, "got a context\n");
++    ok(GetLastError() == ERROR_EVT_INVALID_QUERY, "got %lu\n", GetLastError());
++    EvtClose(event);
++
++    /* the strings of the event, each counted with its terminator */
++    if ((event = first_event(version)))
++    {
++        context = EvtCreateRenderContext(0, NULL, EvtRenderContextUser);
++        used = 0;
++        EvtRender(context, event, EvtRenderEventValues, 0, NULL, &used, &count);
++        values = malloc(used);
++        ret = EvtRender(context, event, EvtRenderEventValues, used, values, &used, &count);
++        ok(ret, "EvtRender error %lu\n", GetLastError());
++        ok(count == 5, "got %lu\n", count);
++        for (i = 0; ret && i < count; i++)
++        {
++            ok(values[i].Type == EvtVarTypeString, "%lu: got type %lu\n", i, values[i].Type);
++            ok(values[i].Count == wcslen(values[i].StringVal) + 1, "%lu: got count %lu\n", i, values[i].Count);
++        }
++        if (ret && count == 5)
++            ok(!wcscmp(values[3].StringVal, L"Multiprocessor Free") || !wcscmp(values[3].StringVal, L"Uniprocessor Free"),
++               "got %s\n", wine_dbgstr_w(values[3].StringVal));
++        free(values);
++        EvtClose(context);
++        EvtClose(event);
++    }
++}
++
++static void test_EvtFormatMessage(void)
++{
++    static const WCHAR rendering[] = L"</EventData><RenderingInfo Culture='en-US'><Message>The Event log service was "
++                                     L"started.</Message><Level>Information</Level><Task>None</Task><Keywords>"
++                                     L"<Keyword>Classic</Keyword></Keywords></RenderingInfo></Event>";
++    EVT_HANDLE event, publisher;
++    WCHAR buffer[2048];
++    DWORD used;
++    BOOL ret;
++
++    if (!(event = first_event(version)))
++    {
++        skip("no EventLog version event\n");
++        return;
++    }
++    publisher = EvtOpenPublisherMetadata(NULL, L"EventLog", NULL, 0, 0);
++    ok(publisher != NULL, "EvtOpenPublisherMetadata error %lu\n", GetLastError());
++
++    /* a message, level or task with two terminators, the keywords with three */
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageEvent, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(used == wcslen(buffer) + 2, "got %lu for %s\n", used, wine_dbgstr_w(buffer));
++    ok(!wcsncmp(buffer, L"Microsoft (R) Windows (R) ", 26), "got %s\n", wine_dbgstr_w(buffer));
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageLevel, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(used == wcslen(buffer) + 2, "got %lu for %s\n", used, wine_dbgstr_w(buffer));
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageTask, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(used == wcslen(buffer) + 2, "got %lu for %s\n", used, wine_dbgstr_w(buffer));
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageKeyword, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(used == wcslen(buffer) + 3, "got %lu for %s\n", used, wine_dbgstr_w(buffer));
++
++    SetLastError(0xdeadbeef);
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageOpcode, ARRAY_SIZE(buffer), buffer, &used);
++    ok(!ret, "EvtFormatMessage succeeded\n");
++    ok(GetLastError() == ERROR_EVT_MESSAGE_ID_NOT_FOUND, "got %lu\n", GetLastError());
++    SetLastError(0xdeadbeef);
++    ret = EvtFormatMessage(NULL, event, 0, 0, NULL, EvtFormatMessageEvent, ARRAY_SIZE(buffer), buffer, &used);
++    ok(!ret, "EvtFormatMessage succeeded\n");
++    ok(GetLastError() == ERROR_EVT_MESSAGE_NOT_FOUND, "got %lu\n", GetLastError());
++    EvtClose(publisher);
++    EvtClose(event);
++
++    /* in the language asked for */
++    if (!(event = first_event(started)))
++    {
++        skip("no EventLog start event\n");
++        return;
++    }
++    publisher = EvtOpenPublisherMetadata(NULL, L"EventLog", NULL, MAKELCID(0x409, SORT_DEFAULT), 0);
++    ok(publisher != NULL, "EvtOpenPublisherMetadata error %lu\n", GetLastError());
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageEvent, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(!wcscmp(buffer, L"The Event log service was started."), "got %s\n", wine_dbgstr_w(buffer));
++    ok(used == 36, "got %lu\n", used);
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageLevel, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret && !wcscmp(buffer, L"Information"), "got %d, %s\n", ret, wine_dbgstr_w(buffer));
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageTask, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret && !wcscmp(buffer, L"None"), "got %d, %s\n", ret, wine_dbgstr_w(buffer));
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageKeyword, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret && !wcscmp(buffer, L"Classic"), "got %d, %s\n", ret, wine_dbgstr_w(buffer));
++    /* a message by its number, without insertions */
++    ret = EvtFormatMessage(publisher, NULL, 0x80001779, 0, NULL, EvtFormatMessageId, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(!wcscmp(buffer, L"Microsoft (R) Windows (R) %1 %2 %3 %4."), "got %s\n", wine_dbgstr_w(buffer));
++    ok(used == wcslen(buffer) + 2, "got %lu\n", used);
++    /* the XML with what is rendered after the event's data, one terminator */
++    ret = EvtFormatMessage(publisher, event, 0, 0, NULL, EvtFormatMessageXml, ARRAY_SIZE(buffer), buffer, &used);
++    ok(ret, "EvtFormatMessage error %lu\n", GetLastError());
++    ok(used == wcslen(buffer) + 1, "got %lu\n", used);
++    ok(wcslen(buffer) > wcslen(rendering) && !wcscmp(buffer + wcslen(buffer) - wcslen(rendering), rendering),
++       "got %s\n", wine_dbgstr_w(buffer));
++    EvtClose(publisher);
++    EvtClose(event);
++
++    SetLastError(0xdeadbeef);
++    publisher = EvtOpenPublisherMetadata(NULL, L"wine-no-such-source", NULL, 0, 0);
++    ok(!publisher, "got a publisher\n");
++    ok(GetLastError() == ERROR_FILE_NOT_FOUND, "got %lu\n", GetLastError());
++}
++
++static void test_EvtGetLogInfo(void)
++{
++    static const BYTE types[] =
++    {
++        EvtVarTypeFileTime, EvtVarTypeFileTime, EvtVarTypeFileTime, EvtVarTypeUInt64, EvtVarTypeUInt32,
++        EvtVarTypeUInt64, EvtVarTypeUInt64, EvtVarTypeBoolean,
++    };
++    EVT_VARIANT value[2];
++    EVT_HANDLE log;
++    DWORD used, i;
++    BOOL ret;
++
++    log = EvtOpenLog(NULL, L"System", EvtOpenChannelPath);
++    ok(log != NULL, "EvtOpenLog error %lu\n", GetLastError());
++    for (i = 0; log && i < ARRAY_SIZE(types); i++)
++    {
++        ret = EvtGetLogInfo(log, i, sizeof(value), value, &used);
++        ok(ret, "%lu: EvtGetLogInfo error %lu\n", i, GetLastError());
++        ok(value[0].Type == types[i], "%lu: got type %lu\n", i, value[0].Type);
++        ok(used == sizeof(EVT_VARIANT), "%lu: got %lu\n", i, used);
++    }
++    if (log) EvtClose(log);
++
++    SetLastError(0xdeadbeef);
++    log = EvtOpenLog(NULL, L"wine-no-such-log", EvtOpenChannelPath);
++    ok(!log, "got a log\n");
++    ok(GetLastError() == ERROR_EVT_CHANNEL_NOT_FOUND, "got %lu\n", GetLastError());
++}
++
++static void test_channels(void)
++{
++    EVT_HANDLE channels, config;
++    BOOL application = FALSE, system = FALSE;
++    WCHAR name[512];
++    struct { EVT_VARIANT var; WCHAR buf[MAX_PATH]; } value;
++    DWORD used;
++    BOOL ret;
++
++    channels = EvtOpenChannelEnum(NULL, 0);
++    ok(channels != NULL, "EvtOpenChannelEnum error %lu\n", GetLastError());
++    while (EvtNextChannelPath(channels, ARRAY_SIZE(name), name, &used))
++    {
++        if (!wcsicmp(name, L"Application")) application = TRUE;
++        if (!wcsicmp(name, L"System")) system = TRUE;
++    }
++    ok(GetLastError() == ERROR_NO_MORE_ITEMS, "got %lu\n", GetLastError());
++    ok(application && system, "got %d %d\n", application, system);
++    EvtClose(channels);
++
++    config = EvtOpenChannelConfig(NULL, L"Application", 0);
++    ok(config != NULL, "EvtOpenChannelConfig error %lu\n", GetLastError());
++    ret = EvtGetChannelConfigProperty(config, EvtChannelConfigEnabled, 0, sizeof(value), &value.var, &used);
++    ok(ret && value.var.Type == EvtVarTypeBoolean && value.var.BooleanVal, "got %d, type %lu\n", ret, value.var.Type);
++    ret = EvtGetChannelConfigProperty(config, EvtChannelConfigClassicEventlog, 0, sizeof(value), &value.var, &used);
++    ok(ret && value.var.Type == EvtVarTypeBoolean && value.var.BooleanVal, "got %d, type %lu\n", ret, value.var.Type);
++    ret = EvtGetChannelConfigProperty(config, EvtChannelConfigType, 0, sizeof(value), &value.var, &used);
++    ok(ret && value.var.Type == EvtVarTypeUInt32 && !value.var.UInt32Val, "got %d, type %lu\n", ret, value.var.Type);
++    ret = EvtGetChannelConfigProperty(config, EvtChannelLoggingConfigMaxSize, 0, sizeof(value), &value.var, &used);
++    ok(ret && value.var.Type == EvtVarTypeUInt64 && value.var.UInt64Val, "got %d, type %lu\n", ret, value.var.Type);
++    ret = EvtGetChannelConfigProperty(config, EvtChannelLoggingConfigRetention, 0, sizeof(value), &value.var, &used);
++    ok(ret && value.var.Type == EvtVarTypeBoolean, "got %d, type %lu\n", ret, value.var.Type);
++    ret = EvtGetChannelConfigProperty(config, EvtChannelConfigOwningPublisher, 0, sizeof(value), &value.var, &used);
++    ok(ret && value.var.Type == EvtVarTypeString && !value.var.StringVal[0], "got %d, type %lu\n", ret, value.var.Type);
++    ok(used == sizeof(EVT_VARIANT) + sizeof(WCHAR), "got %lu\n", used);
++    EvtClose(config);
++
++    SetLastError(0xdeadbeef);
++    config = EvtOpenChannelConfig(NULL, L"wine-no-such-log", 0);
++    ok(!config, "got a config\n");
++    ok(GetLastError() == ERROR_EVT_CHANNEL_NOT_FOUND, "got %lu\n", GetLastError());
++}
++
++static void test_bookmark(void)
++{
++    EVT_HANDLE bookmark, event;
++    WCHAR xml[512], record[32];
++    DWORD used, count;
++    BOOL ret;
++
++    bookmark = EvtCreateBookmark(NULL);
++    ok(bookmark != NULL, "EvtCreateBookmark error %lu\n", GetLastError());
++    ret = EvtRender(NULL, bookmark, EvtRenderBookmark, sizeof(xml), xml, &used, &count);
++    ok(ret, "EvtRender error %lu\n", GetLastError());
++    ok(!wcsncmp(xml, L"<BookmarkList", 13), "got %s\n", wine_dbgstr_w(xml));
++    if ((event = first_event(started)))
++    {
++        EVT_HANDLE context = EvtCreateRenderContext(0, NULL, EvtRenderContextSystem);
++        EVT_VARIANT values[EvtSystemPropertyIdEND + 16];
++
++        ret = EvtUpdateBookmark(bookmark, event);
++        ok(ret, "EvtUpdateBookmark error %lu\n", GetLastError());
++        ret = EvtRender(NULL, bookmark, EvtRenderBookmark, sizeof(xml), xml, &used, &count);
++        ok(ret, "EvtRender error %lu\n", GetLastError());
++        EvtRender(context, event, EvtRenderEventValues, sizeof(values), values, &used, &count);
++        swprintf(record, ARRAY_SIZE(record), L"RecordId='%I64u'", values[EvtSystemEventRecordId].UInt64Val);
++        ok(wcsstr(xml, L"Channel='System'") && wcsstr(xml, record), "got %s\n", wine_dbgstr_w(xml));
++        EvtClose(context);
++        EvtClose(event);
++    }
++    EvtClose(bookmark);
++}
++
++static LONG delivered;
++static DWORD callback_thread;
++static HANDLE delivered_event;
++
++static DWORD WINAPI subscription_callback(EVT_SUBSCRIBE_NOTIFY_ACTION action, void *context, EVT_HANDLE event)
++{
++    ok(action == EvtSubscribeActionDeliver, "got action %u\n", action);
++    ok(context == &delivered, "got context %p\n", context);
++    ok(event != NULL, "no event\n");
++    callback_thread = GetCurrentThreadId();
++    InterlockedIncrement(&delivered);
++    SetEvent(delivered_event);
++    return 0;
++}
++
++static void test_EvtSubscribe(void)
++{
++    HANDLE signal = CreateEventW(NULL, TRUE, FALSE, NULL);
++    EVT_HANDLE subscription, events[4];
++    DWORD returned, total = 0;
++    BOOL ret;
++
++    /* the events there already are there for EvtNext at once, and do not set the signal */
++    subscription = EvtSubscribe(NULL, signal, L"System", started, NULL, NULL, NULL, EvtSubscribeStartAtOldestRecord);
++    ok(subscription != NULL, "EvtSubscribe error %lu\n", GetLastError());
++    if (!subscription) return;
++    while ((ret = EvtNext(subscription, ARRAY_SIZE(events), events, 0, 0, &returned)))
++    {
++        total += returned;
++        while (returned) EvtClose(events[--returned]);
++    }
++    ok(GetLastError() == ERROR_NO_MORE_ITEMS, "got %lu\n", GetLastError());
++    ok(total == query_count(L"System", started, EvtQueryChannelPath), "got %lu events\n", total);
++    /* asked again before more come, EvtNext does not wait for them, whatever the timeout */
++    SetLastError(0xdeadbeef);
++    ret = EvtNext(subscription, ARRAY_SIZE(events), events, INFINITE, 0, &returned);
++    ok(!ret && GetLastError() == ERROR_INVALID_OPERATION, "got %d, error %lu\n", ret, GetLastError());
++    ok(WaitForSingleObject(signal, 0) == WAIT_TIMEOUT, "signal set\n");
++    EvtClose(subscription);
++
++    /* nor does it reset the signal */
++    SetEvent(signal);
++    subscription = EvtSubscribe(NULL, signal, L"System", started, NULL, NULL, NULL, EvtSubscribeToFutureEvents);
++    ok(subscription != NULL, "EvtSubscribe error %lu\n", GetLastError());
++    SetLastError(0xdeadbeef);
++    ret = EvtNext(subscription, ARRAY_SIZE(events), events, 0, 0, &returned);
++    ok(!ret && GetLastError() == ERROR_NO_MORE_ITEMS, "got %d, error %lu\n", ret, GetLastError());
++    ok(!WaitForSingleObject(signal, 0), "signal reset\n");
++    EvtClose(subscription);
++
++    /* a signal or a callback, not both */
++    SetLastError(0xdeadbeef);
++    subscription = EvtSubscribe(NULL, signal, L"System", started, NULL, &delivered, subscription_callback,
++                                EvtSubscribeStartAtOldestRecord);
++    ok(!subscription && GetLastError() == ERROR_INVALID_PARAMETER, "got %p, error %lu\n", subscription, GetLastError());
++
++    /* a callback is called on a thread of the subscription's */
++    delivered_event = CreateEventW(NULL, TRUE, FALSE, NULL);
++    subscription = EvtSubscribe(NULL, NULL, L"System", started, NULL, &delivered, subscription_callback,
++                                EvtSubscribeStartAtOldestRecord);
++    ok(subscription != NULL, "EvtSubscribe error %lu\n", GetLastError());
++    ok(!WaitForSingleObject(delivered_event, 10000), "nothing delivered\n");
++    ok(callback_thread && callback_thread != GetCurrentThreadId(), "called on thread %lx\n", callback_thread);
++    SetLastError(0xdeadbeef);
++    ret = EvtNext(subscription, ARRAY_SIZE(events), events, 0, 0, &returned);
++    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "got %d, error %lu\n", ret, GetLastError());
++    EvtClose(subscription);
++    CloseHandle(delivered_event);
++    CloseHandle(signal);
++}
++
+ START_TEST(wevtapi)
+ {
+     test_EvtGetChannelConfigProperty();
++    test_EvtQuery();
++    test_EvtRender();
++    test_EvtFormatMessage();
++    test_EvtGetLogInfo();
++    test_channels();
++    test_bookmark();
++    test_EvtSubscribe();
+ }
+diff --git a/dlls/wevtapi/wevtapi.mc b/dlls/wevtapi/wevtapi.mc
+new file mode 100644
+index 00000000000..09afc25da20
+--- /dev/null
++++ b/dlls/wevtapi/wevtapi.mc
+@@ -0,0 +1,67 @@
++;
++; What the levels, tasks and keywords of classic events are called
++;
++; Copyright 2026 the Wine Altars project
++;
++; This library is free software; you can redistribute it and/or
++; modify it under the terms of the GNU Lesser General Public
++; License as published by the Free Software Foundation; either
++; version 2.1 of the License, or (at your option) any later version.
++;
++; This library is distributed in the hope that it will be useful,
++; but WITHOUT ANY WARRANTY; without even the implied warranty of
++; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++; Lesser General Public License for more details.
++;
++; You should have received a copy of the GNU Lesser General Public
++; License along with this library; if not, write to the Free Software
++; Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++;
++
++LanguageNames=(ENU=0x409:wevtapi)
++
++MessageId=1
++SymbolicName=MSG_LEVEL_CRITICAL
++Language=ENU
++Critical
++.
++MessageId=2
++SymbolicName=MSG_LEVEL_ERROR
++Language=ENU
++Error
++.
++MessageId=3
++SymbolicName=MSG_LEVEL_WARNING
++Language=ENU
++Warning
++.
++MessageId=4
++SymbolicName=MSG_LEVEL_INFORMATION
++Language=ENU
++Information
++.
++MessageId=5
++SymbolicName=MSG_LEVEL_VERBOSE
++Language=ENU
++Verbose
++.
++MessageId=16
++SymbolicName=MSG_TASK_NONE
++Language=ENU
++None
++.
++MessageId=32
++SymbolicName=MSG_KEYWORD_CLASSIC
++Language=ENU
++Classic
++.
++MessageId=33
++SymbolicName=MSG_KEYWORD_AUDIT_SUCCESS
++Language=ENU
++Audit Success
++.
++MessageId=34
++SymbolicName=MSG_KEYWORD_AUDIT_FAILURE
++Language=ENU
++Audit Failure
++.
+diff --git a/dlls/wevtapi/wevtapi.spec b/dlls/wevtapi/wevtapi.spec
+index e25f9c509cd..b588b531039 100644
+--- a/dlls/wevtapi/wevtapi.spec
++++ b/dlls/wevtapi/wevtapi.spec
+@@ -1,20 +1,20 @@
+-@ stub EvtArchiveExportedLog
+-@ stub EvtCancel
+-@ stub EvtClearLog
++@ stdcall EvtArchiveExportedLog(ptr wstr long long)
++@ stdcall EvtCancel(ptr)
++@ stdcall EvtClearLog(ptr wstr wstr long)
+ @ stdcall EvtClose(ptr)
+ @ stdcall EvtCreateBookmark(wstr)
+ @ stdcall EvtCreateRenderContext(long ptr long)
+ @ stdcall EvtExportLog(ptr wstr wstr wstr long)
+-@ stub EvtFormatMessage
++@ stdcall EvtFormatMessage(ptr ptr long long ptr long long ptr ptr)
+ @ stdcall EvtGetChannelConfigProperty(ptr long long long ptr ptr)
+-@ stub EvtGetEventInfo
++@ stdcall EvtGetEventInfo(ptr long long ptr ptr)
+ @ stub EvtGetEventMetadataProperty
+-@ stub EvtGetExtendedStatus
+-@ stub EvtGetLogInfo
++@ stdcall EvtGetExtendedStatus(long ptr ptr)
++@ stdcall EvtGetLogInfo(ptr long long ptr ptr)
+ @ stub EvtGetObjectArrayProperty
+ @ stub EvtGetObjectArraySize
+-@ stub EvtGetPublisherMetadataProperty
+-@ stub EvtGetQueryInfo
++@ stdcall EvtGetPublisherMetadataProperty(ptr long long long ptr ptr)
++@ stdcall EvtGetQueryInfo(ptr long long ptr ptr)
+ @ stub EvtIntAssertConfig
+ @ stub EvtIntCreateBinXMLFromCustomXML
+ @ stub EvtIntCreateLocalLogfile
+@@ -34,13 +34,13 @@
+ @ stub EvtOpenEventMetadataEnum
+ @ stdcall EvtOpenLog(ptr wstr long)
+ @ stub EvtOpenPublisherEnum
+-@ stub EvtOpenPublisherMetadata
++@ stdcall EvtOpenPublisherMetadata(ptr wstr wstr long long)
+ @ stdcall EvtOpenSession(long ptr long long)
+ @ stdcall EvtQuery(ptr wstr wstr long)
+ @ stdcall EvtRender(ptr ptr long long ptr ptr ptr)
+ @ stdcall EvtSaveChannelConfig(ptr long)
+-@ stub EvtSeek
++@ stdcall EvtSeek(ptr int64 ptr long long)
+ @ stdcall EvtSetChannelConfigProperty(ptr long long ptr)
+ @ stub EvtSetObjectArrayProperty
+ @ stdcall EvtSubscribe(ptr ptr wstr wstr ptr ptr ptr long)
+-@ stub EvtUpdateBookmark
++@ stdcall EvtUpdateBookmark(ptr ptr)
+diff --git a/dlls/wevtapi/wevtapi_private.h b/dlls/wevtapi/wevtapi_private.h
+new file mode 100644
+index 00000000000..b98a0a85fec
+--- /dev/null
++++ b/dlls/wevtapi/wevtapi_private.h
+@@ -0,0 +1,113 @@
++/*
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winreg.h"
++#include "winevt.h"
++#include "wine/list.h"
++
++/* every handle the API gives out, which it checks it gets back */
++enum object_type
++{
++    OBJECT_SESSION,
++    OBJECT_QUERY,
++    OBJECT_EVENT,
++    OBJECT_CONTEXT,
++    OBJECT_LOG,
++    OBJECT_CHANNEL_ENUM,
++    OBJECT_CHANNEL_CONFIG,
++    OBJECT_PUBLISHER,
++    OBJECT_BOOKMARK,
++    OBJECT_SUBSCRIPTION,
++};
++
++struct object
++{
++    struct list entry;
++    enum object_type type;
++    void (*destroy)( struct object *obj );
++};
++
++extern void *alloc_object( enum object_type type, size_t size, void (*destroy)( struct object *obj ) );
++extern struct object *get_object( EVT_HANDLE handle, enum object_type type );
++extern EVT_HANDLE add_object( struct object *obj );
++extern void release_object( struct object *obj );
++
++/* an event of a classic log: its record, and the log it is in */
++struct event
++{
++    struct object obj;
++    EVENTLOGRECORD *record;
++    WCHAR *channel;
++};
++
++extern struct event *create_event( const EVENTLOGRECORD *record, const WCHAR *channel );
++
++/* the XML tree of an event */
++struct node
++{
++    const WCHAR *name;
++    const WCHAR *attr_names[2];
++    WCHAR *attr_values[2];
++    unsigned int attr_count;
++    WCHAR *text;                /* NULL for an element with no text, which XML writes as an empty element */
++    struct node *children;
++    unsigned int child_count;
++    unsigned int type;          /* the EVT_VARIANT_TYPE of the value of the element, or of its first attribute */
++    unsigned int attr_type;
++    BOOL array_item;            /* a Data of a classic event: its strings are one array */
++};
++
++extern struct node *build_event_tree( const struct event *event );
++extern void free_node( struct node *node );
++extern WCHAR *write_event_xml( const struct node *tree, const WCHAR *rendering );
++extern WCHAR *escape_xml( const WCHAR *str );
++extern ULONGLONG node_number( const WCHAR *text );
++extern BOOL parse_system_time( const WCHAR *text, FILETIME *ft );
++
++/* a parsed XPath expression */
++struct xpath;
++
++extern struct xpath *parse_xpath( const WCHAR *text, BOOL render_path );
++extern void free_xpath( struct xpath *xpath );
++enum path_relation { PATH_UNRELATED, PATH_CONFLICT, PATH_SAME_ATTRIBUTE };
++extern enum path_relation render_path_relation( const struct xpath *earlier, const struct xpath *later );
++extern BOOL match_xpath( const struct xpath *xpath, const struct node *tree );
++extern const struct node *select_xpath( const struct xpath *xpath, const struct node *tree, const WCHAR **attr,
++                                        unsigned int *attr_type );
++
++/* what is in a structured query, or what a plain one is */
++struct query_source
++{
++    WCHAR *path;
++    BOOL file;
++    struct xpath **selects;
++    unsigned int select_count;
++    struct xpath **suppresses;
++    unsigned int suppress_count;
++};
++
++extern BOOL parse_structured_query( const WCHAR *text, const WCHAR *default_path, struct query_source **sources,
++                                    unsigned int *count );
++extern void free_query_sources( struct query_source *sources, unsigned int count );
++
++extern BOOL classic_log_exists( const WCHAR *name, WCHAR **canonical );
++extern WCHAR *strdupW( const WCHAR *str );
+diff --git a/include/winevt.h b/include/winevt.h
+index 92f9e409d16..78b42561f03 100644
+--- a/include/winevt.h
++++ b/include/winevt.h
+@@ -57,6 +57,161 @@ typedef enum _EVT_LOGIN_CLASS {
+     EvtRpcLogin = 1
+ } EVT_LOGIN_CLASS;
+ 
++typedef enum _EVT_RPC_LOGIN_FLAGS {
++    EvtRpcLoginAuthDefault = 0,
++    EvtRpcLoginAuthNegotiate,
++    EvtRpcLoginAuthKerberos,
++    EvtRpcLoginAuthNTLM
++} EVT_RPC_LOGIN_FLAGS;
++
++typedef struct _EVT_RPC_LOGIN {
++    LPWSTR Server;
++    LPWSTR User;
++    LPWSTR Domain;
++    LPWSTR Password;
++    DWORD Flags;
++} EVT_RPC_LOGIN;
++
++typedef enum _EVT_QUERY_FLAGS {
++    EvtQueryChannelPath         = 0x1,
++    EvtQueryFilePath            = 0x2,
++    EvtQueryForwardDirection    = 0x100,
++    EvtQueryReverseDirection    = 0x200,
++    EvtQueryTolerateQueryErrors = 0x1000
++} EVT_QUERY_FLAGS;
++
++typedef enum _EVT_SEEK_FLAGS {
++    EvtSeekRelativeToFirst    = 1,
++    EvtSeekRelativeToLast     = 2,
++    EvtSeekRelativeToCurrent  = 3,
++    EvtSeekRelativeToBookmark = 4,
++    EvtSeekOriginMask         = 7,
++    EvtSeekStrict             = 0x10000
++} EVT_SEEK_FLAGS;
++
++typedef enum _EVT_SUBSCRIBE_FLAGS {
++    EvtSubscribeToFutureEvents      = 1,
++    EvtSubscribeStartAtOldestRecord = 2,
++    EvtSubscribeStartAfterBookmark  = 3,
++    EvtSubscribeOriginMask          = 3,
++    EvtSubscribeTolerateQueryErrors = 0x1000,
++    EvtSubscribeStrict              = 0x10000
++} EVT_SUBSCRIBE_FLAGS;
++
++typedef enum _EVT_SYSTEM_PROPERTY_ID {
++    EvtSystemProviderName = 0,
++    EvtSystemProviderGuid,
++    EvtSystemEventID,
++    EvtSystemQualifiers,
++    EvtSystemLevel,
++    EvtSystemTask,
++    EvtSystemOpcode,
++    EvtSystemKeywords,
++    EvtSystemTimeCreated,
++    EvtSystemEventRecordId,
++    EvtSystemActivityID,
++    EvtSystemRelatedActivityID,
++    EvtSystemProcessID,
++    EvtSystemThreadID,
++    EvtSystemChannel,
++    EvtSystemComputer,
++    EvtSystemUserID,
++    EvtSystemVersion,
++    EvtSystemPropertyIdEND
++} EVT_SYSTEM_PROPERTY_ID;
++
++typedef enum _EVT_RENDER_CONTEXT_FLAGS {
++    EvtRenderContextValues = 0,
++    EvtRenderContextSystem,
++    EvtRenderContextUser
++} EVT_RENDER_CONTEXT_FLAGS;
++
++typedef enum _EVT_RENDER_FLAGS {
++    EvtRenderEventValues = 0,
++    EvtRenderEventXml,
++    EvtRenderBookmark
++} EVT_RENDER_FLAGS;
++
++typedef enum _EVT_FORMAT_MESSAGE_FLAGS {
++    EvtFormatMessageEvent = 1,
++    EvtFormatMessageLevel,
++    EvtFormatMessageTask,
++    EvtFormatMessageOpcode,
++    EvtFormatMessageKeyword,
++    EvtFormatMessageChannel,
++    EvtFormatMessageProvider,
++    EvtFormatMessageId,
++    EvtFormatMessageXml
++} EVT_FORMAT_MESSAGE_FLAGS;
++
++typedef enum _EVT_OPEN_LOG_FLAGS {
++    EvtOpenChannelPath = 0x1,
++    EvtOpenFilePath    = 0x2
++} EVT_OPEN_LOG_FLAGS;
++
++typedef enum _EVT_LOG_PROPERTY_ID {
++    EvtLogCreationTime = 0,
++    EvtLogLastAccessTime,
++    EvtLogLastWriteTime,
++    EvtLogFileSize,
++    EvtLogAttributes,
++    EvtLogNumberOfLogRecords,
++    EvtLogOldestRecordNumber,
++    EvtLogFull
++} EVT_LOG_PROPERTY_ID;
++
++typedef enum _EVT_EXPORTLOG_FLAGS {
++    EvtExportLogChannelPath         = 0x1,
++    EvtExportLogFilePath            = 0x2,
++    EvtExportLogTolerateQueryErrors = 0x1000,
++    EvtExportLogOverwrite           = 0x2000
++} EVT_EXPORTLOG_FLAGS;
++
++typedef enum _EVT_EVENT_PROPERTY_ID {
++    EvtEventQueryIDs = 0,
++    EvtEventPath,
++    EvtEventPropertyIdEND
++} EVT_EVENT_PROPERTY_ID;
++
++typedef enum _EVT_QUERY_PROPERTY_ID {
++    EvtQueryNames,
++    EvtQueryStatuses,
++    EvtQueryPropertyIdEND
++} EVT_QUERY_PROPERTY_ID;
++
++typedef enum _EVT_PUBLISHER_METADATA_PROPERTY_ID {
++    EvtPublisherMetadataPublisherGuid = 0,
++    EvtPublisherMetadataResourceFilePath,
++    EvtPublisherMetadataParameterFilePath,
++    EvtPublisherMetadataMessageFilePath,
++    EvtPublisherMetadataHelpLink,
++    EvtPublisherMetadataPublisherMessageID,
++    EvtPublisherMetadataChannelReferences,
++    EvtPublisherMetadataChannelReferencePath,
++    EvtPublisherMetadataChannelReferenceIndex,
++    EvtPublisherMetadataChannelReferenceID,
++    EvtPublisherMetadataChannelReferenceFlags,
++    EvtPublisherMetadataChannelReferenceMessageID,
++    EvtPublisherMetadataLevels,
++    EvtPublisherMetadataLevelName,
++    EvtPublisherMetadataLevelValue,
++    EvtPublisherMetadataLevelMessageID,
++    EvtPublisherMetadataTasks,
++    EvtPublisherMetadataTaskName,
++    EvtPublisherMetadataTaskEventGuid,
++    EvtPublisherMetadataTaskValue,
++    EvtPublisherMetadataTaskMessageID,
++    EvtPublisherMetadataOpcodes,
++    EvtPublisherMetadataOpcodeName,
++    EvtPublisherMetadataOpcodeValue,
++    EvtPublisherMetadataOpcodeMessageID,
++    EvtPublisherMetadataKeywords,
++    EvtPublisherMetadataKeywordName,
++    EvtPublisherMetadataKeywordValue,
++    EvtPublisherMetadataKeywordMessageID,
++    EvtPublisherMetadataPropertyIdEND
++} EVT_PUBLISHER_METADATA_PROPERTY_ID;
++
+ typedef enum _EVT_SUBSCRIBE_NOTIFY_ACTION {
+     EvtSubscribeActionError = 0,
+     EvtSubscribeActionDeliver
+@@ -163,6 +318,24 @@ EVT_HANDLE WINAPI EvtSubscribe(EVT_HANDLE Session, HANDLE SignalEvent, LPCWSTR C
+ EVT_HANDLE WINAPI EvtOpenChannelConfig(EVT_HANDLE Session, LPCWSTR ChannelPath, DWORD Flags);
+ BOOL WINAPI EvtSaveChannelConfig(EVT_HANDLE,DWORD);
+ BOOL WINAPI EvtRender(EVT_HANDLE, EVT_HANDLE, DWORD, DWORD, void *, DWORD *, DWORD *);
++EVT_HANDLE WINAPI EvtOpenSession(EVT_LOGIN_CLASS,PVOID,DWORD,DWORD);
++EVT_HANDLE WINAPI EvtQuery(EVT_HANDLE,LPCWSTR,LPCWSTR,DWORD);
++BOOL WINAPI EvtNext(EVT_HANDLE,DWORD,EVT_HANDLE*,DWORD,DWORD,PDWORD);
++BOOL WINAPI EvtSeek(EVT_HANDLE,LONGLONG,EVT_HANDLE,DWORD,DWORD);
++BOOL WINAPI EvtCancel(EVT_HANDLE);
++BOOL WINAPI EvtGetExtendedStatus(DWORD,LPWSTR,PDWORD);
++BOOL WINAPI EvtFormatMessage(EVT_HANDLE,EVT_HANDLE,DWORD,DWORD,PEVT_VARIANT,DWORD,DWORD,LPWSTR,PDWORD);
++EVT_HANDLE WINAPI EvtOpenLog(EVT_HANDLE,LPCWSTR,DWORD);
++BOOL WINAPI EvtGetLogInfo(EVT_HANDLE,EVT_LOG_PROPERTY_ID,DWORD,PEVT_VARIANT,PDWORD);
++BOOL WINAPI EvtClearLog(EVT_HANDLE,LPCWSTR,LPCWSTR,DWORD);
++BOOL WINAPI EvtArchiveExportedLog(EVT_HANDLE,LPCWSTR,LCID,DWORD);
++EVT_HANDLE WINAPI EvtOpenChannelEnum(EVT_HANDLE,DWORD);
++BOOL WINAPI EvtNextChannelPath(EVT_HANDLE,DWORD,LPWSTR,PDWORD);
++EVT_HANDLE WINAPI EvtOpenPublisherMetadata(EVT_HANDLE,LPCWSTR,LPCWSTR,LCID,DWORD);
++BOOL WINAPI EvtGetPublisherMetadataProperty(EVT_HANDLE,EVT_PUBLISHER_METADATA_PROPERTY_ID,DWORD,DWORD,PEVT_VARIANT,PDWORD);
++BOOL WINAPI EvtGetEventInfo(EVT_HANDLE,EVT_EVENT_PROPERTY_ID,DWORD,PEVT_VARIANT,PDWORD);
++BOOL WINAPI EvtGetQueryInfo(EVT_HANDLE,EVT_QUERY_PROPERTY_ID,DWORD,PEVT_VARIANT,PDWORD);
++BOOL WINAPI EvtUpdateBookmark(EVT_HANDLE,EVT_HANDLE);
+ 
+ #ifdef __cplusplus
+ } /* extern "C" */
+diff --git a/po/zh_CN.po b/po/zh_CN.po
+index 96a47ab9151..9614bc49415 100644
+--- a/po/zh_CN.po
++++ b/po/zh_CN.po
+@@ -21650,3 +21650,39 @@ msgstr "此机器的 NetBIOS 名称和 DNS 主机名从 %1 更改为 %2。\n"
+ #: dlls/netevent/netevent.mc:58
+ msgid "The system uptime is %5 seconds.\n"
+ msgstr "系统启动时间为 %5 秒。\n"
++
++#: dlls/wevtapi/wevtapi.mc:26
++msgid "Critical\n"
++msgstr "关键\n"
++
++#: dlls/wevtapi/wevtapi.mc:31
++msgid "Error\n"
++msgstr "错误\n"
++
++#: dlls/wevtapi/wevtapi.mc:36
++msgid "Warning\n"
++msgstr "警告\n"
++
++#: dlls/wevtapi/wevtapi.mc:41
++msgid "Information\n"
++msgstr "信息\n"
++
++#: dlls/wevtapi/wevtapi.mc:46
++msgid "Verbose\n"
++msgstr "详细\n"
++
++#: dlls/wevtapi/wevtapi.mc:51
++msgid "None\n"
++msgstr "无\n"
++
++#: dlls/wevtapi/wevtapi.mc:56
++msgid "Classic\n"
++msgstr "经典\n"
++
++#: dlls/wevtapi/wevtapi.mc:61
++msgid "Audit Success\n"
++msgstr "审核成功\n"
++
++#: dlls/wevtapi/wevtapi.mc:66
++msgid "Audit Failure\n"
++msgstr "审核失败\n"

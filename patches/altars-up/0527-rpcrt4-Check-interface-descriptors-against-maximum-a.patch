@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:40:18 -0400
+Subject: [PATCH] rpcrt4: Check interface descriptors against maximum available
+ rights.
+
+Own the interface descriptor, check the caller before its callback and
+send access-denied faults when none of the interface rights is granted.
+Windows accepts standard control rights as well as the interface execute
+bit; ordinary and owner/restricted callers therefore need distinct tests.
+RPC_IF_SEC_NO_CACHE requires a callback.
+
+Use native x64 unwind tables for GCC exception tests: Wine's exception
+frame list cannot be assumed to catch exceptions on native Windows.
+The isolated native security tests pass, as do the Wine RPC regressions.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/rpcrt4/rpc_server.c b/dlls/rpcrt4/rpc_server.c
+index 75c28d9ea95..96aa6b76e43 100644
+--- a/dlls/rpcrt4/rpc_server.c
++++ b/dlls/rpcrt4/rpc_server.c
+@@ -106,6 +106,53 @@ static HANDLE listen_done_event;
+ 
+ static UUID uuid_nil;
+ 
++#define RPC_INTERFACE_EXECUTE 1
++
++static GENERIC_MAPPING interface_mapping =
++{
++    STANDARD_RIGHTS_READ | RPC_INTERFACE_EXECUTE,
++    STANDARD_RIGHTS_WRITE | RPC_INTERFACE_EXECUTE,
++    STANDARD_RIGHTS_EXECUTE | RPC_INTERFACE_EXECUTE,
++    STANDARD_RIGHTS_ALL | RPC_INTERFACE_EXECUTE,
++};
++
++static void RPCRT4_free_server_interface(RpcServerInterface *sif)
++{
++    if (sif->SecurityDescriptor) DestroyPrivateObjectSecurity(&sif->SecurityDescriptor);
++    free(sif);
++}
++
++static RPC_STATUS RPCRT4_check_interface_access(RpcConnection *conn, RpcServerInterface *sif)
++{
++    HANDLE token = NULL, previous_token = NULL;
++    PRIVILEGE_SET privileges;
++    DWORD size = sizeof(privileges), granted;
++    RPC_STATUS status = RPC_S_ACCESS_DENIED;
++    BOOL access, impersonated = FALSE;
++
++    if (!sif->SecurityDescriptor) return RPC_S_OK;
++
++    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_IMPERSONATE, TRUE, &previous_token) &&
++            GetLastError() != ERROR_NO_TOKEN)
++        return RPC_S_ACCESS_DENIED;
++
++    if (rpcrt4_conn_impersonate_client(conn) == RPC_S_OK)
++    {
++        impersonated = TRUE;
++        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token))
++        {
++            if (AccessCheck(sif->SecurityDescriptor, token, MAXIMUM_ALLOWED, &interface_mapping,
++                    &privileges, &size, &granted, &access) && access && (granted & interface_mapping.GenericAll))
++                status = RPC_S_OK;
++            CloseHandle(token);
++        }
++    }
++    if (impersonated && rpcrt4_conn_revert_to_self(conn) != RPC_S_OK) status = RPC_S_ACCESS_DENIED;
++    if (!SetThreadToken(NULL, previous_token)) status = RPC_S_ACCESS_DENIED;
++    if (previous_token) CloseHandle(previous_token);
++    return status;
++}
++
+ static inline RpcObjTypeMap *LookupObjTypeMap(UUID *ObjUuid)
+ {
+   RpcObjTypeMap *rslt = RpcObjTypeMaps;
+@@ -165,7 +212,7 @@ static void RPCRT4_release_server_interface(RpcServerInterface *sif)
+      * CallsCompletedEvent is set */
+     if (sif->CallsCompletedEvent)
+       SetEvent(sif->CallsCompletedEvent);
+-    free(sif);
++    RPCRT4_free_server_interface(sif);
+   }
+ }
+ 
+@@ -397,6 +444,18 @@ static RPC_STATUS process_request_packet(RpcConnection *conn, RpcPktRequestHdr *
+     free(response);
+     return RPC_S_OK;
+   }
++  status = RPCRT4_check_interface_access(conn, sif);
++  if (status != RPC_S_OK)
++  {
++    response = RPCRT4_BuildFaultHeader(NDR_LOCAL_DATA_REPRESENTATION, RPC2NCA_STATUS(status));
++    if (response)
++    {
++      RPCRT4_Send(conn, response, NULL, 0);
++      free(response);
++    }
++    RPCRT4_release_server_interface(sif);
++    return RPC_S_OK;
++  }
+   msg->RpcInterfaceInformation = sif->If;
+   /* copy the endpoint vector from sif to msg so that midl-generated code will use it */
+   msg->ManagerEpv = sif->MgrEpv;
+@@ -1155,8 +1214,8 @@ RPC_STATUS WINAPI RpcServerRegisterIf3( RPC_IF_HANDLE IfSpec, UUID* MgrTypeUuid,
+   TRACE("(%p,%s,%p,%u,%u,%u,%p,%p)\n", IfSpec, debugstr_guid(MgrTypeUuid), MgrEpv, Flags, MaxCalls,
+         MaxRpcSize, IfCallbackFn, SecurityDescriptor);
+ 
+-  if (SecurityDescriptor)
+-      FIXME("Unsupported SecurityDescriptor argument.\n");
++  if ((Flags & RPC_IF_SEC_NO_CACHE) && !IfCallbackFn) return ERROR_INVALID_PARAMETER;
++  if (SecurityDescriptor && !IsValidSecurityDescriptor(SecurityDescriptor)) return ERROR_INVALID_SECURITY_DESCR;
+ 
+   TRACE(" interface id: %s %d.%d\n", debugstr_guid(&If->InterfaceId.SyntaxGUID),
+                                      If->InterfaceId.SyntaxVersion.MajorVersion,
+@@ -1177,6 +1236,29 @@ RPC_STATUS WINAPI RpcServerRegisterIf3( RPC_IF_HANDLE IfSpec, UUID* MgrTypeUuid,
+   TRACE(" interpreter info: %p\n", If->InterpreterInfo);
+ 
+   sif = calloc(1, sizeof(RpcServerInterface));
++  if (!sif) return RPC_S_OUT_OF_RESOURCES;
++  if (SecurityDescriptor)
++  {
++    HANDLE token;
++    RPC_STATUS status;
++    BOOL ret;
++
++    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
++    {
++      status = GetLastError();
++      free(sif);
++      return status;
++    }
++    ret = CreatePrivateObjectSecurity(NULL, SecurityDescriptor, &sif->SecurityDescriptor, FALSE,
++                                     token, &interface_mapping);
++    status = ret ? RPC_S_OK : GetLastError();
++    CloseHandle(token);
++    if (status != RPC_S_OK)
++    {
++      RPCRT4_free_server_interface(sif);
++      return status;
++    }
++  }
+   sif->If           = If;
+   if (MgrTypeUuid) {
+     sif->MgrTypeUuid = *MgrTypeUuid;
+@@ -1240,7 +1322,7 @@ RPC_STATUS WINAPI RpcServerUnregisterIf( RPC_IF_HANDLE IfSpec, UUID* MgrTypeUuid
+   }
+ 
+   if (completed)
+-    free(cif);
++    RPCRT4_free_server_interface(cif);
+   else if (event) {
+     /* sif will be freed when the last call is completed, so be careful not to
+      * touch that memory here as that could happen before we get here */
+diff --git a/dlls/rpcrt4/rpc_server.h b/dlls/rpcrt4/rpc_server.h
+index 3360d411741..393d2ff7a86 100644
+--- a/dlls/rpcrt4/rpc_server.h
++++ b/dlls/rpcrt4/rpc_server.h
+@@ -70,6 +70,7 @@ typedef struct _RpcServerInterface
+   UINT MaxCalls;
+   UINT MaxRpcSize;
+   RPC_IF_CALLBACK_FN* IfCallbackFn;
++  PSECURITY_DESCRIPTOR SecurityDescriptor;
+   LONG CurrentCalls; /* number of calls currently executing */
+   /* set when unregistering interface to let the caller of
+    * RpcServerUnregisterIf* know that all calls have finished */
+diff --git a/dlls/rpcrt4/tests/server.c b/dlls/rpcrt4/tests/server.c
+index dcea3dcb01a..4bae33961f3 100644
+--- a/dlls/rpcrt4/tests/server.c
++++ b/dlls/rpcrt4/tests/server.c
+@@ -24,8 +24,10 @@
+ #include <oleauto.h>
+ #include <secext.h>
+ #include <rpcdce.h>
++#include <sddl.h>
+ #include <netfw.h>
+ #include "wine/test.h"
++#include "wine/exception.h"
+ #include "server.h"
+ #define SKIP_TYPE_DECLS
+ #include "server_interp.h"
+@@ -2517,6 +2519,251 @@ static void test_stop_wait_for_call(unsigned char *binding)
+     stop_event = NULL;
+ }
+ 
++static int DECLSPEC_NOINLINE call_security_interface(handle_t binding, BOOL selftest)
++{
++    if (selftest) RpcRaiseException(RPC_S_ACCESS_DENIED);
++    return add(binding, 2, 3);
++}
++
++#if defined(__x86_64__) && defined(__GNUC__) && !defined(USE_COMPILER_EXCEPTIONS)
++static volatile RPC_STATUS security_exception;
++
++static LONG __attribute__((used)) security_exception_filter(EXCEPTION_POINTERS *info, void *frame)
++{
++    DWORD code = info->ExceptionRecord->ExceptionCode;
++
++    if (code >= 0x10000) return EXCEPTION_CONTINUE_SEARCH;
++    security_exception = code;
++    return EXCEPTION_EXECUTE_HANDLER;
++}
++#endif
++
++static RPC_STATUS DECLSPEC_NOINLINE invoke_security_interface(handle_t binding, BOOL selftest, int *result)
++{
++#if defined(__x86_64__) && defined(__GNUC__) && !defined(USE_COMPILER_EXCEPTIONS)
++    /* Native x64 Windows uses unwind tables, not the Wine exception-frame list. */
++    security_exception = RPC_S_OK;
++    __asm__ __volatile__(".Lrpc_security_start:\n"
++            ".seh_handler __C_specific_handler, @except\n"
++            ".seh_handlerdata\n"
++            ".long 1\n"
++            ".rva .Lrpc_security_start, .Lrpc_security_end, security_exception_filter, .Lrpc_security_end\n"
++            ".text\n");
++    *result = call_security_interface(binding, selftest);
++    __asm__ __volatile__("nop\n.Lrpc_security_end: nop\n");
++    return security_exception;
++#else
++    volatile RPC_STATUS exception = RPC_S_OK;
++
++    __TRY
++    {
++        *result = call_security_interface(binding, selftest);
++    }
++    __EXCEPT_ALL
++    {
++        exception = GetExceptionCode();
++    }
++    __ENDTRY
++    return exception;
++#endif
++}
++
++static void test_interface_security(void)
++{
++    static const WCHAR *const descriptors[] =
++    {
++        NULL, L"D:(A;;GA;;;WD)", L"D:", L"D:(A;;GA;;;SY)",
++        L"D:(A;;0x1;;;WD)", L"D:(A;;0x2;;;WD)", L"D:(A;;GX;;;WD)", L"D:(A;;GA;;;WD)",
++    };
++    static const struct
++    {
++        const WCHAR *sddl;
++        RPC_STATUS status;
++    } access_tests[] =
++    {
++        {NULL, RPC_S_OK},
++        {L"D:(A;;GA;;;WD)", RPC_S_OK},
++        {L"D:", RPC_S_ACCESS_DENIED},
++        {L"D:(A;;0x1;;;WD)", RPC_S_OK},
++        {L"D:(A;;0x2;;;WD)", RPC_S_ACCESS_DENIED},
++        {L"D:(A;;GX;;;WD)", RPC_S_OK},
++        {L"D:(D;;0x1;;;WD)(A;;GA;;;WD)", RPC_S_OK},
++        {L"D:(D;;0x1;;;WD)(A;;0x1;;;WD)", RPC_S_ACCESS_DENIED},
++        {L"D:(D;;GA;;;WD)(A;;GA;;;WD)", RPC_S_ACCESS_DENIED},
++        {L"D:(A;;RC;;;WD)", RPC_S_OK},
++        {L"D:(A;;WD;;;WD)", RPC_S_OK},
++        {L"D:(A;;0x00100000;;;WD)", RPC_S_OK},
++        {L"D:(A;;0x4;;;WD)", RPC_S_ACCESS_DENIED},
++    };
++    RPC_STATUS (WINAPI *register_if3)(RPC_IF_HANDLE, UUID *, RPC_MGR_EPV *, UINT, UINT, UINT,
++            RPC_IF_CALLBACK_FN *, void *);
++    RPC_SECURITY_QOS qos = {RPC_C_SECURITY_QOS_VERSION, RPC_C_QOS_CAPABILITIES_DEFAULT,
++            RPC_C_QOS_IDENTITY_STATIC, RPC_C_IMP_LEVEL_IDENTIFY};
++    RPC_BINDING_HANDLE binding;
++    PSECURITY_DESCRIPTOR sd;
++    RPC_WSTR string;
++    WCHAR endpoint[64];
++    RPC_STATUS status;
++    unsigned int i, auth, restricted_mode;
++    BYTE admin_sid[SECURITY_MAX_SID_SIZE];
++    DWORD sid_size = sizeof(admin_sid);
++    SID_AND_ATTRIBUTES disabled;
++    HANDLE primary = NULL, restricted = NULL, impersonation = NULL;
++    int result;
++    BOOL ret, administrator = FALSE;
++
++    /* RpcTryExcept 在没有编译器 SEH 时不捕获异常，先验证真正的异常框架。 */
++    status = invoke_security_interface(NULL, TRUE, &result);
++    ok(status == RPC_S_ACCESS_DENIED, "Got exception %ld.\n", status);
++    if (status != RPC_S_ACCESS_DENIED) return;
++
++    register_if3 = (void *)GetProcAddress(GetModuleHandleA("rpcrt4.dll"), "RpcServerRegisterIf3");
++    if (!register_if3)
++    {
++        win_skip("RpcServerRegisterIf3 is not available.\n");
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(descriptors); ++i)
++    {
++        winetest_push_context("registration %u", i);
++        sd = NULL;
++        if (descriptors[i])
++        {
++            ret = ConvertStringSecurityDescriptorToSecurityDescriptorW(descriptors[i], SDDL_REVISION_1, &sd, NULL);
++            ok(ret, "Got error %lu.\n", GetLastError());
++            if (!ret)
++            {
++                winetest_pop_context();
++                continue;
++            }
++        }
++        SetLastError(0xdeadbeef);
++        status = register_if3(s_RPCExplicitHandle_v0_0_s_ifspec, NULL, NULL,
++                RPC_IF_ALLOW_LOCAL_ONLY | RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH | RPC_IF_SEC_NO_CACHE,
++                2, 4096, NULL, sd);
++        ok(status == ERROR_INVALID_PARAMETER, "Got %lu.\n", status);
++        ok(GetLastError() == 0xdeadbeef, "Got error %lu.\n", GetLastError());
++        if (status == RPC_S_OK) RpcServerUnregisterIf(s_RPCExplicitHandle_v0_0_s_ifspec, NULL, TRUE);
++        LocalFree(sd);
++        winetest_pop_context();
++    }
++
++    ret = CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, admin_sid, &sid_size);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    if (!ret) return;
++    ret = CheckTokenMembership(NULL, admin_sid, &administrator);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    disabled.Sid = admin_sid;
++    disabled.Attributes = 0;
++    ret = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &primary);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    if (!ret) return;
++    ret = CreateRestrictedToken(primary, 0, 1, &disabled, 0, NULL, 0, NULL, &restricted);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    CloseHandle(primary);
++    if (!ret) return;
++    ret = DuplicateToken(restricted, SecurityImpersonation, &impersonation);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    CloseHandle(restricted);
++    if (!ret) return;
++
++    swprintf(endpoint, ARRAY_SIZE(endpoint), L"wine_rpc_security_%lu", GetCurrentProcessId());
++    status = RpcServerUseProtseqEpW((RPC_WSTR)L"ncalrpc", 2, (RPC_WSTR)endpoint, NULL);
++    ok(status == RPC_S_OK, "Got %lu.\n", status);
++    if (status) return;
++    status = RpcServerRegisterAuthInfoW(NULL, RPC_C_AUTHN_WINNT, NULL, NULL);
++    ok(status == RPC_S_OK, "Got %lu.\n", status);
++    status = RpcServerListen(1, 2, TRUE);
++    ok(status == RPC_S_OK, "Got %lu.\n", status);
++    if (status) return;
++
++    for (i = 0; i < ARRAY_SIZE(access_tests); ++i)
++    {
++        winetest_push_context("access %u", i);
++        sd = NULL;
++        if (access_tests[i].sddl)
++        {
++            ret = ConvertStringSecurityDescriptorToSecurityDescriptorW(access_tests[i].sddl,
++                    SDDL_REVISION_1, &sd, NULL);
++            ok(ret, "Got error %lu.\n", GetLastError());
++            if (!ret)
++            {
++                winetest_pop_context();
++                continue;
++            }
++        }
++        status = register_if3(s_RPCExplicitHandle_v0_0_s_ifspec, NULL, NULL,
++                RPC_IF_ALLOW_LOCAL_ONLY | RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH, 2, 4096, NULL, sd);
++        ok(status == RPC_S_OK, "Got %lu.\n", status);
++        if (status)
++        {
++            LocalFree(sd);
++            winetest_pop_context();
++            continue;
++        }
++        for (restricted_mode = 0; restricted_mode < 2; ++restricted_mode)
++        {
++            qos.IdentityTracking = restricted_mode ? RPC_C_QOS_IDENTITY_DYNAMIC : RPC_C_QOS_IDENTITY_STATIC;
++            if (restricted_mode)
++            {
++                ret = SetThreadToken(NULL, impersonation);
++                ok(ret, "Got error %lu.\n", GetLastError());
++                if (!ret) continue;
++            }
++            for (auth = 0; auth < 2; ++auth)
++            {
++                RPC_STATUS expected = !restricted_mode && administrator ? RPC_S_OK : access_tests[i].status;
++
++                winetest_push_context("restricted %u auth %u", restricted_mode, auth);
++                status = RpcStringBindingComposeW(NULL, (RPC_WSTR)L"ncalrpc", NULL, (RPC_WSTR)endpoint, NULL, &string);
++                ok(status == RPC_S_OK, "Got %lu.\n", status);
++                if (status)
++                {
++                    winetest_pop_context();
++                    continue;
++                }
++                status = RpcBindingFromStringBindingW(string, &binding);
++                ok(status == RPC_S_OK, "Got %lu.\n", status);
++                RpcStringFreeW(&string);
++                if (!status)
++                {
++                    if (auth)
++                    {
++                        status = RpcBindingSetAuthInfoExW(binding, NULL, RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
++                                RPC_C_AUTHN_WINNT, NULL, RPC_C_AUTHZ_NONE, &qos);
++                        ok(status == RPC_S_OK, "Got %lu.\n", status);
++                    }
++                    if (!status)
++                    {
++                        result = -1;
++                        status = invoke_security_interface(binding, FALSE, &result);
++                        ok(status == expected, "Got exception %ld, expected %lu.\n", status, expected);
++                        if (!status) ok(result == 5, "Got %d.\n", result);
++                    }
++                    status = RpcBindingFree(&binding);
++                    ok(status == RPC_S_OK, "Got %lu.\n", status);
++                }
++                winetest_pop_context();
++            }
++            if (restricted_mode)
++            {
++                ret = RevertToSelf();
++                ok(ret, "Got error %lu.\n", GetLastError());
++            }
++        }
++        status = RpcServerUnregisterIf(s_RPCExplicitHandle_v0_0_s_ifspec, NULL, TRUE);
++        ok(status == RPC_S_OK, "Got %lu.\n", status);
++        LocalFree(sd);
++        winetest_pop_context();
++    }
++    status = RpcMgmtStopServerListening(NULL);
++    ok(status == RPC_S_OK, "Got %lu.\n", status);
++    status = RpcMgmtWaitServerListen();
++    ok(status == RPC_S_OK, "Got %lu.\n", status);
++    CloseHandle(impersonation);
++}
++
+ static void test_server_listening(void)
+ {
+     static unsigned char np[] = "ncacn_np";
+@@ -2835,6 +3082,10 @@ START_TEST(server)
+     {
+       test_server_listening();
+     }
++    else if (!strcmp(argv[3], "security"))
++    {
++      test_interface_security();
++    }
+     else if(!strcmp(argv[2], "run"))
+     {
+       ULONG event;
+@@ -2874,6 +3125,7 @@ START_TEST(server)
+         win_skip("Skipping reconnect tests on too old Windows version\n");
+ 
+     run_client("test listen");
++    run_client("test security");
+     if (firewall_disabled) set_firewall(APP_REMOVE);
+   }
+ 

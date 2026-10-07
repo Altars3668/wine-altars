@@ -1,0 +1,1283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 13:32:42 -0400
+Subject: [PATCH] secur32: Implement the CredSSP security package.
+
+Wine has never had one, and Microsoft's Remote Desktop client authenticates
+through it.
+
+The package is the whole MS-CSSP exchange: its own TLS session through
+Schannel, SPNEGO/NTLM tokens carried inside DER-encoded TSRequests, the
+public key of the TLS session signed with the authentication context to bind
+the two together, and the credentials delegated at the end.
+
+Two things worth knowing before changing it. The last authentication token
+must travel with the public key: MS-CSSP has the client send both in one
+TSRequest, and a server whose own authentication has nothing further to say
+reads the public key out of the request that completed the authentication
+rather than waiting for another message. And Wine's NTLM is a front end for
+Samba's ntlm_auth, so without winbind installed
+AcquireCredentialsHandle(L"NTLM") fails before any token is produced.
+
+Signed-off-by: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+(cherry picked from commit cfd62d267cc25671365955af92f9841e9dc13de0)
+
+diff --git a/dlls/secur32/Makefile.in b/dlls/secur32/Makefile.in
+index 5f1c58b9b2c..1cf2b623cdb 100644
+--- a/dlls/secur32/Makefile.in
++++ b/dlls/secur32/Makefile.in
+@@ -6,6 +6,7 @@ DELAYIMPORTS = crypt32 ncrypt rpcrt4
+ UNIX_CFLAGS  = $(GNUTLS_CFLAGS)
+ 
+ SOURCES = \
++	credssp.c \
+ 	lsa.c \
+ 	lsass.idl \
+ 	negotiate.c \
+diff --git a/dlls/secur32/credssp.c b/dlls/secur32/credssp.c
+new file mode 100644
+index 00000000000..38706d6cbb9
+--- /dev/null
++++ b/dlls/secur32/credssp.c
+@@ -0,0 +1,1217 @@
++/*
++ * Credential Security Support Provider (MS-CSSP)
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * What this is for: Network Level Authentication. A Remote Desktop client asks
++ * for this package by name before it will offer PROTOCOL_HYBRID, and a server
++ * that requires NLA turns away anything that cannot. Without the package the
++ * client does not merely fail to authenticate -- it never offers the option,
++ * so the two ends never find a security layer they share.
++ *
++ * The protocol, from MS-CSSP 3.1.5, is three exchanges carried inside a TLS
++ * session that this package establishes itself:
++ *
++ *   1. a TLS handshake, driven through Schannel;
++ *   2. SPNEGO/NTLM tokens, each wrapped in a DER-encoded TSRequest and
++ *      encrypted with the TLS session;
++ *   3. the server's public key hashed back to it, to bind the authentication
++ *      to this TLS session, and then the caller's credentials.
++ *
++ * Everything the package needs from below it -- TLS, NTLM -- it gets through
++ * ordinary SSPI calls to the packages already present, so this is the protocol
++ * and nothing else.
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "sspi.h"
++#include "rpc.h"
++#include "rpcdce.h"
++#include "schannel.h"
++#include "wincrypt.h"
++#include "winternl.h"
++#include "secur32_priv.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(secur32);
++
++#define CREDSSP_MAX_TOKEN 16384
++
++/* What a caller passes as pAuthData. Declared here because Wine's headers do
++ * not have it yet; the layout is from the CredSSP documentation. */
++typedef enum
++{
++    CredsspSubmitBufferBoth = 0,
++    CredsspSubmitBufferBothOld,
++    CredsspCredEx,
++} CREDSPP_SUBMIT_TYPE;
++
++typedef struct _CREDSSP_CRED
++{
++    CREDSPP_SUBMIT_TYPE Type;
++    void *pSchannelCred;
++    void *pSpnegoCred;
++} CREDSSP_CRED;
++
++/* MS-CSSP 2.2.1: the version this implementation speaks. Version 3 and later
++ * add the client nonce that binds the public key hash to the client; 2 is the
++ * highest that needs nothing we cannot produce yet. */
++#define CREDSSP_VERSION 2
++
++enum credssp_state
++{
++    CREDSSP_STATE_INITIAL,
++    CREDSSP_STATE_TLS,          /* the inner TLS handshake is running */
++    CREDSSP_STATE_NEGO,         /* SPNEGO/NTLM tokens inside TSRequest */
++    CREDSSP_STATE_PUBKEY,       /* proving the TLS session and the auth are one */
++    CREDSSP_STATE_CREDENTIALS,  /* handing over what the caller wants delegated */
++    CREDSSP_STATE_DONE,
++    CREDSSP_STATE_ERROR,
++};
++
++struct credssp_credentials
++{
++    ULONG use;
++    SEC_WINNT_AUTH_IDENTITY_W *identity;   /* what to delegate, if given */
++    CredHandle schannel;                   /* the TLS credential underneath */
++    BOOL have_schannel;
++};
++
++struct credssp_context
++{
++    enum credssp_state state;
++    struct credssp_credentials *credentials;
++    CtxtHandle schannel;                   /* the TLS context underneath */
++    BOOL have_schannel;
++    CredHandle nego_cred;
++    CtxtHandle nego;
++    BOOL have_nego_cred;
++    BOOL have_nego;
++    WCHAR *target;
++};
++
++/***********************************************************************
++ * DER, enough of it
++ *
++ * TSRequest and the structures inside it are small and fixed in shape, so this
++ * is a writer and a reader for exactly those shapes rather than a general
++ * ASN.1 implementation, which would be far more code and no more correct here.
++ ***********************************************************************/
++
++/* A definite-length header is one to five bytes depending on the length. */
++static ULONG der_length_size( ULONG len )
++{
++    if (len < 0x80) return 1;
++    if (len <= 0xff) return 2;
++    if (len <= 0xffff) return 3;
++    if (len <= 0xffffff) return 4;
++    return 5;
++}
++
++static BYTE *der_write_length( BYTE *p, ULONG len )
++{
++    if (len < 0x80) { *p++ = len; return p; }
++    if (len <= 0xff) { *p++ = 0x81; *p++ = len; return p; }
++    if (len <= 0xffff) { *p++ = 0x82; *p++ = len >> 8; *p++ = len; return p; }
++    if (len <= 0xffffff) { *p++ = 0x83; *p++ = len >> 16; *p++ = len >> 8; *p++ = len; return p; }
++    *p++ = 0x84; *p++ = len >> 24; *p++ = len >> 16; *p++ = len >> 8; *p++ = len;
++    return p;
++}
++
++static const BYTE *der_read_length( const BYTE *p, const BYTE *end, ULONG *len )
++{
++    ULONG n;
++
++    if (p >= end) return NULL;
++    if (*p < 0x80) { *len = *p++; return p; }
++
++    n = *p++ & 0x7f;
++    if (!n || n > 4 || p + n > end) return NULL;
++    for (*len = 0; n--; p++) *len = (*len << 8) | *p;
++    return p;
++}
++
++static ULONG der_integer_size( ULONG value )
++{
++    ULONG body = 1;
++
++    while (value >> (body * 8)) body++;
++    if (value >> (body * 8 - 1)) body++;   /* keep it positive */
++    return 2 + body;
++}
++
++static BYTE *der_write_integer( BYTE *p, ULONG value )
++{
++    ULONG body = 1;
++    ULONG i;
++
++    while (value >> (body * 8)) body++;
++    if (value >> (body * 8 - 1)) body++;
++
++    *p++ = 0x02;
++    *p++ = body;
++    for (i = body; i--; ) *p++ = value >> (i * 8);
++    return p;
++}
++
++/* [n] { OCTET STRING } -- the shape every payload in a TSRequest has. */
++static ULONG der_tagged_octets_size( ULONG len )
++{
++    ULONG octets = 1 + der_length_size( len ) + len;
++    return 1 + der_length_size( octets ) + octets;
++}
++
++static BYTE *der_write_tagged_octets( BYTE *p, BYTE tag, const void *data, ULONG len )
++{
++    ULONG octets = 1 + der_length_size( len ) + len;
++
++    *p++ = 0xa0 | tag;
++    p = der_write_length( p, octets );
++    *p++ = 0x04;
++    p = der_write_length( p, len );
++    memcpy( p, data, len );
++    return p + len;
++}
++
++/***********************************************************************
++ * TSRequest (MS-CSSP 2.2.1)
++ *
++ *   TSRequest ::= SEQUENCE {
++ *       version     [0] INTEGER,
++ *       negoTokens  [1] NegoData OPTIONAL,
++ *       authInfo    [2] OCTET STRING OPTIONAL,
++ *       pubKeyAuth  [3] OCTET STRING OPTIONAL,
++ *       errorCode   [4] INTEGER OPTIONAL
++ *   }
++ *   NegoData ::= SEQUENCE OF SEQUENCE { negoToken [0] OCTET STRING }
++ *
++ * Exactly one of the optional fields is used per message, so the writer takes
++ * one payload and the tag it belongs under.
++ ***********************************************************************/
++
++#define TSREQUEST_NEGOTOKENS 1
++#define TSREQUEST_AUTHINFO   2
++#define TSREQUEST_PUBKEYAUTH 3
++
++struct blob
++{
++    BYTE *data;
++    ULONG len;
++};
++
++static void free_blob( struct blob *b )
++{
++    RtlFreeHeap( GetProcessHeap(), 0, b->data );
++    b->data = NULL;
++    b->len = 0;
++}
++
++/* negoTokens has two more layers of wrapping than the other fields. */
++static ULONG nego_tokens_size( ULONG len )
++{
++    ULONG inner = der_tagged_octets_size( len );          /* [0] { OCTET STRING } */
++    ULONG seq = 1 + der_length_size( inner ) + inner;     /* SEQUENCE of one */
++    ULONG outer = 1 + der_length_size( seq ) + seq;       /* SEQUENCE OF */
++    return 1 + der_length_size( outer ) + outer;          /* [1] */
++}
++
++static BYTE *write_nego_tokens( BYTE *p, const void *token, ULONG len )
++{
++    ULONG inner = der_tagged_octets_size( len );
++    ULONG seq = 1 + der_length_size( inner ) + inner;
++    ULONG outer = 1 + der_length_size( seq ) + seq;
++
++    *p++ = 0xa1;
++    p = der_write_length( p, outer );
++    *p++ = 0x30;
++    p = der_write_length( p, seq );
++    *p++ = 0x30;
++    p = der_write_length( p, inner );
++    return der_write_tagged_octets( p, 0, token, len );
++}
++
++/*
++ * A TSRequest carrying a token, a payload, or both.
++ *
++ * Both is not a convenience: MS-CSSP has the client send its last
++ * authentication token together with the public key it is proving, and a
++ * server whose own authentication has nothing left to say does not wait for a
++ * second message -- it reads the public key out of the one that completed the
++ * authentication. Sending them separately leaves that field empty and the
++ * server rejects the request.
++ */
++static SECURITY_STATUS write_ts_request_full( const void *token, ULONG token_len,
++                                              BYTE tag, const void *payload, ULONG payload_len,
++                                              struct blob *out )
++{
++    ULONG version = der_integer_size( CREDSSP_VERSION );
++    ULONG nego = token_len ? nego_tokens_size( token_len ) : 0;
++    ULONG field = payload_len ? der_tagged_octets_size( payload_len ) : 0;
++    ULONG body = 1 + der_length_size( version ) + version + nego + field;
++    ULONG total = 1 + der_length_size( body ) + body;
++    BYTE *p;
++
++    if (!(out->data = RtlAllocateHeap( GetProcessHeap(), 0, total )))
++        return SEC_E_INSUFFICIENT_MEMORY;
++
++    p = out->data;
++    *p++ = 0x30;
++    p = der_write_length( p, body );
++    *p++ = 0xa0;
++    p = der_write_length( p, version );
++    p = der_write_integer( p, CREDSSP_VERSION );
++
++    /* The fields are tagged, so they must appear in tag order. */
++    if (token_len) p = write_nego_tokens( p, token, token_len );
++    if (payload_len) p = der_write_tagged_octets( p, tag, payload, payload_len );
++
++    out->len = p - out->data;
++    return SEC_E_OK;
++}
++
++static SECURITY_STATUS write_ts_request( BYTE tag, const void *payload, ULONG payload_len,
++                                         struct blob *out )
++{
++    if (tag == TSREQUEST_NEGOTOKENS)
++        return write_ts_request_full( payload, payload_len, 0, NULL, 0, out );
++    return write_ts_request_full( NULL, 0, tag, payload, payload_len, out );
++}
++
++/* Read the one payload a response carries. Returns the field's tag, or 0 when
++ * the message has none -- which is how the server signals it is finished. */
++static SECURITY_STATUS read_ts_request( const BYTE *data, ULONG len, BYTE *tag,
++                                        const BYTE **payload, ULONG *payload_len,
++                                        ULONG *error_code )
++{
++    const BYTE *p = data, *end = data + len;
++    ULONG field_len;
++
++    *tag = 0;
++    *payload = NULL;
++    *payload_len = 0;
++    *error_code = 0;
++
++    if (p >= end || *p++ != 0x30) return SEC_E_INVALID_TOKEN;
++    if (!(p = der_read_length( p, end, &field_len ))) return SEC_E_INVALID_TOKEN;
++    if (p + field_len > end) return SEC_E_INVALID_TOKEN;
++    end = p + field_len;
++
++    while (p < end)
++    {
++        BYTE field_tag = *p++;
++
++        if (!(p = der_read_length( p, end, &field_len ))) return SEC_E_INVALID_TOKEN;
++        if (p + field_len > end) return SEC_E_INVALID_TOKEN;
++
++        switch (field_tag)
++        {
++        case 0xa0:  /* version; only its presence matters here */
++            break;
++
++        case 0xa1:  /* negoTokens: two SEQUENCE layers, then [0] { OCTET STRING } */
++        {
++            const BYTE *q = p, *q_end = p + field_len;
++            ULONG l;
++            int depth;
++
++            for (depth = 0; depth < 3 && q < q_end; depth++)
++            {
++                if (*q != 0x30 && *q != 0xa0) return SEC_E_INVALID_TOKEN;
++                q++;
++                if (!(q = der_read_length( q, q_end, &l ))) return SEC_E_INVALID_TOKEN;
++            }
++            if (q >= q_end || *q++ != 0x04) return SEC_E_INVALID_TOKEN;
++            if (!(q = der_read_length( q, q_end, &l ))) return SEC_E_INVALID_TOKEN;
++            if (q + l > q_end) return SEC_E_INVALID_TOKEN;
++
++            *tag = TSREQUEST_NEGOTOKENS;
++            *payload = q;
++            *payload_len = l;
++            break;
++        }
++
++        case 0xa2:  /* authInfo */
++        case 0xa3:  /* pubKeyAuth */
++        {
++            const BYTE *q = p;
++            ULONG l;
++
++            if (q >= end || *q++ != 0x04) return SEC_E_INVALID_TOKEN;
++            if (!(q = der_read_length( q, end, &l ))) return SEC_E_INVALID_TOKEN;
++            if (q + l > end) return SEC_E_INVALID_TOKEN;
++
++            *tag = field_tag - 0xa0;
++            *payload = q;
++            *payload_len = l;
++            break;
++        }
++
++        case 0xa4:  /* errorCode: the server refusing, with a reason */
++        {
++            const BYTE *q = p;
++            ULONG l, i, value = 0;
++
++            if (q >= end || *q++ != 0x02) break;
++            if (!(q = der_read_length( q, end, &l )) || l > 4) break;
++            for (i = 0; i < l; i++) value = (value << 8) | q[i];
++            *error_code = value;
++            break;
++        }
++
++        default:
++            TRACE( "ignoring TSRequest field %#x\n", field_tag );
++            break;
++        }
++        p += field_len;
++    }
++    return SEC_E_OK;
++}
++
++/*
++ * TSCredentials wrapping TSPasswordCreds (MS-CSSP 2.2.1.2): what the caller
++ * asked to have delegated, in the form the server expects to find it.
++ */
++static SECURITY_STATUS write_ts_credentials( const SEC_WINNT_AUTH_IDENTITY_W *id,
++                                             struct blob *out )
++{
++    ULONG domain_len = id && id->Domain ? id->DomainLength * sizeof(WCHAR) : 0;
++    ULONG user_len = id && id->User ? id->UserLength * sizeof(WCHAR) : 0;
++    ULONG pass_len = id && id->Password ? id->PasswordLength * sizeof(WCHAR) : 0;
++    ULONG creds_body = der_tagged_octets_size( domain_len ) +
++                       der_tagged_octets_size( user_len ) +
++                       der_tagged_octets_size( pass_len );
++    ULONG creds_total = 1 + der_length_size( creds_body ) + creds_body;
++    ULONG type = der_integer_size( 1 );   /* 1 = password credentials */
++    ULONG body = 1 + der_length_size( type ) + type + der_tagged_octets_size( creds_total );
++    ULONG total = 1 + der_length_size( body ) + body;
++    BYTE *p, *creds;
++    SECURITY_STATUS status = SEC_E_INSUFFICIENT_MEMORY;
++
++    if (!(creds = RtlAllocateHeap( GetProcessHeap(), 0, creds_total ))) return status;
++
++    p = creds;
++    *p++ = 0x30;
++    p = der_write_length( p, creds_body );
++    p = der_write_tagged_octets( p, 0, id && id->Domain ? id->Domain : L"", domain_len );
++    p = der_write_tagged_octets( p, 1, id && id->User ? id->User : L"", user_len );
++    p = der_write_tagged_octets( p, 2, id && id->Password ? id->Password : L"", pass_len );
++
++    if ((out->data = RtlAllocateHeap( GetProcessHeap(), 0, total )))
++    {
++        p = out->data;
++        *p++ = 0x30;
++        p = der_write_length( p, body );
++        *p++ = 0xa0;
++        p = der_write_length( p, type );
++        p = der_write_integer( p, 1 );
++        p = der_write_tagged_octets( p, 1, creds, creds_total );
++        out->len = p - out->data;
++        status = SEC_E_OK;
++    }
++
++    SecureZeroMemory( creds, creds_total );
++    RtlFreeHeap( GetProcessHeap(), 0, creds );
++    return status;
++}
++
++/***********************************************************************
++ * Credentials
++ ***********************************************************************/
++
++static SEC_WINNT_AUTH_IDENTITY_W *copy_identity( const SEC_WINNT_AUTH_IDENTITY_W *src )
++{
++    SEC_WINNT_AUTH_IDENTITY_W *id;
++
++    if (!src) return NULL;
++    if (!(id = calloc( 1, sizeof(*id) ))) return NULL;
++
++    id->Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
++    if (src->User && src->UserLength)
++    {
++        id->User = malloc( (src->UserLength + 1) * sizeof(WCHAR) );
++        if (id->User)
++        {
++            memcpy( id->User, src->User, src->UserLength * sizeof(WCHAR) );
++            id->User[src->UserLength] = 0;
++            id->UserLength = src->UserLength;
++        }
++    }
++    if (src->Domain && src->DomainLength)
++    {
++        id->Domain = malloc( (src->DomainLength + 1) * sizeof(WCHAR) );
++        if (id->Domain)
++        {
++            memcpy( id->Domain, src->Domain, src->DomainLength * sizeof(WCHAR) );
++            id->Domain[src->DomainLength] = 0;
++            id->DomainLength = src->DomainLength;
++        }
++    }
++    if (src->Password && src->PasswordLength)
++    {
++        id->Password = malloc( (src->PasswordLength + 1) * sizeof(WCHAR) );
++        if (id->Password)
++        {
++            memcpy( id->Password, src->Password, src->PasswordLength * sizeof(WCHAR) );
++            id->Password[src->PasswordLength] = 0;
++            id->PasswordLength = src->PasswordLength;
++        }
++    }
++    return id;
++}
++
++static void free_identity( SEC_WINNT_AUTH_IDENTITY_W *id )
++{
++    if (!id) return;
++    if (id->Password) SecureZeroMemory( id->Password, id->PasswordLength * sizeof(WCHAR) );
++    free( id->User );
++    free( id->Domain );
++    free( id->Password );
++    free( id );
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_AcquireCredentialsHandleW(
++    SEC_WCHAR *principal, SEC_WCHAR *package, ULONG use, LUID *logon_id, void *auth_data,
++    SEC_GET_KEY_FN get_key_fn, void *get_key_arg, CredHandle *credential, TimeStamp *expiry )
++{
++    struct credssp_credentials *creds;
++    SCHANNEL_CRED schannel_cred = { SCHANNEL_CRED_VERSION };
++    SECURITY_STATUS status;
++
++    TRACE( "%s %s %#lx %p %p %p %p %p %p\n", debugstr_w(principal), debugstr_w(package),
++           use, logon_id, auth_data, get_key_fn, get_key_arg, credential, expiry );
++
++    if (!credential) return SEC_E_INVALID_HANDLE;
++    if (!(creds = calloc( 1, sizeof(*creds) ))) return SEC_E_INSUFFICIENT_MEMORY;
++
++    creds->use = use;
++
++    /*
++     * The caller passes a CREDSSP_CRED, whose first member points at the
++     * identity to delegate. Callers that have no credentials to hand over pass
++     * nothing, which is allowed: the exchange can still authenticate.
++     */
++    if (auth_data)
++    {
++        const CREDSSP_CRED *cred = auth_data;
++
++        if (cred->pSpnegoCred)
++        {
++            const SEC_WINNT_AUTH_IDENTITY_W *id = cred->pSpnegoCred;
++
++            /* The password is never traced. What matters here is the shape of
++             * the identity: a caller may hand over an ANSI one, or the extended
++             * form with a version header, and reading either as a plain
++             * SEC_WINNT_AUTH_IDENTITY_W yields a password that is not the
++             * caller's -- which fails much later, as a bad signature. */
++            TRACE( "identity flags %#lx user %s domain %s password %s\n", id->Flags,
++                   debugstr_wn(id->User, id->UserLength),
++                   debugstr_wn(id->Domain, id->DomainLength),
++                   id->PasswordLength ? "present" : "absent" );
++            creds->identity = copy_identity( id );
++        }
++    }
++
++    /* The TLS session this package runs inside is an ordinary Schannel one. */
++    schannel_cred.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
++    status = AcquireCredentialsHandleW( NULL, (SEC_WCHAR *)UNISP_NAME_W, use, NULL,
++                                        &schannel_cred, NULL, NULL, &creds->schannel, expiry );
++    if (status != SEC_E_OK)
++    {
++        WARN( "no TLS credential to run inside: %#lx\n", status );
++        free_identity( creds->identity );
++        free( creds );
++        return status;
++    }
++    creds->have_schannel = TRUE;
++
++    credential->dwLower = (ULONG_PTR)creds;
++    credential->dwUpper = 0;
++    return SEC_E_OK;
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_AcquireCredentialsHandleA(
++    SEC_CHAR *principal, SEC_CHAR *package, ULONG use, LUID *logon_id, void *auth_data,
++    SEC_GET_KEY_FN get_key_fn, void *get_key_arg, CredHandle *credential, TimeStamp *expiry )
++{
++    FIXME( "ANSI entry point not implemented\n" );
++    return SEC_E_UNSUPPORTED_FUNCTION;
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_FreeCredentialsHandle( CredHandle *credential )
++{
++    struct credssp_credentials *creds;
++
++    TRACE( "%p\n", credential );
++
++    if (!credential) return SEC_E_INVALID_HANDLE;
++    if (!(creds = (struct credssp_credentials *)credential->dwLower)) return SEC_E_INVALID_HANDLE;
++
++    if (creds->have_schannel) FreeCredentialsHandle( &creds->schannel );
++    free_identity( creds->identity );
++    free( creds );
++
++    credential->dwLower = 0;
++    credential->dwUpper = 0;
++    return SEC_E_OK;
++}
++
++/***********************************************************************
++ * Contexts
++ ***********************************************************************/
++
++static void free_context( struct credssp_context *ctx )
++{
++    if (!ctx) return;
++    if (ctx->have_nego) DeleteSecurityContext( &ctx->nego );
++    if (ctx->have_nego_cred) FreeCredentialsHandle( &ctx->nego_cred );
++    if (ctx->have_schannel) DeleteSecurityContext( &ctx->schannel );
++    free( ctx->target );
++    free( ctx );
++}
++
++/* Find the token in a buffer descriptor; there is at most one that matters. */
++static SecBuffer *find_token( SecBufferDesc *desc )
++{
++    ULONG i;
++
++    if (!desc) return NULL;
++    for (i = 0; i < desc->cBuffers; i++)
++        if (desc->pBuffers[i].BufferType == SECBUFFER_TOKEN) return &desc->pBuffers[i];
++    return NULL;
++}
++
++/* Hand a token to the caller, allocating when it asked us to. */
++static SECURITY_STATUS emit_token( SecBufferDesc *output, ULONG context_req,
++                                   const void *data, ULONG len )
++{
++    SecBuffer *token = find_token( output );
++
++    if (!token) return SEC_E_INSUFFICIENT_MEMORY;
++
++    if (context_req & ISC_REQ_ALLOCATE_MEMORY)
++    {
++        if (!(token->pvBuffer = RtlAllocateHeap( GetProcessHeap(), 0, len )))
++            return SEC_E_INSUFFICIENT_MEMORY;
++    }
++    else if (!token->pvBuffer || token->cbBuffer < len) return SEC_E_BUFFER_TOO_SMALL;
++
++    memcpy( token->pvBuffer, data, len );
++    token->cbBuffer = len;
++    return SEC_E_OK;
++}
++
++/*
++ * Everything after the TLS handshake travels inside that session, so each
++ * message is sealed before it goes out and unsealed on the way in. The buffer
++ * shape is Schannel's: header, data, trailer, and two spare.
++ */
++static SECURITY_STATUS seal( struct credssp_context *ctx, const void *data, ULONG len,
++                             struct blob *out )
++{
++    SecPkgContext_StreamSizes sizes;
++    SecBuffer buffers[4] = { { 0 } };
++    SecBufferDesc desc = { SECBUFFER_VERSION, 4, buffers };
++    SECURITY_STATUS status;
++    BYTE *buf;
++
++    status = QueryContextAttributesW( &ctx->schannel, SECPKG_ATTR_STREAM_SIZES, &sizes );
++    if (status != SEC_E_OK) return status;
++
++    if (!(buf = RtlAllocateHeap( GetProcessHeap(), 0,
++                                 sizes.cbHeader + len + sizes.cbTrailer )))
++        return SEC_E_INSUFFICIENT_MEMORY;
++
++    memcpy( buf + sizes.cbHeader, data, len );
++
++    buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
++    buffers[0].pvBuffer = buf;
++    buffers[0].cbBuffer = sizes.cbHeader;
++    buffers[1].BufferType = SECBUFFER_DATA;
++    buffers[1].pvBuffer = buf + sizes.cbHeader;
++    buffers[1].cbBuffer = len;
++    buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
++    buffers[2].pvBuffer = buf + sizes.cbHeader + len;
++    buffers[2].cbBuffer = sizes.cbTrailer;
++    buffers[3].BufferType = SECBUFFER_EMPTY;
++
++    status = EncryptMessage( &ctx->schannel, 0, &desc, 0 );
++    if (status != SEC_E_OK)
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, buf );
++        return status;
++    }
++
++    out->data = buf;
++    out->len = buffers[0].cbBuffer + buffers[1].cbBuffer + buffers[2].cbBuffer;
++    return SEC_E_OK;
++}
++
++/* Unseal in place; the plaintext ends up inside the caller's own buffer. */
++static SECURITY_STATUS unseal( struct credssp_context *ctx, void *data, ULONG len,
++                               const BYTE **plain, ULONG *plain_len )
++{
++    SecBuffer buffers[4] = { { 0 } };
++    SecBufferDesc desc = { SECBUFFER_VERSION, 4, buffers };
++    SECURITY_STATUS status;
++    ULONG i;
++
++    buffers[0].BufferType = SECBUFFER_DATA;
++    buffers[0].pvBuffer = data;
++    buffers[0].cbBuffer = len;
++    buffers[1].BufferType = SECBUFFER_EMPTY;
++    buffers[2].BufferType = SECBUFFER_EMPTY;
++    buffers[3].BufferType = SECBUFFER_EMPTY;
++
++    status = DecryptMessage( &ctx->schannel, &desc, 0, NULL );
++    if (status != SEC_E_OK) return status;
++
++    for (i = 0; i < 4; i++)
++    {
++        if (buffers[i].BufferType == SECBUFFER_DATA)
++        {
++            *plain = buffers[i].pvBuffer;
++            *plain_len = buffers[i].cbBuffer;
++            return SEC_E_OK;
++        }
++    }
++    return SEC_E_INVALID_TOKEN;
++}
++
++/*
++ * The server's public key, which both ends sign over so that the
++ * authentication cannot be lifted onto a different TLS session.
++ */
++static SECURITY_STATUS get_server_public_key( struct credssp_context *ctx, struct blob *out )
++{
++    const CERT_CONTEXT *cert = NULL;
++    SECURITY_STATUS status;
++    const CRYPT_BIT_BLOB *key;
++
++    status = QueryContextAttributesW( &ctx->schannel, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &cert );
++    if (status != SEC_E_OK) return status;
++    if (!cert) return SEC_E_NO_CREDENTIALS;
++
++    key = &cert->pCertInfo->SubjectPublicKeyInfo.PublicKey;
++    if (!(out->data = RtlAllocateHeap( GetProcessHeap(), 0, key->cbData )))
++    {
++        CertFreeCertificateContext( cert );
++        return SEC_E_INSUFFICIENT_MEMORY;
++    }
++    memcpy( out->data, key->pbData, key->cbData );
++    out->len = key->cbData;
++
++    CertFreeCertificateContext( cert );
++    return SEC_E_OK;
++}
++
++/* Seal with the authentication context rather than the TLS one: this is what
++ * proves the party that authenticated is the party holding the TLS session. */
++static SECURITY_STATUS sign_with_nego( struct credssp_context *ctx, const void *data, ULONG len,
++                                       struct blob *out )
++{
++    SecPkgContext_Sizes sizes;
++    SecBuffer buffers[2] = { { 0 } };
++    SecBufferDesc desc = { SECBUFFER_VERSION, 2, buffers };
++    SECURITY_STATUS status;
++    BYTE *token, *body;
++
++    status = QueryContextAttributesW( &ctx->nego, SECPKG_ATTR_SIZES, &sizes );
++    if (status != SEC_E_OK) return status;
++
++    if (!(token = RtlAllocateHeap( GetProcessHeap(), 0, sizes.cbSecurityTrailer + len )))
++        return SEC_E_INSUFFICIENT_MEMORY;
++    body = token + sizes.cbSecurityTrailer;
++    memcpy( body, data, len );
++
++    buffers[0].BufferType = SECBUFFER_TOKEN;
++    buffers[0].pvBuffer = token;
++    buffers[0].cbBuffer = sizes.cbSecurityTrailer;
++    buffers[1].BufferType = SECBUFFER_DATA;
++    buffers[1].pvBuffer = body;
++    buffers[1].cbBuffer = len;
++
++    status = EncryptMessage( &ctx->nego, 0, &desc, 0 );
++    if (status != SEC_E_OK)
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, token );
++        return status;
++    }
++
++    out->data = token;
++    out->len = buffers[0].cbBuffer + buffers[1].cbBuffer;
++    return SEC_E_OK;
++}
++
++static SECURITY_STATUS start_nego( struct credssp_context *ctx )
++{
++    SECURITY_STATUS status;
++
++    status = AcquireCredentialsHandleW( NULL, (SEC_WCHAR *)L"NTLM", SECPKG_CRED_OUTBOUND, NULL,
++                                        ctx->credentials->identity, NULL, NULL,
++                                        &ctx->nego_cred, NULL );
++    if (status != SEC_E_OK) return status;
++
++    ctx->have_nego_cred = TRUE;
++    return SEC_E_OK;
++}
++
++/*
++ * One turn of the exchange. Each call consumes whatever the server sent and
++ * produces the next message, so the caller's loop is unchanged from any other
++ * SSPI package: keep going while SEC_I_CONTINUE_NEEDED comes back.
++ */
++static SECURITY_STATUS run_exchange( struct credssp_context *ctx, ULONG context_req,
++                                     SecBufferDesc *input, SecBufferDesc *output,
++                                     ULONG *context_attr, TimeStamp *expiry )
++{
++    static const char *const states[] = { "INITIAL", "TLS", "NEGO", "PUBKEY", "CREDENTIALS", "DONE" };
++    SECURITY_STATUS status;
++    struct blob message = { 0 }, sealed = { 0 };
++    SecBuffer *in_token = find_token( input );
++
++    TRACE( "state %s, %lu bytes in\n",
++           ctx->state < ARRAY_SIZE(states) ? states[ctx->state] : "?",
++           in_token ? in_token->cbBuffer : 0 );
++
++    if (context_attr) *context_attr = ISC_RET_ALLOCATED_MEMORY | ISC_RET_CONFIDENTIALITY;
++
++    switch (ctx->state)
++    {
++    case CREDSSP_STATE_INITIAL:
++    case CREDSSP_STATE_TLS:
++    {
++        /* The TLS handshake is Schannel's, passed through unchanged. */
++        SecBuffer out_buffers[1] = { { 0 } };
++        SecBufferDesc out_desc = { SECBUFFER_VERSION, 1, out_buffers };
++
++        out_buffers[0].BufferType = SECBUFFER_TOKEN;
++
++        status = InitializeSecurityContextW( &ctx->credentials->schannel,
++                                             ctx->have_schannel ? &ctx->schannel : NULL,
++                                             ctx->target,
++                                             ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY |
++                                             ISC_REQ_STREAM,
++                                             0, 0, ctx->state == CREDSSP_STATE_INITIAL ? NULL : input,
++                                             0, &ctx->schannel, &out_desc, context_attr, expiry );
++        ctx->have_schannel = TRUE;
++
++        if (status == SEC_I_CONTINUE_NEEDED || status == SEC_E_INCOMPLETE_MESSAGE ||
++            (status == SEC_E_OK && out_buffers[0].cbBuffer))
++        {
++            if (out_buffers[0].cbBuffer)
++            {
++                SECURITY_STATUS emit = emit_token( output, context_req, out_buffers[0].pvBuffer,
++                                                   out_buffers[0].cbBuffer );
++                FreeContextBuffer( out_buffers[0].pvBuffer );
++                if (emit != SEC_E_OK) return emit;
++            }
++            if (status == SEC_E_OK) ctx->state = CREDSSP_STATE_NEGO;
++            else ctx->state = CREDSSP_STATE_TLS;
++            return status == SEC_E_OK ? SEC_I_CONTINUE_NEEDED : status;
++        }
++        if (status != SEC_E_OK)
++        {
++            ctx->state = CREDSSP_STATE_ERROR;
++            return status;
++        }
++        ctx->state = CREDSSP_STATE_NEGO;
++    }
++    /* fall through: the handshake finished with nothing left to send, so the
++     * first authentication token can go out in the same turn */
++
++    case CREDSSP_STATE_NEGO:
++    {
++        SecBuffer nego_in[1] = { { 0 } }, nego_out[1] = { { 0 } };
++        SecBufferDesc nego_in_desc = { SECBUFFER_VERSION, 1, nego_in };
++        SecBufferDesc nego_out_desc = { SECBUFFER_VERSION, 1, nego_out };
++        const BYTE *plain = NULL, *payload = NULL;
++        ULONG plain_len = 0, payload_len = 0, error_code = 0;
++        BYTE tag = 0;
++
++        if (!ctx->have_nego_cred && (status = start_nego( ctx )) != SEC_E_OK)
++        {
++            ctx->state = CREDSSP_STATE_ERROR;
++            return status;
++        }
++
++        if (ctx->have_nego)
++        {
++            /* A reply is waiting: unwrap it down to the authentication token. */
++            if (!in_token) return SEC_E_INVALID_TOKEN;
++            status = unseal( ctx, in_token->pvBuffer, in_token->cbBuffer, &plain, &plain_len );
++            if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++
++            status = read_ts_request( plain, plain_len, &tag, &payload, &payload_len, &error_code );
++            if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++            if (error_code)
++            {
++                WARN( "server refused the exchange: %#lx\n", error_code );
++                ctx->state = CREDSSP_STATE_ERROR;
++                return SEC_E_LOGON_DENIED;
++            }
++
++            nego_in[0].BufferType = SECBUFFER_TOKEN;
++            nego_in[0].pvBuffer = (void *)payload;
++            nego_in[0].cbBuffer = payload_len;
++        }
++
++        nego_out[0].BufferType = SECBUFFER_TOKEN;
++        status = InitializeSecurityContextW( &ctx->nego_cred,
++                                             ctx->have_nego ? &ctx->nego : NULL, ctx->target,
++                                             ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY |
++                                             ISC_REQ_INTEGRITY | ISC_REQ_MUTUAL_AUTH,
++                                             0, 0, ctx->have_nego ? &nego_in_desc : NULL,
++                                             0, &ctx->nego, &nego_out_desc, NULL, NULL );
++        ctx->have_nego = TRUE;
++
++        if (status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED)
++        {
++            ctx->state = CREDSSP_STATE_ERROR;
++            return status;
++        }
++
++        if (nego_out[0].cbBuffer)
++        {
++            struct blob key = { 0 }, signed_key = { 0 };
++            SECURITY_STATUS ret = SEC_E_OK;
++
++            /* The final token goes out with the public key beside it. */
++            if (status == SEC_E_OK)
++            {
++                ret = get_server_public_key( ctx, &key );
++                if (ret == SEC_E_OK) ret = sign_with_nego( ctx, key.data, key.len, &signed_key );
++                free_blob( &key );
++                if (ret != SEC_E_OK)
++                {
++                    FreeContextBuffer( nego_out[0].pvBuffer );
++                    ctx->state = CREDSSP_STATE_ERROR;
++                    return ret;
++                }
++            }
++
++            ret = write_ts_request_full( nego_out[0].pvBuffer, nego_out[0].cbBuffer,
++                                         TSREQUEST_PUBKEYAUTH, signed_key.data, signed_key.len,
++                                         &message );
++            FreeContextBuffer( nego_out[0].pvBuffer );
++            free_blob( &signed_key );
++            if (ret != SEC_E_OK) return ret;
++
++            ret = seal( ctx, message.data, message.len, &sealed );
++            free_blob( &message );
++            if (ret != SEC_E_OK) return ret;
++
++            ret = emit_token( output, context_req, sealed.data, sealed.len );
++            free_blob( &sealed );
++            if (ret != SEC_E_OK) return ret;
++
++            /* Having sent the public key with it, what comes back is the
++             * server's answer to that rather than another token. */
++            if (status == SEC_E_OK) ctx->state = CREDSSP_STATE_CREDENTIALS;
++            return SEC_I_CONTINUE_NEEDED;
++        }
++        ctx->state = CREDSSP_STATE_PUBKEY;
++    }
++    /* fall through */
++
++    case CREDSSP_STATE_PUBKEY:
++    {
++        struct blob key = { 0 }, signed_key = { 0 };
++
++        status = get_server_public_key( ctx, &key );
++        if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++
++        status = sign_with_nego( ctx, key.data, key.len, &signed_key );
++        TRACE( "public key %lu bytes, signed %lu bytes, %#lx\n", key.len, signed_key.len, status );
++        free_blob( &key );
++        if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++
++        status = write_ts_request( TSREQUEST_PUBKEYAUTH, signed_key.data, signed_key.len, &message );
++        free_blob( &signed_key );
++        if (status != SEC_E_OK) return status;
++
++        status = seal( ctx, message.data, message.len, &sealed );
++        free_blob( &message );
++        if (status != SEC_E_OK) return status;
++
++        status = emit_token( output, context_req, sealed.data, sealed.len );
++        free_blob( &sealed );
++        if (status != SEC_E_OK) return status;
++
++        ctx->state = CREDSSP_STATE_CREDENTIALS;
++        return SEC_I_CONTINUE_NEEDED;
++    }
++
++    case CREDSSP_STATE_CREDENTIALS:
++    {
++        struct blob creds = { 0 }, sealed_creds = { 0 };
++        const BYTE *plain = NULL, *payload = NULL;
++        ULONG plain_len = 0, payload_len = 0, error_code = 0;
++        BYTE tag = 0;
++
++        /* The server returns its own view of the public key first; a server
++         * that cannot produce it is not the one that holds this TLS session. */
++        if (!in_token) return SEC_E_INVALID_TOKEN;
++        status = unseal( ctx, in_token->pvBuffer, in_token->cbBuffer, &plain, &plain_len );
++        if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++
++        status = read_ts_request( plain, plain_len, &tag, &payload, &payload_len, &error_code );
++        if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++        if (error_code || tag != TSREQUEST_PUBKEYAUTH)
++        {
++            WARN( "server did not return the public key (tag %u, error %#lx)\n", tag, error_code );
++            ctx->state = CREDSSP_STATE_ERROR;
++            return SEC_E_LOGON_DENIED;
++        }
++
++        status = write_ts_credentials( ctx->credentials->identity, &creds );
++        if (status != SEC_E_OK) return status;
++
++        status = sign_with_nego( ctx, creds.data, creds.len, &sealed_creds );
++        SecureZeroMemory( creds.data, creds.len );
++        free_blob( &creds );
++        if (status != SEC_E_OK) { ctx->state = CREDSSP_STATE_ERROR; return status; }
++
++        status = write_ts_request( TSREQUEST_AUTHINFO, sealed_creds.data, sealed_creds.len,
++                                   &message );
++        free_blob( &sealed_creds );
++        if (status != SEC_E_OK) return status;
++
++        status = seal( ctx, message.data, message.len, &sealed );
++        free_blob( &message );
++        if (status != SEC_E_OK) return status;
++
++        status = emit_token( output, context_req, sealed.data, sealed.len );
++        free_blob( &sealed );
++        if (status != SEC_E_OK) return status;
++
++        ctx->state = CREDSSP_STATE_DONE;
++        return SEC_E_OK;
++    }
++
++    case CREDSSP_STATE_DONE:
++        return SEC_E_OK;
++
++    default:
++        return SEC_E_INTERNAL_ERROR;
++    }
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_InitializeSecurityContextW(
++    CredHandle *credential, CtxtHandle *context, SEC_WCHAR *target_name, ULONG context_req,
++    ULONG reserved1, ULONG target_data_rep, SecBufferDesc *input, ULONG reserved2,
++    CtxtHandle *new_context, SecBufferDesc *output, ULONG *context_attr, TimeStamp *expiry )
++{
++    struct credssp_context *ctx;
++
++    TRACE( "%p %p %s %#lx %p %p\n", credential, context, debugstr_w(target_name),
++           context_req, input, output );
++
++    if (context)
++    {
++        ctx = (struct credssp_context *)context->dwLower;
++        if (!ctx) return SEC_E_INVALID_HANDLE;
++    }
++    else
++    {
++        struct credssp_credentials *creds;
++
++        if (!credential || !(creds = (struct credssp_credentials *)credential->dwLower))
++            return SEC_E_INVALID_HANDLE;
++        if (!(ctx = calloc( 1, sizeof(*ctx) ))) return SEC_E_INSUFFICIENT_MEMORY;
++
++        ctx->state = CREDSSP_STATE_INITIAL;
++        ctx->credentials = creds;
++        if (target_name && !(ctx->target = wcsdup( target_name )))
++        {
++            free( ctx );
++            return SEC_E_INSUFFICIENT_MEMORY;
++        }
++        if (new_context)
++        {
++            new_context->dwLower = (ULONG_PTR)ctx;
++            new_context->dwUpper = 0;
++        }
++    }
++
++    return run_exchange( ctx, context_req, input, output, context_attr, expiry );
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_InitializeSecurityContextA(
++    CredHandle *credential, CtxtHandle *context, SEC_CHAR *target_name, ULONG context_req,
++    ULONG reserved1, ULONG target_data_rep, SecBufferDesc *input, ULONG reserved2,
++    CtxtHandle *new_context, SecBufferDesc *output, ULONG *context_attr, TimeStamp *expiry )
++{
++    FIXME( "ANSI entry point not implemented\n" );
++    return SEC_E_UNSUPPORTED_FUNCTION;
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_DeleteSecurityContext( CtxtHandle *context )
++{
++    TRACE( "%p\n", context );
++
++    if (!context) return SEC_E_INVALID_HANDLE;
++    free_context( (struct credssp_context *)context->dwLower );
++    context->dwLower = 0;
++    context->dwUpper = 0;
++    return SEC_E_OK;
++}
++
++/* Once the exchange is done the caller talks to the server through the TLS
++ * session this package established, so these belong to the inner context. */
++static SECURITY_STATUS SEC_ENTRY credssp_EncryptMessage( CtxtHandle *context, ULONG quality,
++                                                         SecBufferDesc *message, ULONG seq_no )
++{
++    struct credssp_context *ctx;
++
++    if (!context || !(ctx = (struct credssp_context *)context->dwLower)) return SEC_E_INVALID_HANDLE;
++    if (!ctx->have_schannel) return SEC_E_INVALID_HANDLE;
++    return EncryptMessage( &ctx->schannel, quality, message, seq_no );
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_DecryptMessage( CtxtHandle *context,
++                                                         SecBufferDesc *message, ULONG seq_no,
++                                                         ULONG *quality )
++{
++    struct credssp_context *ctx;
++
++    if (!context || !(ctx = (struct credssp_context *)context->dwLower)) return SEC_E_INVALID_HANDLE;
++    if (!ctx->have_schannel) return SEC_E_INVALID_HANDLE;
++    return DecryptMessage( &ctx->schannel, message, seq_no, quality );
++}
++
++static SECURITY_STATUS SEC_ENTRY credssp_QueryContextAttributesW( CtxtHandle *context,
++                                                                  ULONG attribute, void *buffer )
++{
++    struct credssp_context *ctx;
++
++    TRACE( "%p %#lx %p\n", context, attribute, buffer );
++
++    if (!context || !(ctx = (struct credssp_context *)context->dwLower)) return SEC_E_INVALID_HANDLE;
++    if (!ctx->have_schannel) return SEC_E_UNSUPPORTED_FUNCTION;
++
++    /* Everything a caller asks about a CredSSP context -- sizes, the peer's
++     * certificate, the cipher -- is a property of the TLS session inside it. */
++    return QueryContextAttributesW( &ctx->schannel, attribute, buffer );
++}
++
++static const SecurityFunctionTableA credsspTableA = {
++    1,
++    NULL, /* EnumerateSecurityPackagesA */
++    NULL, /* QueryCredentialsAttributesA */
++    credssp_AcquireCredentialsHandleA,
++    credssp_FreeCredentialsHandle,
++    NULL, /* Reserved2 */
++    credssp_InitializeSecurityContextA,
++    NULL, /* AcceptSecurityContext */
++    NULL, /* CompleteAuthToken */
++    credssp_DeleteSecurityContext,
++    NULL, /* ApplyControlToken */
++    NULL, /* QueryContextAttributesA */
++    NULL, /* ImpersonateSecurityContext */
++    NULL, /* RevertSecurityContext */
++    NULL, /* MakeSignature */
++    NULL, /* VerifySignature */
++    FreeContextBuffer,
++    NULL, /* QuerySecurityPackageInfoA */
++    NULL, /* Reserved3 */
++    NULL, /* Reserved4 */
++    NULL, /* ExportSecurityContext */
++    NULL, /* ImportSecurityContextA */
++    NULL, /* AddCredentialsA */
++    NULL, /* Reserved8 */
++    NULL, /* QuerySecurityContextToken */
++    credssp_EncryptMessage,
++    credssp_DecryptMessage,
++    NULL, /* SetContextAttributesA */
++};
++
++static const SecurityFunctionTableW credsspTableW = {
++    1,
++    NULL, /* EnumerateSecurityPackagesW */
++    NULL, /* QueryCredentialsAttributesW */
++    credssp_AcquireCredentialsHandleW,
++    credssp_FreeCredentialsHandle,
++    NULL, /* Reserved2 */
++    credssp_InitializeSecurityContextW,
++    NULL, /* AcceptSecurityContext */
++    NULL, /* CompleteAuthToken */
++    credssp_DeleteSecurityContext,
++    NULL, /* ApplyControlToken */
++    credssp_QueryContextAttributesW,
++    NULL, /* ImpersonateSecurityContext */
++    NULL, /* RevertSecurityContext */
++    NULL, /* MakeSignature */
++    NULL, /* VerifySignature */
++    FreeContextBuffer,
++    NULL, /* QuerySecurityPackageInfoW */
++    NULL, /* Reserved3 */
++    NULL, /* Reserved4 */
++    NULL, /* ExportSecurityContext */
++    NULL, /* ImportSecurityContextW */
++    NULL, /* AddCredentialsW */
++    NULL, /* Reserved8 */
++    NULL, /* QuerySecurityContextToken */
++    credssp_EncryptMessage,
++    credssp_DecryptMessage,
++    NULL, /* SetContextAttributesW */
++};
++
++void SECUR32_initCredSSPSP(void)
++{
++    /*
++     * Delegation is the point of this package, not an extra: callers check for
++     * it before deciding the package can carry credentials to a server, and
++     * one that does not claim it is passed over even when present. The rest
++     * describe what the exchange provides -- mutual authentication, a stream
++     * of protected messages -- and are what a caller uses to decide whether it
++     * can rely on the connection afterwards.
++     */
++    static const LONG caps =
++        SECPKG_FLAG_INTEGRITY |
++        SECPKG_FLAG_PRIVACY |
++        SECPKG_FLAG_CONNECTION |
++        SECPKG_FLAG_MULTI_REQUIRED |
++        SECPKG_FLAG_EXTENDED_ERROR |
++        SECPKG_FLAG_IMPERSONATION |
++        SECPKG_FLAG_ACCEPT_WIN32_NAME |
++        SECPKG_FLAG_DELEGATION |
++        SECPKG_FLAG_MUTUAL_AUTH |
++        SECPKG_FLAG_LOGON |
++        SECPKG_FLAG_STREAM;
++    static const short version = 1;
++    SecPkgInfoW info[] = {
++        { caps, version, RPC_C_AUTHN_GSS_NEGOTIATE, CREDSSP_MAX_TOKEN,
++          (SEC_WCHAR *)L"CREDSSP", (SEC_WCHAR *)L"Microsoft CredSSP Security Provider" },
++    };
++    SecureProvider *provider;
++
++    provider = SECUR32_addProvider( &credsspTableA, &credsspTableW, NULL );
++    if (!provider)
++    {
++        ERR( "Failed to add the CredSSP provider.\n" );
++        return;
++    }
++
++    SECUR32_addPackages( provider, ARRAY_SIZE(info), NULL, info );
++}
+diff --git a/dlls/secur32/secur32.c b/dlls/secur32/secur32.c
+index 4ceb646ba95..008f4dd3611 100644
+--- a/dlls/secur32/secur32.c
++++ b/dlls/secur32/secur32.c
+@@ -498,6 +498,7 @@ static void SECUR32_initializeProviders(void)
+     TRACE("\n");
+     /* First load built-in providers */
+     SECUR32_initSchannelSP();
++    SECUR32_initCredSSPSP();
+     /* Load SSP/AP packages (Kerberos and others) */
+     load_auth_packages();
+     /* Now load providers from registry */
+diff --git a/dlls/secur32/secur32_priv.h b/dlls/secur32/secur32_priv.h
+index 1dc4c0ebd94..5773f903462 100644
+--- a/dlls/secur32/secur32_priv.h
++++ b/dlls/secur32/secur32_priv.h
+@@ -72,6 +72,7 @@ SecurePackage *SECUR32_findPackageA(PCSTR packageName);
+ 
+ /* Initialization functions for built-in providers */
+ void SECUR32_initSchannelSP(void);
++void SECUR32_initCredSSPSP(void);
+ void load_auth_packages(void);
+ NTSTATUS NTAPI nego_SpUserModeInitialize(ULONG, PULONG, PSECPKG_USER_FUNCTION_TABLE *, PULONG);
+ extern SECPKG_USER_FUNCTION_TABLE *lsa_find_func_table( const WCHAR *name );

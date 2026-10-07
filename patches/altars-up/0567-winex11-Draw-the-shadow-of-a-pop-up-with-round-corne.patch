@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 12:12:09 -0400
+Subject: [PATCH] winex11: Draw the shadow of a pop-up with round corners, as
+ Windows 11 does.
+
+Windows 11's desktop window manager draws a soft shadow around a window
+that asks for round corners with DWMWA_WINDOW_CORNER_PREFERENCE, and
+none around one that does not.  tools/dwmframeprobe in the wine-altars
+repository captured it on white, grey and black backdrops: black, as
+translucent as two blurred copies of the window's rectangle for ROUND,
+one close and faint (alpha 0.1445, sigma 7.1 px, 2 px down) and one
+wide and further down (0.1487, 19.6 px, 34.5 px down), and one copy for
+ROUNDSMALL (0.0977, 4.1 px, 9.2 px down), at 96 dpi.  Office's menus,
+dropdowns and flyouts ask for round corners.
+
+An override-redirect window with round corners now gets an
+override-redirect ARGB window right below it, that clicks go through,
+holding that shadow and the default border, if the window asks for no
+border colour.  It follows the window as it is moved, sized, restacked,
+shown and hidden.  The window manager draws no shadow of its own around
+a shaped window, which one with round corners is.  It needs a
+compositing manager, and is not drawn for managed windows, for windows
+with per-pixel alpha or in a virtual desktop.
+
+Drawn on Xvfb under xcompmgr, the frames the probe captures are
+Windows' to within 0.3-0.7 per channel on average outside the window,
+and at most 2-8; only the antialiased corner pixels differ.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 3beb66768d6..43b94a7f6e1 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -30,6 +30,7 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <unistd.h>
++#include <math.h>
+ 
+ #include <X11/Xlib.h>
+ #include <X11/Xresource.h>
+@@ -2381,6 +2382,272 @@ static void move_window_bits( HWND hwnd, Window window, const struct window_rect
+ }
+ 
+ 
++/***********************************************************************
++ *              DWM shadows
++ *
++ * The desktop window manager of Windows 11 draws a soft shadow around a pop-up that asks for round
++ * corners with DWMWA_WINDOW_CORNER_PREFERENCE, ROUND or ROUNDSMALL, and none around one that does
++ * not.  tools/dwmframeprobe in the wine-altars repository measured it on white, grey and black
++ * backdrops: black, as translucent as two blurred copies of the window rectangle for ROUND -- one
++ * close and faint, one wide and moved down -- and one smaller for ROUNDSMALL, which this draws to
++ * within a few 1/255 of what was measured.  It needs a compositing manager, and the window manager
++ * draws no shadow of its own around a shaped window, which a window with round corners is.
++ */
++struct dwm_shadow_layer
++{
++    float alpha;
++    float sigma;    /* at 96 dpi */
++    float offset;   /* down, at 96 dpi */
++};
++
++struct dwm_shadow
++{
++    UINT radius;                /* the corner radius it goes with, at 96 dpi */
++    RECT margins;               /* how far it reaches past the window, at 96 dpi */
++    unsigned int count;
++    struct dwm_shadow_layer layers[2];
++};
++
++static const struct dwm_shadow dwm_shadows[] =
++{
++    { 8, { 44, 14, 44, 78 }, 2, { { 0.1445f, 7.08f, 1.98f }, { 0.1487f, 19.55f, 34.5f } } },  /* ROUND */
++    { 4, { 9, 1, 9, 18 }, 1, { { 0.0977f, 4.05f, 9.17f } } },                                 /* ROUNDSMALL */
++};
++
++static BOOL compositing_manager_running( Display *display )
++{
++    static Atom atom;
++
++    if (!atom)
++    {
++        char name[32];
++        snprintf( name, sizeof(name), "_NET_WM_CM_S%d", DefaultScreen( display ) );
++        atom = XInternAtom( display, name, False );
++    }
++    return XGetSelectionOwner( display, atom ) != None;
++}
++
++/* the shadow a window gets, if any: the kind by the radius of its corners in its DPI */
++static const struct dwm_shadow *get_dwm_shadow( struct x11drv_win_data *data, struct window_surface *surface )
++{
++    UINT dpi, radius;
++
++    if (!surface || !surface->frame_radius) return NULL;
++    if (data->managed || data->embedded || data->parent || data->use_alpha || is_virtual_desktop()) return NULL;
++    if (!argb_visual.visualid) return NULL;
++    if (!(dpi = NtUserGetDpiForWindow( data->hwnd ))) dpi = USER_DEFAULT_SCREEN_DPI;
++    radius = (surface->frame_radius * USER_DEFAULT_SCREEN_DPI + dpi / 2) / dpi;
++    return radius >= 6 ? &dwm_shadows[0] : &dwm_shadows[1];
++}
++
++/* the border it draws when a window asks for no colour, measured over the shadow: grey, translucent */
++#define DWM_BORDER_ALPHA 0.40f
++#define DWM_BORDER_PREMULTIPLIED 47.0f
++
++static float dwm_shadow_phi( float x )
++{
++    return 0.5f * (1.0f + erff( x * (float)M_SQRT1_2 ));
++}
++
++/* how many of 64 samples of a pixel lie inside a w x h window whose corners are rounded with
++ * radius r, sampled as win32u samples them to cut the corners out of the window's shape */
++static UINT dwm_frame_coverage( int x, int y, int w, int h, int r )
++{
++    int cx, cy, i, j;
++    UINT count = 0;
++    float dx, dy;
++
++    if (x < 0 || y < 0 || x >= w || y >= h) return 0;
++    cx = x < r ? x : x >= w - r ? w - 1 - x : -1;
++    cy = y < r ? y : y >= h - r ? h - 1 - y : -1;
++    if (cx < 0 || cy < 0) return 64;
++    for (j = 0; j < 8; j++)
++    {
++        for (i = 0; i < 8; i++)
++        {
++            dx = r - (cx + (i + 0.5f) / 8);
++            dy = r - (cy + (j + 0.5f) / 8);
++            if (dx * dx + dy * dy <= (float)r * r) count++;
++        }
++    }
++    return count;
++}
++
++/* the shadow of a window at window, in a pixmap of width x height, as premultiplied ARGB, and
++ * the default border, border pixels wide, where the window leaves its outermost pixels out; it
++ * shows only where the window does not cover it */
++static void render_dwm_shadow( UINT32 *bits, int width, int height, const RECT *window,
++                               const struct dwm_shadow *shadow, float scale, int radius, int border )
++{
++    float *fx, *fy, alpha;
++    unsigned int i;
++    int x, y;
++
++    for (y = 0; y < height; y++) for (x = 0; x < width; x++) bits[y * width + x] = 0xff000000;
++    if (!(fx = malloc( (width + height) * sizeof(*fx) ))) return;
++    fy = fx + width;
++
++    /* 1 - alpha, layer by layer: each is the product of its profiles across and down */
++    for (y = 0; y < height; y++) for (x = 0; x < width; x++) ((float *)bits)[y * width + x] = 1.0f;
++    for (i = 0; i < shadow->count; i++)
++    {
++        const struct dwm_shadow_layer *layer = &shadow->layers[i];
++        float sigma = layer->sigma * scale, offset = layer->offset * scale;
++
++        for (x = 0; x < width; x++)
++            fx[x] = dwm_shadow_phi( (x + 0.5f - window->left) / sigma ) - dwm_shadow_phi( (x + 0.5f - window->right) / sigma );
++        for (y = 0; y < height; y++)
++            fy[y] = dwm_shadow_phi( (y + 0.5f - window->top - offset) / sigma ) -
++                    dwm_shadow_phi( (y + 0.5f - window->bottom - offset) / sigma );
++        for (y = 0; y < height; y++) for (x = 0; x < width; x++)
++            ((float *)bits)[y * width + x] *= 1.0f - layer->alpha * fx[x] * fy[y];
++    }
++    free( fx );
++
++    for (y = 0; y < height; y++) for (x = 0; x < width; x++)
++    {
++        int wx = x - window->left, wy = y - window->top, w = window->right - window->left, h = window->bottom - window->top;
++        float coverage = 0.0f, color;
++        UINT32 premultiplied;
++
++        alpha = 1.0f - ((float *)bits)[y * width + x];
++        if (wx >= 0 && wy >= 0 && wx < w && wy < h)
++        {
++            /* the window covers what is inside its shape, the round corners cut off */
++            if (dwm_frame_coverage( wx - border, wy - border, w - 2 * border, h - 2 * border, radius - border ) >= 32)
++            {
++                bits[y * width + x] = 0;
++                continue;
++            }
++            if (border) coverage = dwm_frame_coverage( wx, wy, w, h, radius ) / 64.0f;
++        }
++        /* the border over the shadow */
++        alpha = 1.0f - (1.0f - alpha) * (1.0f - DWM_BORDER_ALPHA * coverage);
++        color = DWM_BORDER_PREMULTIPLIED * coverage;
++        premultiplied = (UINT32)(color + 0.5f);
++        bits[y * width + x] = ((UINT32)(alpha * 255.0f + 0.5f) << 24) | (premultiplied << 16) | (premultiplied << 8) | premultiplied;
++    }
++}
++
++static void destroy_dwm_shadow( struct x11drv_win_data *data )
++{
++    if (!data->shadow_window) return;
++    XDestroyWindow( data->display, data->shadow_window );
++    XFreeColormap( data->display, data->shadow_colormap );
++    data->shadow_window = 0;
++    data->shadow_colormap = 0;
++    data->shadow_kind = NULL;
++    data->shadow_mapped = 0;
++    SetRectEmpty( &data->shadow_rect );
++}
++
++static void hide_dwm_shadow( struct x11drv_win_data *data )
++{
++    if (!data->shadow_mapped) return;
++    XUnmapWindow( data->display, data->shadow_window );
++    data->shadow_mapped = 0;
++}
++
++/* keep the shadow of an override-redirect window with round corners right below it */
++static void update_dwm_shadow( struct x11drv_win_data *data, struct window_surface *surface )
++{
++#ifdef HAVE_LIBXSHAPE
++    const struct dwm_shadow *shadow = get_dwm_shadow( data, surface );
++    RECT rect = data->pending_state.rect, window;
++    UINT dpi = NtUserGetWinMonitorDpi( data->hwnd, MDT_RAW_DPI );
++    float scale = (float)(dpi ? dpi : USER_DEFAULT_SCREEN_DPI) / USER_DEFAULT_SCREEN_DPI;
++    int width, height, radius = surface ? surface->frame_radius : 0, border = 0;
++    XWindowChanges changes;
++    POINT pt;
++
++    if (!shadow || data->desired_state.wm_state != NormalState || IsRectEmpty( &rect ))
++    {
++        hide_dwm_shadow( data );
++        return;
++    }
++    /* no colour asked for: the default border, drawn here where the window leaves it out */
++    if (surface->frame_border && surface->frame_color == CLR_INVALID && radius > surface->frame_border)
++        border = surface->frame_border;
++    if (!data->shadow_window && !compositing_manager_running( data->display )) return;
++
++    window.left = (int)(shadow->margins.left * scale + 0.5f);
++    window.top = (int)(shadow->margins.top * scale + 0.5f);
++    window.right = window.left + rect.right - rect.left;
++    window.bottom = window.top + rect.bottom - rect.top;
++    width = window.right + (int)(shadow->margins.right * scale + 0.5f);
++    height = window.bottom + (int)(shadow->margins.bottom * scale + 0.5f);
++    pt = virtual_screen_to_root( rect.left, rect.top );
++    SetRect( &rect, pt.x - window.left, pt.y - window.top, pt.x - window.left + width, pt.y - window.top + height );
++
++    if (!data->shadow_window)
++    {
++        XSetWindowAttributes attr;
++
++        attr.override_redirect = True;
++        attr.colormap = data->shadow_colormap = XCreateColormap( data->display, root_window, argb_visual.visual, AllocNone );
++        attr.border_pixel = 0;
++        attr.background_pixmap = None;
++        data->shadow_window = XCreateWindow( data->display, root_window, rect.left, rect.top, width, height, 0,
++                                             32, InputOutput, argb_visual.visual,
++                                             CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixmap, &attr );
++        /* clicks go through it */
++        XShapeCombineRectangles( data->display, data->shadow_window, ShapeInput, 0, 0, NULL, 0, ShapeSet, YXBanded );
++        XStoreName( data->display, data->shadow_window, "Wine DWM shadow" );
++        data->shadow_rect = rect;
++        TRACE( "win %p/%lx shadow %lx\n", data->hwnd, data->whole_window, data->shadow_window );
++    }
++    else if (!EqualRect( &rect, &data->shadow_rect ))
++    {
++        XMoveResizeWindow( data->display, data->shadow_window, rect.left, rect.top, width, height );
++    }
++
++    if (data->shadow_kind != shadow || data->shadow_radius != radius || data->shadow_border != border ||
++        data->shadow_rect.right - data->shadow_rect.left != width ||
++        data->shadow_rect.bottom - data->shadow_rect.top != height || !data->shadow_mapped)
++    {
++        UINT32 *bits = malloc( width * height * sizeof(*bits) );
++        Pixmap pixmap;
++        XImage *image;
++        GC gc;
++
++        if (!bits) return;
++        render_dwm_shadow( bits, width, height, &window, shadow, scale, radius, border );
++        pixmap = XCreatePixmap( data->display, data->shadow_window, width, height, 32 );
++        gc = XCreateGC( data->display, pixmap, 0, NULL );
++        image = XCreateImage( data->display, argb_visual.visual, 32, ZPixmap, 0, (char *)bits, width, height, 32,
++                              width * sizeof(*bits) );
++        XPutImage( data->display, pixmap, gc, image, 0, 0, 0, 0, width, height );
++        image->data = NULL;
++        XDestroyImage( image );
++        free( bits );
++        XFreeGC( data->display, gc );
++        XSetWindowBackgroundPixmap( data->display, data->shadow_window, pixmap );
++        XFreePixmap( data->display, pixmap );
++        XClearWindow( data->display, data->shadow_window );
++        data->shadow_kind = shadow;
++        data->shadow_radius = radius;
++        data->shadow_border = border;
++    }
++    data->shadow_rect = rect;
++
++    /* right below the window, then shown */
++    changes.sibling = data->whole_window;
++    changes.stack_mode = Below;
++    X11DRV_expect_error( data->display, NULL, NULL );
++    XConfigureWindow( data->display, data->shadow_window, CWSibling | CWStackMode, &changes );
++    if (X11DRV_check_error())
++    {
++        hide_dwm_shadow( data );
++        return;
++    }
++    if (!data->shadow_mapped)
++    {
++        XMapWindow( data->display, data->shadow_window );
++        data->shadow_mapped = 1;
++    }
++#endif
++}
++
+ /***********************************************************************
+  *              get_dummy_parent
+  *
+@@ -2646,6 +2913,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
+         }
+     }
+     if (data->whole_colormap) XFreeColormap( data->display, data->whole_colormap );
++    destroy_dwm_shadow( data );
+     data->whole_window = data->client_window = 0;
+     data->whole_colormap = 0;
+     data->managed = FALSE;
+@@ -3518,6 +3786,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+         if (swp_flags & (SWP_FRAMECHANGED | SWP_STATECHANGED)) set_wm_hints( data );
+         update_net_wm_states( data );
+     }
++    update_dwm_shadow( data, surface );
+ 
+     /* if window was fullscreen and is being hidden, release cursor clipping */
+     was_fullscreen &= data->desired_state.wm_state != NormalState;
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 4e027cabd0e..72dbd3fd5fa 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -698,6 +698,13 @@ struct x11drv_win_data
+     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
+     UINT        has_ime_rect : 1; /* has an IME composition rect been set */
+     HWND        anchor;         /* window this one is kept next to, for shadow and border windows */
++    Window      shadow_window;  /* the shadow the desktop window manager would draw around it */
++    Colormap    shadow_colormap;
++    const void *shadow_kind;    /* the kind of shadow drawn in it, NULL for none */
++    RECT        shadow_rect;    /* where it is, in root coordinates */
++    UINT        shadow_radius;  /* the corner radius it was drawn for */
++    UINT        shadow_border;  /* and the width of the default border drawn in it */
++    UINT        shadow_mapped : 1;
+     Window      embedder;       /* window id of embedder */
+     Pixmap         icon_pixmap;
+     Pixmap         icon_mask;

@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 04:52:28 -0400
+Subject: [PATCH] windowscodecs: Give a JPEG frame the ICC profile of its APP2
+ markers as color context.
+
+The profile comes in pieces behind "ICC_PROFILE\0", numbered from 1 with
+their count; all of them in order make the frame's one color context, as
+the PNG decoder has for iCCP.  Office asks for the color context of every
+JPEG it decodes.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/windowscodecs/libjpeg.c b/dlls/windowscodecs/libjpeg.c
+index 40119084e68..79319b454cd 100644
+--- a/dlls/windowscodecs/libjpeg.c
++++ b/dlls/windowscodecs/libjpeg.c
+@@ -86,6 +86,8 @@ struct jpeg_decoder {
+     BYTE source_buffer[1024];
+     UINT stride;
+     BYTE *image_data;
++    BYTE *color_profile;
++    UINT color_profile_len;
+ };
+ 
+ static inline struct jpeg_decoder *impl_from_decoder(struct decoder* iface)
+@@ -104,6 +106,7 @@ static void CDECL jpeg_decoder_destroy(struct decoder* iface)
+ 
+     if (This->cinfo_initialized) jpeg_destroy_decompress(&This->cinfo);
+     free(This->image_data);
++    free(This->color_profile);
+     free(This);
+ }
+ 
+@@ -151,6 +154,43 @@ static void source_mgr_term_source(j_decompress_ptr cinfo)
+ {
+ }
+ 
++/* the ICC profile of APP2 markers, in pieces of "ICC_PROFILE\0", a sequence number from 1 and their count */
++static void read_color_profile(struct jpeg_decoder *This)
++{
++    static const char icc_id[12] = "ICC_PROFILE";
++    jpeg_saved_marker_ptr marker;
++    UINT count = 0, len = 0, seq, pos;
++
++    for (marker = This->cinfo.marker_list; marker; marker = marker->next)
++    {
++        if (marker->marker != JPEG_APP0 + 2 || marker->data_length < sizeof(icc_id) + 2 ||
++            memcmp(marker->data, icc_id, sizeof(icc_id))) continue;
++        if (!count) count = marker->data[sizeof(icc_id) + 1];
++        if (!count || marker->data[sizeof(icc_id) + 1] != count) return;
++        len += marker->data_length - sizeof(icc_id) - 2;
++    }
++    if (!count || !len || !(This->color_profile = malloc(len))) return;
++
++    /* the pieces in the order of their numbers, which must all be there */
++    for (seq = 1, pos = 0; seq <= count; seq++)
++    {
++        for (marker = This->cinfo.marker_list; marker; marker = marker->next)
++            if (marker->marker == JPEG_APP0 + 2 && marker->data_length >= sizeof(icc_id) + 2 &&
++                !memcmp(marker->data, icc_id, sizeof(icc_id)) && marker->data[sizeof(icc_id)] == seq)
++                break;
++        if (!marker) break;
++        memcpy(This->color_profile + pos, marker->data + sizeof(icc_id) + 2, marker->data_length - sizeof(icc_id) - 2);
++        pos += marker->data_length - sizeof(icc_id) - 2;
++    }
++    if (seq <= count || pos != len)
++    {
++        free(This->color_profile);
++        This->color_profile = NULL;
++        return;
++    }
++    This->color_profile_len = len;
++}
++
+ static HRESULT CDECL jpeg_decoder_initialize(struct decoder* iface, IStream *stream, struct decoder_stat *st)
+ {
+     struct jpeg_decoder *This = impl_from_decoder(iface);
+@@ -190,6 +230,8 @@ static HRESULT CDECL jpeg_decoder_initialize(struct decoder* iface, IStream *str
+ 
+     This->cinfo.src = &This->source_mgr;
+ 
++    jpeg_save_markers(&This->cinfo, JPEG_APP0 + 2, 0xffff);
++
+     ret = jpeg_read_header(&This->cinfo, TRUE);
+ 
+     if (ret != JPEG_HEADER_OK) {
+@@ -248,7 +290,8 @@ static HRESULT CDECL jpeg_decoder_initialize(struct decoder* iface, IStream *str
+         break;
+     }
+ 
+-    This->frame.num_color_contexts = 0;
++    read_color_profile(This);
++    This->frame.num_color_contexts = This->color_profile ? 1 : 0;
+     This->frame.num_colors = 0;
+ 
+     This->stride = (This->frame.bpp * This->cinfo.output_width + 7) / 8;
+@@ -299,8 +342,7 @@ static HRESULT CDECL jpeg_decoder_initialize(struct decoder* iface, IStream *str
+     st->frame_count = 1;
+     st->flags = WICBitmapDecoderCapabilityCanDecodeAllImages |
+                 WICBitmapDecoderCapabilityCanDecodeSomeImages |
+-                WICBitmapDecoderCapabilityCanEnumerateMetadata |
+-                DECODER_FLAGS_UNSUPPORTED_COLOR_CONTEXT;
++                WICBitmapDecoderCapabilityCanEnumerateMetadata;
+     return S_OK;
+ }
+ 
+@@ -417,12 +459,15 @@ static HRESULT CDECL jpeg_decoder_get_metadata_blocks(struct decoder* iface, UIN
+     return hr;
+ }
+ 
+-static HRESULT CDECL jpeg_decoder_get_color_context(struct decoder* This, UINT frame, UINT num,
++static HRESULT CDECL jpeg_decoder_get_color_context(struct decoder* iface, UINT frame, UINT num,
+     BYTE **data, DWORD *datasize)
+ {
+-    /* This should never be called because we report 0 color contexts and the unsupported flag. */
+-    FIXME("stub\n");
+-    return E_NOTIMPL;
++    struct jpeg_decoder *This = impl_from_decoder(iface);
++
++    if (!(*data = malloc(This->color_profile_len))) return E_OUTOFMEMORY;
++    memcpy(*data, This->color_profile, This->color_profile_len);
++    *datasize = This->color_profile_len;
++    return S_OK;
+ }
+ 
+ static const struct decoder_funcs jpeg_decoder_vtable = {
+@@ -446,6 +491,8 @@ HRESULT CDECL jpeg_decoder_create(struct decoder_info *info, struct decoder **re
+     This->cinfo_initialized = FALSE;
+     This->stream = NULL;
+     This->image_data = NULL;
++    This->color_profile = NULL;
++    This->color_profile_len = 0;
+     *result = &This->decoder;
+ 
+     info->container_format = GUID_ContainerFormatJpeg;
+diff --git a/dlls/windowscodecs/tests/jpegformat.c b/dlls/windowscodecs/tests/jpegformat.c
+index e150174f98d..61f240e7c58 100644
+--- a/dlls/windowscodecs/tests/jpegformat.c
++++ b/dlls/windowscodecs/tests/jpegformat.c
+@@ -155,11 +155,120 @@ static void test_decode_adobe_cmyk(void)
+ }
+ 
+ 
++static IWICBitmapFrameDecode *decode_frame(IWICImagingFactory *factory, const BYTE *data, UINT size,
++                                           IWICBitmapDecoder **decoder)
++{
++    IWICBitmapFrameDecode *frame = NULL;
++    IStream *stream;
++    HGLOBAL hdata;
++    HRESULT hr;
++
++    hdata = GlobalAlloc(GMEM_MOVEABLE, size);
++    memcpy(GlobalLock(hdata), data, size);
++    GlobalUnlock(hdata);
++    hr = CreateStreamOnHGlobal(hdata, TRUE, &stream);
++    ok(hr == S_OK, "CreateStreamOnHGlobal failed, hr %#lx\n", hr);
++    hr = IWICImagingFactory_CreateDecoderFromStream(factory, stream, NULL, WICDecodeMetadataCacheOnLoad, decoder);
++    ok(hr == S_OK, "CreateDecoderFromStream failed, hr %#lx\n", hr);
++    IStream_Release(stream);
++    if (hr != S_OK) return NULL;
++    hr = IWICBitmapDecoder_GetFrame(*decoder, 0, &frame);
++    ok(hr == S_OK, "GetFrame failed, hr %#lx\n", hr);
++    return frame;
++}
++
++/* an ICC profile in APP2 markers, here in two pieces, is the frame's color context */
++static void test_color_contexts(void)
++{
++    IWICImagingFactory *factory;
++    IWICBitmapFrameDecode *frame;
++    IWICBitmapDecoder *decoder;
++    IWICColorContext *context;
++    WICColorContextType type;
++    BYTE profile[128], jpeg[sizeof(jpeg_adobe_cmyk_1x5) + 2 * (4 + 14) + 128], buffer[256];
++    UINT count, size, pos;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
++        &IID_IWICImagingFactory, (void **)&factory);
++    ok(hr == S_OK, "CoCreateInstance failed, hr %#lx\n", hr);
++
++    /* a profile header without tags */
++    memset(profile, 0, sizeof(profile));
++    profile[3] = sizeof(profile);
++    memcpy(profile + 12, "mntr", 4);
++    memcpy(profile + 16, "RGB ", 4);
++    memcpy(profile + 20, "XYZ ", 4);
++    memcpy(profile + 36, "acsp", 4);
++    profile[8] = 2;
++    profile[10] = 0x10;
++
++    frame = decode_frame(factory, (const BYTE *)jpeg_adobe_cmyk_1x5, sizeof(jpeg_adobe_cmyk_1x5), &decoder);
++    if (frame)
++    {
++        count = 0xdeadbeef;
++        hr = IWICBitmapFrameDecode_GetColorContexts(frame, 0, NULL, &count);
++        ok(hr == S_OK, "GetColorContexts failed, hr %#lx\n", hr);
++        ok(!count, "got %u\n", count);
++        IWICBitmapFrameDecode_Release(frame);
++        IWICBitmapDecoder_Release(decoder);
++    }
++
++    memcpy(jpeg, jpeg_adobe_cmyk_1x5, 2);
++    pos = 2;
++    for (count = 1; count <= 2; count++)
++    {
++        UINT len = 2 + 14 + sizeof(profile) / 2;
++
++        jpeg[pos++] = 0xff;
++        jpeg[pos++] = 0xe2;
++        jpeg[pos++] = len >> 8;
++        jpeg[pos++] = len & 0xff;
++        memcpy(jpeg + pos, "ICC_PROFILE", 12);
++        pos += 12;
++        jpeg[pos++] = count;
++        jpeg[pos++] = 2;
++        memcpy(jpeg + pos, profile + (count - 1) * sizeof(profile) / 2, sizeof(profile) / 2);
++        pos += sizeof(profile) / 2;
++    }
++    memcpy(jpeg + pos, jpeg_adobe_cmyk_1x5 + 2, sizeof(jpeg_adobe_cmyk_1x5) - 2);
++    pos += sizeof(jpeg_adobe_cmyk_1x5) - 2;
++
++    frame = decode_frame(factory, jpeg, pos, &decoder);
++    if (frame)
++    {
++        count = 0xdeadbeef;
++        hr = IWICBitmapFrameDecode_GetColorContexts(frame, 0, NULL, &count);
++        ok(hr == S_OK, "GetColorContexts failed, hr %#lx\n", hr);
++        ok(count == 1, "got %u\n", count);
++
++        hr = IWICImagingFactory_CreateColorContext(factory, &context);
++        ok(hr == S_OK, "CreateColorContext failed, hr %#lx\n", hr);
++        hr = IWICBitmapFrameDecode_GetColorContexts(frame, 1, &context, &count);
++        ok(hr == S_OK, "GetColorContexts failed, hr %#lx\n", hr);
++        hr = IWICColorContext_GetType(context, &type);
++        ok(hr == S_OK, "GetType failed, hr %#lx\n", hr);
++        ok(type == WICColorContextProfile, "got type %u\n", type);
++        size = 0;
++        hr = IWICColorContext_GetProfileBytes(context, sizeof(buffer), buffer, &size);
++        ok(hr == S_OK, "GetProfileBytes failed, hr %#lx\n", hr);
++        ok(size == sizeof(profile), "got size %u\n", size);
++        ok(!memcmp(buffer, profile, sizeof(profile)), "got another profile\n");
++        IWICColorContext_Release(context);
++
++        IWICBitmapFrameDecode_Release(frame);
++        IWICBitmapDecoder_Release(decoder);
++    }
++
++    IWICImagingFactory_Release(factory);
++}
++
+ START_TEST(jpegformat)
+ {
+     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+ 
+     test_decode_adobe_cmyk();
++    test_color_contexts();
+ 
+     CoUninitialize();
+ }

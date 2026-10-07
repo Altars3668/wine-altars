@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 09:54:32 -0400
+Subject: [PATCH] dcomp: compose surfaces a target's device did not draw.
+
+A window target draws with the device of the first surface its tree shows,
+and a surface on any other device was left out.  On Windows the desktop
+window manager composes what every device drew, and Office draws that way:
+a window Word shows while it starts had 40 surfaces from a second device,
+36 of them 262144 by 262144 virtual ones.
+
+Such a surface's tiles are now brought over to the target's device when it
+is drawn: each tile counts the changes to its pixels, and keeps a copy on
+the other device made, through the CPU, from the version it last saw.  A
+frame takes the lock of every device its trees show surfaces of, not only
+the first one's, before it takes the compositor's; a surface that joins a
+tree after the frame took its locks waits for the next.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 4cac4683740b0f332cdc2e3b624fbbf94c490a92)
+
+diff --git a/dlls/dcomp/compositor.c b/dlls/dcomp/compositor.c
+index 740d79a412a..ff161e9adcb 100644
+--- a/dlls/dcomp/compositor.c
++++ b/dlls/dcomp/compositor.c
+@@ -54,6 +54,8 @@ struct compositor
+     ICompositorController *controller;
+     BOOL changed;               /* since the last commit */
+     BOOL work_queued;           /* on the dispatcher queue, to commit or to say one is needed */
++    struct graphics_device **locked;    /* the devices the frame being drawn holds */
++    unsigned int locked_count;
+     struct list commit_needed;
+     UINT64 next_token;
+ 
+@@ -156,24 +158,17 @@ static BOOL frames_wanted( struct compositor *compositor )
+ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+ {
+     struct graphics_device **devices = NULL;
+-    unsigned int count = 0, i;
++    unsigned int count = 0, size = 0, i;
+     struct target *target;
+     HRESULT hr = S_OK;
+ 
+     compositor_lock( compositor );
+-    if ((devices = calloc( list_count( &compositor->targets ) + 1, sizeof(*devices) )))
++    LIST_FOR_EACH_ENTRY( target, &compositor->targets, struct target, entry )
+     {
+-        LIST_FOR_EACH_ENTRY( target, &compositor->targets, struct target, entry )
+-        {
+-            struct graphics_device *device = target->root ? render_tree_device( target->root ) : NULL;
+-
+-            if (!device) continue;
+-            for (i = 0; i < count; i++) if (devices[i] == device) break;
+-            if (i < count) continue;
+-            ICompositionGraphicsDevice_AddRef( &device->ICompositionGraphicsDevice_iface );
+-            devices[count++] = device;
+-        }
++        if (!target->root) continue;
++        if (FAILED(render_tree_devices( target->root, &devices, &count, &size ))) break;
+     }
++    for (i = 0; i < count; i++) ICompositionGraphicsDevice_AddRef( &devices[i]->ICompositionGraphicsDevice_iface );
+     compositor_unlock( compositor );
+ 
+     for (i = 0; i < count; i++) graphics_device_lock( devices[i] );
+@@ -185,11 +180,15 @@ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+     }
+     animations_frame( compositor );
+     trackers_frame( compositor );
++    compositor->locked = devices;
++    compositor->locked_count = count;
+     LIST_FOR_EACH_ENTRY( target, &compositor->targets, struct target, entry )
+     {
+         HRESULT ret = render_target( compositor, target );
+         if (FAILED(ret) && SUCCEEDED(hr)) hr = ret;
+     }
++    compositor->locked = NULL;
++    compositor->locked_count = 0;
+     if (frames_wanted( compositor )) compositor_request_frames( compositor );
+     compositor_unlock( compositor );
+     for (i = 0; i < count; i++)
+@@ -203,6 +202,15 @@ static HRESULT compositor_render( struct compositor *compositor, BOOL commit )
+     return hr;
+ }
+ 
++/* whether the frame being drawn holds a device's lock; called with the compositor locked */
++BOOL compositor_device_locked( struct compositor *compositor, struct graphics_device *device )
++{
++    unsigned int i;
++
++    for (i = 0; i < compositor->locked_count; i++) if (compositor->locked[i] == device) return TRUE;
++    return FALSE;
++}
++
+ HRESULT compositor_commit( struct compositor *compositor )
+ {
+     compositor_render( compositor, TRUE );
+diff --git a/dlls/dcomp/private.h b/dlls/dcomp/private.h
+index afd32c183da..011cc184b2e 100644
+--- a/dlls/dcomp/private.h
++++ b/dlls/dcomp/private.h
+@@ -455,6 +455,11 @@ struct tile
+     struct list entry;
+     RECT rect;                      /* the part of the surface it holds */
+     ID3D11Texture2D *texture;
++    UINT version;                   /* counts the changes to its pixels */
++    /* its pixels on the device a target draws with, when that is another device, as of a version */
++    ID3D11Texture2D *mirror;
++    ID3D11Device *mirror_device;
++    UINT mirror_version;
+ };
+ 
+ struct drawing_surface
+@@ -548,6 +553,11 @@ extern BOOL trackers_moving( struct compositor *compositor );
+ /* rendering */
+ extern HRESULT render_target( struct compositor *compositor, struct target *target );
+ extern struct graphics_device *render_tree_device( struct visual *visual );
++extern BOOL compositor_device_locked( struct compositor *compositor, struct graphics_device *device );
++extern HRESULT render_tree_devices( struct visual *visual, struct graphics_device ***devices, unsigned int *count,
++                                    unsigned int *size );
++extern HRESULT tile_texture( struct drawing_surface *surface, struct tile *tile, ID3D11Device *device,
++                             ID3D11Texture2D **out );
+ extern void render_release( struct target *target );
+ extern HRESULT render_default_device( ID3D11Device **d3d, ID2D1Device **d2d );
+ 
+diff --git a/dlls/dcomp/render.c b/dlls/dcomp/render.c
+index bf4bcf3ea98..28fee56e9a7 100644
+--- a/dlls/dcomp/render.c
++++ b/dlls/dcomp/render.c
+@@ -104,6 +104,56 @@ struct graphics_device *render_tree_device( struct visual *visual )
+     return NULL;
+ }
+ 
++static HRESULT devices_add( struct graphics_device ***devices, unsigned int *count, unsigned int *size,
++                            ICompositionSurface *iface )
++{
++    struct drawing_surface *surface = unsafe_impl_from_ICompositionSurface( iface );
++    struct graphics_device **grown;
++    unsigned int i;
++
++    if (!surface) return S_OK;
++    for (i = 0; i < *count; i++) if ((*devices)[i] == surface->device) return S_OK;
++    if (*count == *size)
++    {
++        if (!(grown = realloc( *devices, max( 4, *size * 2 ) * sizeof(*grown) ))) return E_OUTOFMEMORY;
++        *devices = grown;
++        *size = max( 4, *size * 2 );
++    }
++    (*devices)[(*count)++] = surface->device;
++    return S_OK;
++}
++
++static HRESULT tree_devices( struct visual *visual, struct graphics_device ***devices, unsigned int *count,
++                             unsigned int *size, int redirects )
++{
++    struct brush *brush = visual->brush;
++    struct visual *child;
++    HRESULT hr = S_OK;
++
++    if (brush && brush->kind == BRUSH_SURFACE) hr = devices_add( devices, count, size, brush->surface );
++    else if (brush && brush->kind == BRUSH_NINE_GRID && brush->source && brush->source->kind == BRUSH_SURFACE)
++        hr = devices_add( devices, count, size, brush->source->surface );
++    if (SUCCEEDED(hr) && visual->kind == VISUAL_REDIRECT && visual->redirect_source && redirects < 4)
++        hr = tree_devices( visual->redirect_source, devices, count, size, redirects + 1 );
++    LIST_FOR_EACH_ENTRY( child, &visual->children, struct visual, entry )
++    {
++        if (FAILED(hr)) break;
++        hr = tree_devices( child, devices, count, size, redirects );
++    }
++    return hr;
++}
++
++/*
++ * Every device the surfaces of a tree are on, once each: drawing it takes all
++ * their locks, as a surface on another device than the target's is copied
++ * over from its own.  Called with the compositor locked.
++ */
++HRESULT render_tree_devices( struct visual *visual, struct graphics_device ***devices, unsigned int *count,
++                             unsigned int *size )
++{
++    return tree_devices( visual, devices, count, size, 0 );
++}
++
+ static HRESULT render_prepare( struct target *target, ID3D11Device *d3d, ID2D1Device *d2d, UINT width, UINT height )
+ {
+     DXGI_SWAP_CHAIN_DESC1 desc = {0};
+@@ -283,6 +333,7 @@ static void visual_transform( const struct visual_state *visual, Vector2 size, V
+ struct render
+ {
+     struct target *target;
++    struct compositor *compositor;
+     ID2D1DeviceContext *context;
+     ID2D1SolidColorBrush *solid;
+     unsigned int redirects;     /* redirect visuals being drawn */
+@@ -338,7 +389,7 @@ static D2D1_MATRIX_3X2_F surface_brush_transform( const struct brush_state *brus
+     return matrix_2d_multiply( &m, &t );
+ }
+ 
+-/* a surface's own, if it is one of ours on the device the target draws with */
++/* a surface's own, if it is one of ours with pixels to show */
+ static struct drawing_surface *render_surface( struct render *render, ICompositionSurface *iface )
+ {
+     struct drawing_surface *surface = unsafe_impl_from_ICompositionSurface( iface );
+@@ -348,11 +399,6 @@ static struct drawing_surface *render_surface( struct render *render, ICompositi
+         if (iface) FIXME( "surface %p is not a drawing surface.\n", iface );
+         return NULL;
+     }
+-    if (surface->device->d3d_device != render->target->device)
+-    {
+-        FIXME( "surface %p is on another device.\n", surface );
+-        return NULL;
+-    }
+     if (!surface->size.cx || !surface->size.cy) return NULL;
+     return surface;
+ }
+@@ -375,6 +421,7 @@ static void draw_surface_part( struct render *render, struct drawing_surface *su
+     {
+         D2D1_BITMAP_PROPERTIES1 props = {{0}};
+         D2D1_RECT_F part, from, to;
++        ID3D11Texture2D *texture;
+         ID2D1Bitmap1 *bitmap;
+         IDXGISurface *dxgi;
+         HRESULT hr;
+@@ -389,7 +436,20 @@ static void draw_surface_part( struct render *render, struct drawing_surface *su
+         props.pixelFormat.alphaMode = surface->alpha_mode == DirectXAlphaMode_Ignore ? D2D1_ALPHA_MODE_IGNORE
+                                                                                      : D2D1_ALPHA_MODE_PREMULTIPLIED;
+         props.dpiX = props.dpiY = 96.0f;
+-        if (FAILED(ID3D11Texture2D_QueryInterface( tile->texture, &IID_IDXGISurface, (void **)&dxgi ))) continue;
++        /* one on another device is brought over to the target's, if the frame holds that device too; a surface
++         * that came into the tree after the frame took its locks waits for the next */
++        if (surface->device->d3d_device != render->target->device &&
++            !compositor_device_locked( render->compositor, surface->device ))
++        {
++            compositor_changed( render->compositor );
++            continue;
++        }
++        if (FAILED(hr = tile_texture( surface, tile, render->target->device, &texture )))
++        {
++            WARN( "failed to bring a tile of surface %p over, hr %#lx.\n", surface, hr );
++            continue;
++        }
++        if (FAILED(ID3D11Texture2D_QueryInterface( texture, &IID_IDXGISurface, (void **)&dxgi ))) continue;
+         hr = ID2D1DeviceContext_CreateBitmapFromDxgiSurface( render->context, dxgi, &props, &bitmap );
+         IDXGISurface_Release( dxgi );
+         if (FAILED(hr))
+@@ -648,7 +708,7 @@ HRESULT render_target( struct compositor *compositor, struct target *target )
+ {
+     static const D2D1_COLOR_F clear = {0.0f, 0.0f, 0.0f, 0.0f};
+     struct graphics_device *device = NULL;
+-    struct render render = {target};
++    struct render render = {target, compositor};
+     D2D1_BITMAP_PROPERTIES1 props = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE}, 96.0f, 96.0f,
+                                      D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW};
+     ID2D1Bitmap1 *backbuffer;
+diff --git a/dlls/dcomp/surface.c b/dlls/dcomp/surface.c
+index f20205acfe1..4bc89629346 100644
+--- a/dlls/dcomp/surface.c
++++ b/dlls/dcomp/surface.c
+@@ -105,9 +105,73 @@ static void tile_destroy( struct tile *tile )
+ {
+     list_remove( &tile->entry );
+     ID3D11Texture2D_Release( tile->texture );
++    if (tile->mirror) ID3D11Texture2D_Release( tile->mirror );
++    if (tile->mirror_device) ID3D11Device_Release( tile->mirror_device );
+     free( tile );
+ }
+ 
++/*
++ * A tile's pixels as a texture of the device a target draws with.  On another
++ * device than its own, they are read back from its own and handed to the
++ * other, whenever they have changed since: as on Windows, what any device drew
++ * is composed together.  Both devices are locked by the frame that asks.
++ */
++HRESULT tile_texture( struct drawing_surface *surface, struct tile *tile, ID3D11Device *device, ID3D11Texture2D **out )
++{
++    ID3D11DeviceContext *source, *destination;
++    D3D11_MAPPED_SUBRESOURCE map;
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Texture2D *staging;
++    HRESULT hr;
++
++    if (surface->device->d3d_device == device)
++    {
++        *out = tile->texture;
++        return S_OK;
++    }
++    if (tile->mirror && tile->mirror_device != device)
++    {
++        ID3D11Texture2D_Release( tile->mirror );
++        ID3D11Device_Release( tile->mirror_device );
++        tile->mirror = NULL;
++        tile->mirror_device = NULL;
++    }
++    ID3D11Texture2D_GetDesc( tile->texture, &desc );
++    if (!tile->mirror)
++    {
++        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        desc.MiscFlags = 0;
++        if (FAILED(hr = ID3D11Device_CreateTexture2D( device, &desc, NULL, &tile->mirror ))) return hr;
++        ID3D11Device_AddRef( (tile->mirror_device = device) );
++        tile->mirror_version = tile->version - 1;
++    }
++    if (tile->mirror_version != tile->version)
++    {
++        TRACE( "copying tile %s of surface %p to device %p.\n", wine_dbgstr_rect( &tile->rect ), surface, device );
++        desc.Usage = D3D11_USAGE_STAGING;
++        desc.BindFlags = 0;
++        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        desc.MiscFlags = 0;
++        if (FAILED(hr = ID3D11Device_CreateTexture2D( surface->device->d3d_device, &desc, NULL, &staging ))) return hr;
++        ID3D11Device_GetImmediateContext( surface->device->d3d_device, &source );
++        ID3D11DeviceContext_CopyResource( source, (ID3D11Resource *)staging, (ID3D11Resource *)tile->texture );
++        if (SUCCEEDED(hr = ID3D11DeviceContext_Map( source, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map )))
++        {
++            ID3D11Device_GetImmediateContext( device, &destination );
++            ID3D11DeviceContext_UpdateSubresource( destination, (ID3D11Resource *)tile->mirror, 0, NULL, map.pData,
++                                                   map.RowPitch, 0 );
++            ID3D11DeviceContext_Release( destination );
++            ID3D11DeviceContext_Unmap( source, (ID3D11Resource *)staging, 0 );
++            tile->mirror_version = tile->version;
++        }
++        ID3D11DeviceContext_Release( source );
++        ID3D11Texture2D_Release( staging );
++        if (FAILED(hr)) return hr;
++    }
++    *out = tile->mirror;
++    return S_OK;
++}
++
+ static void surface_drop_tiles( struct drawing_surface *surface )
+ {
+     struct tile *tile, *next;
+@@ -145,6 +209,7 @@ static HRESULT surface_get_tile( struct drawing_surface *surface, int x, int y,
+ 
+     if (!(tile = calloc( 1, sizeof(*tile) ))) return E_OUTOFMEMORY;
+     tile->rect = rect;
++    tile->version = 1;
+     if (FAILED(hr = texture_create( surface->device->d3d_device, rect.right - rect.left, rect.bottom - rect.top,
+                                     surface->pixel_format, &tile->texture )))
+     {
+@@ -209,6 +274,7 @@ static HRESULT surface_write( struct drawing_surface *surface, const RECT *rect,
+             ID3D11DeviceContext_CopySubresourceRegion( context, (ID3D11Resource *)tile->texture, 0,
+                                                        part.left - tile->rect.left, part.top - tile->rect.top, 0,
+                                                        texture, 0, &box );
++            tile->version++;
+             if (!surface->is_virtual) break;
+         }
+         if (!surface->is_virtual) break;
+@@ -292,6 +358,8 @@ static HRESULT surface_resize( struct drawing_surface *surface, SIZE size )
+     if (old)
+     {
+         ID3D11Texture2D_Release( old->texture );
++        if (old->mirror) ID3D11Texture2D_Release( old->mirror );
++        if (old->mirror_device) ID3D11Device_Release( old->mirror_device );
+         free( old );
+     }
+     return hr;
+@@ -483,6 +551,7 @@ static HRESULT WINAPI surface_interop_EndDraw( ICompositionDrawingSurfaceInterop
+         HRESULT ret = surface_write( surface, &surface->update, (ID3D11Resource *)surface->scratch, 0, 0 );
+         if (SUCCEEDED(hr)) hr = ret;
+     }
++    else surface->update_tile->version++;
+     surface->drawing = FALSE;
+     surface->suspended = FALSE;
+     if (device->drawing == surface) device->drawing = NULL;

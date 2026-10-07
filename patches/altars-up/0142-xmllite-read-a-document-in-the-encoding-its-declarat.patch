@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 14:31:16 -0400
+Subject: [PATCH] xmllite: read a document in the encoding its declaration
+ names, and use the MultiLanguage object for the ones it does not know.
+
+Word gives its readers an IMultiLanguage2 as XmlReaderProperty_MultiLanguage,
+and each of the 35 times said it was ignored.  So was the encoding a
+declaration names: a document of bytes was read as UTF-8 whatever it
+declared, and one naming anything but UTF-8, UTF-16 or US-ASCII failed.
+tools/xmlmlangprobe measured Windows 11:
+
+- The reader knows US-ASCII, UTF-8, windows-1250 to 1258 and ISO-8859-1
+  to 9 by itself, in any case; after the declaration the document is
+  read in the one it names, also after a UTF-8 BOM.
+- Any other it asks the MultiLanguage object: GB2312, Shift_JIS, big5,
+  koi8-r, euc-jp and iso-2022-jp are read with one, and fail without
+  one with MX_E_ENCODINGSIGNATURE.  A name the object does not know is
+  MX_E_ENCODING.
+- A document of bytes cannot switch to UTF-16, UTF-16LE, UCS-2, UTF-32,
+  unicode or UTF-7, and one of UTF-16 cannot name an encoding of bytes:
+  MX_E_ENCODINGSWITCH.
+- A name is what ends at its quote ("utf" is not UTF-16, "iso-8859-1 "
+  is WC_E_ENCNAME), and a byte that is not UTF-8 is WC_E_XMLCHARACTER
+  where it is, as is any other character XML does not allow in text.
+
+The reader now converts with the system when it has the code page and
+with the MultiLanguage object otherwise (iso-2022-jp), and keeps a
+character of two or three bytes that a chunk cuts for the next one.
+The comments of 106a65b are in English now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit efd7c409d52a9a619509886ffdd809ca8646cafd)
+
+diff --git a/dlls/xmllite/Makefile.in b/dlls/xmllite/Makefile.in
+index b68910632e8..959d91b7f38 100644
+--- a/dlls/xmllite/Makefile.in
++++ b/dlls/xmllite/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = xmllite.dll
+ IMPORTLIB = xmllite
++IMPORTS   = oleaut32
+ 
+ SOURCES = \
+ 	reader.c \
+diff --git a/dlls/xmllite/reader.c b/dlls/xmllite/reader.c
+index 88cc59e5e42..a73dc511586 100644
+--- a/dlls/xmllite/reader.c
++++ b/dlls/xmllite/reader.c
+@@ -28,6 +28,7 @@
+ #include "initguid.h"
+ #include "objbase.h"
+ #include "xmllite.h"
++#include "mlang.h"
+ #include "xmllite_private.h"
+ 
+ #include "wine/debug.h"
+@@ -283,6 +284,7 @@ typedef struct
+     BOOL is_empty_element;
+     struct element empty_element; /* used for empty elements without end tag <a />,
+                                      and to keep <?xml reader position */
++    strval encoding;              /* the encoding the xml declaration names */
+     UINT resume[XmlReadResume_Last]; /* offsets used to resume reader */
+ } xmlreader;
+ 
+@@ -291,6 +293,8 @@ struct input_buffer
+     encoded_buffer utf16;
+     encoded_buffer encoded;
+     UINT code_page;
++    IMultiLanguage2 *mlang; /* converts code_page when the system does not */
++    DWORD mlang_mode;
+     xmlreaderinput *input;
+ };
+ 
+@@ -743,7 +747,11 @@ xml_encoding parse_encoding_name(const WCHAR *name, int len)
+         n = (min+max)/2;
+ 
+         if (len != -1)
++        {
+             c = wcsnicmp(xml_encoding_map[n].name, name, len);
++            /* a name that only begins like one is not it */
++            if (!c && xml_encoding_map[n].name[len]) c = 1;
++        }
+         else
+             c = wcsicmp(xml_encoding_map[n].name, name);
+         if (!c)
+@@ -770,6 +778,8 @@ static HRESULT alloc_input_buffer(xmlreaderinput *input)
+ 
+     buffer->input = input;
+     buffer->code_page = ~0; /* code page is unknown at this point */
++    buffer->mlang = NULL;
++    buffer->mlang_mode = 0;
+     hr = init_encoded_buffer(input, &buffer->utf16);
+     if (hr != S_OK) {
+         readerinput_free(input, buffer);
+@@ -789,6 +799,7 @@ static HRESULT alloc_input_buffer(xmlreaderinput *input)
+ 
+ static void free_input_buffer(input_buffer *buffer)
+ {
++    if (buffer->mlang) IMultiLanguage2_Release(buffer->mlang);
+     free_encoded_buffer(buffer->input, &buffer->encoded);
+     free_encoded_buffer(buffer->input, &buffer->utf16);
+     readerinput_free(buffer->input, buffer);
+@@ -936,27 +947,47 @@ static int readerinput_get_utf8_convlen(xmlreaderinput *readerinput)
+     /* complete single byte char */
+     if (!(buffer->data[len-1] & 0x80)) return len;
+ 
+-    /* 往回跳过续字节 10xxxxxx，停在多字节序列的首字节上。原先的条件筛的是
+-       0x00-0x3f 这段 ASCII，对续字节和首字节一律立即停下，于是任何以非 ASCII
+-       结尾的缓冲都被截掉最后一个字节 —— 完整的字符被切开，没读完的字符又留不全。 */
++    /* step back over continuation bytes (10xxxxxx) to the byte that begins the sequence */
+     while (len && (buffer->data[len-1] & 0xc0) == 0x80)
+         len--;
+ 
+     if (!len) return 0;
+ 
+-    /* 首字节声明了整个序列有多长，据此判断它在本次缓冲里是否已经读齐 */
++    /* that byte says how long the sequence is, and so whether all of it has been read */
+     lead = buffer->data[len-1];
+     need = (lead & 0xe0) == 0xc0 ? 2 :
+            (lead & 0xf0) == 0xe0 ? 3 :
+            (lead & 0xf8) == 0xf0 ? 4 : 1;
+ 
+-    /* 读齐了就整块都能转换，没读齐就截在这个字符之前 */
++    /* convert all of it if so, and stop before that character if not */
+     return len - 1 + need <= buffer->written ? buffer->written : len - 1;
+ }
+ 
+ /* Returns byte length of complete char sequence for buffer code page,
+    it's relative to current buffer position which is currently used for BOM handling
+    only. */
++/* the same for a code page of one or two bytes a character, or of EUC's three */
++static int readerinput_get_mbcs_convlen(xmlreaderinput *readerinput)
++{
++    encoded_buffer *buffer = &readerinput->buffer->encoded;
++    UINT cp = readerinput->buffer->code_page;
++    unsigned char *data = (unsigned char *)buffer->data;
++    unsigned int pos = buffer->cur, size;
++    BOOL euc = cp == 20932 || cp == 51932;
++    CPINFO info;
++
++    if (!euc && (!GetCPInfo(cp, &info) || info.MaxCharSize == 1)) return buffer->written;
++
++    while (pos < buffer->written)
++    {
++        if (euc) size = data[pos] == 0x8f ? 3 : data[pos] >= 0x80 ? 2 : 1;
++        else size = IsDBCSLeadByteEx(cp, data[pos]) ? 2 : 1;
++        if (pos + size > buffer->written) break;
++        pos += size;
++    }
++    return pos;
++}
++
+ static int readerinput_get_convlen(xmlreaderinput *readerinput)
+ {
+     encoded_buffer *buffer = &readerinput->buffer->encoded;
+@@ -964,6 +995,8 @@ static int readerinput_get_convlen(xmlreaderinput *readerinput)
+ 
+     if (readerinput->buffer->code_page == CP_UTF8)
+         len = readerinput_get_utf8_convlen(readerinput);
++    else if (readerinput->buffer->code_page != 1200)
++        len = readerinput_get_mbcs_convlen(readerinput);
+     else
+         len = buffer->written;
+ 
+@@ -982,9 +1015,8 @@ static void readerinput_shrinkraw(xmlreaderinput *readerinput, int len)
+         len = readerinput_get_convlen(readerinput);
+ 
+     assert(len >= 0);
+-    /* len 是已经转换掉的字节数，要留下的是它后面那段还不成整字符的尾巴：
+-       起点 cur + len，长度 written - cur - len。原先按"末尾 len 字节"搬运，
+-       当多字节字符恰好跨在读取块边界上时留错字节，解析随后报 NC_E_QNAMECHARACTER。 */
++    /* len bytes from cur were converted; what stays is the incomplete character after them,
++       written - cur - len bytes from cur + len */
+     memmove(buffer->data, buffer->data + buffer->cur + len, buffer->written - buffer->cur - len);
+     /* everything below cur is lost too */
+     buffer->written -= len + buffer->cur;
+@@ -1021,6 +1053,69 @@ static void fixup_buffer_cr(encoded_buffer *buffer, int off)
+     *dest = 0;
+ }
+ 
++/* UTF-8 with each byte that is not part of a character made U+FFFF, which is not an XML
++ * character either, so that the reader fails there */
++static int utf8_to_wide(const unsigned char *src, int len, WCHAR *dest)
++{
++    unsigned int ch, i, size, ret = 0;
++    const unsigned char *end = src + len;
++
++    while (src < end)
++    {
++        if (*src < 0x80) { ch = *src; size = 1; }
++        else if ((*src & 0xe0) == 0xc0) { ch = *src & 0x1f; size = 2; }
++        else if ((*src & 0xf0) == 0xe0) { ch = *src & 0x0f; size = 3; }
++        else if ((*src & 0xf8) == 0xf0) { ch = *src & 0x07; size = 4; }
++        else { ch = 0xffff; size = 0; }
++
++        for (i = 1; i < size; i++)
++        {
++            if (src + i >= end || (src[i] & 0xc0) != 0x80) break;
++            ch = (ch << 6) | (src[i] & 0x3f);
++        }
++        if (!size || i < size || (size == 2 && ch < 0x80) || (size == 3 && ch < 0x800) ||
++            (size == 4 && (ch < 0x10000 || ch > 0x10ffff)) || (ch >= 0xd800 && ch <= 0xdfff))
++        {
++            ch = 0xffff;
++            size = 1;
++        }
++        src += size;
++
++        if (ch >= 0x10000)
++        {
++            if (dest)
++            {
++                dest[ret] = 0xd800 | ((ch - 0x10000) >> 10);
++                dest[ret + 1] = 0xdc00 | (ch & 0x3ff);
++            }
++            ret += 2;
++        }
++        else
++        {
++            if (dest) dest[ret] = ch;
++            ret++;
++        }
++    }
++    return ret;
++}
++
++/* converts len bytes of the input's code page, or asks for the size with no dest */
++static int readerinput_convert(xmlreaderinput *readerinput, const char *src, int len, WCHAR *dest, int dest_len)
++{
++    input_buffer *buffer = readerinput->buffer;
++    INT src_len = len, ret = dest ? dest_len : 0;
++    DWORD mode = buffer->mlang_mode;
++
++    if (buffer->code_page == CP_UTF8) return utf8_to_wide((const unsigned char *)src, len, dest);
++    if (!buffer->mlang) return MultiByteToWideChar(buffer->code_page, 0, src, len, dest, dest_len);
++
++    if (FAILED(IMultiLanguage2_ConvertStringToUnicode(buffer->mlang, &mode, buffer->code_page,
++                                                      (CHAR *)src, (UINT *)&src_len, dest, (UINT *)&ret)))
++        return 0;
++    if (dest) buffer->mlang_mode = mode;
++    return ret;
++}
++
+ /* note that raw buffer content is kept */
+ static void readerinput_switchencoding(xmlreaderinput *readerinput, xml_encoding enc)
+ {
+@@ -1048,10 +1143,10 @@ static void readerinput_switchencoding(xmlreaderinput *readerinput, xml_encoding
+     }
+     else
+     {
+-        dest_len = MultiByteToWideChar(cp, 0, src->data + src->cur, len, NULL, 0);
++        dest_len = readerinput_convert(readerinput, src->data + src->cur, len, NULL, 0);
+         readerinput_grow(readerinput, dest_len);
+         ptr = (WCHAR*)dest->data;
+-        MultiByteToWideChar(cp, 0, src->data + src->cur, len, ptr, dest_len);
++        readerinput_convert(readerinput, src->data + src->cur, len, ptr, dest_len);
+         ptr[dest_len] = 0;
+         dest->written += dest_len*sizeof(WCHAR);
+     }
+@@ -1102,10 +1197,10 @@ static HRESULT reader_more(xmlreader *reader)
+     }
+     else
+     {
+-        dest_len = MultiByteToWideChar(cp, 0, src->data + src->cur, len, NULL, 0);
++        dest_len = readerinput_convert(readerinput, src->data + src->cur, len, NULL, 0);
+         readerinput_grow(readerinput, dest_len);
+         ptr = (WCHAR*)(dest->data + dest->written);
+-        MultiByteToWideChar(cp, 0, src->data + src->cur, len, ptr, dest_len);
++        readerinput_convert(readerinput, src->data + src->cur, len, ptr, dest_len);
+         ptr[dest_len] = 0;
+         dest->written += dest_len*sizeof(WCHAR);
+         /* get rid of processed data */
+@@ -1278,7 +1373,6 @@ static inline BOOL is_wchar_encname(WCHAR ch)
+ static HRESULT reader_parse_encname(xmlreader *reader, strval *val)
+ {
+     WCHAR *start = reader_get_ptr(reader), *ptr;
+-    xml_encoding enc;
+     int len;
+ 
+     if ((*start < 'A' || *start > 'Z') && (*start < 'a' || *start > 'z'))
+@@ -1290,20 +1384,165 @@ static HRESULT reader_parse_encname(xmlreader *reader, strval *val)
+     while (is_wchar_encname(*++ptr))
+         ;
+ 
++    /* a name that does not end where the quote is, is not one */
++    if (*ptr != '"' && *ptr != '\'')
++        return WC_E_ENCNAME;
++
+     len = ptr - start;
+-    enc = parse_encoding_name(start, len);
+     TRACE("encoding name %s\n", debugstr_wn(start, len));
+     val->str = start;
+     val->len = len;
+-
+-    if (enc == XmlEncoding_Unknown)
+-        return WC_E_ENCNAME;
++    /* whether the reader can read it is found out once the declaration is read */
++    reader->encoding = *val;
+ 
+     /* skip encoding name */
+     reader_skipn(reader, len);
+     return S_OK;
+ }
+ 
++/* 8-bit encodings a reader knows by itself, sorted as wcsicmp() sorts them */
++static const struct
++{
++    const WCHAR *name;
++    UINT cp;
++}
++reader_encodings[] =
++{
++    { L"ISO-8859-1", 28591 }, { L"ISO-8859-2", 28592 }, { L"ISO-8859-3", 28593 },
++    { L"ISO-8859-4", 28594 }, { L"ISO-8859-5", 28595 }, { L"ISO-8859-6", 28596 },
++    { L"ISO-8859-7", 28597 }, { L"ISO-8859-8", 28598 }, { L"ISO-8859-9", 28599 },
++    { L"US-ASCII",   20127 }, { L"UTF-8", CP_UTF8 },
++    { L"windows-1250", 1250 }, { L"windows-1251", 1251 }, { L"windows-1252", 1252 },
++    { L"windows-1253", 1253 }, { L"windows-1254", 1254 }, { L"windows-1255", 1255 },
++    { L"windows-1256", 1256 }, { L"windows-1257", 1257 }, { L"windows-1258", 1258 },
++};
++
++/* and those of wider characters, which a document of bytes cannot switch to */
++static const WCHAR *wide_encodings[] =
++{
++    L"UCS-2", L"UCS-4", L"UTF-16", L"UTF-16BE", L"UTF-16LE", L"UTF-32", L"unicode",
++};
++
++/* the code page of a declared encoding: 1200 for those of wide characters, the reader's own
++ * 8-bit ones, and whatever the MultiLanguage object knows */
++static HRESULT reader_get_encoding_code_page(xmlreader *reader, const WCHAR *name, UINT *cp,
++                                             IMultiLanguage2 **mlang)
++{
++    IMultiLanguage2 *ml;
++    MIMECSETINFO info;
++    unsigned int i;
++    HRESULT hr;
++    BSTR str;
++
++    *mlang = NULL;
++    for (i = 0; i < ARRAY_SIZE(reader_encodings); i++)
++    {
++        if (wcsicmp(reader_encodings[i].name, name)) continue;
++        *cp = reader_encodings[i].cp;
++        return S_OK;
++    }
++    for (i = 0; i < ARRAY_SIZE(wide_encodings); i++)
++    {
++        if (wcsicmp(wide_encodings[i], name)) continue;
++        *cp = 1200;
++        return S_OK;
++    }
++
++    if (!reader->mlang) return MX_E_ENCODINGSIGNATURE;
++    if (FAILED(IUnknown_QueryInterface(reader->mlang, &IID_IMultiLanguage2, (void **)&ml)))
++        return MX_E_ENCODING;
++
++    str = SysAllocString(name);
++    hr = IMultiLanguage2_GetCharsetInfo(ml, str, &info);
++    SysFreeString(str);
++    if (FAILED(hr))
++    {
++        IMultiLanguage2_Release(ml);
++        return MX_E_ENCODING;
++    }
++
++    TRACE("%s is code page %u\n", debugstr_w(name), info.uiInternetEncoding);
++    switch ((*cp = info.uiInternetEncoding))
++    {
++    case 1200: case 1201: case 12000: case 12001:
++        *cp = 1200;
++        IMultiLanguage2_Release(ml);
++        return S_OK;
++    case CP_UTF7:
++        IMultiLanguage2_Release(ml);
++        return MX_E_ENCODINGSWITCH;
++    }
++    if (IsValidCodePage(*cp) || *cp == CP_UTF8)
++        IMultiLanguage2_Release(ml);
++    else if (IMultiLanguage2_IsConvertible(ml, *cp, 1200) == S_OK)
++        *mlang = ml;
++    else
++    {
++        IMultiLanguage2_Release(ml);
++        return MX_E_ENCODING;
++    }
++    return S_OK;
++}
++
++/* A document of bytes is read, from the end of its declaration on, in the encoding the
++ * declaration names; one of wide characters cannot name an encoding of bytes. */
++static HRESULT reader_switch_declared_encoding(xmlreader *reader)
++{
++    xmlreaderinput *input = reader->input;
++    encoded_buffer *src = &input->buffer->encoded, *dest = &input->buffer->utf16;
++    IMultiLanguage2 *mlang;
++    WCHAR name[64];
++    const char *ptr;
++    int len, dest_len;
++    HRESULT hr;
++    UINT cp;
++
++    if (!reader->encoding.len) return S_OK;
++    if (reader->encoding.len >= ARRAY_SIZE(name))
++        return reader->mlang ? MX_E_ENCODING : MX_E_ENCODINGSIGNATURE;
++    memcpy(name, (WCHAR *)dest->data + reader->encoding.start, reader->encoding.len * sizeof(WCHAR));
++    name[reader->encoding.len] = 0;
++
++    if (FAILED(hr = reader_get_encoding_code_page(reader, name, &cp, &mlang))) return hr;
++    if (cp == input->buffer->code_page) goto done;
++    if (cp == 1200 || input->buffer->code_page == 1200)
++    {
++        hr = MX_E_ENCODINGSWITCH;
++        goto done;
++    }
++
++    /* the declaration is ASCII in anything read as bytes: convert again from its end */
++    for (ptr = src->data + src->cur; ptr + 1 < src->data + src->written; ptr++)
++        if (ptr[0] == '?' && ptr[1] == '>') break;
++    if (ptr + 1 >= src->data + src->written)
++    {
++        hr = MX_E_ENCODING;
++        goto done;
++    }
++
++    TRACE("switching to code page %u\n", cp);
++    input->buffer->code_page = cp;
++    if (input->buffer->mlang) IMultiLanguage2_Release(input->buffer->mlang);
++    input->buffer->mlang = mlang;
++    input->buffer->mlang_mode = 0;
++    mlang = NULL;
++
++    dest->written = reader_get_cur(reader) * sizeof(WCHAR);
++    dest->prev_cr = FALSE;
++    src->cur = ptr + 2 - src->data;
++    len = readerinput_get_convlen(input);
++    dest_len = readerinput_convert(input, src->data + src->cur, len, NULL, 0);
++    readerinput_grow(input, dest_len);
++    readerinput_convert(input, src->data + src->cur, len, (WCHAR *)(dest->data + dest->written), dest_len);
++    ((WCHAR *)(dest->data + dest->written))[dest_len] = 0;
++    dest->written += dest_len * sizeof(WCHAR);
++    fixup_buffer_cr(dest, reader_get_cur(reader));
++
++done:
++    if (mlang) IMultiLanguage2_Release(mlang);
++    return hr;
++}
++
+ /* [80] EncodingDecl ::= S 'encoding' Eq ('"' EncName '"' | "'" EncName "'" ) */
+ static HRESULT reader_parse_encdecl(xmlreader *reader, BOOL *spaces)
+ {
+@@ -2478,6 +2717,8 @@ static HRESULT reader_parse_chardata(xmlreader *reader)
+             return S_OK;
+         }
+ 
++        if (!is_char(*ptr)) return WC_E_XMLCHARACTER;
++
+         /* this covers a case when text has leading whitespace chars */
+         if (!is_wchar_space(*ptr)) reader->nodetype = XmlNodeType_Text;
+ 
+@@ -2591,8 +2832,10 @@ static HRESULT reader_parse_nextnode(xmlreader *reader)
+                 readerinput_switchencoding(reader->input, enc);
+ 
+                 /* parse xml declaration */
++                reader->encoding.len = 0;
+                 hr = reader_parse_xmldecl(reader);
+                 if (FAILED(hr)) return hr;
++                if (hr == S_OK && FAILED(hr = reader_switch_declared_encoding(reader))) return hr;
+ 
+                 readerinput_shrinkraw(reader->input, -1);
+                 reader->instate = XmlReadInState_Misc_DTD;
+@@ -2853,8 +3096,6 @@ static HRESULT WINAPI xmlreader_SetProperty(IXmlReader* iface, UINT property, LO
+             This->mlang = (IUnknown*)value;
+             if (This->mlang)
+                 IUnknown_AddRef(This->mlang);
+-            if (This->mlang)
+-                FIXME("Ignoring MultiLanguage %p\n", This->mlang);
+             break;
+         case XmlReaderProperty_XmlResolver:
+             if (This->resolver)
+diff --git a/dlls/xmllite/tests/reader.c b/dlls/xmllite/tests/reader.c
+index edabad65c42..45f638317e5 100644
+--- a/dlls/xmllite/tests/reader.c
++++ b/dlls/xmllite/tests/reader.c
+@@ -29,6 +29,7 @@
+ #include "initguid.h"
+ #include "ole2.h"
+ #include "xmllite.h"
++#include "mlang.h"
+ #include "wine/test.h"
+ 
+ DEFINE_GUID(IID_IXmlReaderInput, 0x0b3ccc9b, 0x9214, 0x428b, 0xa2, 0xae, 0xef, 0x3a, 0xa8, 0x71, 0xaf, 0xda);
+@@ -2226,6 +2227,189 @@ static void test_encoding_detection(void)
+     IXmlReader_Release(reader);
+ }
+ 
++static HRESULT read_declared_text(const char *encoding, const char *text, IUnknown *mlang, WCHAR *value, UINT size)
++{
++    IXmlReader *reader;
++    const WCHAR *str;
++    XmlNodeType type;
++    IStream *stream;
++    char xml[256];
++    HRESULT hr;
++    UINT len;
++
++    sprintf(xml, "<?xml version=\"1.0\" encoding=\"%s\"?><a>%s</a>", encoding, text);
++    stream = create_stream_on_data(xml, strlen(xml));
++    hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (mlang)
++    {
++        hr = IXmlReader_SetProperty(reader, XmlReaderProperty_MultiLanguage, (LONG_PTR)mlang);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    }
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    *value = 0;
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK)
++    {
++        if (type != XmlNodeType_Text) continue;
++        IXmlReader_GetValue(reader, &str, &len);
++        lstrcpynW(value, str, min(len + 1, size));
++    }
++    IXmlReader_Release(reader);
++    IStream_Release(stream);
++    return hr;
++}
++
++static void test_declared_encoding(void)
++{
++    static const struct
++    {
++        const char *encoding;
++        const char *text;
++        HRESULT hr, hr_mlang;
++        const WCHAR *value, *value_mlang;
++    }
++    tests[] =
++    {
++        { "UTF-8", "\xc3\xa9", S_FALSE, S_FALSE, L"\x00e9", L"\x00e9" },
++        { "windows-1252", "\xe9\x80", S_FALSE, S_FALSE, L"\x00e9\x20ac", L"\x00e9\x20ac" },
++        { "WINDOWS-1251", "\xe9", S_FALSE, S_FALSE, L"\x0439", L"\x0439" },
++        { "iso-8859-2", "\xb1", S_FALSE, S_FALSE, L"\x0105", L"\x0105" },
++        { "ISO-8859-7", "\xe9", S_FALSE, S_FALSE, L"\x03b9", L"\x03b9" },
++        { "US-ASCII", "e", S_FALSE, S_FALSE, L"e", L"e" },
++        { "GB2312", "\xd6\xd0", MX_E_ENCODINGSIGNATURE, S_FALSE, NULL, L"\x4e2d" },
++        { "koi8-r", "\xc1", MX_E_ENCODINGSIGNATURE, S_FALSE, NULL, L"\x0430" },
++        { "Shift_JIS", "\x93\xfa", MX_E_ENCODINGSIGNATURE, S_FALSE, NULL, L"\x65e5" },
++        { "euc-jp", "\xc6\xfc", MX_E_ENCODINGSIGNATURE, S_FALSE, NULL, L"\x65e5" },
++        { "x-no-such", "e", MX_E_ENCODINGSIGNATURE, MX_E_ENCODING },
++        { "utf", "e", MX_E_ENCODINGSIGNATURE, MX_E_ENCODING },
++        { "UTF-7", "e", MX_E_ENCODINGSIGNATURE, MX_E_ENCODINGSWITCH },
++        { "UTF-16", "e", MX_E_ENCODINGSWITCH, MX_E_ENCODINGSWITCH },
++        { "UTF-16LE", "e", MX_E_ENCODINGSWITCH, MX_E_ENCODINGSWITCH },
++        { "unicode", "e", MX_E_ENCODINGSWITCH, MX_E_ENCODINGSWITCH },
++        { "UCS-2", "e", MX_E_ENCODINGSWITCH, MX_E_ENCODINGSWITCH },
++        { "utf-32", "e", MX_E_ENCODINGSWITCH, MX_E_ENCODINGSWITCH },
++    };
++    static const char bom_1252[] = "\xef\xbb\xbf<?xml version=\"1.0\" encoding=\"windows-1252\"?><a>\xe9</a>";
++    static const char crlf_1252[] = "<?xml version=\"1.0\"\r\n encoding='windows-1252'?>\r\n<a>\xe9</a>";
++    static const WCHAR wide_1252[] = L"<?xml version=\"1.0\" encoding=\"windows-1252\"?><a/>";
++    static const WCHAR wide_utf8[] = L"<?xml version=\"1.0\" encoding=\"utf-8\"?><a/>";
++    static const char bad_utf8[] = "<a>\xe9</a>";
++    static const char space[] = "<?xml version=\"1.0\" encoding=\"iso-8859-1 \"?><a/>";
++    IMultiLanguage2 *mlang;
++    IXmlReader *reader;
++    const WCHAR *str;
++    XmlNodeType type;
++    IStream *stream;
++    WCHAR value[64];
++    unsigned int i, start;
++    char *xml;
++    HRESULT hr;
++    UINT len;
++
++    CoInitialize(NULL);
++    hr = CoCreateInstance(&CLSID_CMultiLanguage, NULL, CLSCTX_INPROC_SERVER, &IID_IMultiLanguage2, (void **)&mlang);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        hr = read_declared_text(tests[i].encoding, tests[i].text, NULL, value, ARRAY_SIZE(value));
++        ok(hr == tests[i].hr, "%s: got hr %#lx.\n", tests[i].encoding, hr);
++        if (tests[i].value)
++            ok(!wcscmp(value, tests[i].value), "%s: got %s.\n", tests[i].encoding, debugstr_w(value));
++        hr = read_declared_text(tests[i].encoding, tests[i].text, (IUnknown *)mlang, value, ARRAY_SIZE(value));
++        ok(hr == tests[i].hr_mlang, "%s: got hr %#lx with MultiLanguage.\n", tests[i].encoding, hr);
++        if (tests[i].value_mlang)
++            ok(!wcscmp(value, tests[i].value_mlang), "%s: got %s with MultiLanguage.\n", tests[i].encoding, debugstr_w(value));
++    }
++
++    hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    /* the declaration of an encoding of bytes wins over a UTF-8 BOM, and not over UTF-16 */
++    stream = create_stream_on_data(bom_1252, sizeof(bom_1252) - 1);
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK && type != XmlNodeType_Text);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    IXmlReader_GetValue(reader, &str, &len);
++    ok(len == 1 && str[0] == 0xe9, "Unexpected value %s.\n", debugstr_wn(str, len));
++    IStream_Release(stream);
++
++    stream = create_stream_on_data(crlf_1252, sizeof(crlf_1252) - 1);
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK && type != XmlNodeType_Text);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    IXmlReader_GetValue(reader, &str, &len);
++    ok(len == 1 && str[0] == 0xe9, "Unexpected value %s.\n", debugstr_wn(str, len));
++    IStream_Release(stream);
++
++    stream = create_stream_on_data(wide_1252, sizeof(wide_1252) - sizeof(WCHAR));
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXmlReader_Read(reader, &type);
++    ok(hr == MX_E_ENCODINGSWITCH, "Unexpected hr %#lx.\n", hr);
++    IStream_Release(stream);
++
++    stream = create_stream_on_data(wide_utf8, sizeof(wide_utf8) - sizeof(WCHAR));
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXmlReader_Read(reader, &type);
++    ok(hr == MX_E_ENCODINGSWITCH, "Unexpected hr %#lx.\n", hr);
++    IStream_Release(stream);
++
++    /* a byte that is not UTF-8 is not a character */
++    stream = create_stream_on_data(bad_utf8, sizeof(bad_utf8) - 1);
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK);
++    ok(hr == WC_E_XMLCHARACTER, "Unexpected hr %#lx.\n", hr);
++    IStream_Release(stream);
++
++    stream = create_stream_on_data(space, sizeof(space) - 1);
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXmlReader_Read(reader, &type);
++    ok(hr == WC_E_ENCNAME, "Unexpected hr %#lx.\n", hr);
++    IStream_Release(stream);
++
++    /* characters of two bytes across the reader's chunks */
++    xml = malloc(20000);
++    strcpy(xml, "<?xml version=\"1.0\" encoding=\"GB2312\"?><a>");
++    for (i = start = strlen(xml); i < 16000; i += 2)
++    {
++        xml[i] = '\xd6';
++        xml[i + 1] = '\xd0';
++    }
++    strcpy(xml + i, "</a>");
++    stream = create_stream_on_data(xml, strlen(xml));
++    hr = IXmlReader_SetProperty(reader, XmlReaderProperty_MultiLanguage, (LONG_PTR)mlang);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    len = 0;
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK)
++    {
++        UINT count, j;
++
++        if (type != XmlNodeType_Text) continue;
++        IXmlReader_GetValue(reader, &str, &count);
++        for (j = 0; j < count; j++) if (str[j] != 0x4e2d) break;
++        ok(j == count, "Unexpected character %#x at %u.\n", str[j], len + j);
++        len += count;
++    }
++    ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++    ok(len == (i - start) / 2, "Got %u characters.\n", len);
++    IStream_Release(stream);
++    free(xml);
++
++    IXmlReader_Release(reader);
++    IMultiLanguage2_Release(mlang);
++    CoUninitialize();
++}
++
+ static void test_eof_state(IXmlReader *reader, BOOL eof)
+ {
+     LONG_PTR state;
+@@ -2762,6 +2946,7 @@ START_TEST(reader)
+     test_namespaceuri();
+     test_read_charref();
+     test_encoding_detection();
++    test_declared_encoding();
+     test_endoffile();
+     test_max_element_depth();
+     test_reader_position();

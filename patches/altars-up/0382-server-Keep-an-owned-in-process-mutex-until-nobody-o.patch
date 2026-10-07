@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:16:00 -0400
+Subject: [PATCH] server: Keep an owned in-process mutex until nobody owns it.
+
+When the last handle to an owned mutex was closed, the server closed its
+ntsync object, so the owner's death could no longer abandon it and a
+thread still waiting for it through its own fd waited forever (the
+kernel32 sync test failed twice with /dev/ntsync loaded).  The server
+now keeps such a mutex, abandons it with the others when a thread dies,
+and lets go of it once nobody owns it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index 6c92570e76e..352f7729a55 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -24,6 +24,7 @@
+ #include <errno.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "ntstatus.h"
+ #include "winternl.h"
+@@ -241,20 +242,58 @@ void unacquire_inproc_sync( struct object *obj )
+     }
+ }
+ 
++/* An owned mutex whose last handle is closed can still be waited for through the clients' fds, and
++ * its owner's death still has to abandon it: its fd is kept until nobody owns it. */
++struct orphaned_mutex
++{
++    struct list entry;
++    int         fd;
++};
++
++static struct list orphaned_mutexes = LIST_INIT( orphaned_mutexes );
++
++static int is_inproc_mutex_owned( int fd )
++{
++    struct ntsync_mutex_args args = {0};
++
++    if (ioctl( fd, NTSYNC_IOC_MUTEX_READ, &args ) < 0 && errno != EOWNERDEAD) return 0;
++    return args.owner != 0;
++}
++
+ static void inproc_sync_destroy( struct object *obj )
+ {
+     struct inproc_sync *sync = (struct inproc_sync *)obj;
++    struct orphaned_mutex *orphan;
++
+     assert( obj->ops == &inproc_sync_ops );
+     list_remove( &sync->entry );
++    if (sync->fd == -1) return;
++    if (sync->type == INPROC_SYNC_MUTEX && is_inproc_mutex_owned( sync->fd )
++        && (orphan = malloc( sizeof(*orphan) )))
++    {
++        orphan->fd = sync->fd;
++        list_add_tail( &orphaned_mutexes, &orphan->entry );
++        return;
++    }
+     close( sync->fd );
+ }
+ 
+ void abandon_inproc_mutexes( thread_id_t tid )
+ {
++    struct orphaned_mutex *orphan, *next;
+     struct inproc_sync *mutex;
+ 
+     LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
+         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
++
++    LIST_FOR_EACH_ENTRY_SAFE( orphan, next, &orphaned_mutexes, struct orphaned_mutex, entry )
++    {
++        ioctl( orphan->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
++        if (is_inproc_mutex_owned( orphan->fd )) continue;  /* still owned, maybe by a waiter it woke */
++        list_remove( &orphan->entry );
++        close( orphan->fd );
++        free( orphan );
++    }
+ }
+ 
+ static int get_obj_inproc_sync( struct object *obj, int *type )

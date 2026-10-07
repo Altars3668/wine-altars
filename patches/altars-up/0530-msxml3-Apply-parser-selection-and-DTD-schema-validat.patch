@@ -1,0 +1,1048 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:07:49 -0400
+Subject: [PATCH] msxml3: Apply parser selection and DTD/schema validation
+ during loading.
+
+NewParser selects the newer SAX path and its native errors. ValidateOnParse
+actually rejects invalid DTD or cached-XSD instances; manual validation
+reports the datatype error and failed loads leave no document element.
+Keep locator references and element end positions for validation errors.
+
+Implement deferred XSD compilation and schema cache validation according
+to validateOnLoad, release owned schema documents, and attach copied DTDs
+to their document. ResolveExternals drives external general entity reads
+rather than merely storing an unrelated boolean. Keep DOM error-location
+behaviour private to the DOM adapter, preserving public SAX callbacks.
+
+No-error line/column getters return S_FALSE. Native parser/cache tests,
+the full Wine DOM/schema/SAX suites and real Office saves pass.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index a60285ad654..541f4fc7417 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -1648,6 +1648,7 @@ static HRESULT WINAPI domdoc_put_resolveExternals(IXMLDOMDocument3 *iface, VARIA
+     TRACE("%p, %d.\n", iface, v);
+ 
+     doc->resolving = v;
++    doc->node->properties->resolve_externals = v != VARIANT_FALSE;
+     return S_OK;
+ }
+ 
+@@ -1752,7 +1753,7 @@ static HRESULT WINAPI domdoc_putref_schemas(IXMLDOMDocument3 *iface, VARIANT sch
+     struct domnode *node = doc->node;
+     HRESULT hr = E_FAIL;
+ 
+-    FIXME("%p, %s: semi-stub\n", iface, debugstr_variant(&schema));
++    TRACE("%p, %s.\n", iface, debugstr_variant(&schema));
+ 
+     switch(V_VT(&schema))
+     {
+@@ -1900,8 +1901,9 @@ static HRESULT WINAPI domdoc_setProperty(IXMLDOMDocument3 *iface, BSTR p, VARIAN
+         else if (!wcsicmp(p, L"AllowDocumentFunction")) flag = &properties->allow_document_function;
+         else flag = &properties->use_inline_schema;
+         *flag = b == VARIANT_TRUE;
+-        if (flag != &properties->allow_xslt_script && flag != &properties->allow_document_function)
+-            FIXME("%s is kept, but not enforced.\n", debugstr_w(p));
++        if (flag == &properties->resolve_externals) doc->resolving = b;
++        if (flag == &properties->use_inline_schema && *flag)
++            FIXME("UseInlineSchema is kept, but not enforced.\n");
+         return S_OK;
+     }
+ 
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index 1c36e839b77..ff55f17218a 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -237,6 +237,8 @@ struct domnode
+ 
+     DOMNodeType type;
+     unsigned int flags;
++    LONG parse_line;
++    LONG parse_end_column;
+ 
+     BSTR name;
+     BSTR prefix;
+@@ -454,7 +456,7 @@ extern void node_unlink_children(struct domnode *);
+ 
+ extern UINT get_codepage_for_encoding(const WCHAR *encoding);
+ 
+-extern HRESULT SchemaCache_validate_tree(IXMLDOMSchemaCollection2*, xmlNodePtr);
++extern HRESULT SchemaCache_validate_tree(IXMLDOMSchemaCollection2*, xmlNodePtr, struct parse_error *);
+ extern XDR_DT SchemaCache_get_node_dt(IXMLDOMSchemaCollection2 *, const WCHAR *name, const WCHAR *uri);
+ extern HRESULT cache_from_doc_ns(IXMLDOMSchemaCollection2*, struct domnode *);
+ 
+@@ -595,5 +597,7 @@ extern HRESULT stream_wrapper_create(const void *, DWORD, ISequentialStream **);
+ #define E_XML_ILLEGAL_TEXT                  0xC00CE018
+ /* ... */
+ #define E_XML_REQUIRED_ATTRIBUTE_MISSING    0xC00CE020
++#define E_XML_SCHEMA_DATATYPE               0xC00CE201
++#define E_XML_NEW_PARSER_DTD_VALIDATION      0xC00CE23D
+ 
+ #endif /* __MSXML_PRIVATE__ */
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index 79448003b25..651bc0dca12 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -57,6 +57,9 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(msxml);
+ 
++C_ASSERT(offsetof(xmlEntity, type) == offsetof(xmlNode, type));
++C_ASSERT(offsetof(xmlEntity, doc) == offsetof(xmlNode, doc));
++
+ static const IID IID_domnode = {0x4f2f4ba2,0xb822,0x11df,{0x8b,0x8a,0x68,0x50,0xdf,0xd7,0x20,0x85}};
+ 
+ struct string_buffer
+@@ -4062,6 +4065,8 @@ static HRESULT WINAPI parse_content_handler_putDocumentLocator(ISAXContentHandle
+ {
+     struct parse_context *c = CONTAINING_RECORD(iface, struct parse_context, content_handler);
+ 
++    if (locator) ISAXLocator_AddRef(locator);
++    if (c->locator) ISAXLocator_Release(c->locator);
+     c->locator = locator;
+     return S_OK;
+ }
+@@ -4136,6 +4141,15 @@ static HRESULT WINAPI parse_content_handler_endElement(ISAXContentHandler *iface
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+ 
+     parse_context_create_text_node(c, NODE_TEXT);
++    if (c->node && c->locator)
++    {
++        int line = 0, column = 0;
++
++        ISAXLocator_getLineNumber(c->locator, &line);
++        ISAXLocator_getColumnNumber(c->locator, &column);
++        c->node->parse_line = line;
++        c->node->parse_end_column = column;
++    }
+     c->node = c->node->parent;
+ 
+     return c->status;
+@@ -4531,6 +4545,12 @@ static HRESULT WINAPI parse_lexical_handler_startDTD(ISAXLexicalHandler *iface,
+     struct parse_context *c = impl_from_ISAXLexicalHandler(iface);
+     struct domnode *dtd;
+ 
++    if (c->root->properties->new_parser && c->root->properties->validating)
++    {
++        parse_context_set_error(c, c->locator, E_XML_NEW_PARSER_DTD_VALIDATION, NULL);
++        if (c->error.linepos > 0) c->error.linepos--;
++        return c->status = E_XML_NEW_PARSER_DTD_VALIDATION;
++    }
+     parse_context_node_create(c, NODE_DOCUMENT_TYPE, name, name_len, NULL, 0, c->root, &dtd);
+     parse_context_append_child(c, c->root, dtd);
+     c->node = dtd;
+@@ -4603,6 +4623,7 @@ struct domdoc_properties *domdoc_create_properties(MSXML_VERSION version);
+ 
+ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_properties *properties)
+ {
++    struct domdoc_properties *copy;
+     IUnknown *unk;
+     HRESULT hr;
+     VARIANT v;
+@@ -4617,13 +4638,14 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+     c->buffer.status = &c->status;
+     c->version = properties->version;
+ 
+-    if (FAILED(hr = SAXXMLReader_create(MSXML3, (void **)&unk)))
++    if (FAILED(hr = SAXXMLReader_create(properties->new_parser ? MSXML6 : MSXML3, (void **)&unk)))
+         return hr;
+ 
+     IUnknown_QueryInterface(unk, &IID_ISAXXMLReader, (void **)&c->reader);
+     IUnknown_QueryInterface(unk, &IID_ISAXXMLReaderExtension, (void **)&c->reader_extension);
+     IUnknown_Release(unk);
+ 
++    ISAXXMLReader_putFeature(c->reader, L"http://winehq.org/sax/features/dom-reader", VARIANT_TRUE);
+     ISAXXMLReader_putContentHandler(c->reader, &c->content_handler);
+     ISAXXMLReader_putDTDHandler(c->reader, &c->dtd_handler);
+     ISAXXMLReader_putErrorHandler(c->reader, &c->error_handler);
+@@ -4645,13 +4667,28 @@ static HRESULT parse_context_init(struct parse_context *c, const struct domdoc_p
+     V_I4(&v) = properties->max_element_depth;
+     ISAXXMLReader_putProperty(c->reader, L"max-element-depth", v);
+     ISAXXMLReader_putFeature(c->reader, L"prohibit-dtd", properties->prohibit_dtd ? VARIANT_TRUE : VARIANT_FALSE);
+-    if (properties->version == MSXML6)
++    if (properties->version == MSXML6 && !properties->new_parser)
+         ISAXXMLReader_putFeature(c->reader, L"http://winehq.org/sax/features/dom-version6", VARIANT_TRUE);
+     ISAXXMLReader_putFeature(c->reader, L"normalize-attribute-values", VARIANT_FALSE);
++    ISAXXMLReader_putFeature(c->reader, L"http://xml.org/sax/features/external-general-entities",
++            properties->resolve_externals ? VARIANT_TRUE : VARIANT_FALSE);
++    if (properties->uri)
++    {
++        BSTR url;
++        if (SUCCEEDED(IUri_GetAbsoluteUri(properties->uri, &url)))
++        {
++            ISAXXMLReader_putBaseURL(c->reader, url);
++            SysFreeString(url);
++        }
++    }
+ 
+-    domnode_create(NODE_DOCUMENT, NULL, 0, NULL, 0, NULL, &c->root);
+-    c->root->properties = domdoc_create_properties(MSXML_DEFAULT);
+-    c->root->properties->preserving = properties->preserving;
++    if (!(copy = domdoc_properties_clone(properties))) return E_OUTOFMEMORY;
++    if (FAILED(hr = domnode_create(NODE_DOCUMENT, NULL, 0, NULL, 0, NULL, &c->root)))
++    {
++        domdoc_properties_destroy(copy);
++        return hr;
++    }
++    c->root->properties = copy;
+     c->node = c->root;
+ 
+     return hr;
+@@ -4661,12 +4698,16 @@ static void parse_context_cleanup(struct parse_context *c)
+ {
+     SysFreeString(c->error.reason);
+     free(c->buffer.data);
++    if (c->root) domnode_destroy_tree(c->root);
++    if (c->locator) ISAXLocator_Release(c->locator);
+     if (c->reader)
+         ISAXXMLReader_Release(c->reader);
+     if (c->reader_extension)
+         ISAXXMLReaderExtension_Release(c->reader_extension);
+ }
+ 
++static HRESULT node_validate_tree(struct domnode *doc, struct domnode *node, struct parse_error *error);
++
+ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_properties *properties,
+         struct domnode **tree, struct parse_error *error)
+ {
+@@ -4679,7 +4720,10 @@ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_
+         memset(error, 0, sizeof(*error));
+ 
+     if (FAILED(hr = parse_context_init(&context, properties)))
++    {
++        parse_context_cleanup(&context);
+         return hr;
++    }
+ 
+     if (utf16)
+     {
+@@ -4692,6 +4736,33 @@ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_
+         hr = ISAXXMLReader_parse(context.reader, v);
+     }
+ 
++    if (hr == S_OK && properties->validating)
++    {
++        struct domnode *child;
++        LONG count = 0;
++        BOOL required;
++
++        if (properties->schemaCache) IXMLDOMSchemaCollection2_get_length(properties->schemaCache, &count);
++        required = count > 0;
++        LIST_FOR_EACH_ENTRY(child, &context.root->children, struct domnode, entry)
++            if (child->type == NODE_DOCUMENT_TYPE) required = TRUE;
++        if (required)
++        {
++            struct parse_error validation;
++            hr = node_validate_tree(context.root, context.root, &validation);
++            if (hr == S_FALSE)
++            {
++                parse_context_set_error(&context, context.locator, validation.code, validation.reason);
++                if (validation.line)
++                {
++                    context.error.line = validation.line;
++                    context.error.linepos = validation.linepos;
++                }
++                hr = validation.code;
++            }
++            SysFreeString(validation.reason);
++        }
++    }
+     if (hr == S_OK)
+     {
+         *tree = context.root;
+@@ -4866,6 +4937,11 @@ static xmlNodePtr create_xmlnode_from_domnode(struct xmldoc_context *context, st
+         case NODE_DOCUMENT_TYPE:
+             dtd = create_xmldtd_from_domnode(node);
+             context->xmldoc->intSubset = dtd;
++            if (dtd)
++            {
++                dtd->parent = context->xmldoc;
++                xmlSetTreeDoc((xmlNodePtr)dtd, context->xmldoc);
++            }
+             break;
+         default:
+             FIXME("Not supported for node type %d.\n", node->type);
+@@ -5095,95 +5171,66 @@ static void LIBXML2_LOG_CALLBACK validate_warning(void* ctx, char const* msg, ..
+     va_end(ap);
+ }
+ 
+-HRESULT node_validate(struct domnode *doc, IXMLDOMNode *node_obj, IXMLDOMParseError **err)
++static HRESULT node_validate_tree(struct domnode *doc, struct domnode *node, struct parse_error *error)
+ {
+-    IXMLDOMSchemaCollection2 *schema;
+-    struct domnode *node;
+-    LONG err_code = 0;
++    IXMLDOMSchemaCollection2 *schema = doc->properties->schemaCache;
+     HRESULT hr = S_OK;
+     int validated = 0;
+     xmlDocPtr xmldoc;
+     xmlNodePtr xmlnode;
+ 
+-    if (!(node = get_node_obj(node_obj)))
+-        return E_FAIL;
+-
+-    if (node->owner != doc && node != doc)
+-    {
+-        if (err)
+-            *err = create_parseError(err_code, NULL, NULL, NULL, 0, 0, 0);
+-        return E_FAIL;
+-    }
+-
+-    /* TODO: for now simply treat empty document as not well-formed */
+-    if (list_empty(&node->children))
++    memset(error, 0, sizeof(*error));
++    if (node == doc && !domnode_get_root_element(doc))
+     {
+-        if (err)
+-            *err = create_parseError(E_XML_NOTWF, NULL, NULL, NULL, 0, 0, 0);
++        error->code = E_XML_NOTWF;
+         return S_FALSE;
+     }
+-
+-    xmldoc = create_xmldoc_from_domdoc(node, &xmlnode);
+-
+-    /* DTD validation */
+-    if (xmldoc->intSubset || xmldoc->extSubset)
++    if (!(xmldoc = create_xmldoc_from_domdoc(node, &xmlnode))) return E_OUTOFMEMORY;
++    if (!doc->properties->new_parser && (xmldoc->intSubset || xmldoc->extSubset))
+     {
+-        xmlValidCtxtPtr vctx = xmlNewValidCtxt();
+-        int ret;
++        xmlValidCtxtPtr context = xmlNewValidCtxt();
++        int valid;
+ 
+-        vctx->error = validate_error;
+-        vctx->warning = validate_warning;
++        if (!context) { xmlFreeDoc(xmldoc); return E_OUTOFMEMORY; }
++        context->error = validate_error;
++        context->warning = validate_warning;
+         ++validated;
+-
+-        ret = node == doc ? xmlValidateDocument(vctx, xmldoc) : xmlValidateElement(vctx, xmldoc, xmlnode);
+-        if (!ret)
++        valid = node == doc ? xmlValidateDocument(context, xmldoc) : xmlValidateElement(context, xmldoc, xmlnode);
++        if (!valid)
+         {
+-            /* TODO: get a real error code here */
+-            TRACE("DTD validation failed\n");
+-            err_code = E_XML_INVALID;
++            xmlNodePtr root = node == doc ? xmlDocGetRootElement(xmldoc) : xmlnode;
++            error->code = root && !root->children ? E_XML_EMPTY_NOT_ALLOWED : E_XML_INVALID;
+             hr = S_FALSE;
+         }
+-        xmlFreeValidCtxt(vctx);
++        xmlFreeValidCtxt(context);
+     }
+-
+-    /* Schema validation */
+-    schema = doc->properties->schemaCache;
+     if (hr == S_OK && schema)
+     {
+-
+-        hr = SchemaCache_validate_tree(schema, xmlnode);
+-        if (SUCCEEDED(hr))
+-        {
+-            ++validated;
+-            /* TODO: get a real error code here */
+-            if (hr == S_OK)
+-            {
+-                TRACE("schema validation succeeded\n");
+-            }
+-            else
+-            {
+-                WARN("schema validation failed\n");
+-                err_code = E_XML_INVALID;
+-            }
+-        }
+-        else
+-        {
+-            /* not really OK, just didn't find a schema for the ns */
+-            hr = S_OK;
+-        }
++        hr = SchemaCache_validate_tree(schema, xmlnode, error);
++        if (SUCCEEDED(hr)) ++validated;
++        else hr = S_OK;
++        if (hr == S_FALSE && !error->code) error->code = E_XML_INVALID;
+     }
+     xmlFreeDoc(xmldoc);
+-
+     if (!validated)
+     {
+-        WARN("no DTD or schema found\n");
+-        err_code = E_XML_NODTD;
++        error->code = E_XML_NODTD;
+         hr = S_FALSE;
+     }
++    return hr;
++}
+ 
+-    if (err)
+-        *err = create_parseError(err_code, NULL, NULL, NULL, 0, 0, 0);
++HRESULT node_validate(struct domnode *doc, IXMLDOMNode *node_obj, IXMLDOMParseError **err)
++{
++    struct domnode *node;
++    struct parse_error error = {0};
++    HRESULT hr;
+ 
++    if (!(node = get_node_obj(node_obj))) return E_FAIL;
++    if (node->owner != doc && node != doc) hr = E_FAIL;
++    else hr = node_validate_tree(doc, node, &error);
++    if (err) *err = create_parseError(error.code, NULL, error.reason, NULL, 0, 0, 0);
++    SysFreeString(error.reason);
+     return hr;
+ }
+ 
+diff --git a/dlls/msxml3/parseerror.c b/dlls/msxml3/parseerror.c
+index 0c3820f35c5..eb97b916823 100644
+--- a/dlls/msxml3/parseerror.c
++++ b/dlls/msxml3/parseerror.c
+@@ -220,7 +220,7 @@ static HRESULT WINAPI parseError_get_line(
+     if (!line) return E_INVALIDARG;
+ 
+     *line = This->line;
+-    return S_OK;
++    return This->code ? S_OK : S_FALSE;
+ }
+ 
+ static HRESULT WINAPI parseError_get_linepos(
+@@ -234,7 +234,7 @@ static HRESULT WINAPI parseError_get_linepos(
+     if (!linepos) return E_INVALIDARG;
+ 
+     *linepos = This->linepos;
+-    return S_OK;
++    return This->code ? S_OK : S_FALSE;
+ }
+ 
+ static HRESULT WINAPI parseError_get_filepos(
+diff --git a/dlls/msxml3/saxreader.c b/dlls/msxml3/saxreader.c
+index 4ffc386d91c..5e338f07a4d 100644
+--- a/dlls/msxml3/saxreader.c
++++ b/dlls/msxml3/saxreader.c
+@@ -315,6 +315,7 @@ enum saxreader_feature
+     NormalizeLineBreaks          = 0x00008000,
+     NormalizeAttributeValues     = 0x00010000,
+     DOMVersion6                  = 0x00020000,
++    DOMReader                    = 0x00040000,
+     FeatureForceDWord            = 0xffffffff,
+ };
+ 
+@@ -326,6 +327,7 @@ struct saxreader_feature_pair
+ 
+ static const struct saxreader_feature_pair saxreader_feature_map[] = {
+     { ExhaustiveErrors, L"exhaustive-errors" },
++    { DOMReader, L"http://winehq.org/sax/features/dom-reader" },
+     { DOMVersion6, L"http://winehq.org/sax/features/dom-version6" },
+     { ExternalGeneralEntities, L"http://xml.org/sax/features/external-general-entities" },
+     { ExternalParameterEntities, L"http://xml.org/sax/features/external-parameter-entities" },
+@@ -2628,7 +2630,12 @@ static void saxlocator_end_document(struct saxlocator *locator)
+     if (locator->status != S_OK)
+         return;
+ 
+-    if (locator->saxreader->version >= MSXML4)
++    if (locator->saxreader->features & DOMReader)
++    {
++        locator->line = locator->buffer.position.line;
++        locator->column = locator->buffer.position.column;
++    }
++    else if (locator->saxreader->version >= MSXML4)
+     {
+         locator->line = locator->buffer.position.line;
+         locator->column = locator->buffer.position.column - 1;
+@@ -4503,7 +4510,19 @@ static void saxreader_parse_endtag(struct saxlocator *locator)
+         if (!wcscmp(element->name.qname, name.qname))
+             saxlocator_end_element(locator, &position, element);
+         else
++        {
+             hr = E_SAX_ENDTAGMISMATCH;
++            if (locator->saxreader->features & DOMReader)
++            {
++                locator->line = position.line;
++                if (locator->saxreader->version >= MSXML4)
++                {
++                    locator->column = locator->buffer.position.column - 1;
++                    hr = 0xc00cee3b;
++                }
++                else locator->column = position.column;
++            }
++        }
+ 
+         list_remove(&element->entry);
+         saxreader_free_element(element);
+@@ -4690,6 +4709,99 @@ static void saxreader_push_entity(struct saxlocator *locator, const struct text_
+ /* [66] CharRef ::= '&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';'
+    [67] Reference ::= EntityRef | CharRef
+    [68] EntityRef ::= '&' Name ';' */
++static HRESULT saxreader_load_external_entity(struct saxlocator *locator, struct entity_decl *entity)
++{
++    IStream *stream;
++    BYTE *data = NULL, chunk[4096];
++    ULONG read, length = 0;
++    HRESULT hr;
++    UINT codepage = CP_UTF8;
++    BSTR value;
++    int count;
++
++    if (FAILED(hr = URLOpenBlockingStreamW(NULL, entity->sysid, &stream, 0, NULL))) return hr;
++    do
++    {
++        BYTE *buffer;
++        hr = IStream_Read(stream, chunk, sizeof(chunk), &read);
++        if (FAILED(hr)) break;
++        if (read >= ~0u - length || !(buffer = realloc(data, (size_t)length + read + 1)))
++        {
++            hr = E_OUTOFMEMORY;
++            break;
++        }
++        data = buffer;
++        memcpy(data + length, chunk, read);
++        length += read;
++        data[length] = 0;
++    } while (read);
++    IStream_Release(stream);
++    if (FAILED(hr)) { free(data); return hr; }
++    if (length >= 2 && ((data[0] == 0xff && data[1] == 0xfe) || (data[0] == 0xfe && data[1] == 0xff)))
++    {
++        unsigned int i;
++
++        if (length & 1) { free(data); return E_SAX_INVALIDENCODING; }
++        value = SysAllocStringLen(NULL, (length - 2) / 2);
++        if (value)
++            for (i = 0; i < (length - 2) / 2; ++i)
++                value[i] = data[0] == 0xff ? data[2 + i * 2] | data[3 + i * 2] << 8 :
++                                           data[2 + i * 2] << 8 | data[3 + i * 2];
++    }
++    else
++    {
++        const char *text = (const char *)data;
++        ULONG skip = length >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf ? 3 : 0;
++
++        text += skip;
++        length -= skip;
++        if (length >= 5 && !memcmp(text, "<?xml", 5))
++        {
++            const char *end = strstr(text, "?>"), *encoding = strstr(text, "encoding");
++            if (end && encoding && encoding < end)
++            {
++                const char *p = strchr(encoding, '=');
++                if (p && p < end)
++                {
++                    WCHAR name[64];
++                    unsigned int i = 0;
++                    char quote;
++                    p++;
++                    while (p < end && (*p == ' ' || *p == '\t')) p++;
++                    quote = *p++;
++                    if (quote == '\'' || quote == '"')
++                    {
++                        while (p < end && *p != quote && i < ARRAY_SIZE(name) - 1) name[i++] = *p++;
++                        name[i] = 0;
++                        codepage = get_codepage_for_encoding(name);
++                    }
++                }
++            }
++        }
++        count = codepage ? MultiByteToWideChar(codepage, codepage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0,
++                text, length, NULL, 0) : 0;
++        value = SysAllocStringLen(NULL, count);
++        if (value && count) MultiByteToWideChar(codepage, codepage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0,
++                text, length, value, count);
++        if (length && !count) { SysFreeString(value); value = NULL; hr = E_SAX_INVALIDENCODING; }
++    }
++    free(data);
++    if (!value) return FAILED(hr) ? hr : E_OUTOFMEMORY;
++    if (!wcsncmp(value, L"<?xml", 5))
++    {
++        WCHAR *end = wcsstr(value, L"?>");
++        if (end)
++        {
++            BSTR text = SysAllocString(end + 2);
++            SysFreeString(value);
++            value = text;
++        }
++    }
++    if (!value) return E_OUTOFMEMORY;
++    entity->value = value;
++    return S_OK;
++}
++
+ static void saxreader_parse_reference(struct saxlocator *locator)
+ {
+     struct string_buffer buffer = { 0 };
+@@ -4719,10 +4831,16 @@ static void saxreader_parse_reference(struct saxlocator *locator)
+             {
+                 if (entity->unparsed)
+                     saxreader_set_error(locator, E_SAX_UNPARSEDENTITYREF);
+-                else if (entity->value && *entity->value)
+-                    saxreader_push_entity(locator, &position, entity);
+                 else
+-                    saxlocator_skipped_entity(locator, &position, entity->name);
++                {
++                    HRESULT hr = S_OK;
++
++                    if (!entity->value && entity->sysid && (locator->saxreader->features & ExternalGeneralEntities))
++                        hr = saxreader_load_external_entity(locator, entity);
++                    if (FAILED(hr)) saxreader_set_error(locator, hr);
++                    else if (entity->value && *entity->value) saxreader_push_entity(locator, &position, entity);
++                    else saxlocator_skipped_entity(locator, &position, entity->name);
++                }
+             }
+             else
+             {
+@@ -5403,7 +5521,7 @@ static void saxreader_resolve_system_id(struct saxlocator *locator, BSTR *system
+     const struct saxreader *reader = locator->saxreader;
+     BSTR resolved;
+ 
+-    if (!*systemid || reader->version < MSXML4) return;
++    if (!*systemid || (reader->version < MSXML4 && !(reader->features & DOMReader))) return;
+ 
+     if (reader->base_url && *reader->base_url)
+         lstrcpynW(base, reader->base_url, ARRAY_SIZE(base));
+@@ -6986,13 +7104,14 @@ static HRESULT WINAPI isaxxmlreader_putFeature(ISAXXMLReader *iface, const WCHAR
+          feature == NormalizeLineBreaks ||
+          feature == NormalizeAttributeValues ||
+          feature == DOMVersion6 ||
++         feature == DOMReader ||
++         feature == ExternalGeneralEntities ||
+          feature == ProhibitDTD)
+     {
+         return set_feature_value(reader, feature, value);
+     }
+ 
+     if (feature == LexicalHandlerParEntities ||
+-            feature == ExternalGeneralEntities ||
+             feature == ExternalParameterEntities)
+     {
+         FIXME("%p, %s, %#x stub\n", iface, debugstr_w(name), value);
+diff --git a/dlls/msxml3/schema.c b/dlls/msxml3/schema.c
+index e6242a8b550..ff1986a056e 100644
+--- a/dlls/msxml3/schema.c
++++ b/dlls/msxml3/schema.c
+@@ -202,7 +202,28 @@ static void LIBXML2_LOG_CALLBACK validate_warning(void* ctx, char const* msg, ..
+ 
+ static void validate_serror(void* ctx, const xmlError* err)
+ {
++    struct parse_error *error = ctx;
++
+     LIBXML2_CALLBACK_SERROR(Schema_validate_tree, err);
++    if (!error || error->code) return;
++    switch (err->code)
++    {
++    case XML_SCHEMAV_CVC_DATATYPE_VALID_1_2_1:
++        error->code = E_XML_SCHEMA_DATATYPE;
++        break;
++    default:
++        error->code = E_XML_INVALID;
++        break;
++    }
++    if (err->node)
++    {
++        struct domnode *node = ((xmlNodePtr)err->node)->_private2;
++        if (node)
++        {
++            error->line = node->parse_line;
++            error->linepos = node->parse_end_column;
++        }
++    }
+ }
+ 
+ static HRESULT schema_cache_get_item(IUnknown *iface, LONG index, VARIANT *item)
+@@ -216,7 +237,7 @@ static const struct enumvariant_funcs schemacache_enumvariant = {
+     NULL
+ };
+ 
+-static inline HRESULT Schema_validate_tree(xmlSchemaPtr schema, xmlNodePtr tree)
++static inline HRESULT Schema_validate_tree(xmlSchemaPtr schema, xmlNodePtr tree, struct parse_error *error)
+ {
+     xmlSchemaValidCtxtPtr svctx;
+     int err;
+@@ -226,7 +247,7 @@ static inline HRESULT Schema_validate_tree(xmlSchemaPtr schema, xmlNodePtr tree)
+      *       we probably need to validate the schema here. */
+     svctx = xmlSchemaNewValidCtxt(schema);
+     xmlSchemaSetValidErrors(svctx, validate_error, validate_warning, NULL);
+-    xmlSchemaSetValidStructuredErrors(svctx, validate_serror, NULL);
++    xmlSchemaSetValidStructuredErrors(svctx, validate_serror, error);
+ 
+     if (tree->type == XML_DOCUMENT_NODE)
+         err = xmlSchemaValidateDoc(svctx, (xmlDocPtr)tree);
+@@ -552,7 +573,7 @@ HRESULT dt_validate(XDR_DT dt, const WCHAR *contentW)
+                 xmlSetNs(node, ns);
+                 xmlDocSetRootElement(tmp_doc, node);
+ 
+-                hr = Schema_validate_tree(datatypes_schema, (xmlNodePtr)tmp_doc);
++                hr = Schema_validate_tree(datatypes_schema, (xmlNodePtr)tmp_doc, NULL);
+                 xmlFreeDoc(tmp_doc);
+ 
+                 free(content);
+@@ -579,10 +600,36 @@ static inline cache_entry* get_entry(schema_cache* This, xmlChar const* nsURI)
+                      xmlHashLookup(This->cache, nsURI);
+ }
+ 
++static CRITICAL_SECTION schema_compile_cs;
++static CRITICAL_SECTION_DEBUG schema_compile_cs_debug =
++{
++    0, 0, &schema_compile_cs,
++    { &schema_compile_cs_debug.ProcessLocksList, &schema_compile_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": schema_compile_cs") }
++};
++static CRITICAL_SECTION schema_compile_cs = { &schema_compile_cs_debug, -1, 0, 0, 0, 0 };
++
++static HRESULT cache_entry_compile(cache_entry *entry)
++{
++    xmlSchemaParserCtxtPtr context;
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection(&schema_compile_cs);
++    if (entry->type == CacheEntryType_NS || entry->schema) goto done;
++    if (entry->type != CacheEntryType_XSD || !entry->doc) { hr = E_FAIL; goto done; }
++    if (!(context = xmlSchemaNewDocParserCtxt(entry->doc))) { hr = E_OUTOFMEMORY; goto done; }
++    entry->schema = Schema_parse(context);
++    xmlSchemaFreeParserCtxt(context);
++    if (!entry->schema) hr = E_FAIL;
++done:
++    LeaveCriticalSection(&schema_compile_cs);
++    return hr;
++}
++
+ static inline xmlSchemaPtr get_node_schema(schema_cache* This, xmlNodePtr node)
+ {
+     cache_entry* entry = get_entry(This, get_node_nsURI(node));
+-    return (!entry)? NULL : entry->schema;
++    return entry && SUCCEEDED(cache_entry_compile(entry)) ? entry->schema : NULL;
+ }
+ 
+ static xmlExternalEntityLoader _external_entity_loader;
+@@ -665,17 +712,18 @@ static LONG cache_entry_release(cache_entry* entry)
+ 
+     if (ref == 0)
+     {
+-        if (entry->type == CacheEntryType_XSD)
+-        {
+-            entry->schema->doc = NULL;
+-            xmlSchemaFree(entry->schema);
+-        }
+-        else if (entry->type == CacheEntryType_XDR)
++        if (entry->type == CacheEntryType_XSD || entry->type == CacheEntryType_XDR)
+         {
+-            entry->schema->doc = NULL;
+-            xmlSchemaFree(entry->schema);
+-        }
++            if (entry->schema)
++            {
++                xmlDocPtr schema_doc = entry->schema->doc;
+ 
++                entry->schema->doc = NULL;
++                xmlSchemaFree(entry->schema);
++                if (schema_doc != entry->doc) xmlFreeDoc(schema_doc);
++            }
++            xmlFreeDoc(entry->doc);
++        }
+         free(entry);
+     }
+     return ref;
+@@ -821,33 +869,26 @@ static void rewrite_unicode_escapes(xmlNodePtr node)
+     }
+ }
+ 
+-static cache_entry* cache_entry_from_xsd_doc(xmlDocPtr doc, xmlChar const* nsURI, MSXML_VERSION v)
++static cache_entry* cache_entry_from_xsd_doc(xmlDocPtr doc, xmlChar const* nsURI, MSXML_VERSION v,
++        VARIANT_BOOL validate_on_load)
+ {
+-    cache_entry* entry = malloc(sizeof(cache_entry));
+-    xmlSchemaParserCtxtPtr spctx;
+-    xmlDocPtr new_doc = xmlCopyDoc(doc, 1);
+-
+-    rewrite_unicode_escapes((xmlNodePtr)new_doc->children);
+-    link_datatypes(new_doc);
++    cache_entry *entry = calloc(1, sizeof(*entry));
+ 
+-    /* TODO: if the nsURI is different from the default xmlns or targetNamespace,
+-     *       do we need to do something special here? */
+-    entry->type = CacheEntryType_XSD;
+-    entry->ref = 0;
+-    spctx = xmlSchemaNewDocParserCtxt(new_doc);
+-
+-    if ((entry->schema = Schema_parse(spctx)))
++    if (!entry) return NULL;
++    if (!(entry->doc = xmlCopyDoc(doc, 1)))
+     {
+-        entry->doc = entry->schema->doc;
++        free(entry);
++        return NULL;
+     }
+-    else
++    rewrite_unicode_escapes((xmlNodePtr)entry->doc->children);
++    link_datatypes(entry->doc);
++    entry->type = CacheEntryType_XSD;
++    if (validate_on_load && FAILED(cache_entry_compile(entry)))
+     {
+-        FIXME("failed to parse doc\n");
+-        xmlFreeDoc(new_doc);
++        xmlFreeDoc(entry->doc);
+         free(entry);
+-        entry = NULL;
++        return NULL;
+     }
+-    xmlSchemaFreeParserCtxt(spctx);
+     return entry;
+ }
+ 
+@@ -893,7 +934,8 @@ static HRESULT cache_entry_on_data_available(void *obj, char *ptr, DWORD len)
+     return S_OK;
+ }
+ 
+-static cache_entry* cache_entry_from_url(const WCHAR *url, xmlChar const* nsURI, MSXML_VERSION version)
++static cache_entry* cache_entry_from_url(const WCHAR *url, xmlChar const* nsURI, MSXML_VERSION version,
++        VARIANT_BOOL validate_on_load)
+ {
+     CacheEntryType type = CacheEntryType_Invalid;
+     xmlDocPtr doc = NULL;
+@@ -920,7 +962,7 @@ static cache_entry* cache_entry_from_url(const WCHAR *url, xmlChar const* nsURI,
+     switch (type)
+     {
+         case CacheEntryType_XSD:
+-            entry = cache_entry_from_xsd_doc(doc, nsURI, version);
++            entry = cache_entry_from_xsd_doc(doc, nsURI, version, validate_on_load);
+             break;
+         case CacheEntryType_XDR:
+             entry = cache_entry_from_xdr_doc(doc, nsURI, version);
+@@ -1197,7 +1239,7 @@ static HRESULT WINAPI schema_cache_add(IXMLDOMSchemaCollection2* iface, BSTR uri
+ 
+         case VT_BSTR:
+             {
+-                cache_entry* entry = cache_entry_from_url(V_BSTR(&var), name, cache->version);
++                cache_entry* entry = cache_entry_from_url(V_BSTR(&var), name, cache->version, cache->validateOnLoad);
+ 
+                 if (entry)
+                 {
+@@ -1256,7 +1298,7 @@ static HRESULT WINAPI schema_cache_add(IXMLDOMSchemaCollection2* iface, BSTR uri
+                 type = cache_type_from_xmlDocPtr(doc);
+                 if (type == CacheEntryType_XSD)
+                 {
+-                    entry = cache_entry_from_xsd_doc(doc, name, cache->version);
++                    entry = cache_entry_from_xsd_doc(doc, name, cache->version, cache->validateOnLoad);
+                 }
+                 else if (type == CacheEntryType_XDR)
+                 {
+@@ -1445,22 +1487,27 @@ static HRESULT WINAPI schema_cache_get__newEnum(IXMLDOMSchemaCollection2 *iface,
+ 
+ static HRESULT WINAPI schema_cache_validate(IXMLDOMSchemaCollection2* iface)
+ {
+-    FIXME("%p: stub\n", iface);
++    schema_cache *cache = impl_from_IXMLDOMSchemaCollection2(iface);
++    int i;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p.\n", iface);
++    for (i = 0; i < cache->count; ++i)
++    {
++        cache_entry *entry = get_entry(cache, cache->uris[i]);
++        if (entry && FAILED(hr = cache_entry_compile(entry))) return hr;
++    }
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI schema_cache_put_validateOnLoad(IXMLDOMSchemaCollection2* iface,
+                                                       VARIANT_BOOL value)
+ {
+     schema_cache* This = impl_from_IXMLDOMSchemaCollection2(iface);
+-    FIXME("(%p)->(%d): stub\n", This, value);
+-
++    TRACE("%p, %d.\n", This, value);
++    if (This->read_only) return E_FAIL;
+     This->validateOnLoad = value;
+-    /* it's ok to disable it, cause we don't validate on load anyway */
+-    if (value == VARIANT_FALSE) return S_OK;
+-
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI schema_cache_get_validateOnLoad(IXMLDOMSchemaCollection2 *iface, VARIANT_BOOL *value)
+@@ -1550,7 +1597,7 @@ static inline xmlNodePtr lookup_schema_element(xmlSchemaPtr schema, const xmlCha
+     return (decl != NULL)? decl->node : NULL;
+ }
+ 
+-HRESULT SchemaCache_validate_tree(IXMLDOMSchemaCollection2* iface, xmlNodePtr tree)
++HRESULT SchemaCache_validate_tree(IXMLDOMSchemaCollection2* iface, xmlNodePtr tree, struct parse_error *error)
+ {
+     schema_cache* This = impl_from_IXMLDOMSchemaCollection2(iface);
+     xmlSchemaPtr schema;
+@@ -1567,7 +1614,7 @@ HRESULT SchemaCache_validate_tree(IXMLDOMSchemaCollection2* iface, xmlNodePtr tr
+     /* TODO: if the ns is not in the cache, and it's a URL,
+      *       do we try to load from that? */
+     if (schema)
+-        return Schema_validate_tree(schema, tree);
++        return Schema_validate_tree(schema, tree, error);
+     else
+         WARN("no schema found for xmlns=%s\n", get_node_nsURI(tree));
+ 
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index a8df5861ce1..48d5d0840b2 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -19785,9 +19785,68 @@ static void test_document_stream(void)
+     IXMLDOMDocument_Release(doc);
+ }
+ 
++static void test_new_parser_validation(void)
++{
++    static const struct
++    {
++        const char *xml;
++        BOOL validate;
++        LONG code[2], line[2], column[2];
++    } cases[] =
++    {
++        {"<!DOCTYPE root [<!ELEMENT root EMPTY>]><root/>", TRUE, {0, 0xc00ce23d}, {0, 1}, {0, 16}},
++        {"<!DOCTYPE root [<!ELEMENT root (child)><!ELEMENT child EMPTY>]><root/>", FALSE, {0, 0}, {0, 0}, {0, 0}},
++        {"<!DOCTYPE root [<!ELEMENT root (child)><!ELEMENT child EMPTY>]><root/>", TRUE,
++         {0xc00ce011, 0xc00ce23d}, {1, 1}, {71, 16}},
++        {"<root>\n  <child>value</root>", FALSE, {0xc00ce56d, 0xc00cee3b}, {2, 2}, {17, 21}},
++    };
++    IXMLDOMDocument2 *doc;
++    IXMLDOMParseError *error;
++    VARIANT option;
++    VARIANT_BOOL loaded;
++    HRESULT hr;
++    LONG code, line, column;
++    unsigned int i, newer;
++
++    if (!is_clsid_supported(&CLSID_DOMDocument60, &IID_IXMLDOMDocument2)) return;
++    for (newer = 0; newer < 2; ++newer)
++    for (i = 0; i < ARRAY_SIZE(cases); ++i)
++    {
++        winetest_push_context("NewParser %u case %u", newer, i);
++        doc = create_document_version(60, &IID_IXMLDOMDocument2);
++        V_VT(&option) = VT_BOOL;
++        V_BOOL(&option) = VARIANT_FALSE;
++        hr = IXMLDOMDocument2_setProperty(doc, _bstr_("ProhibitDTD"), option);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        V_BOOL(&option) = newer ? VARIANT_TRUE : VARIANT_FALSE;
++        hr = IXMLDOMDocument2_setProperty(doc, _bstr_("NewParser"), option);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        IXMLDOMDocument2_put_validateOnParse(doc, cases[i].validate ? VARIANT_TRUE : VARIANT_FALSE);
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_(cases[i].xml), &loaded);
++        ok(hr == (cases[i].code[newer] ? S_FALSE : S_OK), "Got %#lx.\n", hr);
++        ok(loaded == (cases[i].code[newer] ? VARIANT_FALSE : VARIANT_TRUE), "Got loaded %d.\n", loaded);
++        hr = IXMLDOMDocument2_get_parseError(doc, &error);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        hr = IXMLDOMParseError_get_errorCode(error, &code);
++        ok(hr == (cases[i].code[newer] ? S_OK : S_FALSE), "Got %#lx.\n", hr);
++        ok(code == cases[i].code[newer], "Got error %#lx.\n", code);
++        hr = IXMLDOMParseError_get_line(error, &line);
++        ok(hr == (code ? S_OK : S_FALSE), "Got line hr %#lx.\n", hr);
++        ok(line == cases[i].line[newer], "Got line %ld.\n", line);
++        hr = IXMLDOMParseError_get_linepos(error, &column);
++        ok(hr == (code ? S_OK : S_FALSE), "Got column hr %#lx.\n", hr);
++        ok(column == cases[i].column[newer], "Got column %ld.\n", column);
++        IXMLDOMParseError_Release(error);
++        IXMLDOMDocument2_Release(doc);
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(domdoc)
+ {
+     HRESULT hr;
++    int argc;
++    char **argv;
+ 
+     hr = CoInitialize( NULL );
+     ok( hr == S_OK, "failed to init com\n");
+@@ -19801,6 +19860,14 @@ START_TEST(domdoc)
+         return;
+     }
+ 
++    argc = winetest_get_mainargs(&argv);
++    if (argc >= 3 && !strcmp(argv[2], "newparser"))
++    {
++        test_new_parser_validation();
++        CoUninitialize();
++        return;
++    }
++    test_new_parser_validation();
+     test_createProcessingInstruction();
+     test_load_with_site();
+     test_domdoc();
+diff --git a/dlls/msxml3/tests/schema.c b/dlls/msxml3/tests/schema.c
+index 2ab5689468d..98206f5edfb 100644
+--- a/dlls/msxml3/tests/schema.c
++++ b/dlls/msxml3/tests/schema.c
+@@ -1575,13 +1575,72 @@ static void test_dispex(void)
+     IXMLDOMSchemaCollection_Release(cache);
+ }
+ 
++static void test_deferred_schema_validation(void)
++{
++    static const WCHAR *const sources[] =
++    {
++        L"<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema' targetNamespace='urn:test'><xs:element name='root' type='xs:int'/></xs:schema>",
++        L"<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema' targetNamespace='urn:test'><xs:element name='root' type='xs:undefinedType'/></xs:schema>",
++    };
++    unsigned int mode, invalid;
++    HRESULT hr;
++
++    for (mode = 0; mode < 2; ++mode)
++    for (invalid = 0; invalid < ARRAY_SIZE(sources); ++invalid)
++    {
++        IXMLDOMSchemaCollection2 *cache;
++        IXMLDOMDocument2 *doc;
++        VARIANT input;
++        VARIANT_BOOL loaded, validating;
++        BSTR xml, uri;
++
++        winetest_push_context("validateOnLoad %u invalid %u", mode, invalid);
++        hr = CoCreateInstance(&CLSID_XMLSchemaCache60, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IXMLDOMSchemaCollection2, (void **)&cache);
++        if (FAILED(hr)) { win_skip("MSXML6 schema cache is unavailable.\n"); winetest_pop_context(); return; }
++        hr = IXMLDOMSchemaCollection2_put_validateOnLoad(cache, mode ? VARIANT_TRUE : VARIANT_FALSE);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        hr = IXMLDOMSchemaCollection2_get_validateOnLoad(cache, &validating);
++        ok(hr == S_OK && validating == (mode ? VARIANT_TRUE : VARIANT_FALSE), "Got %#lx, %d.\n", hr, validating);
++        hr = CoCreateInstance(&CLSID_DOMDocument60, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IXMLDOMDocument2, (void **)&doc);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        if (FAILED(hr)) { IXMLDOMSchemaCollection2_Release(cache); winetest_pop_context(); continue; }
++        xml = SysAllocString(sources[invalid]);
++        hr = IXMLDOMDocument2_loadXML(doc, xml, &loaded);
++        ok(hr == S_OK && loaded == VARIANT_TRUE, "Got %#lx, %d.\n", hr, loaded);
++        SysFreeString(xml);
++        V_VT(&input) = VT_DISPATCH;
++        V_DISPATCH(&input) = (IDispatch *)doc;
++        uri = SysAllocString(L"urn:test");
++        hr = IXMLDOMSchemaCollection2_add(cache, uri, input);
++        ok(hr == (mode && invalid ? E_FAIL : S_OK), "Got add %#lx.\n", hr);
++        hr = IXMLDOMSchemaCollection2_validate(cache);
++        ok(hr == (!mode && invalid ? E_FAIL : S_OK), "Got validate %#lx.\n", hr);
++        SysFreeString(uri);
++        IXMLDOMDocument2_Release(doc);
++        IXMLDOMSchemaCollection2_Release(cache);
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(schema)
+ {
+     HRESULT r;
++    int argc;
++    char **argv;
+ 
+     r = CoInitialize( NULL );
+     ok( r == S_OK, "failed to init com\n");
+ 
++    argc = winetest_get_mainargs(&argv);
++    if (argc >= 3 && !strcmp(argv[2], "deferred"))
++    {
++        test_deferred_schema_validation();
++        CoUninitialize();
++        return;
++    }
++    test_deferred_schema_validation();
+     test_schema_refs();
+     test_collection_refs();
+     test_length();

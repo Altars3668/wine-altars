@@ -1,0 +1,2227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:02:14 -0400
+Subject: [PATCH] windowscodecs: Decode WebP, as Windows does.
+
+Windows 11 has a WebP decoder in WIC, and Office inserts a WebP picture
+through it -- once it has found the transform Windows' WebP image
+extension registers, which is how Office tells that WebP can be decoded:
+without it the insert silently gives nothing.  Measured on Windows 11
+build 29671 (tools/wicwebpprobe, tools/mftwebpprobe):
+
+- The decoder gives every frame in 32bppRGBA at 72 dpi, the canvas as
+  libwebp's animation decoder composes it, a still picture being an
+  animation of one frame; the pixels are byte for byte libwebp's.
+- A still picture is taken on the strength of its header and only
+  decoded for its pixels, failing then with MF_E_INVALID_FILE_FORMAT; an
+  animation has to be whole from the start (E_UNEXPECTED).  GetFrame
+  takes any index, copying a missing frame fails with MF_E_INVALIDINDEX.
+- An animation's loop count and each frame's duration are its metadata,
+  through readers of the ANIM and ANMF chunks that have component
+  information but no COM registration.
+- The transform is a video decoder for the subtype that is the WIC
+  decoder's CLSID, out to P010, named WebpImageExtension; every method
+  but GetAttributes is E_NOTIMPL.
+
+Beside it, the component information now answers as Windows does: the
+four DoesSupport* of each codec, DoesRequireFixedSize of the metadata
+handlers, the signing status (always signed) and the specification
+version, which were stubs or missing; the DDS encoder is registered, and
+the handlers' names and flags are corrected.  The tests pass on
+Windows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 2330bd8f5a1332493a8a236d3b9c916e9d1cc098)
+
+diff --git a/dlls/windowscodecs/Makefile.in b/dlls/windowscodecs/Makefile.in
+index 54b6b097293..720ba9120f0 100644
+--- a/dlls/windowscodecs/Makefile.in
++++ b/dlls/windowscodecs/Makefile.in
+@@ -1,7 +1,8 @@
+ MODULE    = windowscodecs.dll
+ IMPORTLIB = windowscodecs
+-IMPORTS   = $(TIFF_PE_LIBS) $(JPEG_PE_LIBS) $(PNG_PE_LIBS) windowscodecs uuid ole32 oleaut32 propsys rpcrt4 shlwapi user32 gdi32 advapi32
+-EXTRAINCL = $(TIFF_PE_CFLAGS) $(JPEG_PE_CFLAGS) $(PNG_PE_CFLAGS)
++IMPORTS   = $(TIFF_PE_LIBS) $(JPEG_PE_LIBS) $(PNG_PE_LIBS) $(WEBP_PE_LIBS) windowscodecs uuid mfuuid ole32 oleaut32 propsys rpcrt4 shlwapi user32 gdi32 advapi32
++DELAYIMPORTS = mfplat
++EXTRAINCL = $(TIFF_PE_CFLAGS) $(JPEG_PE_CFLAGS) $(PNG_PE_CFLAGS) $(WEBP_PE_CFLAGS)
+ 
+ VER_FILEDESCRIPTION_STR = "Wine Windows Codecs Library"
+ VER_PRODUCTVERSION      = 6,0,6001,17009
+@@ -26,6 +27,7 @@ SOURCES = \
+ 	libjpeg.c \
+ 	libpng.c \
+ 	libtiff.c \
++	libwebp.c \
+ 	main.c \
+ 	metadatahandler.c \
+ 	metadataquery.c \
+diff --git a/dlls/windowscodecs/clsfactory.c b/dlls/windowscodecs/clsfactory.c
+index e7cde87ce71..4c366f45d7e 100644
+--- a/dlls/windowscodecs/clsfactory.c
++++ b/dlls/windowscodecs/clsfactory.c
+@@ -59,6 +59,10 @@ static const classinfo wic_classes[] = {
+     {&CLSID_WICTiffEncoder, TiffEncoder_CreateInstance},
+     {&CLSID_WICDdsDecoder, DdsDecoder_CreateInstance},
+     {&CLSID_WICDdsEncoder, DdsEncoder_CreateInstance},
++    {&CLSID_WICWebpDecoder, WebpDecoder_CreateInstance},
++    {&CLSID_WebpImageExtension, WebpImageExtension_CreateInstance},
++    {&CLSID_WICWebpAnimMetadataReader, WebpAnimReader_CreateInstance},
++    {&CLSID_WICWebpAnmfMetadataReader, WebpAnmfReader_CreateInstance},
+     {&CLSID_WICDefaultFormatConverter, FormatConverter_CreateInstance},
+     {&CLSID_WICUnknownMetadataReader, UnknownMetadataReader_CreateInstance},
+     {&CLSID_WICUnknownMetadataWriter, UnknownMetadataWriter_CreateInstance},
+diff --git a/dlls/windowscodecs/decoder.c b/dlls/windowscodecs/decoder.c
+index 4c6a0596e9c..9b4cede310d 100644
+--- a/dlls/windowscodecs/decoder.c
++++ b/dlls/windowscodecs/decoder.c
+@@ -1121,7 +1121,8 @@ static HRESULT WINAPI CommonDecoder_GetFrame(IWICBitmapDecoder *iface,
+ 
+     EnterCriticalSection(&This->lock);
+ 
+-    if (!This->stream || index >= This->file_info.frame_count)
++    if (!This->stream ||
++        (index >= This->file_info.frame_count && !(This->file_info.flags & DECODER_FLAGS_ANY_FRAME_INDEX)))
+         hr = WINCODEC_ERR_FRAMEMISSING;
+ 
+     if (SUCCEEDED(hr))
+diff --git a/dlls/windowscodecs/info.c b/dlls/windowscodecs/info.c
+index 4063196e27c..59d9d7a89be 100644
+--- a/dlls/windowscodecs/info.c
++++ b/dlls/windowscodecs/info.c
+@@ -135,6 +135,16 @@ static HRESULT ComponentInfo_GetUINTValue(ComponentInfo *info, LPCWSTR value,
+     return HRESULT_FROM_WIN32(ret);
+ }
+ 
++/* WIC does not check signatures: Windows reports every component as signed */
++static HRESULT get_signing_status(DWORD *status)
++{
++    if (!status)
++        return E_INVALIDARG;
++
++    *status = WICComponentSigned;
++    return S_OK;
++}
++
+ static HRESULT ComponentInfo_GetGuidList(ComponentInfo *info, LPCWSTR subkeyname,
+     UINT buffersize, GUID *buffer, UINT *actual_size)
+ {
+@@ -289,8 +299,9 @@ static HRESULT WINAPI BitmapDecoderInfo_GetCLSID(IWICBitmapDecoderInfo *iface, C
+ 
+ static HRESULT WINAPI BitmapDecoderInfo_GetSigningStatus(IWICBitmapDecoderInfo *iface, DWORD *pStatus)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pStatus);
+-    return E_NOTIMPL;
++    TRACE("(%p,%p)\n", iface, pStatus);
++
++    return get_signing_status(pStatus);
+ }
+ 
+ static HRESULT WINAPI BitmapDecoderInfo_GetAuthor(IWICBitmapDecoderInfo *iface, UINT cchAuthor,
+@@ -407,29 +418,41 @@ static HRESULT WINAPI BitmapDecoderInfo_GetFileExtensions(IWICBitmapDecoderInfo
+ static HRESULT WINAPI BitmapDecoderInfo_DoesSupportAnimation(IWICBitmapDecoderInfo *iface,
+     BOOL *pfSupportAnimation)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportAnimation);
+-    return E_NOTIMPL;
++    BitmapDecoderInfo *This = impl_from_IWICBitmapDecoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportAnimation);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportAnimation", pfSupportAnimation);
+ }
+ 
+ static HRESULT WINAPI BitmapDecoderInfo_DoesSupportChromaKey(IWICBitmapDecoderInfo *iface,
+     BOOL *pfSupportChromaKey)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportChromaKey);
+-    return E_NOTIMPL;
++    BitmapDecoderInfo *This = impl_from_IWICBitmapDecoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportChromaKey);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportChromakey", pfSupportChromaKey);
+ }
+ 
+ static HRESULT WINAPI BitmapDecoderInfo_DoesSupportLossless(IWICBitmapDecoderInfo *iface,
+     BOOL *pfSupportLossless)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportLossless);
+-    return E_NOTIMPL;
++    BitmapDecoderInfo *This = impl_from_IWICBitmapDecoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportLossless);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportLossless", pfSupportLossless);
+ }
+ 
+ static HRESULT WINAPI BitmapDecoderInfo_DoesSupportMultiframe(IWICBitmapDecoderInfo *iface,
+     BOOL *pfSupportMultiframe)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportMultiframe);
+-    return E_NOTIMPL;
++    BitmapDecoderInfo *This = impl_from_IWICBitmapDecoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportMultiframe);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportMultiframe", pfSupportMultiframe);
+ }
+ 
+ static HRESULT WINAPI BitmapDecoderInfo_MatchesMimeType(IWICBitmapDecoderInfo *iface,
+@@ -765,8 +788,9 @@ static HRESULT WINAPI BitmapEncoderInfo_GetCLSID(IWICBitmapEncoderInfo *iface, C
+ 
+ static HRESULT WINAPI BitmapEncoderInfo_GetSigningStatus(IWICBitmapEncoderInfo *iface, DWORD *pStatus)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pStatus);
+-    return E_NOTIMPL;
++    TRACE("(%p,%p)\n", iface, pStatus);
++
++    return get_signing_status(pStatus);
+ }
+ 
+ static HRESULT WINAPI BitmapEncoderInfo_GetAuthor(IWICBitmapEncoderInfo *iface, UINT cchAuthor,
+@@ -883,29 +907,41 @@ static HRESULT WINAPI BitmapEncoderInfo_GetFileExtensions(IWICBitmapEncoderInfo
+ static HRESULT WINAPI BitmapEncoderInfo_DoesSupportAnimation(IWICBitmapEncoderInfo *iface,
+     BOOL *pfSupportAnimation)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportAnimation);
+-    return E_NOTIMPL;
++    BitmapEncoderInfo *This = impl_from_IWICBitmapEncoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportAnimation);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportAnimation", pfSupportAnimation);
+ }
+ 
+ static HRESULT WINAPI BitmapEncoderInfo_DoesSupportChromaKey(IWICBitmapEncoderInfo *iface,
+     BOOL *pfSupportChromaKey)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportChromaKey);
+-    return E_NOTIMPL;
++    BitmapEncoderInfo *This = impl_from_IWICBitmapEncoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportChromaKey);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportChromakey", pfSupportChromaKey);
+ }
+ 
+ static HRESULT WINAPI BitmapEncoderInfo_DoesSupportLossless(IWICBitmapEncoderInfo *iface,
+     BOOL *pfSupportLossless)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportLossless);
+-    return E_NOTIMPL;
++    BitmapEncoderInfo *This = impl_from_IWICBitmapEncoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportLossless);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportLossless", pfSupportLossless);
+ }
+ 
+ static HRESULT WINAPI BitmapEncoderInfo_DoesSupportMultiframe(IWICBitmapEncoderInfo *iface,
+     BOOL *pfSupportMultiframe)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pfSupportMultiframe);
+-    return E_NOTIMPL;
++    BitmapEncoderInfo *This = impl_from_IWICBitmapEncoderInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, pfSupportMultiframe);
++
++    return ComponentInfo_GetUINTValue(&This->base, L"SupportMultiframe", pfSupportMultiframe);
+ }
+ 
+ static HRESULT WINAPI BitmapEncoderInfo_MatchesMimeType(IWICBitmapEncoderInfo *iface,
+@@ -1048,8 +1084,9 @@ static HRESULT WINAPI FormatConverterInfo_GetCLSID(IWICFormatConverterInfo *ifac
+ 
+ static HRESULT WINAPI FormatConverterInfo_GetSigningStatus(IWICFormatConverterInfo *iface, DWORD *pStatus)
+ {
+-    FIXME("(%p,%p): stub\n", iface, pStatus);
+-    return E_NOTIMPL;
++    TRACE("(%p,%p)\n", iface, pStatus);
++
++    return get_signing_status(pStatus);
+ }
+ 
+ static HRESULT WINAPI FormatConverterInfo_GetAuthor(IWICFormatConverterInfo *iface, UINT cchAuthor,
+@@ -1564,8 +1601,9 @@ static HRESULT WINAPI MetadataReaderInfo_GetCLSID(IWICMetadataReaderInfo *iface,
+ static HRESULT WINAPI MetadataReaderInfo_GetSigningStatus(IWICMetadataReaderInfo *iface,
+     DWORD *status)
+ {
+-    FIXME("(%p,%p): stub\n", iface, status);
+-    return E_NOTIMPL;
++    TRACE("(%p,%p)\n", iface, status);
++
++    return get_signing_status(status);
+ }
+ 
+ static HRESULT WINAPI MetadataReaderInfo_GetAuthor(IWICMetadataReaderInfo *iface,
+@@ -1681,8 +1719,9 @@ static HRESULT WINAPI MetadataReaderInfo_DoesSupportPadding(IWICMetadataReaderIn
+ static HRESULT WINAPI MetadataReaderInfo_DoesRequireFixedSize(IWICMetadataReaderInfo *iface,
+     BOOL *param)
+ {
+-    FIXME("(%p,%p): stub\n", iface, param);
+-    return E_NOTIMPL;
++    MetadataReaderInfo *This = impl_from_IWICMetadataReaderInfo(iface);
++    TRACE("(%p,%p)\n", iface, param);
++    return ComponentInfo_GetUINTValue(&This->base, L"FixedSize", param);
+ }
+ 
+ static HRESULT WINAPI MetadataReaderInfo_GetPatterns(IWICMetadataReaderInfo *iface,
+@@ -2060,8 +2099,9 @@ static HRESULT WINAPI metadata_writer_info_GetCLSID(IWICMetadataWriterInfo *ifac
+ 
+ static HRESULT WINAPI metadata_writer_info_GetSigningStatus(IWICMetadataWriterInfo *iface, DWORD *status)
+ {
+-    FIXME("(%p,%p): stub\n", iface, status);
+-    return E_NOTIMPL;
++    TRACE("(%p,%p)\n", iface, status);
++
++    return get_signing_status(status);
+ }
+ 
+ static HRESULT WINAPI metadata_writer_info_GetAuthor(IWICMetadataWriterInfo *iface,
+@@ -2164,8 +2204,11 @@ static HRESULT WINAPI metadata_writer_info_DoesSupportPadding(IWICMetadataWriter
+ 
+ static HRESULT WINAPI metadata_writer_info_DoesRequireFixedSize(IWICMetadataWriterInfo *iface, BOOL *param)
+ {
+-    FIXME("(%p,%p): stub\n", iface, param);
+-    return E_NOTIMPL;
++    struct metadata_writer_info *info = impl_from_IWICMetadataWriterInfo(iface);
++
++    TRACE("(%p,%p)\n", iface, param);
++
++    return ComponentInfo_GetUINTValue(&info->base, L"FixedSize", param);
+ }
+ 
+ static HRESULT WINAPI metadata_writer_info_GetHeader(IWICMetadataWriterInfo *iface, REFGUID container_format,
+diff --git a/dlls/windowscodecs/libwebp.c b/dlls/windowscodecs/libwebp.c
+new file mode 100644
+index 00000000000..9c6f2f693fa
+--- /dev/null
++++ b/dlls/windowscodecs/libwebp.c
+@@ -0,0 +1,606 @@
++/*
++ * WebP decoder
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Windows' WebP decoder is libwebp's: its frames are what the animation decoder composes on the canvas, in
++ * straight RGBA, a still picture being an animation of one frame.  GetFrame takes any index, and copying the
++ * pixels of a frame the file does not have fails.  A still picture is taken on the strength of its header and
++ * only decoded for its pixels, an animation has to be whole from the start.  An animation's loop count and each
++ * frame's duration are its metadata, read from the ANIM and ANMF chunks by readers of their own. */
++
++#include <stdarg.h>
++#include <webp/decode.h>
++#include <webp/demux.h>
++
++#define COBJMACROS
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "winbase.h"
++#include "objbase.h"
++#include "shlwapi.h"
++#include "mfapi.h"
++#include "mftransform.h"
++#include "mferror.h"
++
++#include "wincodecs_private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wincodecs);
++
++struct webp_chunk
++{
++    ULONG offset;  /* of the payload */
++    ULONG length;
++};
++
++struct webp_decoder
++{
++    struct decoder decoder;
++    BYTE *data;
++    ULONG size;
++    WebPAnimDecoder *anim;
++    WebPAnimInfo info;
++    UINT decoded;  /* frames composed on the canvas so far */
++    BYTE *canvas;
++    struct webp_chunk anim_chunk;
++    struct webp_chunk *frame_chunks;
++    UINT frame_chunk_count;
++};
++
++/* where the ANIM chunk and the ANMF chunks are */
++static HRESULT find_animation_chunks( struct webp_decoder *This )
++{
++    ULONG offset = 12, length;
++
++    while (offset + 8 <= This->size)
++    {
++        length = This->data[offset + 4] | This->data[offset + 5] << 8 | This->data[offset + 6] << 16 |
++                 This->data[offset + 7] << 24;
++        if (length > This->size - offset - 8) break;
++        if (!memcmp( This->data + offset, "ANIM", 4 ))
++        {
++            This->anim_chunk.offset = offset + 8;
++            This->anim_chunk.length = length;
++        }
++        else if (!memcmp( This->data + offset, "ANMF", 4 ))
++        {
++            struct webp_chunk *chunks;
++
++            if (!(chunks = realloc( This->frame_chunks, (This->frame_chunk_count + 1) * sizeof(*chunks) )))
++                return E_OUTOFMEMORY;
++            This->frame_chunks = chunks;
++            chunks[This->frame_chunk_count].offset = offset + 8;
++            chunks[This->frame_chunk_count].length = length;
++            This->frame_chunk_count++;
++        }
++        offset += 8 + length + (length & 1);
++    }
++    return S_OK;
++}
++
++static inline struct webp_decoder *impl_from_decoder( struct decoder *iface )
++{
++    return CONTAINING_RECORD( iface, struct webp_decoder, decoder );
++}
++
++static WebPAnimDecoder *create_anim_decoder( struct webp_decoder *This )
++{
++    WebPAnimDecoderOptions options;
++    WebPData webp;
++
++    WebPAnimDecoderOptionsInit( &options );
++    options.color_mode = MODE_RGBA;
++    options.use_threads = 0;
++    webp.bytes = This->data;
++    webp.size = This->size;
++    return WebPAnimDecoderNew( &webp, &options );
++}
++
++static HRESULT CDECL webp_decoder_initialize( struct decoder *iface, IStream *stream, struct decoder_stat *st )
++{
++    struct webp_decoder *This = impl_from_decoder( iface );
++    WebPBitstreamFeatures features;
++    ULONGLONG size;
++    ULONG read;
++    HRESULT hr;
++
++    /* after a failed attempt */
++    WebPAnimDecoderDelete( This->anim );
++    This->anim = NULL;
++    free( This->data );
++    This->data = NULL;
++    free( This->frame_chunks );
++    This->frame_chunks = NULL;
++    This->frame_chunk_count = 0;
++    memset( &This->anim_chunk, 0, sizeof(This->anim_chunk) );
++
++    if (FAILED(hr = stream_getsize( stream, &size ))) return hr;
++    if (size > 0x7fffffff) return WINCODEC_ERR_BADIMAGE;
++    if (FAILED(hr = stream_seek( stream, 0, STREAM_SEEK_SET, NULL ))) return hr;
++    if (!(This->data = malloc( size ))) return E_OUTOFMEMORY;
++    if (FAILED(hr = stream_read( stream, This->data, size, &read ))) return hr;
++    This->size = read;
++
++    if (WebPGetFeatures( This->data, read, &features ) != VP8_STATUS_OK)
++    {
++        WARN( "not a WebP file\n" );
++        return MF_E_INVALID_FILE_FORMAT;
++    }
++    if (features.has_animation)
++    {
++        if (!(This->anim = create_anim_decoder( This )))
++        {
++            WARN( "broken animation\n" );
++            return E_UNEXPECTED;
++        }
++        WebPAnimDecoderGetInfo( This->anim, &This->info );
++        if (FAILED(hr = find_animation_chunks( This ))) return hr;
++    }
++    else
++    {
++        This->info.canvas_width = features.width;
++        This->info.canvas_height = features.height;
++        This->info.frame_count = 1;
++    }
++    TRACE( "%ux%u, %u frames, loop %u, background %08x\n", This->info.canvas_width, This->info.canvas_height,
++           This->info.frame_count, This->info.loop_count, This->info.bgcolor );
++
++    st->frame_count = This->info.frame_count;
++    st->flags = WICBitmapDecoderCapabilityCanDecodeAllImages | WICBitmapDecoderCapabilityCanEnumerateMetadata |
++                DECODER_FLAGS_METADATA_AT_DECODER | DECODER_FLAGS_UNSUPPORTED_COLOR_CONTEXT |
++                DECODER_FLAGS_ANY_FRAME_INDEX;
++    return S_OK;
++}
++
++static HRESULT CDECL webp_decoder_get_frame_info( struct decoder *iface, UINT frame, struct decoder_frame *info )
++{
++    struct webp_decoder *This = impl_from_decoder( iface );
++
++    info->pixel_format = GUID_WICPixelFormat32bppRGBA;
++    info->width = This->info.canvas_width;
++    info->height = This->info.canvas_height;
++    info->bpp = 32;
++    info->dpix = info->dpiy = 72.0;
++    info->num_color_contexts = 0;
++    info->num_colors = 0;
++    return S_OK;
++}
++
++static HRESULT CDECL webp_decoder_get_decoder_palette( struct decoder *iface, UINT frame, WICColor *colors,
++                                                       UINT *num_colors )
++{
++    *num_colors = 0;
++    return S_OK;
++}
++
++static HRESULT CDECL webp_decoder_copy_pixels( struct decoder *iface, UINT frame, const WICRect *prc,
++                                               UINT stride, UINT buffersize, BYTE *buffer )
++{
++    struct webp_decoder *This = impl_from_decoder( iface );
++    uint8_t *canvas;
++    int timestamp;
++
++    if (frame >= This->info.frame_count) return MF_E_INVALIDINDEX;
++    if (!This->anim && !(This->anim = create_anim_decoder( This ))) return MF_E_INVALID_FILE_FORMAT;
++
++    /* the frames are composed in order, each on those before */
++    if (frame + 1 < This->decoded)
++    {
++        WebPAnimDecoderReset( This->anim );
++        This->decoded = 0;
++    }
++    while (This->decoded <= frame)
++    {
++        if (!WebPAnimDecoderGetNext( This->anim, &canvas, &timestamp ))
++        {
++            WARN( "frame %u does not decode\n", This->decoded );
++            WebPAnimDecoderReset( This->anim );
++            This->decoded = 0;
++            return MF_E_INVALID_FILE_FORMAT;
++        }
++        This->canvas = canvas;
++        This->decoded++;
++    }
++
++    return copy_pixels( 32, This->canvas, This->info.canvas_width, This->info.canvas_height,
++                        This->info.canvas_width * 4, prc, stride, buffersize, buffer );
++}
++
++static HRESULT CDECL webp_decoder_get_metadata_blocks( struct decoder *iface, UINT frame, UINT *count,
++                                                       struct decoder_block **blocks )
++{
++    struct webp_decoder *This = impl_from_decoder( iface );
++    const struct webp_chunk *chunk = NULL;
++    const CLSID *reader = NULL;
++
++    *count = 0;
++    *blocks = NULL;
++    if (frame == ~0u && This->anim_chunk.length)
++    {
++        chunk = &This->anim_chunk;
++        reader = &CLSID_WICWebpAnimMetadataReader;
++    }
++    else if (frame < This->frame_chunk_count)
++    {
++        chunk = &This->frame_chunks[frame];
++        reader = &CLSID_WICWebpAnmfMetadataReader;
++    }
++    if (!chunk) return S_OK;
++
++    if (!(*blocks = calloc( 1, sizeof(**blocks) ))) return E_OUTOFMEMORY;
++    (*blocks)->offset = chunk->offset;
++    (*blocks)->length = chunk->length;
++    (*blocks)->options = DECODER_BLOCK_READER_CLSID;
++    (*blocks)->reader_clsid = *reader;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT CDECL webp_decoder_get_color_context( struct decoder *iface, UINT frame, UINT num,
++                                                     BYTE **data, DWORD *datasize )
++{
++    return E_NOTIMPL;
++}
++
++static void CDECL webp_decoder_destroy( struct decoder *iface )
++{
++    struct webp_decoder *This = impl_from_decoder( iface );
++
++    WebPAnimDecoderDelete( This->anim );
++    free( This->frame_chunks );
++    free( This->data );
++    free( This );
++}
++
++static const struct decoder_funcs webp_decoder_vtable =
++{
++    webp_decoder_initialize,
++    webp_decoder_get_frame_info,
++    webp_decoder_get_decoder_palette,
++    webp_decoder_copy_pixels,
++    webp_decoder_get_metadata_blocks,
++    webp_decoder_get_color_context,
++    webp_decoder_destroy
++};
++
++HRESULT CDECL webp_decoder_create( struct decoder_info *info, struct decoder **result )
++{
++    struct webp_decoder *This;
++
++    if (!(This = calloc( 1, sizeof(*This) ))) return E_OUTOFMEMORY;
++    This->decoder.vtable = &webp_decoder_vtable;
++    *result = &This->decoder;
++
++    info->container_format = GUID_ContainerFormatWebp;
++    info->block_format = GUID_ContainerFormatWebp;
++    info->clsid = CLSID_WICWebpDecoder;
++    return S_OK;
++}
++
++/* the loop count after the background colour of the ANIM chunk */
++static HRESULT load_anim_metadata( MetadataHandler *handler, IStream *stream, const GUID *vendor, DWORD options )
++{
++    MetadataItem *item;
++    BYTE data[6];
++    ULONG read;
++    HRESULT hr;
++
++    if (FAILED(hr = IStream_Read( stream, data, sizeof(data), &read ))) return hr;
++    if (read != sizeof(data)) return WINCODEC_ERR_BADMETADATAHEADER;
++
++    if (!(item = calloc( 1, sizeof(*item) ))) return E_OUTOFMEMORY;
++    item->id.vt = VT_LPWSTR;
++    SHStrDupW( L"LoopCount", &item->id.pwszVal );
++    item->value.vt = VT_UI2;
++    item->value.uiVal = data[4] | data[5] << 8;
++
++    MetadataHandler_FreeItems( handler );
++    handler->items = item;
++    handler->item_count = 1;
++    return S_OK;
++}
++
++static const MetadataHandlerVtbl anim_reader_vtbl =
++{
++    .clsid = &CLSID_WICWebpAnimMetadataReader,
++    .fnLoad = load_anim_metadata,
++};
++
++HRESULT WebpAnimReader_CreateInstance( REFIID iid, void **ppv )
++{
++    return MetadataReader_Create( &anim_reader_vtbl, iid, ppv );
++}
++
++/* the duration after the frame's offset and size in the ANMF chunk */
++static HRESULT load_anmf_metadata( MetadataHandler *handler, IStream *stream, const GUID *vendor, DWORD options )
++{
++    MetadataItem *item;
++    BYTE data[16];
++    ULONG read;
++    HRESULT hr;
++
++    if (FAILED(hr = IStream_Read( stream, data, sizeof(data), &read ))) return hr;
++    if (read != sizeof(data)) return WINCODEC_ERR_BADMETADATAHEADER;
++
++    if (!(item = calloc( 1, sizeof(*item) ))) return E_OUTOFMEMORY;
++    item->id.vt = VT_LPWSTR;
++    SHStrDupW( L"FrameDuration", &item->id.pwszVal );
++    item->value.vt = VT_UI4;
++    item->value.ulVal = data[12] | data[13] << 8 | data[14] << 16;
++
++    MetadataHandler_FreeItems( handler );
++    handler->items = item;
++    handler->item_count = 1;
++    return S_OK;
++}
++
++static const MetadataHandlerVtbl anmf_reader_vtbl =
++{
++    .clsid = &CLSID_WICWebpAnmfMetadataReader,
++    .fnLoad = load_anmf_metadata,
++};
++
++HRESULT WebpAnmfReader_CreateInstance( REFIID iid, void **ppv )
++{
++    return MetadataReader_Create( &anmf_reader_vtbl, iid, ppv );
++}
++
++/* Windows' WebP image extension registers a video decoder transform for the WebP subtype, which is the WIC
++ * decoder's class id.  It decodes nothing -- every method but GetAttributes is E_NOTIMPL -- but Office inserts a
++ * WebP picture only when there is one, and then decodes it with WIC. */
++struct webp_extension
++{
++    IMFTransform IMFTransform_iface;
++    LONG refcount;
++    IMFAttributes *attributes;
++};
++
++static inline struct webp_extension *impl_from_IMFTransform( IMFTransform *iface )
++{
++    return CONTAINING_RECORD( iface, struct webp_extension, IMFTransform_iface );
++}
++
++static HRESULT WINAPI webp_extension_QueryInterface( IMFTransform *iface, REFIID iid, void **out )
++{
++    struct webp_extension *transform = impl_from_IMFTransform( iface );
++
++    TRACE( "iface %p, iid %s, out %p\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IMFTransform ))
++    {
++        *out = &transform->IMFTransform_iface;
++        IMFTransform_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI webp_extension_AddRef( IMFTransform *iface )
++{
++    struct webp_extension *transform = impl_from_IMFTransform( iface );
++    return InterlockedIncrement( &transform->refcount );
++}
++
++static ULONG WINAPI webp_extension_Release( IMFTransform *iface )
++{
++    struct webp_extension *transform = impl_from_IMFTransform( iface );
++    ULONG refcount = InterlockedDecrement( &transform->refcount );
++
++    if (!refcount)
++    {
++        IMFAttributes_Release( transform->attributes );
++        free( transform );
++    }
++    return refcount;
++}
++
++static HRESULT WINAPI webp_extension_GetStreamLimits( IMFTransform *iface, DWORD *input_minimum,
++                                                      DWORD *input_maximum, DWORD *output_minimum,
++                                                      DWORD *output_maximum )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetStreamCount( IMFTransform *iface, DWORD *inputs, DWORD *outputs )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetStreamIDs( IMFTransform *iface, DWORD input_size, DWORD *inputs,
++                                                   DWORD output_size, DWORD *outputs )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetInputStreamInfo( IMFTransform *iface, DWORD id, MFT_INPUT_STREAM_INFO *info )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetOutputStreamInfo( IMFTransform *iface, DWORD id,
++                                                          MFT_OUTPUT_STREAM_INFO *info )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetAttributes( IMFTransform *iface, IMFAttributes **attributes )
++{
++    struct webp_extension *transform = impl_from_IMFTransform( iface );
++
++    TRACE( "iface %p, attributes %p\n", iface, attributes );
++
++    IMFAttributes_AddRef( (*attributes = transform->attributes) );
++    return S_OK;
++}
++
++static HRESULT WINAPI webp_extension_GetInputStreamAttributes( IMFTransform *iface, DWORD id,
++                                                               IMFAttributes **attributes )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetOutputStreamAttributes( IMFTransform *iface, DWORD id,
++                                                                IMFAttributes **attributes )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_DeleteInputStream( IMFTransform *iface, DWORD id )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_AddInputStreams( IMFTransform *iface, DWORD streams, DWORD *ids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetInputAvailableType( IMFTransform *iface, DWORD id, DWORD index,
++                                                            IMFMediaType **type )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetOutputAvailableType( IMFTransform *iface, DWORD id, DWORD index,
++                                                             IMFMediaType **type )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_SetInputType( IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_SetOutputType( IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetInputCurrentType( IMFTransform *iface, DWORD id, IMFMediaType **type )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetOutputCurrentType( IMFTransform *iface, DWORD id, IMFMediaType **type )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetInputStatus( IMFTransform *iface, DWORD id, DWORD *flags )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_GetOutputStatus( IMFTransform *iface, DWORD *flags )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_SetOutputBounds( IMFTransform *iface, LONGLONG lower, LONGLONG upper )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_ProcessEvent( IMFTransform *iface, DWORD id, IMFMediaEvent *event )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_ProcessMessage( IMFTransform *iface, MFT_MESSAGE_TYPE message, ULONG_PTR param )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_ProcessInput( IMFTransform *iface, DWORD id, IMFSample *sample, DWORD flags )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI webp_extension_ProcessOutput( IMFTransform *iface, DWORD flags, DWORD count,
++                                                    MFT_OUTPUT_DATA_BUFFER *samples, DWORD *status )
++{
++    return E_NOTIMPL;
++}
++
++static const IMFTransformVtbl webp_extension_vtbl =
++{
++    webp_extension_QueryInterface,
++    webp_extension_AddRef,
++    webp_extension_Release,
++    webp_extension_GetStreamLimits,
++    webp_extension_GetStreamCount,
++    webp_extension_GetStreamIDs,
++    webp_extension_GetInputStreamInfo,
++    webp_extension_GetOutputStreamInfo,
++    webp_extension_GetAttributes,
++    webp_extension_GetInputStreamAttributes,
++    webp_extension_GetOutputStreamAttributes,
++    webp_extension_DeleteInputStream,
++    webp_extension_AddInputStreams,
++    webp_extension_GetInputAvailableType,
++    webp_extension_GetOutputAvailableType,
++    webp_extension_SetInputType,
++    webp_extension_SetOutputType,
++    webp_extension_GetInputCurrentType,
++    webp_extension_GetOutputCurrentType,
++    webp_extension_GetInputStatus,
++    webp_extension_GetOutputStatus,
++    webp_extension_SetOutputBounds,
++    webp_extension_ProcessEvent,
++    webp_extension_ProcessMessage,
++    webp_extension_ProcessInput,
++    webp_extension_ProcessOutput,
++};
++
++HRESULT WebpImageExtension_CreateInstance( REFIID iid, void **out )
++{
++    struct webp_extension *transform;
++    HRESULT hr;
++
++    if (!(transform = calloc( 1, sizeof(*transform) ))) return E_OUTOFMEMORY;
++    transform->IMFTransform_iface.lpVtbl = &webp_extension_vtbl;
++    transform->refcount = 1;
++    if (FAILED(hr = MFCreateAttributes( &transform->attributes, 0 )))
++    {
++        free( transform );
++        return hr;
++    }
++    hr = IMFTransform_QueryInterface( &transform->IMFTransform_iface, iid, out );
++    IMFTransform_Release( &transform->IMFTransform_iface );
++    return hr;
++}
++
++HRESULT register_webp_image_extension(void)
++{
++    MFT_REGISTER_TYPE_INFO input = { MFMediaType_Video, CLSID_WICWebpDecoder };
++    MFT_REGISTER_TYPE_INFO output = { MFMediaType_Video, MFVideoFormat_P010 };
++
++    return MFTRegister( CLSID_WebpImageExtension, MFT_CATEGORY_VIDEO_DECODER, (WCHAR *)L"WebpImageExtension",
++                        MFT_ENUM_FLAG_SYNCMFT, 1, &input, 1, &output, NULL );
++}
++
++HRESULT unregister_webp_image_extension(void)
++{
++    return MFTUnregister( CLSID_WebpImageExtension );
++}
+diff --git a/dlls/windowscodecs/main.c b/dlls/windowscodecs/main.c
+index 27012f7431d..8a09feee616 100644
+--- a/dlls/windowscodecs/main.c
++++ b/dlls/windowscodecs/main.c
+@@ -118,6 +118,20 @@ HRESULT JpegDecoder_CreateInstance(REFIID iid, void** ppv)
+     return hr;
+ }
+ 
++HRESULT WebpDecoder_CreateInstance(REFIID iid, void** ppv)
++{
++    HRESULT hr;
++    struct decoder *decoder;
++    struct decoder_info decoder_info;
++
++    hr = webp_decoder_create(&decoder_info, &decoder);
++
++    if (SUCCEEDED(hr))
++        hr = CommonDecoder_CreateInstance(decoder, &decoder_info, iid, ppv);
++
++    return hr;
++}
++
+ HRESULT JpegEncoder_CreateInstance(REFIID iid, void** ppv)
+ {
+     HRESULT hr;
+diff --git a/dlls/windowscodecs/regsvr.c b/dlls/windowscodecs/regsvr.c
+index 8c2ff060fe0..ed4897c71c0 100644
+--- a/dlls/windowscodecs/regsvr.c
++++ b/dlls/windowscodecs/regsvr.c
+@@ -60,8 +60,15 @@ struct regsvr_decoder
+     LPCSTR extensions;
+     GUID const * const *formats;
+     const struct decoder_pattern *patterns;
++    DWORD supports;
+ };
+ 
++/* what IWICBitmapCodecInfo says a codec supports */
++#define SUPPORTS_ANIMATION   0x1
++#define SUPPORTS_CHROMAKEY   0x2
++#define SUPPORTS_LOSSLESS    0x4
++#define SUPPORTS_MULTIFRAME  0x8
++
+ static HRESULT register_decoders(struct regsvr_decoder const *list);
+ static HRESULT unregister_decoders(struct regsvr_decoder const *list);
+ 
+@@ -76,6 +83,7 @@ struct regsvr_encoder
+     LPCSTR mimetypes;
+     LPCSTR extensions;
+     GUID const * const *formats;
++    DWORD supports;
+ };
+ 
+ static HRESULT register_encoders(struct regsvr_encoder const *list);
+@@ -195,6 +203,26 @@ static const char numericrepresentation_valuename[] = "NumericRepresentation";
+ static const char supportstransparency_valuename[] = "SupportsTransparency";
+ static const WCHAR channelmasks_keyname[] = L"ChannelMasks";
+ 
++static LONG register_supports(HKEY key, DWORD supports)
++{
++    static const struct { const char *name; DWORD flag; } values[] =
++    {
++        { "SupportAnimation", SUPPORTS_ANIMATION },
++        { "SupportChromakey", SUPPORTS_CHROMAKEY },
++        { "SupportLossless", SUPPORTS_LOSSLESS },
++        { "SupportMultiframe", SUPPORTS_MULTIFRAME },
++    };
++    LONG res = ERROR_SUCCESS;
++    unsigned int i;
++
++    for (i = 0; res == ERROR_SUCCESS && i < ARRAY_SIZE(values); i++)
++    {
++        DWORD value = !!(supports & values[i].flag);
++        res = RegSetValueExA(key, values[i].name, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
++    }
++    return res;
++}
++
+ /***********************************************************************
+  *		register_decoders
+  */
+@@ -277,6 +305,10 @@ static HRESULT register_decoders(struct regsvr_decoder const *list)
+ 	    if (res != ERROR_SUCCESS) goto error_close_clsid_key;
+         }
+ 
++        /* as on Windows */
++        res = RegSetValueExA(clsid_key, specversion_valuename, 0, REG_SZ, (const BYTE *)"1.0.0.0", 8);
++        if (res != ERROR_SUCCESS) goto error_close_clsid_key;
++
+         if (list->mimetypes) {
+ 	    res = RegSetValueExA(clsid_key, mimetypes_valuename, 0, REG_SZ,
+                                  (const BYTE*)list->mimetypes,
+@@ -291,6 +323,9 @@ static HRESULT register_decoders(struct regsvr_decoder const *list)
+ 	    if (res != ERROR_SUCCESS) goto error_close_clsid_key;
+         }
+ 
++        res = register_supports(clsid_key, list->supports);
++        if (res != ERROR_SUCCESS) goto error_close_clsid_key;
++
+         if (list->formats) {
+             HKEY formats_key;
+             GUID const * const *format;
+@@ -491,6 +526,10 @@ static HRESULT register_encoders(struct regsvr_encoder const *list)
+ 	    if (res != ERROR_SUCCESS) goto error_close_clsid_key;
+         }
+ 
++        /* as on Windows */
++        res = RegSetValueExA(clsid_key, specversion_valuename, 0, REG_SZ, (const BYTE *)"1.0.0.0", 8);
++        if (res != ERROR_SUCCESS) goto error_close_clsid_key;
++
+         if (list->mimetypes) {
+ 	    res = RegSetValueExA(clsid_key, mimetypes_valuename, 0, REG_SZ,
+                                  (const BYTE*)list->mimetypes,
+@@ -505,6 +544,9 @@ static HRESULT register_encoders(struct regsvr_encoder const *list)
+ 	    if (res != ERROR_SUCCESS) goto error_close_clsid_key;
+         }
+ 
++        res = register_supports(clsid_key, list->supports);
++        if (res != ERROR_SUCCESS) goto error_close_clsid_key;
++
+         if (list->formats) {
+             HKEY formats_key;
+             GUID const * const *format;
+@@ -662,6 +704,10 @@ static HRESULT register_converters(struct regsvr_converter const *list)
+ 	    if (res != ERROR_SUCCESS) goto error_close_clsid_key;
+         }
+ 
++        /* as on Windows */
++        res = RegSetValueExA(clsid_key, specversion_valuename, 0, REG_SZ, (const BYTE *)"1.0.0.0", 8);
++        if (res != ERROR_SUCCESS) goto error_close_clsid_key;
++
+         if (list->formats) {
+             HKEY formats_key;
+             GUID const * const *format;
+@@ -1326,6 +1372,19 @@ static struct decoder_pattern const dds_patterns[] = {
+     {0}
+ };
+ 
++static const BYTE webp_magic[] = {'R','I','F','F',0,0,0,0,'W','E','B','P'};
++static const BYTE webp_mask[] = {0xff,0xff,0xff,0xff,0,0,0,0,0xff,0xff,0xff,0xff};
++
++static GUID const * const webp_formats[] = {
++    &GUID_WICPixelFormat32bppRGBA,
++    NULL
++};
++
++static struct decoder_pattern const webp_patterns[] = {
++    {12,0,webp_magic,webp_mask,0},
++    {0}
++};
++
+ static const BYTE gif87a_magic[6] = "GIF87a";
+ static const BYTE gif89a_magic[6] = "GIF89a";
+ 
+@@ -1476,7 +1535,8 @@ static struct regsvr_decoder const decoder_list[] = {
+ 	"image/bmp",
+ 	".bmp,.dib,.rle",
+ 	bmp_formats,
+-	bmp_patterns
++	bmp_patterns,
++	SUPPORTS_LOSSLESS
+     },
+     {   &CLSID_WICDdsDecoder,
+     "The Wine Project",
+@@ -1487,7 +1547,8 @@ static struct regsvr_decoder const decoder_list[] = {
+     "image/vnd.ms-dds",
+     ".dds",
+     dds_formats,
+-    dds_patterns
++    dds_patterns,
++    SUPPORTS_MULTIFRAME
+     },
+     {   &CLSID_WICGifDecoder,
+ 	"The Wine Project",
+@@ -1498,7 +1559,8 @@ static struct regsvr_decoder const decoder_list[] = {
+ 	"image/gif",
+ 	".gif",
+ 	gif_formats,
+-	gif_patterns
++	gif_patterns,
++	SUPPORTS_ANIMATION | SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
+     },
+     {   &CLSID_WICIcoDecoder,
+         "The Wine Project",
+@@ -1509,7 +1571,8 @@ static struct regsvr_decoder const decoder_list[] = {
+         "image/ico,image/x-icon",
+         ".ico,.icon",
+         ico_formats,
+-        ico_patterns
++        ico_patterns,
++        SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
+     },
+     {   &CLSID_WICJpegDecoder,
+         "The Wine Project",
+@@ -1520,7 +1583,8 @@ static struct regsvr_decoder const decoder_list[] = {
+         "image/jpeg,image/jpe,image/jpg",
+         ".jpeg,.jpe,.jpg,.jfif,.exif",
+         jpeg_formats,
+-        jpeg_patterns
++        jpeg_patterns,
++        0
+     },
+     {   &CLSID_WICWmpDecoder,
+ 	"The Wine Project",
+@@ -1531,7 +1595,8 @@ static struct regsvr_decoder const decoder_list[] = {
+ 	"image/jxr",
+ 	".jxr;.hdp;.wdp",
+ 	wmp_formats,
+-	wmp_patterns
++	wmp_patterns,
++	SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
+     },
+     {   &CLSID_WICPngDecoder,
+ 	"The Wine Project",
+@@ -1542,7 +1607,8 @@ static struct regsvr_decoder const decoder_list[] = {
+ 	"image/png",
+ 	".png",
+ 	png_formats,
+-	png_patterns
++	png_patterns,
++	SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS
+     },
+     {   &CLSID_WICTiffDecoder,
+         "The Wine Project",
+@@ -1553,7 +1619,20 @@ static struct regsvr_decoder const decoder_list[] = {
+         "image/tiff,image/tif",
+         ".tiff,.tif",
+         tiff_decode_formats,
+-        tiff_patterns
++        tiff_patterns,
++        SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
++    },
++    {   &CLSID_WICWebpDecoder,
++        "The Wine Project",
++        "Microsoft Webp Decoder",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_ContainerFormatWebp,
++        "image/webp",
++        ".webp",
++        webp_formats,
++        webp_patterns,
++        SUPPORTS_ANIMATION | SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
+     },
+     { NULL }			/* list terminator */
+ };
+@@ -1613,7 +1692,8 @@ static struct regsvr_encoder const encoder_list[] = {
+ 	&GUID_ContainerFormatBmp,
+ 	"image/bmp",
+ 	".bmp,.dib,.rle",
+-	bmp_encode_formats
++	bmp_encode_formats,
++	SUPPORTS_LOSSLESS
+     },
+     {   &CLSID_WICGifEncoder,
+ 	"The Wine Project",
+@@ -1623,7 +1703,8 @@ static struct regsvr_encoder const encoder_list[] = {
+ 	&GUID_ContainerFormatGif,
+ 	"image/gif",
+ 	".gif",
+-	gif_formats
++	gif_formats,
++	SUPPORTS_ANIMATION | SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
+     },
+     {   &CLSID_WICJpegEncoder,
+         "The Wine Project",
+@@ -1633,7 +1714,8 @@ static struct regsvr_encoder const encoder_list[] = {
+         &GUID_ContainerFormatJpeg,
+         "image/jpeg,image/jpe,image/jpg",
+         ".jpeg,.jpe,.jpg,.jfif,.exif",
+-        jpeg_formats
++        jpeg_formats,
++        0
+     },
+     {   &CLSID_WICPngEncoder,
+ 	"The Wine Project",
+@@ -1643,7 +1725,8 @@ static struct regsvr_encoder const encoder_list[] = {
+ 	&GUID_ContainerFormatPng,
+ 	"image/png",
+ 	".png",
+-	png_encode_formats
++	png_encode_formats,
++	SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS
+     },
+     {   &CLSID_WICTiffEncoder,
+         "The Wine Project",
+@@ -1653,7 +1736,19 @@ static struct regsvr_encoder const encoder_list[] = {
+         &GUID_ContainerFormatTiff,
+         "image/tiff,image/tif",
+         ".tiff,.tif",
+-        tiff_encode_formats
++        tiff_encode_formats,
++        SUPPORTS_CHROMAKEY | SUPPORTS_LOSSLESS | SUPPORTS_MULTIFRAME
++    },
++    {   &CLSID_WICDdsEncoder,
++        "The Wine Project",
++        "DDS Encoder",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_ContainerFormatDds,
++        "image/vnd.ms-dds",
++        ".dds",
++        dds_formats,
++        SUPPORTS_MULTIFRAME
+     },
+     { NULL }			/* list terminator */
+ };
+@@ -1761,6 +1856,22 @@ static const struct reader_containers pngtext_containers[] = {
+ 
+ static const BYTE gAMA[] = "gAMA";
+ 
++/* the WebP readers are the decoder's own, and take any stream */
++static const BYTE webp_anim_any[] = { 0 };
++
++static const struct metadata_pattern webp_anim_metadata_pattern[] = {
++    { 0, 1, webp_anim_any, webp_anim_any, 0 },
++    { 0 }
++};
++
++static const struct reader_containers webp_containers[] = {
++    {
++        &GUID_ContainerFormatWebp,
++        webp_anim_metadata_pattern
++    },
++    { NULL } /* list terminator */
++};
++
+ static const struct metadata_pattern pnggama_metadata_pattern[] = {
+     { 4, 4, gAMA, mask_all, 4 },
+     { 0 }
+@@ -1911,12 +2022,12 @@ static const struct reader_containers gif_comment_containers[] = {
+ static struct regsvr_metadatareader const metadatareader_list[] = {
+     {   &CLSID_WICUnknownMetadataReader,
+         "The Wine Project",
+-        "Unknown Metadata Reader",
++        "Unknown Reader",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatUnknown,
+-        0, 0, 0,
++        0, 0, 1,
+         NULL
+     },
+     {   &CLSID_WICIfdMetadataReader,
+@@ -1956,7 +2067,7 @@ static struct regsvr_metadatareader const metadatareader_list[] = {
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatApp1,
+-        1, 1, 0,
++        0, 1, 0,
+         app1_containers
+     },
+     {   &CLSID_WICPngChrmMetadataReader,
+@@ -1966,7 +2077,7 @@ static struct regsvr_metadatareader const metadatareader_list[] = {
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatChunkcHRM,
+-        0, 0, 0,
++        0, 0, 1,
+         pngchrm_containers
+     },
+     {   &CLSID_WICPngGamaMetadataReader,
+@@ -1976,7 +2087,7 @@ static struct regsvr_metadatareader const metadatareader_list[] = {
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatChunkgAMA,
+-        0, 0, 0,
++        0, 0, 1,
+         pnggama_containers
+     },
+     {   &CLSID_WICPngHistMetadataReader,
+@@ -1996,7 +2107,7 @@ static struct regsvr_metadatareader const metadatareader_list[] = {
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatChunktEXt,
+-        0, 0, 0,
++        0, 0, 1,
+         pngtext_containers
+     },
+     {   &CLSID_WICPngTimeMetadataReader,
+@@ -2006,7 +2117,7 @@ static struct regsvr_metadatareader const metadatareader_list[] = {
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatChunktIME,
+-        0, 0, 0,
++        0, 0, 1,
+         pngtime_containers
+     },
+     {   &CLSID_WICPngBkgdMetadataReader,
+@@ -2069,6 +2180,26 @@ static struct regsvr_metadatareader const metadatareader_list[] = {
+         0, 0, 0,
+         gif_comment_containers
+     },
++    {   &CLSID_WICWebpAnimMetadataReader,
++        "The Wine Project",
++        "Webp ANIM Properties Reader",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatWebpANIM,
++        0, 0, 1,
++        webp_containers
++    },
++    {   &CLSID_WICWebpAnmfMetadataReader,
++        "The Wine Project",
++        "Webp ANMF Properties Reader",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatWebpANMF,
++        0, 0, 1,
++        webp_containers
++    },
+     { NULL }			/* list terminator */
+ };
+ 
+@@ -2077,65 +2208,72 @@ static struct regsvr_metadatawriter const metadatawriters_list[] =
+     {
+         &CLSID_WICUnknownMetadataWriter,
+         "The Wine Project",
+-        "Unknown Metadata Writer",
++        "Unknown Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatUnknown,
++        0, 0, 1,
+     },
+     {
+         &CLSID_WICGpsMetadataWriter,
+         "The Wine Project",
+-        "Gps Metadata Writer",
++        "Gps Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatGps,
++        1, 1, 0,
+     },
+     {
+         &CLSID_WICExifMetadataWriter,
+         "The Wine Project",
+-        "Exif Metadata Writer",
++        "Exif Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatExif,
++        1, 1, 0,
+     },
+     {
+         &CLSID_WICIfdMetadataWriter,
+         "The Wine Project",
+-        "Ifd Metadata Writer",
++        "Ifd Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatIfd,
++        1, 1, 0,
+     },
+     {
+         &CLSID_WICApp1MetadataWriter,
+         "The Wine Project",
+-        "App1 Metadata Writer",
++        "App1 Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatApp1,
++        0, 1, 0,
+     },
+     {
+         &CLSID_WICPngBkgdMetadataWriter,
+         "The Wine Project",
+-        "Png bKGD Metadata Writer",
++        "Chunk bKGD Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatChunkbKGD,
++        0, 0, 0,
+     },
+     {
+         &CLSID_WICPngTimeMetadataWriter,
+         "The Wine Project",
+-        "Png tIME Metadata Writer",
++        "Chunk tIME Writer",
+         "1.0.0.0",
+         "1.0.0.0",
+         &GUID_VendorMicrosoft,
+         &GUID_MetadataFormatChunktIME,
++        0, 0, 1,
+     },
+     { NULL } /* list terminator */
+ };
+@@ -2647,6 +2785,8 @@ HRESULT WINAPI DllRegisterServer(void)
+         hr = register_metadatawriters(metadatawriters_list);
+     if (SUCCEEDED(hr))
+         hr = register_pixelformats(pixelformat_list);
++    if (SUCCEEDED(hr))
++        hr = register_webp_image_extension();
+     return hr;
+ }
+ 
+@@ -2671,5 +2811,7 @@ HRESULT WINAPI DllUnregisterServer(void)
+         hr = unregister_metadatawriters(metadatawriters_list);
+     if (SUCCEEDED(hr))
+         hr = unregister_pixelformats(pixelformat_list);
++    if (SUCCEEDED(hr))
++        hr = unregister_webp_image_extension();
+     return hr;
+ }
+diff --git a/dlls/windowscodecs/tests/Makefile.in b/dlls/windowscodecs/tests/Makefile.in
+index f6052992846..1081411b9de 100644
+--- a/dlls/windowscodecs/tests/Makefile.in
++++ b/dlls/windowscodecs/tests/Makefile.in
+@@ -16,4 +16,5 @@ SOURCES = \
+ 	propertybag.c \
+ 	stream.c \
+ 	tiffformat.c \
++	webpformat.c \
+ 	wmpformat.c
+diff --git a/dlls/windowscodecs/tests/info.c b/dlls/windowscodecs/tests/info.c
+index b2dcf1ab532..1fbc7cabb55 100644
+--- a/dlls/windowscodecs/tests/info.c
++++ b/dlls/windowscodecs/tests/info.c
+@@ -86,6 +86,42 @@ static HRESULT get_component_info(const GUID *clsid, IWICComponentInfo **result)
+     return hr;
+ }
+ 
++/* what a codec says it supports, and what every component reports as its signing and specification version */
++static void check_codec_info(IWICBitmapCodecInfo *info, const char *supports)
++{
++    WCHAR value[16];
++    DWORD status;
++    BOOL flag;
++    HRESULT hr;
++    UINT len;
++
++    flag = 0xdeadbeef;
++    hr = IWICBitmapCodecInfo_DoesSupportAnimation(info, &flag);
++    ok(hr == S_OK && flag == supports[0] - '0', "animation: got hr %#lx, %d\n", hr, flag);
++    flag = 0xdeadbeef;
++    hr = IWICBitmapCodecInfo_DoesSupportChromaKey(info, &flag);
++    ok(hr == S_OK && flag == supports[1] - '0', "chroma key: got hr %#lx, %d\n", hr, flag);
++    flag = 0xdeadbeef;
++    hr = IWICBitmapCodecInfo_DoesSupportLossless(info, &flag);
++    ok(hr == S_OK && flag == supports[2] - '0', "lossless: got hr %#lx, %d\n", hr, flag);
++    flag = 0xdeadbeef;
++    hr = IWICBitmapCodecInfo_DoesSupportMultiframe(info, &flag);
++    ok(hr == S_OK && flag == supports[3] - '0', "multiframe: got hr %#lx, %d\n", hr, flag);
++    hr = IWICBitmapCodecInfo_DoesSupportMultiframe(info, NULL);
++    ok(hr == E_INVALIDARG, "got hr %#lx\n", hr);
++
++    status = 0xdeadbeef;
++    hr = IWICBitmapCodecInfo_GetSigningStatus(info, &status);
++    ok(hr == S_OK && status == WICComponentSigned, "signing: got hr %#lx, %#lx\n", hr, status);
++    hr = IWICBitmapCodecInfo_GetSigningStatus(info, NULL);
++    ok(hr == E_INVALIDARG, "got hr %#lx\n", hr);
++
++    len = 0;
++    hr = IWICBitmapCodecInfo_GetSpecVersion(info, ARRAY_SIZE(value), value, &len);
++    ok(hr == S_OK && !wcscmp(value, L"1.0.0.0") && len == 8, "spec version: got hr %#lx, %s %u\n", hr,
++       debugstr_w(value), len);
++}
++
+ static BOOL is_pixelformat(GUID *format)
+ {
+     IWICComponentInfo *info;
+@@ -110,42 +146,56 @@ static void test_decoder_info(void)
+         const CLSID *clsid;
+         const WCHAR *mimetype;
+         const WCHAR *extensions;
++        const char *supports;  /* animation, chroma key, lossless, multiple frames */
+     } decoder_info_tests[] =
+     {
+         {
+             &CLSID_WICBmpDecoder,
+             L"image/bmp",
+-            L".bmp,.dib,.rle"
++            L".bmp,.dib,.rle",
++            "0010"
+         },
+         {
+             &CLSID_WICGifDecoder,
+             L"image/gif",
+-            L".gif"
++            L".gif",
++            "1111"
+         },
+         {
+             &CLSID_WICIcoDecoder,
+             L"image/ico,image/x-icon",
+             L".ico,.icon",
++            "0111"
+         },
+         {
+             &CLSID_WICJpegDecoder,
+             L"image/jpeg,image/jpe,image/jpg",
+             L".jpeg,.jpe,.jpg,.jfif,.exif",
++            "0000"
+         },
+         {
+             &CLSID_WICPngDecoder,
+             L"image/png",
+-            L".png"
++            L".png",
++            "0110"
+         },
+         {
+             &CLSID_WICTiffDecoder,
+             L"image/tiff,image/tif",
+             L".tiff,.tif",
++            "0111"
+         },
+         {
+             &CLSID_WICDdsDecoder,
+             L"image/vnd.ms-dds",
+             L".dds",
++            "0001"
++        },
++        {
++            &CLSID_WICWebpDecoder,
++            L"image/webp",
++            L".webp",
++            "1011"
+         }
+     };
+     IWICBitmapDecoderInfo *decoder_info, *decoder_info2;
+@@ -168,6 +218,10 @@ static void test_decoder_info(void)
+             win_skip("DDS decoder is not supported\n");
+             continue;
+         }
++        if (test->clsid == &CLSID_WICWebpDecoder && hr != S_OK) {
++            win_skip("WebP decoder is not supported\n");
++            continue;
++        }
+         ok(SUCCEEDED(hr), "Failed to create decoder, hr %#lx.\n", hr);
+ 
+         decoder_info = NULL;
+@@ -199,6 +253,8 @@ static void test_decoder_info(void)
+         hr = IWICBitmapDecoderInfo_GetCLSID(decoder_info, NULL);
+         ok(hr == E_INVALIDARG, "GetCLSID failed, hr=%lx\n", hr);
+ 
++        check_codec_info((IWICBitmapCodecInfo *)decoder_info, test->supports);
++
+         hr = IWICBitmapDecoderInfo_GetCLSID(decoder_info, &clsid);
+         ok(hr == S_OK, "GetCLSID failed, hr=%lx\n", hr);
+         ok(IsEqualGUID(test->clsid, &clsid), "GetCLSID returned wrong result\n");
+@@ -313,32 +369,44 @@ static void test_encoder_info(void)
+         const CLSID *clsid;
+         const WCHAR *mimetype;
+         const WCHAR *extensions;
++        const char *supports;  /* animation, chroma key, lossless, multiple frames */
+     } encoder_info_tests[] =
+     {
+         {
+             &CLSID_WICBmpEncoder,
+             L"image/bmp",
+-            L".bmp,.dib,.rle"
++            L".bmp,.dib,.rle",
++            "0010"
+         },
+         {
+             &CLSID_WICGifEncoder,
+             L"image/gif",
+-            L".gif"
++            L".gif",
++            "1111"
+         },
+         {
+             &CLSID_WICPngEncoder,
+             L"image/png",
+-            L".png"
++            L".png",
++            "0110"
+         },
+         {
+             &CLSID_WICJpegEncoder,
+             L"image/jpeg,image/jpe,image/jpg",
+             L".jpeg,.jpe,.jpg,.jfif,.exif",
++            "0000"
+         },
+         {
+             &CLSID_WICTiffEncoder,
+             L"image/tiff,image/tif",
+             L".tiff,.tif",
++            "0111"
++        },
++        {
++            &CLSID_WICDdsEncoder,
++            L"image/vnd.ms-dds",
++            L".dds",
++            "0001"
+         },
+     };
+     IWICBitmapEncoderInfo *encoder_info, *encoder_info2;
+@@ -357,7 +425,7 @@ static void test_encoder_info(void)
+         IWICBitmapEncoder *encoder, *encoder2;
+ 
+         hr = CoCreateInstance(test->clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IWICBitmapEncoder, (void **)&encoder);
+-        if (IsEqualGUID(&test->clsid, &CLSID_WICDdsDecoder) && hr != S_OK)
++        if (test->clsid == &CLSID_WICDdsEncoder && hr != S_OK)
+         {
+             win_skip("DDS encoder is not supported\n");
+             continue;
+@@ -395,6 +463,8 @@ static void test_encoder_info(void)
+         hr = IWICBitmapEncoderInfo_GetCLSID(encoder_info, NULL);
+         ok(hr == E_INVALIDARG, "GetCLSID failed, hr=%lx\n", hr);
+ 
++        check_codec_info((IWICBitmapCodecInfo *)encoder_info, test->supports);
++
+         hr = IWICBitmapEncoderInfo_GetCLSID(encoder_info, &clsid);
+         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+         ok(IsEqualGUID(test->clsid, &clsid), "GetCLSID returned wrong result\n");
+diff --git a/dlls/windowscodecs/tests/webpformat.c b/dlls/windowscodecs/tests/webpformat.c
+new file mode 100644
+index 00000000000..404faf9e765
+--- /dev/null
++++ b/dlls/windowscodecs/tests/webpformat.c
+@@ -0,0 +1,529 @@
++/*
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++
++#include "windef.h"
++#include "wincodec.h"
++#include "wincodecsdk.h"
++#include "shlwapi.h"
++#include "mferror.h"
++#include "wine/test.h"
++
++/* made with Pillow: a gradient with a rectangle and a circle, lossy at 33x17, lossless with alpha at 96x64, and
++ * three lossless frames at 64x48, the second with alpha */
++static const BYTE webp_odd_size[] =
++{
++    0x52,0x49,0x46,0x46,0xf2,0x00,0x00,0x00,0x57,0x45,0x42,0x50,0x56,0x50,0x38,0x20,
++    0xe6,0x00,0x00,0x00,0x90,0x05,0x00,0x9d,0x01,0x2a,0x21,0x00,0x11,0x00,0x3e,0x2d,
++    0x12,0x87,0x42,0xa1,0xa1,0x0d,0x52,0x00,0x0c,0x01,0x62,0x59,0x8d,0xc0,0x00,0x95,
++    0x87,0xf2,0x8f,0xc7,0x4b,0xe9,0xbe,0x00,0x7b,0x4c,0xdd,0x9a,0x51,0x00,0x0b,0x7a,
++    0x28,0x5b,0x7e,0xcc,0x6e,0x35,0xfe,0xec,0x00,0x00,0xfe,0xff,0xb3,0xf5,0xbd,0x0c,
++    0x7a,0xcd,0x55,0xbf,0x89,0x02,0xba,0x6c,0x5f,0x40,0xfd,0x3d,0xb3,0x3f,0xfd,0xc0,
++    0xff,0x83,0x9d,0xf2,0xb7,0xd4,0xcc,0x68,0x4e,0xcd,0xfd,0x08,0x37,0x79,0xeb,0xa1,
++    0x2a,0x67,0x15,0xff,0xff,0xe5,0xed,0xd3,0x06,0xf6,0xd7,0x7c,0x4d,0x6e,0x6f,0xfd,
++    0xb0,0xff,0x66,0xa2,0xff,0x31,0xe5,0xdb,0xff,0xc6,0x67,0xeb,0x52,0xfa,0xac,0x5f,
++    0xff,0xee,0xb3,0x93,0x54,0x59,0x0f,0x8b,0x94,0xde,0x27,0xff,0xe9,0xe7,0xf4,0xff,
++    0xf2,0x77,0xf5,0xdb,0xd0,0x93,0x53,0xf9,0x77,0xf5,0x75,0xbb,0x09,0xe1,0xec,0xdc,
++    0x51,0xb9,0xca,0x2e,0x94,0x9c,0xca,0xdd,0x44,0xab,0x25,0x30,0x81,0x9f,0x72,0x81,
++    0x98,0x7e,0x88,0x89,0xc2,0x0c,0x64,0x3f,0x99,0xdf,0xf0,0xf0,0x8b,0xdb,0xc0,0x56,
++    0x54,0xb8,0x19,0xcb,0xb0,0x3e,0xe8,0x83,0x45,0xe3,0x59,0xc3,0x3d,0x3a,0x7b,0xdb,
++    0x76,0x04,0x4a,0xec,0x0b,0x7b,0xe0,0x05,0xbd,0xea,0x86,0x31,0x61,0x5c,0xee,0x43,
++    0xa4,0x60,0x98,0x70,0x33,0x3a,0x00,0x00,0x00,0x00,
++};
++
++static const BYTE webp_lossless_alpha[] =
++{
++    0x52,0x49,0x46,0x46,0x62,0x03,0x00,0x00,0x57,0x45,0x42,0x50,0x56,0x50,0x38,0x4c,
++    0x56,0x03,0x00,0x00,0x2f,0x5f,0xc0,0x0f,0x10,0x09,0x46,0x6d,0x23,0x49,0x92,0xa2,
++    0xf9,0x99,0x3f,0xe2,0x39,0x77,0x11,0x44,0xf4,0x7f,0x02,0x3a,0x87,0xdd,0x1a,0x95,
++    0x79,0x1a,0xfd,0x9b,0x5a,0x28,0x6a,0x1b,0xc9,0xc9,0x33,0xd7,0x8f,0x3f,0xdd,0x2d,
++    0x18,0x14,0xb7,0x6d,0xe3,0xa6,0x98,0xf2,0x2c,0x77,0x83,0xde,0x7f,0x21,0x41,0x82,
++    0xcd,0x29,0xd8,0x77,0x93,0x88,0x40,0x06,0x12,0x80,0x06,0xd1,0x4c,0x7c,0x7c,0x7c,
++    0xe9,0x7c,0x20,0x27,0x00,0x30,0xd9,0xb4,0x26,0xd9,0xe6,0x22,0xe2,0x90,0x54,0x3a,
++    0x0e,0xf1,0xc8,0xcd,0xf6,0x3f,0x8d,0xa4,0x09,0x3c,0xe9,0x15,0xc0,0xcc,0xcc,0x10,
++    0x6e,0x01,0xc7,0x17,0x32,0x33,0x33,0x46,0xfb,0x6c,0x78,0xcc,0xcc,0xcc,0x50,0xc0,
++    0x86,0x1b,0x1e,0x33,0x33,0x73,0x01,0xb7,0xa7,0xb1,0x34,0xd2,0x62,0xf4,0x45,0xee,
++    0x60,0x8b,0x70,0x13,0xd3,0x81,0xd2,0x29,0x62,0xff,0x15,0xd8,0x11,0xec,0xda,0xd6,
++    0x0e,0x49,0xff,0xaa,0x0a,0xa0,0x6d,0xdb,0x76,0x27,0x61,0xdb,0xee,0xb1,0x03,0xb0,
++    0x6d,0xfb,0xb1,0xc2,0xa8,0xc7,0xb1,0x6d,0xcf,0x64,0xe0,0x36,0x92,0x24,0x45,0x9a,
++    0xb1,0x72,0x41,0x3a,0xbe,0x93,0x19,0x9f,0x25,0x7e,0x95,0xa1,0x57,0x7c,0x18,0x57,
++    0xde,0x25,0xd7,0x91,0x6c,0x9b,0xd6,0x4e,0xe3,0x7e,0xdf,0x74,0xee,0x7d,0xb6,0x6d,
++    0xdb,0xb6,0x6d,0xdb,0x4e,0xe7,0xa5,0xb2,0xcb,0x8d,0xdb,0x48,0x8e,0x44,0xad,0xeb,
++    0x8d,0x3a,0x3a,0xf3,0x05,0x32,0x10,0x63,0x06,0x66,0xf4,0xa1,0x93,0x77,0x6b,0x95,
++    0x00,0x66,0xa8,0x37,0x2d,0x00,0x04,0xc6,0x05,0x80,0x41,0xa9,0x3a,0xf3,0xe8,0x99,
++    0xfe,0x98,0xf5,0x68,0xf2,0x4f,0x38,0x00,0xd3,0xea,0x6c,0x52,0xa5,0x7c,0xb0,0x55,
++    0x6d,0xd8,0x35,0xc7,0x3b,0xa7,0x6e,0x36,0x02,0xf5,0x2c,0x7a,0xb2,0x80,0x41,0x29,
++    0x0b,0x08,0x22,0x63,0x0d,0xe1,0x25,0x95,0xd3,0xa5,0x80,0x4b,0x90,0x23,0x2e,0x59,
++    0x5e,0x03,0x18,0xbb,0x1f,0xe9,0x1a,0xc2,0xb3,0x7c,0x39,0x1b,0x73,0x11,0x42,0x3b,
++    0xab,0xb9,0xcd,0x70,0x6a,0x38,0x99,0x76,0x01,0x00,0x18,0x87,0xd8,0x98,0xfa,0x23,
++    0xe8,0xa8,0xfd,0xd1,0x03,0x38,0x29,0x3f,0xaf,0x4e,0x4a,0x4e,0x1b,0x77,0x1c,0xcd,
++    0x89,0x0f,0x60,0xd2,0x9e,0xce,0x24,0x3e,0x55,0x9b,0x84,0x46,0x16,0x9f,0x1c,0xd4,
++    0x5f,0x26,0x00,0x01,0x44,0x18,0xc0,0x84,0x71,0x31,0x76,0xc0,0xc1,0x82,0x78,0x80,
++    0x69,0x1b,0xaa,0xe0,0xd3,0xb0,0xa6,0xed,0x67,0x3a,0x0f,0xe0,0x86,0xbd,0x65,0x71,
++    0x01,0xb3,0xd6,0x54,0x29,0xd5,0xa9,0x08,0xe0,0x82,0x9d,0x35,0x71,0x00,0xf3,0x96,
++    0x55,0x25,0xd5,0x13,0x03,0xd8,0xb7,0xb5,0x41,0x6c,0xc0,0xa2,0x05,0x55,0x4b,0x75,
++    0xc5,0x00,0xb6,0x6d,0x6c,0x12,0x0b,0xb0,0x6c,0x4e,0x35,0x52,0x7d,0x45,0x00,0xcb,
++    0x80,0x55,0xd3,0xaa,0x95,0x9a,0x88,0x35,0xad,0x67,0x30,0xe9,0x7d,0xe2,0x7d,0x06,
++    0x22,0xcc,0xc0,0x84,0x85,0x42,0xa3,0xc6,0x54,0x68,0xf4,0x39,0x95,0xb5,0xfe,0x4c,
++    0xb0,0x6e,0x42,0x75,0x52,0x33,0x31,0x94,0x11,0xd7,0x2f,0x8b,0x9f,0x8f,0x22,0x80,
++    0x98,0xed,0x25,0x02,0x28,0xbf,0xa7,0xac,0xd8,0xd0,0xb1,0x37,0x40,0xe9,0x68,0xd3,
++    0x33,0x56,0xfa,0xf2,0xe4,0xc1,0x06,0xbc,0xfa,0x58,0x04,0x88,0x31,0x01,0xaa,0x2f,
++    0x4b,0xba,0x0e,0x3a,0xd8,0x3c,0x5c,0x0f,0xf2,0x60,0xf3,0xfb,0x93,0x03,0x4b,0x30,
++    0xea,0x67,0x0d,0x20,0x79,0x20,0x40,0x1d,0x41,0x16,0x30,0xe4,0xbd,0x28,0x02,0xa2,
++    0x28,0x32,0xd8,0x4b,0x09,0x88,0x2a,0xab,0x89,0x5f,0xdf,0xe8,0x2e,0x66,0x30,0xac,
++    0x69,0x6b,0xc9,0x83,0x61,0x94,0xe8,0x01,0x37,0xfe,0x5f,0x54,0x8d,0xfd,0xb9,0x27,
++    0xe5,0xbd,0xe3,0x04,0x4a,0x1a,0x96,0x36,0x31,0xad,0x84,0xee,0xdf,0xa0,0xfc,0xe7,
++    0xc2,0xb0,0x48,0x00,0x63,0x80,0xd8,0x54,0x31,0x30,0x8e,0x60,0x68,0x6d,0xe9,0x30,
++    0x34,0x94,0xe9,0x5f,0xa0,0xe2,0xeb,0xcc,0xb2,0x4a,0x80,0x81,0xe5,0xa9,0xcb,0xc8,
++    0x40,0x8e,0x7f,0x02,0xc4,0xae,0x9b,0xc3,0xe3,0x00,0xe8,0x5b,0x98,0x7a,0x0c,0xf4,
++    0xe5,0xfb,0x87,0x7f,0x5b,0xdd,0x7c,0x07,0xc7,0x32,0xb9,0x3b,0x3a,0xf6,0x80,0x9e,
++    0xb9,0x89,0x4f,0x5b,0x4f,0xa1,0xbf,0x03,0xee,0xbe,0x80,0x27,0xb6,0xc9,0xc3,0x89,
++    0x49,0x07,0xe8,0x9a,0x9e,0x04,0x34,0x75,0x95,0xf8,0x1b,0xe0,0xe1,0x13,0x04,0x62,
++    0x9f,0x3c,0x9d,0x9e,0xb5,0x80,0x8e,0x89,0x49,0x48,0x4b,0x47,0xb9,0xbf,0x02,0x9e,
++    0xde,0x43,0x24,0x4e,0xf4,0x72,0x0e,0x0d,0xa0,0x6d,0xcc,0x8f,0xb4,0x0d,0xfb,0xb1,
++    0x50,0x6d,0x35,0xf9,0x0c,0xe0,0xe5,0x0d,0x24,0xe2,0x48,0x6f,0x17,0x50,0x03,0x68,
++    0x19,0xf0,0x13,0xf0,0x16,0x59,0xc5,0x54,0x2d,0x2d,0xd5,0x00,0x00,0xde,0x5e,0x41,
++    0x26,0xce,0xf4,0x71,0x19,0x95,0x8f,0x6b,0x28,0x01,0xd0,0xd4,0x31,0xcd,0x91,0xbb,
++    0x8f,0x27,0x50,0x7d,0x3c,0x87,0x42,0x5c,0xea,0xeb,0x06,0x0a,0x5f,0xb7,0x91,0x23,
++    0xac,0xaf,0xfb,0x47,0x9d,0x17,0xd7,0xfa,0xb9,0x87,0x4c,0xe2,0x9b,0xb8,0x67,0x19,
++    0xd5,0x4f,0x74,0x67,0xf1,0x89,0x38,0xd9,0x5f,0x64,0x15,0x53,0xff,0xb7,0x4a,0xd5,
++    0x2c,0xb2,0x5e,0x92,0x63,0xfa,0x6f,0x89,0xf0,0x22,
++};
++
++static const BYTE webp_animated[] =
++{
++    0x52,0x49,0x46,0x46,0x94,0x06,0x00,0x00,0x57,0x45,0x42,0x50,0x56,0x50,0x38,0x58,
++    0x0a,0x00,0x00,0x00,0x12,0x00,0x00,0x00,0x3f,0x00,0x00,0x2f,0x00,0x00,0x41,0x4e,
++    0x49,0x4d,0x06,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x41,0x4e,0x4d,0x46,
++    0xf0,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0x00,0x00,0x2f,0x00,0x00,
++    0x64,0x00,0x00,0x02,0x56,0x50,0x38,0x4c,0xd7,0x01,0x00,0x00,0x2f,0x3f,0xc0,0x0b,
++    0x00,0x0d,0x75,0x21,0xa2,0xff,0x01,0xa8,0xb5,0x6d,0xbb,0x56,0x96,0x79,0x4f,0xa1,
++    0x68,0x06,0x45,0x09,0x78,0x3c,0x2a,0x47,0x95,0x73,0xce,0x19,0x95,0x15,0x68,0x4a,
++    0x40,0xd1,0xcf,0x6f,0xe0,0xa6,0x73,0xdf,0x3f,0xfb,0x8f,0xaf,0xa1,0xd6,0xb6,0xed,
++    0xaa,0x9a,0x62,0xbf,0x06,0xc8,0x1d,0xa4,0x02,0xd0,0x58,0x34,0x16,0x8b,0x46,0xa2,
++    0x72,0x68,0x00,0x8d,0x45,0x63,0xb1,0x68,0x7c,0x2c,0xe0,0x87,0x16,0x08,0x63,0x38,
++    0xad,0xb6,0x6d,0x59,0xee,0x7b,0x10,0xda,0x9f,0x48,0x9e,0x5c,0x13,0x99,0xcc,0x02,
++    0x3a,0x02,0x03,0x10,0x6d,0x02,0x32,0xc9,0x93,0x6b,0x22,0xb1,0xcc,0xf7,0x85,0x60,
++    0xe0,0xb6,0x6d,0x9c,0x60,0x50,0x97,0x22,0xbd,0x2f,0xbf,0x01,0x10,0x89,0x44,0x22,
++    0x91,0x48,0x24,0x12,0x89,0x44,0x22,0x91,0x48,0x24,0x12,0x89,0x44,0x22,0x85,0x9e,
++    0x9d,0x69,0xde,0x71,0x00,0x2c,0x52,0x6a,0xed,0x2b,0x10,0x89,0xed,0x2b,0x84,0x0e,
++    0xc4,0x38,0xa5,0x53,0x20,0x75,0x40,0x03,0xeb,0x3f,0xef,0x82,0x26,0x24,0xc4,0x54,
++    0x57,0xd3,0xb5,0x58,0xf1,0xd5,0xbb,0x18,0x56,0xd3,0xd3,0xc9,0xa3,0xaa,0x5d,0xcc,
++    0x56,0xd3,0x69,0xdf,0x95,0x99,0x95,0x2e,0x9a,0xfd,0xf1,0xc2,0x7f,0x29,0x01,0x00,
++    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++    0x00,0xc6,0xc6,0xb1,0x7f,0x80,0x7e,0xad,0x79,0x47,0x0a,0xc3,0xfe,0xee,0x06,0x3f,
++    0x6b,0x5f,0x21,0x20,0xdb,0xdf,0x4a,0x98,0x2b,0xa4,0xb2,0xda,0x6a,0xfa,0x3b,0x46,
++    0x88,0x79,0x46,0xdc,0x21,0x0e,0xe9,0x56,0xd1,0x70,0xc5,0x80,0xda,0xcd,0x24,0x25,
++    0x76,0xce,0xb6,0x09,0x00,0x52,0x1c,0xee,0xd2,0x69,0x38,0x4a,0x6c,0xef,0x33,0xa9,
++    0x37,0xfb,0xd3,0xbf,0x10,0x6b,0x87,0x22,0x00,0xe0,0x64,0xfc,0x23,0x36,0xef,0xa8,
++    0xc3,0xea,0xb1,0x04,0x00,0xb8,0x1a,0x7d,0x95,0xc5,0x16,0x4e,0x75,0x00,0xc0,0xfd,
++    0xf0,0xa1,0xac,0x68,0xfa,0xdc,0x01,0x00,0xbc,0x0c,0xce,0xca,0x7d,0x3f,0x75,0xe9,
++    0x02,0x00,0x5e,0xfb,0x27,0xc5,0xbe,0xb5,0xbb,0xf8,0xd5,0xdb,0x76,0x38,0x77,0x3f,
++    0x8b,0x69,0xf1,0x44,0x78,0xbc,0x7b,0x93,0xcf,0x1e,0x00,0xdf,0xdd,0x8d,0x42,0x37,
++    0x54,0x66,0xc8,0x78,0xa1,0xf3,0x7b,0xd8,0xf9,0x89,0x9b,0xf8,0xef,0x03,0xf0,0xdb,
++    0x5c,0x6b,0x74,0x4b,0xcc,0x34,0x52,0x8d,0xee,0x49,0x51,0x86,0x49,0x9c,0xe2,0xd9,
++    0x19,0xff,0x0e,0x01,0xf8,0x2b,0xaf,0x44,0xba,0xab,0x68,0x2c,0x4b,0x35,0x28,0x4a,
++    0xa7,0xcb,0x42,0xab,0xfb,0x86,0x03,0x9a,0x77,0xd4,0x3b,0xcd,0x3b,0xaa,0x9d,0x24,
++    0x20,0xb4,0x21,0xd9,0x39,0x94,0xa1,0x77,0x1d,0x8c,0x74,0xe6,0x60,0xb4,0x31,0xeb,
++    0xfd,0x4c,0x32,0x85,0xea,0xae,0xdb,0xcd,0x63,0x5f,0xaa,0x55,0x6f,0xd4,0xaa,0xca,
++    0x32,0x29,0x04,0x00,0x41,0x4e,0x4d,0x46,0x3e,0x02,0x00,0x00,0x00,0x00,0x00,0x00,
++    0x00,0x00,0x3f,0x00,0x00,0x2f,0x00,0x00,0xc8,0x00,0x00,0x02,0x56,0x50,0x38,0x4c,
++    0x26,0x02,0x00,0x00,0x2f,0x3f,0xc0,0x0b,0x10,0x0d,0x75,0x21,0xa2,0xff,0x01,0xa8,
++    0xb5,0x6d,0xbb,0x56,0xd6,0x07,0xee,0x55,0x28,0x9a,0x41,0x51,0x02,0x9e,0x7a,0x72,
++    0xce,0xc9,0xa1,0xf9,0x9a,0x12,0x50,0xf4,0xf3,0xfd,0x4b,0xe7,0xdc,0x7b,0xc2,0x2f,
++    0xc0,0x69,0x6b,0xdb,0xb2,0xb2,0xc4,0x79,0x41,0x23,0xf1,0x14,0x41,0x07,0x63,0x0f,
++    0x28,0x82,0xc3,0x11,0x34,0x34,0x40,0x45,0xd8,0xb1,0x01,0x42,0x07,0xb3,0xff,0xff,
++    0xf3,0x8c,0xd3,0xd8,0xb6,0x5d,0x65,0xef,0xaf,0x3f,0x59,0xe5,0x6a,0xd0,0x54,0x40,
++    0x27,0x39,0x74,0x82,0xa2,0x02,0x2c,0x68,0x5c,0x8e,0x0a,0x45,0x11,0x2f,0x8c,0xdb,
++    0xd8,0xb6,0x55,0x65,0xfd,0xaa,0x7e,0x3f,0x1f,0x27,0x76,0x89,0x5c,0x23,0x8d,0xe8,
++    0xc6,0x29,0x8a,0x33,0x0a,0x24,0xc9,0x8c,0x54,0x6c,0xee,0xab,0x8a,0xe5,0x0d,0xf4,
++    0x1b,0x88,0x21,0x86,0x18,0x62,0x88,0x21,0x86,0x18,0x62,0x88,0x21,0x86,0x18,0x62,
++    0x88,0x21,0x86,0x18,0x62,0x88,0x21,0x86,0x18,0x62,0x28,0x26,0xf2,0x31,0xa5,0x46,
++    0xa9,0x52,0x6a,0x14,0x2e,0xa6,0x42,0x31,0xf5,0x1f,0x24,0x77,0xea,0x3f,0x88,0x06,
++    0x53,0xb3,0xfe,0x83,0xfc,0x25,0xcb,0x31,0xa5,0x46,0xc9,0xdb,0x84,0x4e,0x53,0x39,
++    0xa2,0x96,0x2c,0x9b,0xc4,0x05,0x49,0x76,0x27,0xda,0x4d,0x6b,0x0a,0x86,0xc6,0x7a,
++    0xcb,0x6b,0xfe,0x8f,0xc5,0x1f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0e,0x4f,0x83,0x47,
++    0xc3,0xee,0xd5,0x60,0xff,0x8b,0x80,0x57,0x96,0x77,0x4a,0xbb,0xd5,0x83,0xd1,0x52,
++    0xff,0x81,0xf6,0xbb,0x56,0x33,0x1a,0xb4,0xdf,0xb6,0x1b,0x59,0x9d,0xe6,0xaa,0x94,
++    0x4e,0xaf,0x99,0x02,0xdd,0xc1,0x68,0x30,0xb1,0x49,0x30,0xd8,0xd8,0x24,0x0a,0x24,
++    0xef,0x58,0xbd,0x29,0xea,0x20,0x07,0x6f,0x4e,0x97,0x85,0xc9,0xd3,0xaa,0x9c,0x59,
++    0x79,0x6b,0x3e,0x3e,0xa6,0x73,0xb3,0x69,0x8d,0xa6,0xad,0x56,0xde,0x14,0x97,0xf9,
++    0xe1,0x7c,0xdf,0xee,0x2d,0xf7,0x34,0x79,0x33,0xdc,0x6f,0x85,0x9e,0x1e,0xfe,0xf3,
++    0x52,0xa3,0x3c,0x59,0xc9,0x25,0x00,0x00,0x57,0xbb,0xdf,0xda,0xc9,0xdb,0x01,0xfa,
++    0xb0,0xfd,0x6e,0xeb,0x3f,0x70,0xc6,0x2d,0xbf,0xbe,0xae,0x1f,0x7b,0x77,0xdc,0x73,
++    0xeb,0xd7,0xf2,0x7c,0x9c,0xd7,0x3a,0xe3,0x9e,0x57,0x07,0xc5,0xef,0x7b,0x71,0x7a,
++    0x08,0xbb,0x4d,0x5a,0xb2,0xe8,0xec,0x77,0x6e,0x58,0xdf,0xb7,0x85,0x9d,0xf7,0x4f,
++    0x6e,0xc3,0x26,0x00,0xfc,0x8c,0x8f,0xa7,0xf5,0xfc,0xf0,0x91,0x14,0x15,0x16,0x77,
++    0x4b,0x8d,0x3a,0x8f,0x51,0x4e,0xe3,0x02,0x0b,0x19,0x35,0x1f,0x73,0xfc,0x18,0xd5,
++    0x01,0xe0,0x77,0xb4,0xbf,0xe8,0x08,0x67,0x8e,0xfb,0xb6,0x08,0x4f,0x31,0x9d,0x3a,
++    0x4c,0xda,0x51,0xc1,0x24,0x73,0xde,0x92,0x10,0x22,0x8f,0x7e,0xe3,0x0a,0x00,0xfe,
++    0x86,0xbb,0x5b,0xe3,0xb5,0xb1,0x79,0xcb,0xd4,0x34,0xd4,0xe1,0x79,0x93,0xb0,0x95,
++    0x0e,0x59,0xc4,0xe6,0x4d,0xe2,0x88,0x54,0x90,0x06,0x94,0x0b,0x8d,0xe1,0xed,0x91,
++    0x94,0xbc,0x73,0x4b,0x3a,0xa5,0x46,0xa9,0xb0,0x79,0xce,0xee,0xfb,0x83,0x4d,0x1d,
++    0x38,0xe8,0x4d,0xba,0x9b,0x66,0x75,0xf1,0xf9,0x9d,0x39,0x6f,0xeb,0xf8,0x9d,0x72,
++    0xa3,0xa4,0xbc,0x5b,0xc6,0x5c,0xc9,0x3b,0x14,0x03,0x41,0x4e,0x4d,0x46,0x2a,0x02,
++    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0x00,0x00,0x2f,0x00,0x00,0x2c,0x01,
++    0x00,0x00,0x56,0x50,0x38,0x4c,0x12,0x02,0x00,0x00,0x2f,0x3f,0xc0,0x0b,0x10,0x0d,
++    0x75,0x21,0xa2,0xff,0x01,0xa8,0xb5,0x6d,0xbb,0x56,0x16,0xe1,0x5d,0x85,0xa2,0x19,
++    0x14,0x25,0xe0,0xe9,0x03,0x95,0x73,0xce,0x19,0x95,0x15,0x68,0xe8,0x00,0x45,0x3f,
++    0xbf,0x81,0x97,0xce,0x39,0x77,0x9f,0x06,0xdc,0x54,0xdb,0xb6,0x2c,0xf7,0xf0,0xfc,
++    0x3f,0xe4,0xa0,0x03,0x21,0x08,0x60,0x33,0x8c,0xee,0xee,0x3a,0x69,0x02,0x62,0x40,
++    0x03,0x6f,0xf0,0xf7,0x40,0xde,0x77,0x71,0x5a,0x6d,0xdb,0xb2,0xdc,0xcf,0xff,0xa3,
++    0xc9,0x13,0x91,0x4c,0x24,0x33,0x01,0x9b,0x10,0x99,0x43,0x37,0x21,0x32,0x01,0x99,
++    0xe4,0xc9,0x35,0xb9,0x7d,0x26,0x20,0x28,0xf2,0x7f,0x34,0x06,0x6e,0xdb,0xc6,0x31,
++    0x36,0xf7,0x44,0xd7,0x76,0x89,0x93,0x37,0x90,0xa8,0x42,0x82,0x04,0x09,0x12,0x24,
++    0x48,0x90,0x20,0x41,0x82,0x04,0x09,0x12,0x24,0x48,0x90,0x20,0x41,0x82,0x04,0x09,
++    0x12,0x02,0x51,0x6e,0xa6,0x71,0x2b,0x0b,0x8d,0x5b,0x49,0x70,0x2a,0xc3,0xcd,0x14,
++    0x33,0x12,0x1b,0xc5,0x8c,0x0c,0x72,0xab,0x19,0xe4,0x77,0xea,0x29,0xd0,0x29,0x46,
++    0xec,0x29,0x66,0xe4,0xdb,0x5d,0xe3,0x56,0x1e,0xac,0x85,0x8a,0x19,0xa1,0x2d,0xfe,
++    0x5f,0x9e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x58,0x78,0xd6,0x38,
++    0x76,0x3b,0x9c,0xe7,0x00,0x50,0x8b,0xce,0xee,0x1d,0xbb,0x1d,0xaf,0xa4,0x43,0x31,
++    0xc3,0xf6,0x9b,0x41,0xdd,0xb4,0x47,0x09,0x45,0xfc,0xae,0x71,0xcb,0xe9,0x6e,0xdc,
++    0xfa,0x7d,0x27,0x69,0x1b,0xd6,0x68,0x52,0xc3,0xe8,0xcc,0x9a,0x62,0x56,0x53,0xc8,
++    0x55,0x93,0x04,0xf2,0xd5,0x24,0x81,0x22,0x72,0x92,0xb4,0x50,0x96,0xdd,0x5d,0xa7,
++    0x6d,0xad,0xdf,0x87,0xe4,0x48,0xd2,0x18,0xdc,0xf0,0x69,0x21,0x6e,0x78,0x80,0xc8,
++    0xa0,0x88,0x0e,0x6a,0xd9,0xfa,0x1f,0x10,0xd6,0x9d,0x62,0x86,0x82,0xb6,0x06,0xb9,
++    0xfa,0x0f,0xec,0x9d,0x3f,0x9b,0xba,0xa7,0xf6,0xfb,0xd5,0x65,0x39,0x00,0x00,0x70,
++    0x7c,0xba,0xed,0xe9,0x9e,0xd6,0x6f,0x56,0x76,0x95,0x00,0x00,0xc0,0xe5,0xf6,0x7a,
++    0xa7,0xdb,0x69,0xd4,0xbf,0x77,0x93,0xc3,0xad,0x85,0xe5,0x61,0x8a,0x10,0x00,0x00,
++    0x78,0x6e,0xaf,0xaf,0x8c,0x3b,0x82,0xf7,0xa5,0xb8,0xba,0x8f,0x7b,0x55,0x8d,0xea,
++    0xe6,0x67,0x7e,0x7a,0x75,0xdc,0xfd,0x8e,0x86,0xaa,0x74,0x7f,0xf9,0x5a,0x0f,0x00,
++    0xf8,0xca,0x4d,0x1e,0x2a,0x6c,0x17,0xf7,0x14,0x29,0x42,0x60,0x33,0x63,0xbf,0x17,
++    0xc4,0xdd,0x91,0x98,0xbb,0x9b,0x59,0xba,0x35,0x02,0x00,0x7e,0x52,0xe3,0x2d,0xbf,
++    0x57,0xa6,0x18,0xa1,0xb2,0x8b,0xdb,0xaa,0x14,0x21,0x88,0xba,0xbc,0xc1,0x97,0x33,
++    0x6b,0x33,0x8b,0x51,0x33,0x00,0xe0,0x2f,0x39,0xda,0xd8,0x6d,0x38,0xee,0x07,0xc5,
++    0x28,0x50,0x2a,0xf2,0x96,0x98,0xa8,0x3b,0x62,0xa1,0xc8,0x3b,0xcc,0x2d,0x2a,0x29,
++    0x2c,0x46,0xd9,0xd4,0x7f,0xd6,0x27,0x6d,0xde,0x34,0x50,0xd4,0xd4,0xc6,0x70,0xf9,
++    0xd4,0x86,0x3f,0x25,0x2b,0xef,0x9c,0xfc,0x3a,0xcf,0xc5,0xdb,0x01,0xe6,0x3f,0xad,
++    0x26,0xf1,0xc1,0x7a,0xaa,0xf1,0x1b,0x29,0x42,0x86,0x4b,0x20,
++};
++static IWICImagingFactory *factory;
++
++static DWORD checksum(const BYTE *data, UINT size)
++{
++    DWORD hash = 2166136261u;
++    UINT i;
++
++    for (i = 0; i < size; i++) hash = (hash ^ data[i]) * 16777619u;
++    return hash;
++}
++
++/* the one block an animation has, at the decoder or at a frame, and its one item */
++static void check_blocks(IUnknown *object, const GUID *format, const WCHAR *name, VARTYPE vt, ULONG value)
++{
++    PROPVARIANT schema, id, item;
++    IWICMetadataBlockReader *blocks;
++    IWICMetadataReader *reader;
++    UINT count;
++    GUID guid;
++    HRESULT hr;
++
++    hr = IUnknown_QueryInterface(object, &IID_IWICMetadataBlockReader, (void **)&blocks);
++    ok(hr == S_OK, "no block reader, hr %#lx\n", hr);
++    if (hr != S_OK) return;
++    hr = IWICMetadataBlockReader_GetCount(blocks, &count);
++    ok(hr == S_OK && count == (format ? 1 : 0), "got hr %#lx, %u blocks\n", hr, count);
++    if (format && count == 1)
++    {
++        hr = IWICMetadataBlockReader_GetReaderByIndex(blocks, 0, &reader);
++        ok(hr == S_OK, "GetReaderByIndex failed, hr %#lx\n", hr);
++        hr = IWICMetadataReader_GetMetadataFormat(reader, &guid);
++        ok(hr == S_OK && IsEqualGUID(&guid, format), "got format %s\n", wine_dbgstr_guid(&guid));
++        hr = IWICMetadataReader_GetCount(reader, &count);
++        ok(hr == S_OK && count == 1, "got hr %#lx, %u items\n", hr, count);
++        PropVariantInit(&schema);
++        PropVariantInit(&id);
++        PropVariantInit(&item);
++        hr = IWICMetadataReader_GetValueByIndex(reader, 0, &schema, &id, &item);
++        ok(hr == S_OK, "GetValueByIndex failed, hr %#lx\n", hr);
++        ok(schema.vt == VT_EMPTY, "got schema type %d\n", schema.vt);
++        ok(id.vt == VT_LPWSTR && !wcscmp(id.pwszVal, name), "got id %s\n",
++           id.vt == VT_LPWSTR ? debugstr_w(id.pwszVal) : "not a string");
++        ok(item.vt == vt && (vt == VT_UI2 ? item.uiVal : item.ulVal) == value, "got type %d, %lu\n", item.vt,
++           item.ulVal);
++        PropVariantClear(&schema);
++        PropVariantClear(&id);
++        PropVariantClear(&item);
++        IWICMetadataReader_Release(reader);
++    }
++    IWICMetadataBlockReader_Release(blocks);
++}
++
++static void check_frame(IWICBitmapDecoder *decoder, UINT index, UINT width, UINT height, DWORD expect,
++                        UINT duration)
++{
++    IWICMetadataQueryReader *reader;
++    IWICBitmapFrameDecode *frame;
++    WICPixelFormatGUID format;
++    UINT w, h, stride = width * 4;
++    double dpi_x, dpi_y;
++    BYTE *pixels;
++    HRESULT hr;
++
++    winetest_push_context("frame %u", index);
++    hr = IWICBitmapDecoder_GetFrame(decoder, index, &frame);
++    ok(hr == S_OK, "GetFrame failed, hr %#lx\n", hr);
++    hr = IWICBitmapFrameDecode_GetSize(frame, &w, &h);
++    ok(hr == S_OK && w == width && h == height, "got hr %#lx, %ux%u\n", hr, w, h);
++    hr = IWICBitmapFrameDecode_GetPixelFormat(frame, &format);
++    ok(hr == S_OK && IsEqualGUID(&format, &GUID_WICPixelFormat32bppRGBA), "got hr %#lx, %s\n", hr,
++       wine_dbgstr_guid(&format));
++    hr = IWICBitmapFrameDecode_GetResolution(frame, &dpi_x, &dpi_y);
++    ok(hr == S_OK && dpi_x == 72.0 && dpi_y == 72.0, "got hr %#lx, %f %f\n", hr, dpi_x, dpi_y);
++    hr = IWICBitmapFrameDecode_GetMetadataQueryReader(frame, &reader);
++    ok(hr == S_OK, "GetMetadataQueryReader failed, hr %#lx\n", hr);
++    if (hr == S_OK) IWICMetadataQueryReader_Release(reader);
++    check_blocks((IUnknown *)frame, duration ? &GUID_MetadataFormatWebpANMF : NULL, L"FrameDuration", VT_UI4,
++                 duration);
++
++    pixels = malloc(stride * height);
++    hr = IWICBitmapFrameDecode_CopyPixels(frame, NULL, stride, stride * height, pixels);
++    ok(hr == S_OK, "CopyPixels failed, hr %#lx\n", hr);
++    ok(checksum(pixels, stride * height) == expect, "got pixels %08lx\n", checksum(pixels, stride * height));
++    free(pixels);
++    IWICBitmapFrameDecode_Release(frame);
++    winetest_pop_context();
++}
++
++static void test_webp_decoder(void)
++{
++    static const struct
++    {
++        const BYTE *data;
++        UINT size, width, height, frames;
++        DWORD pixels[3];
++        UINT durations[3];
++    }
++    tests[] =
++    {
++        { webp_odd_size, sizeof(webp_odd_size), 33, 17, 1, { 0x49f47f80 } },
++        { webp_lossless_alpha, sizeof(webp_lossless_alpha), 96, 64, 1, { 0xa2fa2566 } },
++        { webp_animated, sizeof(webp_animated), 64, 48, 3, { 0xfe8e2047, 0x20c824de, 0x37a363fa },
++          { 100, 200, 300 } },
++    };
++    IWICMetadataQueryReader *reader;
++    IWICBitmapDecoderInfo *info;
++    IWICBitmapFrameDecode *frame;
++    IWICBitmapDecoder *decoder;
++    IWICBitmapSource *source;
++    IWICColorContext *context;
++    IWICPalette *palette;
++    IEnumString *names;
++    IStream *stream;
++    LPOLESTR name;
++    DWORD capability;
++    UINT count, i, j, w, h;
++    GUID guid;
++    HRESULT hr;
++    BYTE *pixels;
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context("%u", i);
++        stream = SHCreateMemStream(tests[i].data, tests[i].size);
++        hr = IWICImagingFactory_CreateDecoderFromStream(factory, stream, NULL, WICDecodeMetadataCacheOnDemand,
++                                                        &decoder);
++        if (hr == WINCODEC_ERR_COMPONENTNOTFOUND)
++        {
++            win_skip("WebP is not supported\n");
++            IStream_Release(stream);
++            winetest_pop_context();
++            return;
++        }
++        ok(hr == S_OK, "CreateDecoderFromStream failed, hr %#lx\n", hr);
++
++        hr = IWICBitmapDecoder_GetContainerFormat(decoder, &guid);
++        ok(hr == S_OK && IsEqualGUID(&guid, &GUID_ContainerFormatWebp), "got %s\n", wine_dbgstr_guid(&guid));
++        hr = IWICBitmapDecoder_GetDecoderInfo(decoder, &info);
++        ok(hr == S_OK, "GetDecoderInfo failed, hr %#lx\n", hr);
++        hr = IWICBitmapDecoderInfo_GetCLSID(info, &guid);
++        ok(hr == S_OK && IsEqualGUID(&guid, &CLSID_WICWebpDecoder), "got %s\n", wine_dbgstr_guid(&guid));
++        IWICBitmapDecoderInfo_Release(info);
++
++        hr = IWICBitmapDecoder_GetFrameCount(decoder, &count);
++        ok(hr == S_OK && count == tests[i].frames, "got hr %#lx, %u frames\n", hr, count);
++
++        /* no metadata in these, but the readers are there */
++        hr = IWICBitmapDecoder_GetMetadataQueryReader(decoder, &reader);
++        ok(hr == S_OK, "GetMetadataQueryReader failed, hr %#lx\n", hr);
++        if (hr == S_OK)
++        {
++            hr = IWICMetadataQueryReader_GetEnumerator(reader, &names);
++            ok(hr == S_OK, "GetEnumerator failed, hr %#lx\n", hr);
++            name = NULL;
++            hr = IEnumString_Next(names, 1, &name, NULL);
++            ok(hr == (tests[i].frames > 1 ? S_OK : S_FALSE), "got hr %#lx\n", hr);
++            CoTaskMemFree(name);
++            IEnumString_Release(names);
++            IWICMetadataQueryReader_Release(reader);
++        }
++        hr = IWICBitmapDecoder_GetThumbnail(decoder, &source);
++        ok(hr == WINCODEC_ERR_CODECNOTHUMBNAIL, "GetThumbnail returned %#lx\n", hr);
++        hr = IWICBitmapDecoder_GetPreview(decoder, &source);
++        ok(hr == WINCODEC_ERR_UNSUPPORTEDOPERATION, "GetPreview returned %#lx\n", hr);
++        IWICImagingFactory_CreatePalette(factory, &palette);
++        hr = IWICBitmapDecoder_CopyPalette(decoder, palette);
++        ok(hr == WINCODEC_ERR_PALETTEUNAVAILABLE, "CopyPalette returned %#lx\n", hr);
++        IWICPalette_Release(palette);
++        IWICImagingFactory_CreateColorContext(factory, &context);
++        hr = IWICBitmapDecoder_GetColorContexts(decoder, 1, &context, &count);
++        ok(hr == WINCODEC_ERR_UNSUPPORTEDOPERATION, "GetColorContexts returned %#lx\n", hr);
++        IWICColorContext_Release(context);
++        check_blocks((IUnknown *)decoder, tests[i].frames > 1 ? &GUID_MetadataFormatWebpANIM : NULL, L"LoopCount",
++                     VT_UI2, 0);
++
++        /* the frames are the canvas as composed, whichever comes first */
++        for (j = tests[i].frames; j-- > 0;)
++            check_frame(decoder, j, tests[i].width, tests[i].height, tests[i].pixels[j], tests[i].durations[j]);
++        check_frame(decoder, 0, tests[i].width, tests[i].height, tests[i].pixels[0], tests[i].durations[0]);
++
++        /* any frame can be had, but not the pixels of one that is not there */
++        hr = IWICBitmapDecoder_GetFrame(decoder, tests[i].frames + 5, &frame);
++        ok(hr == S_OK, "GetFrame failed, hr %#lx\n", hr);
++        if (hr == S_OK)
++        {
++            hr = IWICBitmapFrameDecode_GetSize(frame, &w, &h);
++            ok(hr == S_OK && w == tests[i].width && h == tests[i].height, "got hr %#lx, %ux%u\n", hr, w, h);
++            pixels = malloc(w * 4 * h);
++
++            hr = IWICBitmapFrameDecode_CopyPixels(frame, NULL, w * 4, w * 4 * h, pixels);
++            ok(hr == MF_E_INVALIDINDEX, "CopyPixels returned %#lx\n", hr);
++            free(pixels);
++            IWICBitmapFrameDecode_Release(frame);
++        }
++        IWICBitmapDecoder_Release(decoder);
++
++        hr = CoCreateInstance(&CLSID_WICWebpDecoder, NULL, CLSCTX_INPROC_SERVER, &IID_IWICBitmapDecoder,
++                              (void **)&decoder);
++        ok(hr == S_OK, "CoCreateInstance failed, hr %#lx\n", hr);
++        capability = 0xdeadbeef;
++        hr = IWICBitmapDecoder_QueryCapability(decoder, stream, &capability);
++        ok(hr == S_OK, "QueryCapability failed, hr %#lx\n", hr);
++        ok(capability == (WICBitmapDecoderCapabilityCanDecodeAllImages |
++                          WICBitmapDecoderCapabilityCanEnumerateMetadata), "got capability %#lx\n", capability);
++        IWICBitmapDecoder_Release(decoder);
++        IStream_Release(stream);
++        winetest_pop_context();
++    }
++
++    /* a still picture cut short or damaged is had, and fails to decode; a broken animation is refused */
++    {
++        static const struct { UINT size, damage; HRESULT create; } broken[] =
++        {
++            { 40, 0, S_OK },
++            { sizeof(webp_odd_size), 60, S_OK },
++            { 12, 0, MF_E_INVALID_FILE_FORMAT },
++            { 900, 0, E_UNEXPECTED },
++        };
++        BYTE *data = malloc(sizeof(webp_animated));
++
++        for (i = 0; i < ARRAY_SIZE(broken); i++)
++        {
++            winetest_push_context("broken %u", i);
++            memcpy(data, i == 3 ? webp_animated : webp_odd_size, broken[i].size);
++            if (broken[i].damage) memset(data + broken[i].damage, 0x55, broken[i].size - broken[i].damage);
++            stream = SHCreateMemStream(data, broken[i].size);
++            hr = IWICImagingFactory_CreateDecoderFromStream(factory, stream, NULL, WICDecodeMetadataCacheOnDemand,
++                                                            &decoder);
++            ok(hr == broken[i].create, "got hr %#lx\n", hr);
++            if (hr == S_OK)
++            {
++                hr = IWICBitmapDecoder_GetFrameCount(decoder, &count);
++                ok(hr == S_OK && count == 1, "got hr %#lx, %u frames\n", hr, count);
++                hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
++                ok(hr == S_OK, "GetFrame failed, hr %#lx\n", hr);
++                hr = IWICBitmapFrameDecode_GetSize(frame, &w, &h);
++                ok(hr == S_OK && w == 33 && h == 17, "got hr %#lx, %ux%u\n", hr, w, h);
++                pixels = malloc(33 * 17 * 4);
++                hr = IWICBitmapFrameDecode_CopyPixels(frame, NULL, 33 * 4, 33 * 17 * 4, pixels);
++                ok(hr == MF_E_INVALID_FILE_FORMAT, "CopyPixels returned %#lx\n", hr);
++                free(pixels);
++                IWICBitmapFrameDecode_Release(frame);
++                IWICBitmapDecoder_Release(decoder);
++            }
++            IStream_Release(stream);
++            winetest_pop_context();
++        }
++        free(data);
++    }
++}
++
++/* the metadata readers are the decoder's, and not to be had on their own */
++static void test_webp_metadata_readers(void)
++{
++    static const struct { const CLSID *clsid; const GUID *format; } readers[] =
++    {
++        { &CLSID_WICWebpAnimMetadataReader, &GUID_MetadataFormatWebpANIM },
++        { &CLSID_WICWebpAnmfMetadataReader, &GUID_MetadataFormatWebpANMF },
++    };
++    IWICMetadataReaderInfo *info;
++    IWICComponentInfo *component;
++    IWICMetadataReader *reader;
++    GUID format, containers[4];
++    UINT count, i;
++    HRESULT hr;
++    BOOL flag;
++
++    for (i = 0; i < ARRAY_SIZE(readers); i++)
++    {
++        hr = CoCreateInstance(readers[i].clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IWICMetadataReader,
++                              (void **)&reader);
++        ok(hr == REGDB_E_CLASSNOTREG, "%u: got hr %#lx\n", i, hr);
++        if (hr == S_OK) IWICMetadataReader_Release(reader);
++
++        hr = IWICImagingFactory_CreateComponentInfo(factory, readers[i].clsid, &component);
++        ok(hr == S_OK, "%u: CreateComponentInfo failed, hr %#lx\n", i, hr);
++        if (hr != S_OK) continue;
++        hr = IWICComponentInfo_QueryInterface(component, &IID_IWICMetadataReaderInfo, (void **)&info);
++        ok(hr == S_OK, "%u: got hr %#lx\n", i, hr);
++        IWICComponentInfo_Release(component);
++        hr = IWICMetadataReaderInfo_GetMetadataFormat(info, &format);
++        ok(hr == S_OK && IsEqualGUID(&format, readers[i].format), "%u: got %s\n", i, wine_dbgstr_guid(&format));
++        count = 0;
++        hr = IWICMetadataReaderInfo_GetContainerFormats(info, ARRAY_SIZE(containers), containers, &count);
++        ok(hr == S_OK && count == 1 && IsEqualGUID(&containers[0], &GUID_ContainerFormatWebp), "%u: got %u %s\n",
++           i, count, wine_dbgstr_guid(&containers[0]));
++        hr = IWICMetadataReaderInfo_DoesRequireFixedSize(info, &flag);
++        ok(hr == S_OK && flag, "%u: got %d\n", i, flag);
++        hr = IWICMetadataReaderInfo_DoesRequireFullStream(info, &flag);
++        ok(hr == S_OK && !flag, "%u: got %d\n", i, flag);
++        IWICMetadataReaderInfo_Release(info);
++    }
++}
++
++START_TEST(webpformat)
++{
++    HRESULT hr;
++
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory,
++                          (void **)&factory);
++    ok(hr == S_OK, "CoCreateInstance failed, hr %#lx\n", hr);
++    if (FAILED(hr)) return;
++
++    test_webp_decoder();
++    test_webp_metadata_readers();
++
++    IWICImagingFactory_Release(factory);
++    CoUninitialize();
++}
+diff --git a/dlls/windowscodecs/wincodecs_private.h b/dlls/windowscodecs/wincodecs_private.h
+index 2608b72b35c..c667e4b5c4a 100644
+--- a/dlls/windowscodecs/wincodecs_private.h
++++ b/dlls/windowscodecs/wincodecs_private.h
+@@ -27,6 +27,10 @@
+ #include "wine/debug.h"
+ 
+ extern IID IID_IMILBitmap;
++
++/* the media transform Windows' WebP image extension registers, which is how Office tells that WebP pictures
++ * can be decoded */
++DEFINE_GUID(CLSID_WebpImageExtension, 0x796e24bc,0x928f,0x4c5e,0x85,0xfd,0x6b,0x16,0x9a,0x3a,0x82,0x6e);
+ extern IID IID_IMILBitmapSource;
+ extern IID IID_IMILBitmapLock;
+ extern IID IID_IMILBitmapScaler;
+@@ -132,6 +136,12 @@ extern HRESULT FormatConverter_CreateInstance(REFIID riid, void** ppv);
+ extern HRESULT ImagingFactory_CreateInstance(REFIID riid, void** ppv);
+ extern HRESULT BmpDecoder_CreateInstance(REFIID riid, void** ppv);
+ extern HRESULT PngDecoder_CreateInstance(REFIID iid, void** ppv);
++extern HRESULT WebpDecoder_CreateInstance(REFIID iid, void** ppv);
++extern HRESULT WebpAnimReader_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT WebpImageExtension_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT register_webp_image_extension(void);
++extern HRESULT unregister_webp_image_extension(void);
++extern HRESULT WebpAnmfReader_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT PngEncoder_CreateInstance(REFIID iid, void** ppv);
+ extern HRESULT BmpEncoder_CreateInstance(REFIID iid, void** ppv);
+ extern HRESULT DibDecoder_CreateInstance(REFIID iid, void** ppv);
+@@ -304,6 +314,8 @@ enum decoder_flags
+     DECODER_FLAGS_CAPABILITY_MASK = 0x1f,
+     DECODER_FLAGS_UNSUPPORTED_COLOR_CONTEXT = 0x80000000,
+     DECODER_FLAGS_METADATA_AT_DECODER = 0x40000000,
++    /* GetFrame takes any index; only copying the pixels of a frame that is not there fails */
++    DECODER_FLAGS_ANY_FRAME_INDEX = 0x20000000,
+ };
+ 
+ struct decoder_stat
+@@ -455,6 +467,7 @@ void CDECL encoder_destroy(struct encoder* This);
+ HRESULT CDECL png_decoder_create(struct decoder_info *info, struct decoder **result);
+ HRESULT CDECL tiff_decoder_create(struct decoder_info *info, struct decoder **result);
+ HRESULT CDECL jpeg_decoder_create(struct decoder_info *info, struct decoder **result);
++HRESULT CDECL webp_decoder_create(struct decoder_info *info, struct decoder **result);
+ 
+ HRESULT CDECL png_encoder_create(struct encoder_info *info, struct encoder **result);
+ HRESULT CDECL tiff_encoder_create(struct encoder_info *info, struct encoder **result);
+diff --git a/dlls/windowscodecs/windowscodecs_wincodec.idl b/dlls/windowscodecs/windowscodecs_wincodec.idl
+index 624a7f8610d..d02bad1461e 100644
+--- a/dlls/windowscodecs/windowscodecs_wincodec.idl
++++ b/dlls/windowscodecs/windowscodecs_wincodec.idl
+@@ -132,6 +132,20 @@ coclass WICDdsDecoder { interface IWICBitmapDecoder; }
+ ]
+ coclass WICDdsEncoder { interface IWICBitmapEncoder; }
+ 
++[
++    helpstring("WIC WebP Decoder"),
++    threading(both),
++    uuid(7693e886-51c9-4070-8419-9f70738ec8fa)
++]
++coclass WICWebpDecoder { interface IWICBitmapDecoder; }
++
++[
++    helpstring("WebP Image Extension"),
++    threading(both),
++    uuid(796e24bc-928f-4c5e-85fd-6b169a3a826e)
++]
++coclass WebpImageExtension { interface IUnknown; }
++
+ [
+     helpstring("WIC Default Format Converter"),
+     threading(both),

@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 07:00:12 -0400
+Subject: [PATCH] msxml3: Load from streams and documents as Windows does.
+
+Measured against MSXML 3 and 6 on Windows 11 (build 29671):
+
+- An empty document's stream reads as an empty stream, S_OK and no
+  bytes; it failed Read without setting the count, the path on which
+  Word's References tab used to crash.
+- A document is a source as an IDispatch as well as an IUnknown.
+- load() answers S_FALSE when the stream fails or does not parse, leaves
+  an empty document, and parseError says why; it returned the error.
+- That error is the stream's own, or the parser's: XML_E_MISSINGROOT for
+  a stream with nothing in it, where E_FAIL replaced it.  IPersistStreamInit
+  Load returns the same.  Two todo_wine tests pass now.
+
+Not done: a stream answering E_PENDING, which Windows keeps reading later.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index 872d0389e8a..e73cd336ce6 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -313,10 +313,11 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+     domdoc_set_parse_error(doc, &error);
+     IStream_Release(hstream);
+ 
++    /* the parser's own error, XML_E_MISSINGROOT for nothing at all, as on Windows */
+     if (!node)
+     {
+-        ERR("Failed to parse xml\n");
+-        return E_FAIL;
++        WARN("failed to parse, hr %#lx.\n", hr);
++        return FAILED(hr) ? hr : E_FAIL;
+     }
+ 
+     attach_doc_node(doc, node);
+@@ -1291,7 +1292,7 @@ static HRESULT WINAPI domdoc_load(IXMLDOMDocument3 *iface, VARIANT source, VARIA
+                 }
+                 else
+                 {
+-                    doc->error = E_FAIL;
++                    doc->error = FAILED(hr) ? hr : E_FAIL;
+                     TRACE("failed to parse document\n");
+                 }
+ 
+@@ -1302,6 +1303,8 @@ static HRESULT WINAPI domdoc_load(IXMLDOMDocument3 *iface, VARIANT source, VARIA
+             }
+         }
+         break;
++    /* another document comes as either */
++    case VT_DISPATCH:
+     case VT_UNKNOWN:
+ 
+         if (!V_UNKNOWN(&source)) return E_INVALIDARG;
+@@ -1310,10 +1313,14 @@ static HRESULT WINAPI domdoc_load(IXMLDOMDocument3 *iface, VARIANT source, VARIA
+             || IUnknown_QueryInterface(V_UNKNOWN(&source), &IID_ISequentialStream, (void **)&stream) == S_OK)
+         {
+             hr = doc->error = domdoc_load_from_stream(doc, stream);
++            ISequentialStream_Release(stream);
+             if (SUCCEEDED(hr))
++            {
+                 *result = VARIANT_TRUE;
+-            ISequentialStream_Release(stream);
+-            return hr;
++                return hr;
++            }
++            /* what failed leaves an empty document, and the error to parseError */
++            break;
+         }
+         else if (IUnknown_QueryInterface(V_UNKNOWN(&source), &IID_IPersistStream, (void **)&unk) == S_OK)
+         {
+@@ -2658,6 +2665,12 @@ static HRESULT WINAPI docstream_Read(IStream *iface, void *buffer, ULONG size, U
+     hr = docstream_save(stream);
+     if (hr == S_OK && stream->state == DOCSTREAM_STATE_READING)
+         return IStream_Read(stream->stream, buffer, size, read_size);
++    /* an empty document reads as an empty stream, and can still be written to */
++    if (hr == S_OK && stream->state == DOCSTREAM_STATE_INITIAL)
++    {
++        if (read_size) *read_size = 0;
++        return S_OK;
++    }
+ 
+     return E_FAIL;
+ }
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index 6796eec05a9..289a5ae0676 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -2198,10 +2198,10 @@ static void test_persiststream(void)
+ 
+     istream = SHCreateMemStream((const BYTE*)"", 0);
+     hr = IPersistStreamInit_Load(streaminit, istream);
+-    todo_wine ok(hr == XML_E_MISSINGROOT, "Unexpected hr %#lx.\n", hr);
++    ok(hr == XML_E_MISSINGROOT, "Unexpected hr %#lx.\n", hr);
+     ok(FAILED(hr), "got success\n");
+     IStream_Release(istream);
+-    EXPECT_PARSE_ERROR(doc, XML_E_MISSINGROOT, TRUE);
++    EXPECT_PARSE_ERROR(doc, XML_E_MISSINGROOT, FALSE);
+ 
+     IPersistStreamInit_Release(streaminit);
+     IXMLDOMDocument_Release(doc);
+@@ -12379,9 +12379,9 @@ static void test_load(void)
+     V_UNKNOWN(&src) = (IUnknown*)stream;
+     b = VARIANT_TRUE;
+     hr = IXMLDOMDocument_load(doc, src, &b);
+-    todo_wine ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++    ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
+     ok(b == VARIANT_FALSE, "got %d\n", b);
+-    EXPECT_PARSE_ERROR(doc, XML_E_INVALIDATROOTLEVEL, TRUE);
++    EXPECT_PARSE_ERROR(doc, XML_E_INVALIDATROOTLEVEL, FALSE);
+     VariantClear(&src);
+ 
+     /* test istream with valid xml */
+@@ -19842,11 +19842,160 @@ static void test_new_parser_validation(void)
+     }
+ }
+ 
++/* a stream that gives some data, then answers Read with a result of its choosing */
++struct read_stream
++{
++    IStream IStream_iface;
++    const char *data;
++    HRESULT result;
++    BOOL given;
++};
++
++static HRESULT WINAPI read_stream_QueryInterface(IStream *iface, REFIID riid, void **obj)
++{
++    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_ISequentialStream) ||
++            IsEqualGUID(riid, &IID_IStream))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI read_stream_AddRef(IStream *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI read_stream_Release(IStream *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI read_stream_Read(IStream *iface, void *buffer, ULONG size, ULONG *read)
++{
++    struct read_stream *stream = CONTAINING_RECORD(iface, struct read_stream, IStream_iface);
++    ULONG len = stream->data && !stream->given ? strlen(stream->data) : 0;
++
++    if (len && len <= size)
++    {
++        memcpy(buffer, stream->data, len);
++        if (read) *read = len;
++        stream->given = TRUE;
++        return S_OK;
++    }
++    /* a failure leaves the count as it was */
++    if (SUCCEEDED(stream->result) && read) *read = 0;
++    return stream->result;
++}
++
++static HRESULT WINAPI read_stream_Write(IStream *iface, const void *data, ULONG size, ULONG *written)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_Seek(IStream *iface, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *pos)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_SetSize(IStream *iface, ULARGE_INTEGER size)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_CopyTo(IStream *iface, IStream *stream, ULARGE_INTEGER len,
++        ULARGE_INTEGER *read, ULARGE_INTEGER *written)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_Commit(IStream *iface, DWORD flags)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_Revert(IStream *iface)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_LockRegion(IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER len, DWORD type)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_UnlockRegion(IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER len, DWORD type)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_Stat(IStream *iface, STATSTG *stat, DWORD flags)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_stream_Clone(IStream *iface, IStream **stream)
++{
++    return E_NOTIMPL;
++}
++
++static const IStreamVtbl read_stream_vtbl =
++{
++    read_stream_QueryInterface,
++    read_stream_AddRef,
++    read_stream_Release,
++    read_stream_Read,
++    read_stream_Write,
++    read_stream_Seek,
++    read_stream_SetSize,
++    read_stream_CopyTo,
++    read_stream_Commit,
++    read_stream_Revert,
++    read_stream_LockRegion,
++    read_stream_UnlockRegion,
++    read_stream_Stat,
++    read_stream_Clone,
++};
++
++#define check_parse_error_code(doc, expect) check_parse_error_code_(__LINE__, doc, expect)
++static void check_parse_error_code_(unsigned int line, IXMLDOMDocument *doc, HRESULT expect)
++{
++    IXMLDOMParseError *error;
++    LONG code = 0;
++    HRESULT hr;
++
++    hr = IXMLDOMDocument_get_parseError(doc, &error);
++    ok_(__FILE__, line)(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXMLDOMParseError_get_errorCode(error, &code);
++    ok_(__FILE__, line)(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok_(__FILE__, line)(code == expect, "Unexpected error code %#lx.\n", code);
++    IXMLDOMParseError_Release(error);
++}
++
+ /* Loading a document from another document goes through that document's stream.  Its Read fails
+  * without setting the count while the stream is written to (see test_document_stream), and Word
+  * loads documents from empty ones: none of this may read the count. */
+ static void test_load_from_document_stream(void)
+ {
++    static const struct
++    {
++        const char *data;
++        HRESULT result;
++        HRESULT error;
++    }
++    streams[] =
++    {
++        { NULL, E_FAIL, E_FAIL },
++        { "<a>", E_FAIL, E_FAIL },
++        { NULL, S_FALSE, 0xc00ce558 /* XML_E_MISSINGROOT */ },
++        { NULL, S_OK, 0xc00ce558 },
++    };
++    struct read_stream read_stream = { { &read_stream_vtbl } };
++    IPersistStreamInit *persist;
++    char buffer[16];
++    unsigned int i;
+     IXMLDOMDocument *src, *doc;
+     IXMLDOMElement *root;
+     VARIANT_BOOL loaded;
+@@ -19875,18 +20024,73 @@ static void test_load_from_document_stream(void)
+     IStream_Release(stream);
+     IXMLDOMDocument_Release(src);
+ 
+-    /* from an empty document */
++    /* an empty document reads as an empty stream */
+     src = create_document(&IID_IXMLDOMDocument);
++    hr = IXMLDOMDocument_QueryInterface(src, &IID_IStream, (void **)&stream);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    length = 0xdeadbeef;
++    hr = IStream_Read(stream, buffer, sizeof(buffer), &length);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!length, "Unexpected length %lu.\n", length);
++    IStream_Release(stream);
++
++    /* so loading from one finds no root */
+     doc = create_document(&IID_IXMLDOMDocument);
+     V_VT(&v) = VT_UNKNOWN;
+     V_UNKNOWN(&v) = (IUnknown *)src;
+     loaded = VARIANT_TRUE;
+     hr = IXMLDOMDocument_load(doc, v, &loaded);
+-    trace("load from an empty document: hr %#lx, loaded %d.\n", hr, loaded);
++    ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++    ok(loaded == VARIANT_FALSE, "Unexpected result %d.\n", loaded);
++    check_parse_error_code(doc, 0xc00ce558);
+     hr = IXMLDOMDocument_get_documentElement(doc, &root);
+     ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
+     IXMLDOMDocument_Release(doc);
+     IXMLDOMDocument_Release(src);
++
++    /* a document is a source as an IDispatch too */
++    src = create_document(&IID_IXMLDOMDocument);
++    hr = IXMLDOMDocument_loadXML(src, _bstr_("<root/>"), &loaded);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    doc = create_document(&IID_IXMLDOMDocument);
++    V_VT(&v) = VT_DISPATCH;
++    V_DISPATCH(&v) = (IDispatch *)src;
++    loaded = VARIANT_FALSE;
++    hr = IXMLDOMDocument_load(doc, v, &loaded);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(loaded == VARIANT_TRUE, "Unexpected result %d.\n", loaded);
++    hr = IXMLDOMDocument_get_documentElement(doc, &root);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (hr == S_OK) IXMLDOMElement_Release(root);
++    IXMLDOMDocument_Release(doc);
++    IXMLDOMDocument_Release(src);
++
++    /* what a stream that fails or gives nothing leaves: load answers S_FALSE, and the error is the
++     * stream's or the parser's */
++    for (i = 0; i < ARRAY_SIZE(streams); i++)
++    {
++        winetest_push_context("%u", i);
++        doc = create_document(&IID_IXMLDOMDocument);
++        read_stream.data = streams[i].data;
++        read_stream.result = streams[i].result;
++        read_stream.given = FALSE;
++        V_VT(&v) = VT_UNKNOWN;
++        V_UNKNOWN(&v) = (IUnknown *)&read_stream.IStream_iface;
++        loaded = VARIANT_TRUE;
++        hr = IXMLDOMDocument_load(doc, v, &loaded);
++        ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++        ok(loaded == VARIANT_FALSE, "Unexpected result %d.\n", loaded);
++        check_parse_error_code(doc, streams[i].error);
++
++        read_stream.given = FALSE;
++        hr = IXMLDOMDocument_QueryInterface(doc, &IID_IPersistStreamInit, (void **)&persist);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        hr = IPersistStreamInit_Load(persist, &read_stream.IStream_iface);
++        ok(hr == streams[i].error, "Unexpected hr %#lx.\n", hr);
++        IPersistStreamInit_Release(persist);
++        IXMLDOMDocument_Release(doc);
++        winetest_pop_context();
++    }
+ }
+ 
+ START_TEST(domdoc)

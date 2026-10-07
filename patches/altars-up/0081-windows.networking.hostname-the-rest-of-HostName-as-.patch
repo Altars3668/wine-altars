@@ -1,0 +1,747 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 19:15:04 -0400
+Subject: [PATCH] windows.networking.hostname: the rest of HostName, as Windows
+ has it.
+
+Only RawName was there.  Now a name is parsed into one of the four kinds
+it can be, as a probe measured them on Windows, and refused with
+E_INVALIDARG when it is none:
+
+- a Bluetooth address, "(aa:bb:cc:dd:ee:ff)", displayed in upper case;
+- an IPv6 address, bracketed or not, with a numeric scope or not,
+  displayed as RtlIpv6AddressToStringEx writes it, or, mapped from
+  IPv4, as the IPv4 address it is;
+- an IPv4 address, strictly four decimal parts: a name of several
+  labels whose last one is a number has to be one;
+- otherwise a domain name, of labels of letters, digits, '-' and '_' or
+  of characters beyond ASCII, none empty but after a final dot, none
+  longer than 63.  One with characters beyond ASCII or punycode labels
+  displays as IDNA gives it back in Unicode, in lower case.
+
+The canonical name is the display name, in lower case for a domain
+name; IsEqual and IHostNameStatics::Compare go by it.  The class names
+itself, and is IStringable as its display name.  IPInformation is NULL:
+Windows has one for this machine's own addresses, and there are no
+network adapters here to describe.
+
+Not copied: Windows also takes "1.2.3.4." and a nine-part
+"0:0:0:0:0:0:0:0:0" for Bluetooth addresses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 541fa5175bb6db3f5abd758fe37008b5a5c0d8c1)
+
+diff --git a/dlls/windows.networking.hostname/Makefile.in b/dlls/windows.networking.hostname/Makefile.in
+index 8bb0eee7729..aa3b8241051 100644
+--- a/dlls/windows.networking.hostname/Makefile.in
++++ b/dlls/windows.networking.hostname/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE  = windows.networking.hostname.dll
+-IMPORTS = combase
++IMPORTS = combase ntdll
+ 
+ SOURCES = \
+ 	classes.idl \
+diff --git a/dlls/windows.networking.hostname/hostname.c b/dlls/windows.networking.hostname/hostname.c
+index b77186af212..465e8aac22d 100644
+--- a/dlls/windows.networking.hostname/hostname.c
++++ b/dlls/windows.networking.hostname/hostname.c
+@@ -17,6 +17,8 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <wctype.h>
++
+ #include "private.h"
+ #include "wine/debug.h"
+ 
+@@ -26,6 +28,7 @@ struct hostname_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+     IHostNameFactory IHostNameFactory_iface;
++    IHostNameStatics IHostNameStatics_iface;
+     LONG ref;
+ };
+ 
+@@ -57,6 +60,13 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IHostNameStatics ))
++    {
++        *out = &impl->IHostNameStatics_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -115,14 +125,206 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+     factory_ActivateInstance,
+ };
+ 
++/*
++ * A host name is one of four kinds, told apart as Windows does:
++ *
++ * - a Bluetooth address, "(01:23:45:67:89:ab)", written in upper case;
++ * - an IPv6 address, in brackets or not, with a numeric scope or not,
++ *   written as RtlIpv6AddressToStringEx writes it -- unless it is an IPv4
++ *   address mapped into IPv6, which is that IPv4 address;
++ * - an IPv4 address, in four decimal parts and nothing else: a name of more
++ *   than one label whose last label is a number has to be one;
++ * - otherwise a domain name, of labels of letters, digits, '-' and '_', or
++ *   of characters beyond ASCII, none empty but a last one after a final
++ *   dot, none longer than 63 characters.  One with characters beyond ASCII
++ *   or punycode labels displays as IDNA gives it back in Unicode.
++ *
++ * The canonical name of a domain name is its display name in lower case; of
++ * an address, the address as it displays.  It is what two host names are
++ * compared by.
++ */
++
+ struct hostname
+ {
+     IHostName IHostName_iface;
++    IStringable IStringable_iface;
+     LONG ref;
+ 
+     HSTRING raw_name;
++    HSTRING display_name;
++    HSTRING canonical_name;
++    HostNameType type;
+ };
+ 
++static BOOL parse_bluetooth( const WCHAR *name, UINT32 len, WCHAR **display )
++{
++    WCHAR *ret;
++    UINT32 i;
++
++    if (len != 19 || name[0] != '(' || name[18] != ')') return FALSE;
++    for (i = 1; i < 18; i++)
++    {
++        if (i % 3 == 0 ? name[i] != ':' : !iswxdigit( name[i] ) || name[i] >= 0x80) return FALSE;
++    }
++    if (!(ret = malloc( (len + 1) * sizeof(WCHAR) ))) return FALSE;
++    for (i = 0; i < len; i++) ret[i] = towupper( name[i] );
++    ret[len] = 0;
++    *display = ret;
++    return TRUE;
++}
++
++static WCHAR *strndupW( const WCHAR *str, UINT32 len )
++{
++    WCHAR *ret;
++    if (!(ret = malloc( (len + 1) * sizeof(WCHAR) ))) return NULL;
++    memcpy( ret, str, len * sizeof(WCHAR) );
++    ret[len] = 0;
++    return ret;
++}
++
++static WCHAR *format_ipv4( const BYTE *bytes )
++{
++    WCHAR *ret;
++    if (!(ret = malloc( 16 * sizeof(WCHAR) ))) return NULL;
++    swprintf( ret, 16, L"%u.%u.%u.%u", bytes[0], bytes[1], bytes[2], bytes[3] );
++    return ret;
++}
++
++static BOOL parse_ipv6( const WCHAR *name, UINT32 len, HostNameType *type, WCHAR **display )
++{
++    static const BYTE mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
++    WCHAR buffer[64], *copy;
++    ULONG scope, size = ARRAY_SIZE(buffer);
++    USHORT port;
++    IN6_ADDR addr;
++    NTSTATUS status;
++
++    if (name[0] == '[')
++    {
++        if (len < 3 || name[len - 1] != ']') return FALSE;
++        name++;
++        len -= 2;
++    }
++    else if (name[len - 1] == ']') return FALSE;
++    if (!(copy = strndupW( name, len ))) return FALSE;
++    status = RtlIpv6StringToAddressExW( copy, &addr, &scope, &port );
++    free( copy );
++    if (status || port) return FALSE;
++
++    if (!memcmp( addr.u.Byte, mapped, sizeof(mapped) ))
++    {
++        *type = HostNameType_Ipv4;
++        return !!(*display = format_ipv4( addr.u.Byte + 12 ));
++    }
++    if (RtlIpv6AddressToStringExW( &addr, scope, 0, buffer, &size )) return FALSE;
++    *type = HostNameType_Ipv6;
++    return !!(*display = wcsdup( buffer ));
++}
++
++static BOOL parse_ipv4( const WCHAR *name, UINT32 len, WCHAR **display )
++{
++    BYTE bytes[4];
++    UINT32 i = 0, part, digits, value;
++
++    for (part = 0; part < 4; part++)
++    {
++        if (part && (i >= len || name[i++] != '.')) return FALSE;
++        for (digits = 0, value = 0; i < len && name[i] >= '0' && name[i] <= '9'; i++, digits++)
++            value = value * 10 + name[i] - '0';
++        /* no leading zeros */
++        if (!digits || digits > 3 || value > 255 || (digits > 1 && name[i - digits] == '0')) return FALSE;
++        bytes[part] = value;
++    }
++    if (i != len) return FALSE;
++    return !!(*display = format_ipv4( bytes ));
++}
++
++static BOOL is_label_char( WCHAR c )
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c >= 0x80;
++}
++
++static BOOL parse_domain( const WCHAR *name, UINT32 len, HostNameType *type, WCHAR **display )
++{
++    UINT32 i, label = 0, labels = 0;
++    BOOL idn = FALSE, numeric = TRUE;
++    WCHAR ascii[256], unicode[256];
++    int ascii_len, unicode_len;
++
++    if (len > 253) return FALSE;
++    for (i = 0; i <= len; i++)
++    {
++        if (i == len || name[i] == '.')
++        {
++            if (i == label)
++            {
++                /* a final dot is allowed, an empty label anywhere else not */
++                if (i != len || !labels) return FALSE;
++                break;
++            }
++            if (i - label > 63) return FALSE;
++            if (i - label >= 4 && !wcsnicmp( name + label, L"xn--", 4 )) idn = TRUE;
++            numeric = TRUE;
++            for (; label < i; label++) if (name[label] < '0' || name[label] > '9') numeric = FALSE;
++            label = i + 1;
++            labels++;
++            continue;
++        }
++        if (!is_label_char( name[i] )) return FALSE;
++        if (name[i] >= 0x80) idn = TRUE;
++    }
++    if (labels > 1 && numeric)
++    {
++        *type = HostNameType_Ipv4;
++        return parse_ipv4( name, len, display );
++    }
++
++    *type = HostNameType_DomainName;
++    if (!idn) return !!(*display = strndupW( name, len ));
++
++    /* Characters beyond ASCII and punycode alike display as IDNA gives them
++     * back in Unicode, in lower case; a punycode label that decodes to
++     * nothing is no label. */
++    for (i = 0; i < len && name[i] < 0x80; i++) ;
++    if (i < len)
++    {
++        if (!(ascii_len = IdnToAscii( IDN_ALLOW_UNASSIGNED, name, len, ascii, ARRAY_SIZE(ascii) ))) return FALSE;
++    }
++    else
++    {
++        /* punycode is read without regard to case */
++        for (i = 0; i < len; i++) ascii[i] = towlower( name[i] );
++        ascii_len = len;
++    }
++    if (!(unicode_len = IdnToUnicode( IDN_ALLOW_UNASSIGNED, ascii, ascii_len, unicode, ARRAY_SIZE(unicode) - 1 )))
++        return FALSE;
++    for (i = 0; i < unicode_len; i++)
++        if (unicode[i] == '.' && (!i || unicode[i - 1] == '.')) return FALSE;
++    if (unicode[unicode_len - 1] == '.' && ascii[ascii_len - 1] != '.') return FALSE;
++    if (!(*display = strndupW( unicode, unicode_len ))) return FALSE;
++    LCMapStringEx( LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, *display, -1, *display, unicode_len + 1, NULL, NULL, 0 );
++    return TRUE;
++}
++
++static HRESULT parse_hostname( HSTRING raw, HostNameType *type, WCHAR **display )
++{
++    UINT32 len;
++    const WCHAR *name = WindowsGetStringRawBuffer( raw, &len );
++
++    *display = NULL;
++    if (!len) return E_INVALIDARG;
++    if (name[0] == '(')
++    {
++        *type = HostNameType_Bluetooth;
++        return parse_bluetooth( name, len, display ) ? S_OK : E_INVALIDARG;
++    }
++    if (wcschr( name, ':' ) || name[0] == '[')
++        return parse_ipv6( name, len, type, display ) ? S_OK : E_INVALIDARG;
++    return parse_domain( name, len, type, display ) ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT hostname_create( HSTRING name, IHostName **out );
++
+ static inline struct hostname *impl_from_IHostName( IHostName *iface )
+ {
+     return CONTAINING_RECORD( iface, struct hostname, IHostName_iface );
+@@ -144,6 +346,13 @@ static HRESULT WINAPI hostname_QueryInterface( IHostName *iface, REFIID iid, voi
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IStringable ))
++    {
++        *out = &impl->IStringable_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -167,6 +376,8 @@ static ULONG WINAPI hostname_Release( IHostName *iface )
+     if (!ref)
+     {
+         WindowsDeleteString( impl->raw_name );
++        WindowsDeleteString( impl->display_name );
++        WindowsDeleteString( impl->canonical_name );
+         free( impl );
+     }
+ 
+@@ -181,8 +392,9 @@ static HRESULT WINAPI hostname_GetIids( IHostName *iface, ULONG *iid_count, IID
+ 
+ static HRESULT WINAPI hostname_GetRuntimeClassName( IHostName *iface, HSTRING *class_name )
+ {
+-    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Networking_HostName,
++                                wcslen( RuntimeClass_Windows_Networking_HostName ), class_name );
+ }
+ 
+ static HRESULT WINAPI hostname_GetTrustLevel( IHostName *iface, TrustLevel *trust_level )
+@@ -193,8 +405,17 @@ static HRESULT WINAPI hostname_GetTrustLevel( IHostName *iface, TrustLevel *trus
+ 
+ static HRESULT WINAPI hostname_get_IPInformation( IHostName *iface, IIPInformation **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct hostname *impl = impl_from_IHostName( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    /* Windows has one for an address of this machine; there are no network
++     * adapters here to describe. */
++    if (impl->type == HostNameType_Ipv4 || impl->type == HostNameType_Ipv6)
++        FIXME( "no IP information for %s.\n", debugstr_hstring( impl->canonical_name ) );
++    *value = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI hostname_get_RawName( IHostName *iface, HSTRING *value )
+@@ -209,26 +430,50 @@ static HRESULT WINAPI hostname_get_RawName( IHostName *iface, HSTRING *value )
+ 
+ static HRESULT WINAPI hostname_get_DisplayName( IHostName *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct hostname *impl = impl_from_IHostName( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    return WindowsDuplicateString( impl->display_name, value );
+ }
+ 
+ static HRESULT WINAPI hostname_get_CanonicalName( IHostName *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct hostname *impl = impl_from_IHostName( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    return WindowsDuplicateString( impl->canonical_name, value );
+ }
+ 
+ static HRESULT WINAPI hostname_get_Type( IHostName *iface, HostNameType *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct hostname *impl = impl_from_IHostName( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = impl->type;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI hostname_IsEqual( IHostName *iface, IHostName *name, boolean *equal )
+ {
+-    FIXME( "iface %p, name %p, equal %p stub!\n", iface, name, equal );
+-    return E_NOTIMPL;
++    struct hostname *impl = impl_from_IHostName( iface );
++    HSTRING canonical;
++    INT32 order;
++    HRESULT hr;
++
++    TRACE( "iface %p, name %p, equal %p.\n", iface, name, equal );
++
++    if (!name || !equal) return E_POINTER;
++    if (FAILED(hr = IHostName_get_CanonicalName( name, &canonical ))) return hr;
++    hr = WindowsCompareStringOrdinal( impl->canonical_name, canonical, &order );
++    WindowsDeleteString( canonical );
++    if (SUCCEEDED(hr)) *equal = !order;
++    return hr;
+ }
+ 
+ static const struct IHostNameVtbl hostname_vtbl =
+@@ -249,32 +494,81 @@ static const struct IHostNameVtbl hostname_vtbl =
+     hostname_IsEqual,
+ };
+ 
+-DEFINE_IINSPECTABLE( hostname_factory, IHostNameFactory, struct hostname_statics, IActivationFactory_iface )
++DEFINE_IINSPECTABLE( hostname_stringable, IStringable, struct hostname, IHostName_iface )
+ 
+-static HRESULT WINAPI hostname_factory_CreateHostName( IHostNameFactory *iface, HSTRING name, IHostName **value )
++/* A host name reads as its display name. */
++static HRESULT WINAPI hostname_stringable_ToString( IStringable *iface, HSTRING *value )
+ {
+-    struct hostname *impl;
+-    HRESULT hr;
++    struct hostname *impl = impl_from_IStringable( iface );
+ 
+-    TRACE( "iface %p, name %s, value %p\n", iface, debugstr_hstring(name), value );
++    TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (!name) return E_INVALIDARG;
+-    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    return WindowsDuplicateString( impl->display_name, value );
++}
+ 
++static const struct IStringableVtbl hostname_stringable_vtbl =
++{
++    hostname_stringable_QueryInterface,
++    hostname_stringable_AddRef,
++    hostname_stringable_Release,
++    /* IInspectable methods */
++    hostname_stringable_GetIids,
++    hostname_stringable_GetRuntimeClassName,
++    hostname_stringable_GetTrustLevel,
++    /* IStringable methods */
++    hostname_stringable_ToString,
++};
++
++static HRESULT hostname_create( HSTRING name, IHostName **out )
++{
++    struct hostname *impl;
++    WCHAR *display;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+     impl->IHostName_iface.lpVtbl = &hostname_vtbl;
++    impl->IStringable_iface.lpVtbl = &hostname_stringable_vtbl;
+     impl->ref = 1;
+-    if (FAILED(hr = WindowsDuplicateString( name, &impl->raw_name )))
++
++    if (FAILED(hr = parse_hostname( name, &impl->type, &display )))
+     {
+         free( impl );
+         return hr;
+     }
++    if (SUCCEEDED(hr = WindowsDuplicateString( name, &impl->raw_name )) &&
++        SUCCEEDED(hr = WindowsCreateString( display, wcslen( display ), &impl->display_name )))
++    {
++        /* the canonical name of a domain name is its display name in lower case */
++        if (impl->type == HostNameType_DomainName)
++            LCMapStringEx( LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, display, -1, display, wcslen( display ) + 1,
++                           NULL, NULL, 0 );
++        hr = WindowsCreateString( display, wcslen( display ), &impl->canonical_name );
++    }
++    free( display );
++    if (FAILED(hr))
++    {
++        IHostName_Release( &impl->IHostName_iface );
++        return hr;
++    }
+ 
+-    *value = &impl->IHostName_iface;
+-    TRACE( "created IHostName %p.\n", *value );
++    *out = &impl->IHostName_iface;
++    TRACE( "created IHostName %p.\n", *out );
+     return S_OK;
+ }
+ 
++DEFINE_IINSPECTABLE( hostname_factory, IHostNameFactory, struct hostname_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI hostname_factory_CreateHostName( IHostNameFactory *iface, HSTRING name, IHostName **value )
++{
++    TRACE( "iface %p, name %s, value %p\n", iface, debugstr_hstring(name), value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!name) return E_INVALIDARG;
++    return hostname_create( name, value );
++}
++
+ static const struct IHostNameFactoryVtbl hostname_factory_vtbl =
+ {
+     hostname_factory_QueryInterface,
+@@ -288,10 +582,55 @@ static const struct IHostNameFactoryVtbl hostname_factory_vtbl =
+     hostname_factory_CreateHostName,
+ };
+ 
++DEFINE_IINSPECTABLE( hostname_statics, IHostNameStatics, struct hostname_statics, IActivationFactory_iface )
++
++/* Compares the canonical names, which both have to be host names. */
++static HRESULT WINAPI hostname_statics_Compare( IHostNameStatics *iface, HSTRING value1, HSTRING value2, INT32 *result )
++{
++    IHostName *name1, *name2;
++    HSTRING canonical1 = NULL, canonical2 = NULL;
++    INT32 order;
++    HRESULT hr;
++
++    TRACE( "iface %p, value1 %s, value2 %s, result %p.\n", iface, debugstr_hstring(value1), debugstr_hstring(value2), result );
++
++    if (!result) return E_POINTER;
++    if (!value1 || !value2) return E_INVALIDARG;
++    if (FAILED(hr = hostname_create( value1, &name1 ))) return hr;
++    if (FAILED(hr = hostname_create( value2, &name2 )))
++    {
++        IHostName_Release( name1 );
++        return hr;
++    }
++    IHostName_get_CanonicalName( name1, &canonical1 );
++    IHostName_get_CanonicalName( name2, &canonical2 );
++    if (SUCCEEDED(hr = WindowsCompareStringOrdinal( canonical1, canonical2, &order )))
++        *result = order < 0 ? -1 : order > 0 ? 1 : 0;
++    WindowsDeleteString( canonical1 );
++    WindowsDeleteString( canonical2 );
++    IHostName_Release( name1 );
++    IHostName_Release( name2 );
++    return hr;
++}
++
++static const struct IHostNameStaticsVtbl hostname_statics_vtbl =
++{
++    hostname_statics_QueryInterface,
++    hostname_statics_AddRef,
++    hostname_statics_Release,
++    /* IInspectable methods */
++    hostname_statics_GetIids,
++    hostname_statics_GetRuntimeClassName,
++    hostname_statics_GetTrustLevel,
++    /* IHostNameStatics methods */
++    hostname_statics_Compare,
++};
++
+ static struct hostname_statics hostname_statics =
+ {
+     {&factory_vtbl},
+     {&hostname_factory_vtbl},
++    {&hostname_statics_vtbl},
+     1,
+ };
+ 
+diff --git a/dlls/windows.networking.hostname/private.h b/dlls/windows.networking.hostname/private.h
+index 5c43a41433b..9c0102fee1d 100644
+--- a/dlls/windows.networking.hostname/private.h
++++ b/dlls/windows.networking.hostname/private.h
+@@ -25,7 +25,12 @@
+ #define COBJMACROS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winnls.h"
++#include "winternl.h"
+ #include "winstring.h"
++#include "inaddr.h"
++#include "in6addr.h"
++#include "ip2string.h"
+ 
+ #include "activation.h"
+ 
+diff --git a/dlls/windows.networking.hostname/tests/hostname.c b/dlls/windows.networking.hostname/tests/hostname.c
+index 31a3e1651ca..3aa48c75fa1 100644
+--- a/dlls/windows.networking.hostname/tests/hostname.c
++++ b/dlls/windows.networking.hostname/tests/hostname.c
+@@ -113,6 +113,169 @@ static void test_HostnameStatics(void)
+     ok( ref == 1, "got ref %ld.\n", ref );
+ }
+ 
++static void test_HostName_kinds(void)
++{
++    static const struct
++    {
++        const WCHAR *name;
++        HRESULT hr;
++        HostNameType type;
++        const WCHAR *display;
++        const WCHAR *canonical;
++    }
++    tests[] =
++    {
++        {L"example.com", S_OK, HostNameType_DomainName, L"example.com", L"example.com"},
++        {L"EXAMPLE.com", S_OK, HostNameType_DomainName, L"EXAMPLE.com", L"example.com"},
++        {L"Example.COM.", S_OK, HostNameType_DomainName, L"Example.COM.", L"example.com."},
++        {L"host_name", S_OK, HostNameType_DomainName, L"host_name", L"host_name"},
++        {L"-bad.com", S_OK, HostNameType_DomainName, L"-bad.com", L"-bad.com"},
++        {L"123", S_OK, HostNameType_DomainName, L"123", L"123"},
++        {L"h\x00e9llo.example", S_OK, HostNameType_DomainName, L"h\x00e9llo.example", L"h\x00e9llo.example"},
++        {L"H\x00c9LLO.example", S_OK, HostNameType_DomainName, L"h\x00e9llo.example", L"h\x00e9llo.example"},
++        {L"xn--hllo-bpa.example", S_OK, HostNameType_DomainName, L"h\x00e9llo.example", L"h\x00e9llo.example"},
++        {L"XN--HLLO-BPA.example", S_OK, HostNameType_DomainName, L"h\x00e9llo.example", L"h\x00e9llo.example"},
++        {L"127.0.0.1", S_OK, HostNameType_Ipv4, L"127.0.0.1", L"127.0.0.1"},
++        {L"255.255.255.255", S_OK, HostNameType_Ipv4, L"255.255.255.255", L"255.255.255.255"},
++        {L"::1", S_OK, HostNameType_Ipv6, L"::1", L"::1"},
++        {L"[::1]", S_OK, HostNameType_Ipv6, L"::1", L"::1"},
++        {L"FE80::1%12", S_OK, HostNameType_Ipv6, L"fe80::1%12", L"fe80::1%12"},
++        {L"FE80::1%0", S_OK, HostNameType_Ipv6, L"fe80::1", L"fe80::1"},
++        {L"2001:DB8::0:1", S_OK, HostNameType_Ipv6, L"2001:db8::1", L"2001:db8::1"},
++        {L"::1.2.3.4", S_OK, HostNameType_Ipv6, L"::1.2.3.4", L"::1.2.3.4"},
++        {L"::ffff:1.2.3.4", S_OK, HostNameType_Ipv4, L"1.2.3.4", L"1.2.3.4"},
++        {L"(00:11:22:33:44:55)", S_OK, HostNameType_Bluetooth, L"(00:11:22:33:44:55)", L"(00:11:22:33:44:55)"},
++        {L"(aa:bb:cc:dd:ee:ff)", S_OK, HostNameType_Bluetooth, L"(AA:BB:CC:DD:EE:FF)", L"(AA:BB:CC:DD:EE:FF)"},
++        {L"", E_INVALIDARG},
++        {L"a b", E_INVALIDARG},
++        {L"127.1", E_INVALIDARG},
++        {L"1.2.3", E_INVALIDARG},
++        {L"a.1", E_INVALIDARG},
++        {L"256.1.1.1", E_INVALIDARG},
++        {L"01.02.03.04", E_INVALIDARG},
++        {L"1.2.3.4.5", E_INVALIDARG},
++        {L"example.com:80", E_INVALIDARG},
++        {L"a..b", E_INVALIDARG},
++        {L".leading", E_INVALIDARG},
++        {L"*", E_INVALIDARG},
++        {L"a@b", E_INVALIDARG},
++        {L"exa%6dple.com", E_INVALIDARG},
++        {L"a/b", E_INVALIDARG},
++        {L"1.2.3.4 ", E_INVALIDARG},
++        {L"[fe80::1]:80", E_INVALIDARG},
++        {L"fe80::1%eth0", E_INVALIDARG},
++        {L"[::1", E_INVALIDARG},
++        {L"::1]", E_INVALIDARG},
++        {L"1::2::3", E_INVALIDARG},
++        {L"(00:11:22:33:44:5G)", E_INVALIDARG},
++        {L"xn--", E_INVALIDARG},
++        {L"a.xn--", E_INVALIDARG},
++        {L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com", E_INVALIDARG},
++    };
++    static const struct
++    {
++        const WCHAR *first, *second;
++        HRESULT hr;
++        INT32 result;
++    }
++    compare_tests[] =
++    {
++        {L"a.com", L"b.com", S_OK, -1},
++        {L"b.com", L"a.com", S_OK, 1},
++        {L"A.com", L"a.COM", S_OK, 0},
++        {L"::1", L"0:0::1", S_OK, 0},
++        {L"h\x00e9llo.example", L"xn--hllo-bpa.example", S_OK, 0},
++        {L"Example.COM.", L"example.com", S_OK, 1},
++        {L"127.0.0.1", L"127.1", E_INVALIDARG},
++        {L"", L"", E_INVALIDARG},
++    };
++    IHostNameFactory *factory;
++    IHostNameStatics *statics;
++    IHostName *name, *reference;
++    IStringable *stringable;
++    HSTRING str, str2;
++    HostNameType type;
++    boolean equal;
++    INT32 result;
++    HRESULT hr;
++    UINT32 i;
++
++    WindowsCreateString( L"Windows.Networking.HostName", wcslen( L"Windows.Networking.HostName" ), &str );
++    hr = RoGetActivationFactory( str, &IID_IHostNameFactory, (void **)&factory );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = RoGetActivationFactory( str, &IID_IHostNameStatics, (void **)&statics );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    WindowsDeleteString( str );
++
++    WindowsCreateString( L"EXAMPLE.COM", 11, &str );
++    hr = IHostNameFactory_CreateHostName( factory, str, &reference );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    WindowsDeleteString( str );
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context( "%s", debugstr_w( tests[i].name ) );
++        WindowsCreateString( tests[i].name, wcslen( tests[i].name ), &str );
++        name = (void *)0xdeadbeef;
++        hr = IHostNameFactory_CreateHostName( factory, str, &name );
++        ok( hr == tests[i].hr, "got hr %#lx.\n", hr );
++        if (SUCCEEDED(hr))
++        {
++            hr = IHostName_get_Type( name, &type );
++            ok( hr == S_OK && type == tests[i].type, "got hr %#lx, type %d.\n", hr, type );
++            hr = IHostName_get_RawName( name, &str2 );
++            ok( hr == S_OK && !wcscmp( WindowsGetStringRawBuffer( str2, NULL ), tests[i].name ),
++                "got hr %#lx, %s.\n", hr, debugstr_hstring( str2 ) );
++            WindowsDeleteString( str2 );
++            hr = IHostName_get_DisplayName( name, &str2 );
++            ok( hr == S_OK && !wcscmp( WindowsGetStringRawBuffer( str2, NULL ), tests[i].display ),
++                "got hr %#lx, display %s.\n", hr, debugstr_hstring( str2 ) );
++            WindowsDeleteString( str2 );
++            hr = IHostName_get_CanonicalName( name, &str2 );
++            ok( hr == S_OK && !wcscmp( WindowsGetStringRawBuffer( str2, NULL ), tests[i].canonical ),
++                "got hr %#lx, canonical %s.\n", hr, debugstr_hstring( str2 ) );
++            WindowsDeleteString( str2 );
++            hr = IHostName_QueryInterface( name, &IID_IStringable, (void **)&stringable );
++            ok( hr == S_OK, "got hr %#lx.\n", hr );
++            hr = IStringable_ToString( stringable, &str2 );
++            ok( hr == S_OK && !wcscmp( WindowsGetStringRawBuffer( str2, NULL ), tests[i].display ),
++                "got hr %#lx, %s.\n", hr, debugstr_hstring( str2 ) );
++            WindowsDeleteString( str2 );
++            IStringable_Release( stringable );
++            hr = IHostName_GetRuntimeClassName( name, &str2 );
++            ok( hr == S_OK && !wcscmp( WindowsGetStringRawBuffer( str2, NULL ), L"Windows.Networking.HostName" ),
++                "got hr %#lx, %s.\n", hr, debugstr_hstring( str2 ) );
++            WindowsDeleteString( str2 );
++            equal = 2;
++            hr = IHostName_IsEqual( name, reference, &equal );
++            ok( hr == S_OK, "got hr %#lx.\n", hr );
++            ok( equal == !wcscmp( tests[i].canonical, L"example.com" ), "got %d.\n", equal );
++            IHostName_Release( name );
++        }
++        WindowsDeleteString( str );
++        winetest_pop_context();
++    }
++
++    for (i = 0; i < ARRAY_SIZE(compare_tests); i++)
++    {
++        winetest_push_context( "%s %s", debugstr_w( compare_tests[i].first ), debugstr_w( compare_tests[i].second ) );
++        WindowsCreateString( compare_tests[i].first, wcslen( compare_tests[i].first ), &str );
++        WindowsCreateString( compare_tests[i].second, wcslen( compare_tests[i].second ), &str2 );
++        result = 99;
++        hr = IHostNameStatics_Compare( statics, str, str2, &result );
++        ok( hr == compare_tests[i].hr, "got hr %#lx.\n", hr );
++        if (SUCCEEDED(hr)) ok( result == compare_tests[i].result, "got %d.\n", result );
++        else ok( result == 99, "got %d.\n", result );
++        WindowsDeleteString( str );
++        WindowsDeleteString( str2 );
++        winetest_pop_context();
++    }
++
++    IHostName_Release( reference );
++    IHostNameStatics_Release( statics );
++    IHostNameFactory_Release( factory );
++}
++
+ START_TEST(hostname)
+ {
+     HRESULT hr;
+@@ -121,6 +284,7 @@ START_TEST(hostname)
+     ok( hr == S_OK, "RoInitialize failed, hr %#lx\n", hr );
+ 
+     test_HostnameStatics();
++    test_HostName_kinds();
+ 
+     RoUninitialize();
+ }

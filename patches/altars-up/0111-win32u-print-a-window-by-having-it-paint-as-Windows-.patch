@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 10:22:53 -0400
+Subject: [PATCH] win32u: print a window by having it paint, as Windows does.
+
+PrintWindow sent the window WM_PRINT, and IsWindowRedirectedForPrint was a
+stub answering FALSE.  Measured on Windows 11 (tools/printredirectprobe in
+the wine-altars tree): no WM_PRINT arrives.  The window, and its children,
+repaint the way they always do -- WM_PAINT, then WM_NCPAINT and
+WM_ERASEBKGND from inside BeginPaint -- from the thread that calls or from
+another; what they paint is what is printed; and while they paint,
+IsWindowRedirectedForPrint answers -1 for the window printed and 0 for its
+children.  With PW_RENDERFULLCONTENT the window repaints too, and answers 0.
+
+Office asks IsWindowRedirectedForPrint hundreds of times as it paints: it
+paints with GDI rather than through its compositor when it is being
+printed.  PrintWindow now marks the window it prints with a property, which
+the window's own process sees wherever it runs, has it repaint now, and
+copies what the window, or its client area, then shows.  As on Windows, a
+window that is not there fails with ERROR_INVALID_WINDOW_HANDLE, and with no
+DC to copy to the window is printed all the same: TRUE, with
+ERROR_INVALID_HANDLE.
+
+PW_RENDERFULLCONTENT is added to winuser.h.  Content drawn through the
+Direct3D swap chains of a window is not yet in what is copied.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit d216875274359728253cde72143726b04beb1641)
+
+diff --git a/dlls/user32/misc.c b/dlls/user32/misc.c
+index 0fa04b855da..39f12257925 100644
+--- a/dlls/user32/misc.c
++++ b/dlls/user32/misc.c
+@@ -454,8 +454,10 @@ BOOL WINAPI IsImmersiveProcess( HANDLE process )
+  */
+ BOOL WINAPI IsWindowRedirectedForPrint( HWND hwnd )
+ {
+-    FIXME("(%p): stub\n", hwnd);
+-    return FALSE;
++    TRACE("(%p)\n", hwnd);
++
++    /* PrintWindow marks the window it prints for as long as it paints it; Windows answers -1 then. */
++    return GetPropW( hwnd, L"__wine_print_redirected" ) ? -1 : FALSE;
+ }
+ 
+ /**********************************************************************
+diff --git a/dlls/user32/tests/win.c b/dlls/user32/tests/win.c
+index 8de4cdd276e..96727af0161 100644
+--- a/dlls/user32/tests/win.c
++++ b/dlls/user32/tests/win.c
+@@ -14630,6 +14630,134 @@ static void test_toolwindow_width_clamping_size(void)
+     DestroyWindow( normal );
+ }
+ 
++static BOOL (WINAPI *pIsWindowRedirectedForPrint)(HWND);
++static HWND print_window, print_child;
++static unsigned int print_paints, print_prints, print_child_paints;
++static int print_redirected, print_child_redirected;
++
++static LRESULT WINAPI print_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    switch (msg)
++    {
++    case WM_PRINT:
++    case WM_PRINTCLIENT:
++        ++print_prints;
++        break;
++    case WM_PAINT:
++    {
++        PAINTSTRUCT ps;
++        HBRUSH brush = CreateSolidBrush(hwnd == print_window ? RGB(0, 0xff, 0) : RGB(0, 0, 0xff));
++        HDC hdc;
++
++        if (hwnd == print_window)
++        {
++            ++print_paints;
++            print_redirected = pIsWindowRedirectedForPrint(print_window);
++            print_child_redirected = pIsWindowRedirectedForPrint(print_child);
++        }
++        else ++print_child_paints;
++        hdc = BeginPaint(hwnd, &ps);
++        FillRect(hdc, &ps.rcPaint, brush);
++        EndPaint(hwnd, &ps);
++        DeleteObject(brush);
++        return 0;
++    }
++    }
++    return DefWindowProcA(hwnd, msg, wparam, lparam);
++}
++
++static void test_PrintWindow(void)
++{
++    BITMAPINFO bmi = {{sizeof(BITMAPINFOHEADER), 200, -150, 1, 32, BI_RGB}};
++    WNDCLASSA cls = {0};
++    RECT client;
++    POINT offset;
++    DWORD *bits;
++    HBITMAP dib;
++    BOOL ret;
++    HDC hdc;
++
++    pIsWindowRedirectedForPrint = (void *)GetProcAddress(GetModuleHandleA("user32.dll"), "IsWindowRedirectedForPrint");
++    if (!pIsWindowRedirectedForPrint)
++    {
++        win_skip("IsWindowRedirectedForPrint is not available.\n");
++        return;
++    }
++
++    cls.lpfnWndProc = print_window_proc;
++    cls.hInstance = GetModuleHandleA(NULL);
++    cls.lpszClassName = "print_window";
++    cls.hCursor = LoadCursorA(0, (LPCSTR)IDC_ARROW);
++    RegisterClassA(&cls);
++    print_window = CreateWindowA("print_window", "print", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 200, 150,
++                                 NULL, NULL, cls.hInstance, NULL);
++    print_child = CreateWindowA("print_window", "child", WS_CHILD | WS_VISIBLE, 10, 10, 50, 50, print_window, NULL,
++                                cls.hInstance, NULL);
++    flush_events(TRUE);
++
++    ok(!pIsWindowRedirectedForPrint(print_window), "Got redirected.\n");
++    ok(!pIsWindowRedirectedForPrint(NULL), "Got redirected.\n");
++
++    hdc = CreateCompatibleDC(NULL);
++    dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
++    SelectObject(hdc, dib);
++
++    /* The window repaints the way it always does, and not through WM_PRINT; while it does, it is redirected
++     * for the print, and its children are not. */
++    print_paints = print_prints = print_child_paints = 0;
++    print_redirected = print_child_redirected = 0xdead;
++    memset(bits, 0xcc, 200 * 150 * 4);
++    ret = PrintWindow(print_window, hdc, PW_CLIENTONLY);
++    ok(ret, "PrintWindow failed, error %lu.\n", GetLastError());
++    ok(print_paints == 1, "Got %u paints.\n", print_paints);
++    ok(print_child_paints >= 1, "Got %u paints of the child.\n", print_child_paints);
++    ok(!print_prints, "Got %u WM_PRINT or WM_PRINTCLIENT.\n", print_prints);
++    ok(print_redirected == -1, "Got redirected %d.\n", print_redirected);
++    ok(!print_child_redirected, "Got the child redirected %d.\n", print_child_redirected);
++    ok(!pIsWindowRedirectedForPrint(print_window), "Got redirected after PrintWindow.\n");
++    /* what it painted is what is printed: the client area at the origin */
++    GetClientRect(print_window, &client);
++    ok((bits[(client.bottom - 5) * 200 + client.right - 5] & 0xffffff) == 0x00ff00,
++       "Got colour %#lx.\n", bits[(client.bottom - 5) * 200 + client.right - 5]);
++    ok((bits[20 * 200 + 20] & 0xffffff) == 0x0000ff, "Got colour %#lx.\n", bits[20 * 200 + 20]);
++
++    /* with the whole window, the client area comes after the frame */
++    memset(bits, 0xcc, 200 * 150 * 4);
++    ret = PrintWindow(print_window, hdc, 0);
++    ok(ret, "PrintWindow failed, error %lu.\n", GetLastError());
++    offset.x = offset.y = 0;
++    ClientToScreen(print_window, &offset);
++    {
++        RECT window;
++        GetWindowRect(print_window, &window);
++        offset.x -= window.left;
++        offset.y -= window.top;
++    }
++    ok((bits[(offset.y + 20) * 200 + offset.x + 20] & 0xffffff) == 0x0000ff, "Got colour %#lx.\n",
++       bits[(offset.y + 20) * 200 + offset.x + 20]);
++
++    /* the content rendered in full is not a redirection */
++    print_redirected = 0xdead;
++    ret = PrintWindow(print_window, hdc, PW_RENDERFULLCONTENT);
++    ok(ret, "PrintWindow failed, error %lu.\n", GetLastError());
++    ok(!print_redirected, "Got redirected %d.\n", print_redirected);
++
++    SetLastError(0xdeadbeef);
++    ret = PrintWindow((HWND)0xdeadbeef, hdc, 0);
++    ok(!ret, "PrintWindow succeeded.\n");
++    ok(GetLastError() == ERROR_INVALID_WINDOW_HANDLE, "Got error %lu.\n", GetLastError());
++    /* with nowhere to copy to, the window is printed all the same */
++    SetLastError(0xdeadbeef);
++    ret = PrintWindow(print_window, NULL, 0);
++    ok(ret, "PrintWindow failed.\n");
++    ok(GetLastError() == ERROR_INVALID_HANDLE, "Got error %lu.\n", GetLastError());
++
++    DeleteDC(hdc);
++    DeleteObject(dib);
++    DestroyWindow(print_window);
++    UnregisterClassA("print_window", GetModuleHandleA(NULL));
++}
++
+ START_TEST(win)
+ {
+     char **argv;
+@@ -14809,6 +14937,7 @@ START_TEST(win)
+     test_winregion();
+     test_map_points();
+     test_update_region();
++    test_PrintWindow();
+     test_window_without_child_style();
+     test_smresult();
+     test_GetMessagePos();
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc84bc7..73f45c6c09d 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -2237,15 +2237,19 @@ INT WINAPI NtUserScrollWindowEx( HWND hwnd, INT dx, INT dy, const RECT *rect,
+  */
+ BOOL WINAPI NtUserPrintWindow( HWND hwnd, HDC hdc, UINT flags )
+ {
++    static const WCHAR print_redirected[] = {'_','_','w','i','n','e','_','p','r','i','n','t','_',
++                                             'r','e','d','i','r','e','c','t','e','d',0};
+     RECT rect = {0};
+     HDC hwnd_dc;
+ 
+     TRACE( "hwnd %p, hdc %p, flags %#x\n", hwnd, hdc, flags );
+ 
+-    if (flags & PW_RENDERFULLCONTENT)
+-        WARN( "PW_RENDERFULLCONTENT is unsupported.\n" );
+-
+-    if (!is_window( hwnd ) || flags & ~(PW_CLIENTONLY | PW_RENDERFULLCONTENT))
++    if (!is_window( hwnd ))
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
++        return FALSE;
++    }
++    if (flags & ~(PW_CLIENTONLY | PW_RENDERFULLCONTENT))
+         return FALSE;
+ 
+     if (flags & PW_CLIENTONLY)
+@@ -2255,9 +2259,15 @@ BOOL WINAPI NtUserPrintWindow( HWND hwnd, HDC hdc, UINT flags )
+ 
+     if (is_window_visible( hwnd ))
+     {
++        /* While the window repaints, IsWindowRedirectedForPrint() says so for it alone, and not when the
++         * content is to be rendered in full: Office paints with GDI rather than through its compositor then. */
++        if (!(flags & PW_RENDERFULLCONTENT)) NtUserSetProp( hwnd, print_redirected, (HANDLE)1 );
+         NtUserRedrawWindow( hwnd, NULL, NULL, RDW_INVALIDATE | RDW_FRAME | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW );
++        if (!(flags & PW_RENDERFULLCONTENT)) NtUserRemoveProp( hwnd, print_redirected );
+         hwnd_dc = flags & PW_CLIENTONLY ? NtUserGetDC( hwnd ) : NtUserGetWindowDC( hwnd );
+-        NtGdiBitBlt( hdc, 0, 0, rect.right - rect.left, rect.bottom - rect.top, hwnd_dc, 0, 0, SRCCOPY, 0, 0 );
++        /* printed, as far as Windows is concerned, even when there is nothing to copy what was painted to */
++        if (!NtGdiBitBlt( hdc, 0, 0, rect.right - rect.left, rect.bottom - rect.top, hwnd_dc, 0, 0, SRCCOPY, 0, 0 ))
++            RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
+         NtUserReleaseDC( hwnd, hwnd_dc );
+     }
+     else

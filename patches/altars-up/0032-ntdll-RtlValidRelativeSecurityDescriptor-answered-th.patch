@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 22:45:36 -0400
+Subject: [PATCH] ntdll: RtlValidRelativeSecurityDescriptor answered the
+ opposite of the truth.
+
+    BOOLEAN WINAPI RtlValidSecurityDescriptor( PSECURITY_DESCRIPTOR descriptor )
+    {
+        SECURITY_DESCRIPTOR *sd = descriptor;
+        return sd && sd->Revision == SECURITY_DESCRIPTOR_REVISION;
+    }
+
+    BOOLEAN WINAPI RtlValidRelativeSecurityDescriptor( ... )
+    {
+        FIXME("%p,%lu,%ld: semi-stub\n", descriptor, length, info);
+        return RtlValidSecurityDescriptor(descriptor) == STATUS_SUCCESS;
+    }
+
+The first returns a BOOLEAN; the second compares it against STATUS_SUCCESS,
+which is 0.  A valid descriptor gives TRUE, TRUE == 0 is false, and the
+function reports it invalid.  An invalid one gives FALSE, FALSE == 0 is true,
+and it is waved through.  Every answer is inverted.
+
+Office's Click-to-Run installs its App-V virtual registry as fifteen
+root\vreg\*.vreg.dat hives -- the package database gives their sizes, 786,432
+bytes for word.x-none, 2,097,152 for office.x-none -- and reads them with
+offreg.dll, the Offline Registry library it ships.  A relay trace of
+OROpenHive shows it read the whole 786,432 bytes, hand the descriptor out of
+the hive's sk record to RtlValidRelativeSecurityDescriptor, twice, get FALSE
+both times, free everything and return 1017, ERROR_BADDB.  C2R then falls back
+to creating a fresh hive and saves that over the staged file, so all fifteen
+end up as 8192-byte husks holding nothing but ROOT\REGISTRY.  That is where
+Office's COM registration lives: HKLM\...\ClickToRun\REGISTRY has 29,791 keys
+on a real machine and 6 in the prefix, Word.Application is registered nowhere,
+and Word opens and then says the installation needs repairing.
+
+So implement it rather than deferring to the absolute-descriptor check: the
+buffer has to hold a SECURITY_DESCRIPTOR_RELATIVE, carry the right revision
+and SE_SELF_RELATIVE, and every component it claims has to be a valid SID or
+ACL lying wholly inside the length it was given.  info names the components
+that must be present.
+
+offregprobe drives the same library by hand.  Before: OROpenHive 1017.  After:
+OROpenHive 0, REGISTRY\MACHINE\Software\Classes with 86 subkeys (.asd, .dic,
+.doc, .dochtml, .docm, ...), and ORSaveHive writing 708,608 bytes where it used
+to write 8192.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit e4448c902cd6d427d793c23dac412f5823c445df)
+
+diff --git a/dlls/ntdll/sec.c b/dlls/ntdll/sec.c
+index 74a63370ec9..161f44941c1 100644
+--- a/dlls/ntdll/sec.c
++++ b/dlls/ntdll/sec.c
+@@ -550,14 +550,74 @@ BOOLEAN WINAPI RtlValidSecurityDescriptor(PSECURITY_DESCRIPTOR descriptor)
+     return sd && sd->Revision == SECURITY_DESCRIPTOR_REVISION;
+ }
+ 
++/* Check that a component of a self-relative descriptor lies inside it.  An
++ * offset of zero means the component is absent, which the caller decides
++ * about; anything else has to name at least min_size bytes within length. */
++static BOOLEAN sd_offset_in_bounds( ULONG offset, ULONG length, ULONG min_size )
++{
++    return offset < length && length - offset >= min_size;
++}
++
+ /**************************************************************************
+  * RtlValidRelativeSecurityDescriptor		[NTDLL.@]
++ *
++ * Validate a self-relative security descriptor held in a buffer of the given
++ * length, and check that it carries the components named by info.
+  */
+-BOOLEAN WINAPI RtlValidRelativeSecurityDescriptor(PSECURITY_DESCRIPTOR descriptor,
+-    ULONG length, SECURITY_INFORMATION info)
++BOOLEAN WINAPI RtlValidRelativeSecurityDescriptor( PSECURITY_DESCRIPTOR descriptor,
++    ULONG length, SECURITY_INFORMATION info )
+ {
+-    FIXME("%p,%lu,%ld: semi-stub\n", descriptor, length, info);
+-    return RtlValidSecurityDescriptor(descriptor) == STATUS_SUCCESS;
++    const SECURITY_DESCRIPTOR_RELATIVE *sd = descriptor;
++
++    TRACE( "%p,%lu,%ld\n", descriptor, length, info );
++
++    if (!sd || length < sizeof(*sd)) return FALSE;
++    if (sd->Revision != SECURITY_DESCRIPTOR_REVISION) return FALSE;
++    if (!(sd->Control & SE_SELF_RELATIVE)) return FALSE;
++
++    if (sd->Owner)
++    {
++        PSID sid = (PSID)((const char *)sd + sd->Owner);
++
++        if (!sd_offset_in_bounds( sd->Owner, length, offsetof(SID, SubAuthority) )) return FALSE;
++        if (!RtlValidSid( sid )) return FALSE;
++        if (!sd_offset_in_bounds( sd->Owner, length, RtlLengthSid( sid ) )) return FALSE;
++    }
++    else if (info & OWNER_SECURITY_INFORMATION) return FALSE;
++
++    if (sd->Group)
++    {
++        PSID sid = (PSID)((const char *)sd + sd->Group);
++
++        if (!sd_offset_in_bounds( sd->Group, length, offsetof(SID, SubAuthority) )) return FALSE;
++        if (!RtlValidSid( sid )) return FALSE;
++        if (!sd_offset_in_bounds( sd->Group, length, RtlLengthSid( sid ) )) return FALSE;
++    }
++    else if (info & GROUP_SECURITY_INFORMATION) return FALSE;
++
++    /* A present but NULL DACL or SACL is legal and grants everything, so only
++     * a non-zero offset names an ACL to look at. */
++    if ((sd->Control & SE_DACL_PRESENT) && sd->Dacl)
++    {
++        PACL acl = (PACL)((const char *)sd + sd->Dacl);
++
++        if (!sd_offset_in_bounds( sd->Dacl, length, sizeof(ACL) )) return FALSE;
++        if (!sd_offset_in_bounds( sd->Dacl, length, acl->AclSize )) return FALSE;
++        if (!RtlValidAcl( acl )) return FALSE;
++    }
++    else if (info & DACL_SECURITY_INFORMATION && !(sd->Control & SE_DACL_PRESENT)) return FALSE;
++
++    if ((sd->Control & SE_SACL_PRESENT) && sd->Sacl)
++    {
++        PACL acl = (PACL)((const char *)sd + sd->Sacl);
++
++        if (!sd_offset_in_bounds( sd->Sacl, length, sizeof(ACL) )) return FALSE;
++        if (!sd_offset_in_bounds( sd->Sacl, length, acl->AclSize )) return FALSE;
++        if (!RtlValidAcl( acl )) return FALSE;
++    }
++    else if (info & SACL_SECURITY_INFORMATION && !(sd->Control & SE_SACL_PRESENT)) return FALSE;
++
++    return TRUE;
+ }
+ 
+ /**************************************************************************

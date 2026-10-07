@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 08:52:26 -0400
+Subject: [PATCH] crypt32: Implement CryptMsgVerifyCountersignatureEncoded(Ex).
+
+A PKCS #9 counter signature signs the signature of the signer it counter
+signs: the hash of its encrypted digest, or attributes whose message
+digest is that hash.  The legacy time stamps of Authenticode signatures
+are counter signatures, which wintrust read the time out of unverified.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/crypt32/msg.c b/dlls/crypt32/msg.c
+index be0f2291627..778048ee603 100644
+--- a/dlls/crypt32/msg.c
++++ b/dlls/crypt32/msg.c
+@@ -4118,21 +4118,139 @@ BOOL WINAPI CryptMsgVerifyCountersignatureEncoded(HCRYPTPROV_LEGACY hCryptProv,
+  PBYTE pbSignerInfoCountersignature, DWORD cbSignerInfoCountersignature,
+  CERT_INFO *pciCountersigner)
+ {
+-    FIXME("(%08Ix, %08lx, %p, %ld, %p, %ld, %p): stub\n", hCryptProv,
++    TRACE("(%08Ix, %08lx, %p, %ld, %p, %ld, %p)\n", hCryptProv,
+      dwEncodingType, pbSignerInfo, cbSignerInfo, pbSignerInfoCountersignature,
+      cbSignerInfoCountersignature, pciCountersigner);
+-    return FALSE;
++
++    if (!pciCountersigner)
++    {
++        SetLastError(E_INVALIDARG);
++        return FALSE;
++    }
++    return CryptMsgVerifyCountersignatureEncodedEx(hCryptProv, dwEncodingType,
++     pbSignerInfo, cbSignerInfo, pbSignerInfoCountersignature,
++     cbSignerInfoCountersignature, CMSG_VERIFY_SIGNER_PUBKEY,
++     &pciCountersigner->SubjectPublicKeyInfo, 0, NULL);
+ }
+ 
++/*
++ * A counter signature (PKCS #9) signs the signature of the signer it counter
++ * signs: either its hash, or attributes whose message digest is that hash.
++ */
+ BOOL WINAPI CryptMsgVerifyCountersignatureEncodedEx(HCRYPTPROV_LEGACY hCryptProv,
+  DWORD dwEncodingType, PBYTE pbSignerInfo, DWORD cbSignerInfo,
+  PBYTE pbSignerInfoCountersignature, DWORD cbSignerInfoCountersignature,
+  DWORD dwSignerType, void *pvSigner, DWORD dwFlags, void *pvReserved)
+ {
+-    FIXME("(%08Ix, %08lx, %p, %ld, %p, %ld, %ld, %p, %08lx, %p): stub\n", hCryptProv,
++    CMSG_SIGNER_INFO *signer = NULL;
++    CMSG_CMS_SIGNER_INFO *counter = NULL;
++    const CERT_CHAIN_CONTEXT *chain;
++    CERT_PUBLIC_KEY_INFO *key;
++    CRYPT_HASH_BLOB reversed = { 0 };
++    HCRYPTHASH hash = 0;
++    HCRYPTKEY hkey = 0;
++    BYTE *attrs = NULL;
++    ALG_ID algid, key_algid = 0;
++    DWORD size;
++    BOOL ret = FALSE;
++
++    TRACE("(%08Ix, %08lx, %p, %ld, %p, %ld, %ld, %p, %08lx, %p)\n", hCryptProv,
+      dwEncodingType, pbSignerInfo, cbSignerInfo, pbSignerInfoCountersignature,
+      cbSignerInfoCountersignature, dwSignerType, pvSigner, dwFlags, pvReserved);
+-    return FALSE;
++
++    switch (dwSignerType)
++    {
++    case CMSG_VERIFY_SIGNER_PUBKEY:
++        key = pvSigner;
++        break;
++    case CMSG_VERIFY_SIGNER_CERT:
++        key = &((CERT_CONTEXT *)pvSigner)->pCertInfo->SubjectPublicKeyInfo;
++        break;
++    case CMSG_VERIFY_SIGNER_CHAIN:
++        chain = pvSigner;
++        key = &chain->rgpChain[0]->rgpElement[0]->pCertContext->pCertInfo->SubjectPublicKeyInfo;
++        break;
++    default:
++        FIXME("unimplemented for signer type %ld\n", dwSignerType);
++        SetLastError(E_INVALIDARG);
++        return FALSE;
++    }
++
++    if (!CryptDecodeObjectEx(dwEncodingType, PKCS7_SIGNER_INFO, pbSignerInfo,
++     cbSignerInfo, CRYPT_DECODE_ALLOC_FLAG, NULL, &signer, &size) ||
++     !CryptDecodeObjectEx(dwEncodingType, CMS_SIGNER_INFO,
++     pbSignerInfoCountersignature, cbSignerInfoCountersignature,
++     CRYPT_DECODE_ALLOC_FLAG, NULL, &counter, &size))
++        goto done;
++    if (!(algid = CertOIDToAlgId(counter->HashAlgorithm.pszObjId)))
++    {
++        SetLastError(NTE_BAD_ALGID);
++        goto done;
++    }
++    if (!hCryptProv)
++        hCryptProv = I_CryptGetDefaultCryptProv(algid);
++    if (!CryptCreateHash(hCryptProv, algid, 0, 0, &hash) ||
++     !CryptHashData(hash, signer->EncryptedHash.pbData,
++     signer->EncryptedHash.cbData, 0))
++        goto done;
++    if (counter->AuthAttrs.cAttr)
++    {
++        CRYPT_DATA_BLOB *digest = NULL;
++        BYTE *value = NULL;
++        DWORD i, value_size;
++        BOOL match = FALSE;
++
++        for (i = 0; i < counter->AuthAttrs.cAttr; i++)
++            if (!strcmp(counter->AuthAttrs.rgAttr[i].pszObjId, szOID_RSA_messageDigest)) break;
++        if (i == counter->AuthAttrs.cAttr || counter->AuthAttrs.rgAttr[i].cValue != 1)
++        {
++            SetLastError(CRYPT_E_AUTH_ATTR_MISSING);
++            goto done;
++        }
++        if (CryptDecodeObjectEx(X509_ASN_ENCODING, X509_OCTET_STRING,
++         counter->AuthAttrs.rgAttr[i].rgValue[0].pbData,
++         counter->AuthAttrs.rgAttr[i].rgValue[0].cbData, CRYPT_DECODE_ALLOC_FLAG,
++         NULL, &digest, &size) && extract_hash(hash, &value, &value_size))
++            match = digest->cbData == value_size && !memcmp(digest->pbData, value, value_size);
++        LocalFree(digest);
++        CryptMemFree(value);
++        if (!match)
++        {
++            SetLastError(CRYPT_E_HASH_VALUE);
++            goto done;
++        }
++        CryptDestroyHash(hash);
++        hash = 0;
++        if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_ATTRIBUTES,
++         &counter->AuthAttrs, CRYPT_ENCODE_ALLOC_FLAG, NULL, &attrs, &size) ||
++         !CryptCreateHash(hCryptProv, algid, 0, 0, &hash) ||
++         !CryptHashData(hash, attrs, size, 0))
++            goto done;
++    }
++
++    if (key->Algorithm.pszObjId)
++        key_algid = CertOIDToAlgId(key->Algorithm.pszObjId);
++    if (key_algid == CALG_OID_INFO_PARAMETERS || key_algid == CALG_OID_INFO_CNG_ONLY)
++        ret = cng_verify_msg_signature(counter, hash, key);
++    else if (CryptImportPublicKeyInfo(hCryptProv, X509_ASN_ENCODING, key, &hkey) &&
++     CRYPT_ConstructBlob(&reversed, &counter->EncryptedHash))
++    {
++        CRYPT_ReverseBytes(&reversed);
++        ret = CryptVerifySignatureW(hash, reversed.pbData, reversed.cbData, hkey,
++         NULL, 0);
++    }
++
++done:
++    CryptMemFree(reversed.pbData);
++    if (hkey)
++        CryptDestroyKey(hkey);
++    if (hash)
++        CryptDestroyHash(hash);
++    LocalFree(attrs);
++    LocalFree(counter);
++    LocalFree(signer);
++    TRACE("returning %d\n", ret);
++    return ret;
+ }
+ 
+ BOOL WINAPI CryptMsgEncodeAndSignCTL(DWORD dwMsgEncodingType,

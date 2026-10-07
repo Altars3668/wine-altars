@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:01:53 -0400
+Subject: [PATCH] windows.web: Iterate over the members of a JsonObject in the
+ order Windows does.
+
+Windows writes the members of an object out in the order they were added
+and iterates over them, and over its views, in the order of the hash
+table it keeps them in.  tools/jsonprobe in the wine-altars repository
+printed that order for 27 sizes from 16 to 500 members, after removals,
+a clear and a parse; every line of it is an ATL map (CAtlMap) keyed by
+FNV-1a of the name's UTF-16 bytes: 17 bins at first, a new member put
+first in its bin, and when there are more than 2.25 members per bin a
+rehash into the first prime of ATL's table past 4/3 of the count, the
+bins taken in order and each member put first in its new bin.
+
+Objects now keep such a table beside their members, and views and
+iterators take the members in its order; Stringify keeps the order they
+were added.  The probe's output is now Windows' line for line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/windows.web/json_object.c b/dlls/windows.web/json_object.c
+index c51f2aad464..95bc2fa2721 100644
+--- a/dlls/windows.web/json_object.c
++++ b/dlls/windows.web/json_object.c
+@@ -611,6 +611,20 @@ static HRESULT view_create( struct json_members *members, UINT32 start, UINT32 c
+ 
+ /*** JsonObject ***/
+ 
++/*
++ * Windows iterates over the members of an object in the order of the ATL map (CAtlMap) it keeps
++ * them in, and writes them out in the order they were added.  The map hashes names with FNV-1a over
++ * their UTF-16 bytes into 17 bins at first, puts a new member first in its bin, and when there are
++ * more than 2.25 members per bin rehashes into the next prime of its table past 4/3 of the count,
++ * taking the bins in order and putting each member first in its new bin.
++ */
++struct json_node
++{
++    struct json_node *next;
++    UINT32 hash;
++    UINT32 index;                /* of its member in the object's members */
++};
++
+ struct json_object
+ {
+     IJsonObject IJsonObject_iface;
+@@ -626,9 +640,110 @@ struct json_object
+     UINT32 *sorted;              /* their indices, in the ordinal order of their names */
+     UINT32 count;
+     UINT32 capacity;
++    struct json_node **bins;     /* the members in the order they are iterated over */
++    UINT32 bin_count;
+     LONG version;                /* counts the changes */
+ };
+ 
++static UINT32 json_name_hash( HSTRING name )
++{
++    UINT32 len, hash = 0x811c9dc5, i;
++    const BYTE *bytes = (const BYTE *)WindowsGetStringRawBuffer( name, &len );
++
++    for (i = 0; i < len * sizeof(WCHAR); i++) hash = (hash ^ bytes[i]) * 0x01000193;
++    return hash;
++}
++
++/* the bin count for that many members */
++static UINT32 json_bin_count( UINT32 count )
++{
++    static const UINT32 primes[] =
++    {
++        17, 23, 29, 37, 41, 53, 67, 83, 103, 131, 163, 211, 257, 331, 409, 521, 647, 821, 1031, 1291, 1627,
++        2053, 2591, 3251, 4099, 5167, 6521, 8209, 10331, 13007, 16411, 20663, 26017, 32771, 41299, 52021, 65537,
++        82571, 104033, 131101, 165161, 208067, 262147, 330287, 416147, 524309, 660563, 832291, 1048583, 1321139,
++        1664543, 2097169, 2642257, 3329023, 4194319, 5284493, 6658049, 8388617, 10568993, 13316089
++    };
++    UINT32 estimate = count / 0.75f, i;
++
++    for (i = 0; i < ARRAY_SIZE(primes); i++) if (estimate <= primes[i]) return primes[i];
++    return estimate;
++}
++
++/* a failure leaves the bins as they are: the order then differs, nothing is lost */
++static void json_bins_rehash( struct json_object *impl, UINT32 bin_count )
++{
++    struct json_node **bins, *node, *next;
++    UINT32 i;
++
++    if (bin_count == impl->bin_count) return;
++    if (!(bins = calloc( bin_count, sizeof(*bins) ))) return;
++    for (i = 0; i < impl->bin_count; i++)
++    {
++        for (node = impl->bins[i]; node; node = next)
++        {
++            next = node->next;
++            node->next = bins[node->hash % bin_count];
++            bins[node->hash % bin_count] = node;
++        }
++    }
++    free( impl->bins );
++    impl->bins = bins;
++    impl->bin_count = bin_count;
++}
++
++/* the member just added, last in impl->members */
++static void json_bins_add( struct json_object *impl, struct json_node *node )
++{
++    UINT32 bin;
++
++    node->hash = json_name_hash( impl->members[impl->count - 1].name );
++    node->index = impl->count - 1;
++    bin = node->hash % impl->bin_count;
++    node->next = impl->bins[bin];
++    impl->bins[bin] = node;
++    if (impl->count > (UINT32)(2.25f * impl->bin_count)) json_bins_rehash( impl, json_bin_count( impl->count ));
++}
++
++/* the member that was at index, the ones after it moved down by one */
++static void json_bins_remove( struct json_object *impl, UINT32 index )
++{
++    struct json_node **link, *node;
++    UINT32 i, low;
++
++    for (i = 0; i < impl->bin_count; i++)
++    {
++        for (link = &impl->bins[i]; (node = *link);)
++        {
++            if (node->index == index)
++            {
++                *link = node->next;
++                free( node );
++                continue;
++            }
++            if (node->index > index) node->index--;
++            link = &node->next;
++        }
++    }
++    if ((low = 0.25f * impl->bin_count) >= 17 && impl->count < low)
++        json_bins_rehash( impl, json_bin_count( impl->count ));
++}
++
++static void json_bins_free( struct json_node **bins, UINT32 bin_count )
++{
++    struct json_node *node, *next;
++    UINT32 i;
++
++    if (!bins) return;
++    for (i = 0; i < bin_count; i++)
++        for (node = bins[i]; node; node = next)
++        {
++            next = node->next;
++            free( node );
++        }
++    free( bins );
++}
++
+ static const struct IJsonValueVtbl json_object_value_vtbl;
+ 
+ static inline struct json_object *impl_from_IJsonObject( IJsonObject *iface )
+@@ -707,15 +822,22 @@ static BOOL json_object_grow( struct json_object *impl )
+ 
+ static HRESULT json_object_insert( struct json_object *impl, HSTRING name, IJsonValue *value, boolean *replaced )
+ {
++    struct json_node *node;
+     IJsonValue *old = NULL;
+     HRESULT hr = S_OK;
+     UINT32 pos, index;
+     HSTRING copy;
+ 
+-    if (FAILED(hr = WindowsDuplicateString( name, &copy ))) return hr;
++    if (!(node = malloc( sizeof(*node) ))) return E_OUTOFMEMORY;
++    if (FAILED(hr = WindowsDuplicateString( name, &copy )))
++    {
++        free( node );
++        return hr;
++    }
+ 
+     AcquireSRWLockExclusive( &impl->lock );
+-    if (json_object_find( impl, name, &pos ))
++    if (!impl->bins && !(impl->bins = calloc( impl->bin_count, sizeof(*impl->bins) ))) hr = E_OUTOFMEMORY;
++    else if (json_object_find( impl, name, &pos ))
+     {
+         /* in the old one's place */
+         index = impl->sorted[pos];
+@@ -732,13 +854,16 @@ static HRESULT json_object_insert( struct json_object *impl, HSTRING name, IJson
+         IJsonValue_AddRef( (impl->members[index].value = value) );
+         memmove( impl->sorted + pos + 1, impl->sorted + pos, (index - pos) * sizeof(*impl->sorted) );
+         impl->sorted[pos] = index;
++        json_bins_add( impl, node );
+         json_object_changed( impl );
+         copy = NULL;
++        node = NULL;
+         *replaced = FALSE;
+     }
+     ReleaseSRWLockExclusive( &impl->lock );
+ 
+     WindowsDeleteString( copy );
++    free( node );
+     if (old) IJsonValue_Release( old );
+     return hr;
+ }
+@@ -758,6 +883,7 @@ static BOOL json_object_remove( struct json_object *impl, HSTRING name )
+         memmove( impl->members + index, impl->members + index + 1, (impl->count - index) * sizeof(*impl->members) );
+         memmove( impl->sorted + pos, impl->sorted + pos + 1, (impl->count - pos) * sizeof(*impl->sorted) );
+         for (i = 0; i < impl->count; i++) if (impl->sorted[i] > index) impl->sorted[i]--;
++        json_bins_remove( impl, index );
+         json_object_changed( impl );
+     }
+     ReleaseSRWLockExclusive( &impl->lock );
+@@ -771,18 +897,24 @@ static BOOL json_object_remove( struct json_object *impl, HSTRING name )
+ static void json_object_clear( struct json_object *impl )
+ {
+     struct json_member *members;
+-    UINT32 count, i;
++    struct json_node **bins;
++    UINT32 count, bin_count, i;
+ 
+     AcquireSRWLockExclusive( &impl->lock );
+     members = impl->members;
+     count = impl->count;
++    bins = impl->bins;
++    bin_count = impl->bin_count;
+     free( impl->sorted );
+     impl->members = NULL;
+     impl->sorted = NULL;
+     impl->count = impl->capacity = 0;
++    impl->bins = NULL;
++    impl->bin_count = json_bin_count( 0 );
+     json_object_changed( impl );
+     ReleaseSRWLockExclusive( &impl->lock );
+ 
++    json_bins_free( bins, bin_count );
+     for (i = 0; i < count; i++)
+     {
+         WindowsDeleteString( members[i].name );
+@@ -791,11 +923,13 @@ static void json_object_clear( struct json_object *impl )
+     free( members );
+ }
+ 
+-/* the members in their order, and the version of the object they are */
+-static struct json_members *json_object_snapshot( struct json_object *impl, LONG *version )
++/* the members, in the order they are iterated over or the order they were added, and the version
++ * of the object they are */
++static struct json_members *json_object_snapshot( struct json_object *impl, BOOL iteration, LONG *version )
+ {
+     struct json_members *members;
+-    UINT32 i;
++    struct json_node *node = NULL;
++    UINT32 i, bin = 0;
+ 
+     AcquireSRWLockShared( &impl->lock );
+     if (version) *version = impl->version;
+@@ -805,9 +939,17 @@ static struct json_members *json_object_snapshot( struct json_object *impl, LONG
+         members->count = impl->count;
+         for (i = 0; i < impl->count; i++)
+         {
++            const struct json_member *member = impl->members + i;
++
++            if (iteration)
++            {
++                node = node ? node->next : NULL;
++                while (!node) node = impl->bins[bin++];
++                member = impl->members + node->index;
++            }
+             /* the names here are never references, and duplicate without failing */
+-            WindowsDuplicateString( impl->members[i].name, &members->member[i].name );
+-            IJsonValue_AddRef( (members->member[i].value = impl->members[i].value) );
++            WindowsDuplicateString( member->name, &members->member[i].name );
++            IJsonValue_AddRef( (members->member[i].value = member->value) );
+         }
+     }
+     ReleaseSRWLockShared( &impl->lock );
+@@ -1260,7 +1402,7 @@ static HRESULT WINAPI json_object_map_GetView( IMap_HSTRING_IJsonValue *iface, I
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (!(members = json_object_snapshot( impl, &version ))) return E_OUTOFMEMORY;
++    if (!(members = json_object_snapshot( impl, TRUE, &version ))) return E_OUTOFMEMORY;
+     hr = view_create( members, 0, members->count, impl, version, value );
+     json_members_release( members );
+     return hr;
+@@ -1331,7 +1473,7 @@ static HRESULT WINAPI json_object_iterable_First( IIterable_IKeyValuePair_HSTRIN
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (!(members = json_object_snapshot( impl, &version ))) return E_OUTOFMEMORY;
++    if (!(members = json_object_snapshot( impl, TRUE, &version ))) return E_OUTOFMEMORY;
+     hr = iterator_create( members, 0, members->count, impl, version, value );
+     json_members_release( members );
+     return hr;
+@@ -1389,6 +1531,7 @@ HRESULT json_object_create( IJsonObject **out )
+     impl->IIterable_IKeyValuePair_HSTRING_IJsonValue_iface.lpVtbl = &json_object_iterable_vtbl;
+     impl->IStringable_iface.lpVtbl = &json_object_stringable_vtbl;
+     impl->ref = 1;
++    impl->bin_count = json_bin_count( 0 );
+     InitializeSRWLock( &impl->lock );
+ 
+     *out = &impl->IJsonObject_iface;
+@@ -1407,7 +1550,7 @@ HRESULT json_object_append_json( struct strbuf *buf, struct json_object *object,
+     UINT32 i, len;
+ 
+     if (depth >= JSON_MAX_DEPTH) return JSON_E_IMPLEMENTATION_LIMIT;
+-    if (!(members = json_object_snapshot( object, NULL ))) return E_OUTOFMEMORY;
++    if (!(members = json_object_snapshot( object, FALSE, NULL ))) return E_OUTOFMEMORY;
+ 
+     strbuf_appendc( buf, '{' );
+     for (i = 0; i < members->count && SUCCEEDED(hr); i++)

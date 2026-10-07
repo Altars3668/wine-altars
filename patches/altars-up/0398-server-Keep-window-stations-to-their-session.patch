@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:08:04 -0400
+Subject: [PATCH] server: Keep window stations to their session.
+
+EnumWindowStations lists the window stations of the caller's session on Windows; here it listed
+those of every session, so a process saw two WinSta0 once session 0 had one too, and the name of
+either opened its own.  And a process started in another session than its parent's took its parent's
+window station and desktop; it now connects to those of its own session, by name, which also makes
+the server find a named window station at all: the name was looked up with no root, and never
+found.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/user32/tests/winstation.c b/dlls/user32/tests/winstation.c
+index a435df78f3b..5e39341541d 100644
+--- a/dlls/user32/tests/winstation.c
++++ b/dlls/user32/tests/winstation.c
+@@ -386,8 +386,24 @@ static BOOL CALLBACK open_window_station_callbackA(LPSTR winsta, LPARAM lp)
+     return lp;
+ }
+ 
++struct window_station_count
++{
++    const char *name;
++    unsigned int count;
++};
++
++static BOOL CALLBACK count_window_station_callbackA(LPSTR winsta, LPARAM lp)
++{
++    struct window_station_count *data = (struct window_station_count *)lp;
++
++    if (!lstrcmpiA(winsta, data->name)) data->count++;
++    return TRUE;
++}
++
+ static void test_enumstations(void)
+ {
++    struct window_station_count data;
++    char name[MAX_PATH];
+     DWORD ret;
+     HWINSTA hwinsta;
+ 
+@@ -417,6 +433,22 @@ static void test_enumstations(void)
+     ret = EnumWindowStationsA(window_station_callbackA, 0);
+     ok(!ret, "EnumWindowStationsA returned %lx\n", ret);
+     ok(GetLastError() == 0xdeadbeef, "LastError is set to %08lx\n", GetLastError());
++
++    /* the window stations of this session, each once, although other sessions have one of the same name */
++    ret = GetUserObjectInformationA(GetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL);
++    ok(ret, "GetUserObjectInformationA failed, error %lu\n", GetLastError());
++    data.name = name;
++    data.count = 0;
++    ret = EnumWindowStationsA(count_window_station_callbackA, (LPARAM)&data);
++    ok(ret, "EnumWindowStationsA failed, error %lu\n", GetLastError());
++    ok(data.count == 1, "%s listed %u times\n", name, data.count);
++
++    data.name = "winsta_test";
++    data.count = 0;
++    ret = EnumWindowStationsA(count_window_station_callbackA, (LPARAM)&data);
++    ok(ret, "EnumWindowStationsA failed, error %lu\n", GetLastError());
++    ok(data.count == 1, "winsta_test listed %u times\n", data.count);
++    CloseWindowStation(hwinsta);
+ }
+ 
+ static BOOL CALLBACK desktop_callbackA(LPSTR desktop, LPARAM lp)
+diff --git a/server/winstation.c b/server/winstation.c
+index 0554adfbacd..1c08007aa0b 100644
+--- a/server/winstation.c
++++ b/server/winstation.c
+@@ -602,6 +602,28 @@ void set_process_default_desktop( struct process *process, struct desktop *deskt
+         set_thread_default_desktop( thread, desktop, handle );
+ }
+ 
++/* the directory of a session's window stations, \Sessions\<id>\Windows\WindowStations, which for session 0
++ * leads to \Windows\WindowStations */
++static struct object *get_session_winstations_dir( unsigned int session_id )
++{
++    struct unicode_str name, name_left;
++    struct object *dir;
++    char buffer[64];
++    WCHAR *nameW;
++
++    snprintf( buffer, sizeof(buffer), "\\Sessions\\%u\\Windows\\WindowStations", session_id );
++    if (!(nameW = ascii_to_unicode_str( buffer, &name ))) return NULL;
++    dir = lookup_named_object( NULL, name, OBJ_CASE_INSENSITIVE, &name_left );
++    free( nameW );
++    if (dir && name_left.len)
++    {
++        release_object( dir );
++        dir = NULL;
++    }
++    clear_error();
++    return dir;
++}
++
+ /* connect a process to its window station */
+ void connect_process_winstation( struct process *process, struct unicode_str desktop_name,
+                                  struct thread *parent_thread, struct process *parent_process )
+@@ -609,6 +631,7 @@ void connect_process_winstation( struct process *process, struct unicode_str des
+     struct unicode_str winstation_name = {0};
+     struct winstation *winstation = NULL;
+     struct desktop *desktop = NULL;
++    struct object *dir = NULL;
+     const WCHAR *wch, *end;
+     obj_handle_t handle;
+     struct object_params params = { .attr = OBJ_CASE_INSENSITIVE | OBJ_OPENIF };
+@@ -625,6 +648,9 @@ void connect_process_winstation( struct process *process, struct unicode_str des
+         }
+     }
+ 
++    /* a window station is named in the session the process runs in */
++    if (winstation_name.len) dir = get_session_winstations_dir( process->session_id );
++    params.root = dir;
+     params.ops  = &winstation_ops;
+     params.name = winstation_name;
+ 
+@@ -633,11 +659,13 @@ void connect_process_winstation( struct process *process, struct unicode_str des
+     {
+         winstation = (struct winstation *)get_handle_obj( process, handle, 0, &winstation_ops );
+     }
+-    else if (winstation_name.len && (winstation = open_named_object( &params )))
++    else if (dir && (winstation = open_named_object( &params )))
+     {
+         handle = alloc_handle( process, winstation, STANDARD_RIGHTS_REQUIRED | WINSTA_ALL_ACCESS, 0 );
+     }
+-    else if (parent_process->winstation)
++    /* a process started in another session, such as the services' session, does not use the window station
++     * and desktop of its parent but those of its session: it connects to them by name when it starts */
++    else if (parent_process->winstation && process->session_id == parent_process->session_id)
+     {
+         handle = duplicate_handle( parent_process, parent_process->winstation,
+                                    process, 0, 0, DUPLICATE_SAME_ACCESS );
+@@ -679,6 +707,7 @@ void connect_process_winstation( struct process *process, struct unicode_str des
+ done:
+     if (desktop) release_object( desktop );
+     if (winstation) release_object( winstation );
++    if (dir) release_object( dir );
+     clear_error();
+ }
+ 
+@@ -1108,10 +1137,15 @@ DECL_HANDLER(enum_winstation)
+     }
+     else
+     {
++        /* the window stations of the caller's session only, as on Windows: those of another session may
++         * have the same names, WinSta0 first, and are not the ones these names open */
++        struct object *dir = get_session_winstations_dir( current->process->session_id );
++
+         LIST_FOR_EACH_ENTRY( winstation, &winstation_list, struct winstation, entry )
+         {
+             unsigned int access = WINSTA_ENUMERATE;
+             if (!(name = winstation->obj.name)) continue;
++            if (name->parent != dir) continue;
+             if (!check_object_access( NULL, &winstation->obj, &access )) continue;
+             reply->count++;
+             reply->total += name->len + sizeof(WCHAR);
+@@ -1121,6 +1155,7 @@ DECL_HANDLER(enum_winstation)
+                 *ptr++ = 0;
+             }
+         }
++        if (dir) release_object( dir );
+     }
+ 
+     if (reply->total <= size)

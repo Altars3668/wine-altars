@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 16:12:13 -0400
+Subject: [PATCH] dxgi: Give GDI only the dirty rectangle of a surface, start a
+ discarding GetDC on nothing, and fail as Windows does.
+
+As measured on Windows 11 build 29671:
+- ReleaseDC keeps what GDI drew inside the dirty rectangle only, an empty one keeping nothing and none all of it;
+- GetDC with discard hands GDI a surface of zeros, and ReleaseDC then keeps all of it;
+- a second GetDC, a ReleaseDC without a DC and GetDC on a surface that is not GDI compatible fail with
+  DXGI_ERROR_INVALID_CALL, leaving the caller's handle as it was;
+- a GDI compatible texture is a render target of one level (any number of layers), anything else being
+  E_INVALIDARG at creation.
+
+Device creation no longer complains about the flags every device here honours anyway: BGRA support, single
+threaded use, no internal threading optimisations and no layer settings from the registry.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/d3d11/tests/d3d11.c b/dlls/d3d11/tests/d3d11.c
+index c674c49953c..ae3177ffbe8 100644
+--- a/dlls/d3d11/tests/d3d11.c
++++ b/dlls/d3d11/tests/d3d11.c
+@@ -18427,6 +18427,8 @@ static void test_vs_input_relative_addressing(void)
+ 
+ static void test_getdc(void)
+ {
++    static const float green[] = {0.0f, 1.0f, 0.0f, 0.5f};
++    static const float blue[] = {0.0f, 0.0f, 1.0f, 1.0f};
+     static const struct
+     {
+         const char *name;
+@@ -18443,14 +18445,19 @@ static void test_getdc(void)
+         {"B8G8R8X8_UNORM_SRGB", DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, FALSE },
+     };
+     struct device_desc device_desc;
++    ID3D11DeviceContext *context;
++    ID3D11RenderTargetView *rtv;
+     D3D11_TEXTURE2D_DESC desc;
+     ID3D11Texture2D *texture;
+     IDXGISurface1 *surface;
+     ID3D11Device *device;
+     unsigned int i;
+     ULONG refcount;
++    HBRUSH brush;
++    DWORD color;
++    HDC dc, dc2;
+     HRESULT hr;
+-    HDC dc;
++    RECT rect;
+ 
+     device_desc.feature_level = NULL;
+     device_desc.flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+@@ -18478,13 +18485,27 @@ static void test_getdc(void)
+     hr = ID3D11Texture2D_QueryInterface(texture, &IID_IDXGISurface1, (void**)&surface);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
++    dc = (HDC)0xdeadbeef;
+     hr = IDXGISurface1_GetDC(surface, FALSE, &dc);
+-    todo_wine ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    ok(dc == (HDC)0xdeadbeef, "Got unexpected dc %p.\n", dc);
++    hr = IDXGISurface1_ReleaseDC(surface, NULL);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+ 
+     IDXGISurface1_Release(surface);
+     ID3D11Texture2D_Release(texture);
+ 
++    /* A GDI compatible texture is a render target with one level. */
+     desc.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
++    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
++    desc.MipLevels = 2;
++    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++    desc.MipLevels = 1;
++
+     hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
+@@ -18492,14 +18513,59 @@ static void test_getdc(void)
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
+     hr = IDXGISurface1_ReleaseDC(surface, NULL);
+-    todo_wine ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+ 
+     hr = IDXGISurface1_GetDC(surface, FALSE, &dc);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
++    /* one at a time */
++    dc2 = (HDC)0xdeadbeef;
++    hr = IDXGISurface1_GetDC(surface, FALSE, &dc2);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    ok(dc2 == (HDC)0xdeadbeef, "Got unexpected dc %p.\n", dc2);
++
++    hr = IDXGISurface1_ReleaseDC(surface, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IDXGISurface1_ReleaseDC(surface, NULL);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    /* What GDI draws outside the dirty rectangle is dropped. */
++    hr = ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)texture, NULL, &rtv);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11DeviceContext_ClearRenderTargetView(context, rtv, green);
++    hr = IDXGISurface1_GetDC(surface, FALSE, &dc);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    color = GetPixel(dc, 1, 1);
++    ok(color == RGB(0, 255, 0), "Got unexpected colour %#lx.\n", color);
++    SetRect(&rect, 0, 0, 64, 64);
++    brush = CreateSolidBrush(RGB(255, 0, 0));
++    FillRect(dc, &rect, brush);
++    DeleteObject(brush);
++    SetRect(&rect, 0, 0, 1, 1);
++    hr = IDXGISurface1_ReleaseDC(surface, &rect);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    color = get_texture_color(texture, 0, 0);
++    ok(color == 0x00ff0000, "Got unexpected colour %08lx.\n", color);
++    color = get_texture_color(texture, 10, 10);
++    ok(compare_color(color, 0x8000ff00, 1), "Got unexpected colour %08lx.\n", color);
++
++    /* A discarding GetDC has GDI start on nothing, and all of it is kept. */
++    ID3D11DeviceContext_ClearRenderTargetView(context, rtv, blue);
++    hr = IDXGISurface1_GetDC(surface, TRUE, &dc);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    color = GetPixel(dc, 1, 1);
++    ok(!color, "Got unexpected colour %#lx.\n", color);
++    SetPixel(dc, 2, 2, RGB(0, 255, 255));
+     hr = IDXGISurface1_ReleaseDC(surface, NULL);
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    color = get_texture_color(texture, 2, 2);
++    ok(color == 0x0000ffff, "Got unexpected colour %08lx.\n", color);
++    color = get_texture_color(texture, 3, 3);
++    ok(!color, "Got unexpected colour %08lx.\n", color);
+ 
++    ID3D11DeviceContext_Release(context);
++    ID3D11RenderTargetView_Release(rtv);
+     IDXGISurface1_Release(surface);
+     ID3D11Texture2D_Release(texture);
+ 
+diff --git a/dlls/d3d11/texture.c b/dlls/d3d11/texture.c
+index 819ba679105..f3fcb921ce8 100644
+--- a/dlls/d3d11/texture.c
++++ b/dlls/d3d11/texture.c
+@@ -938,6 +938,10 @@ static BOOL is_gdi_compatible_texture(const D3D11_TEXTURE2D_DESC *desc)
+     if (desc->Usage != D3D11_USAGE_DEFAULT)
+         return FALSE;
+ 
++    /* GDI draws on a render target of one level */
++    if (!(desc->BindFlags & D3D11_BIND_RENDER_TARGET) || desc->MipLevels != 1)
++        return FALSE;
++
+     return TRUE;
+ }
+ 
+diff --git a/dlls/dxgi/dxgi_main.c b/dlls/dxgi/dxgi_main.c
+index ca1fb525535..e6a82084923 100644
+--- a/dlls/dxgi/dxgi_main.c
++++ b/dlls/dxgi/dxgi_main.c
+@@ -145,7 +145,11 @@ HRESULT WINAPI DXGID3D10CreateDevice(HMODULE d3d10core, IDXGIFactory *factory, I
+     TRACE("d3d10core %p, factory %p, adapter %p, flags %#x, feature_levels %p, level_count %u, device %p.\n",
+             d3d10core, factory, adapter, flags, feature_levels, level_count, device);
+ 
+-    if (flags)
++    /* What every device here is anyway, for Direct3D 10 and 11 alike: BGRA formats are always there, it is safe
++     * on any thread whether or not the caller uses only one, and there is no threading optimisation to turn off
++     * and no layer settings in the registry to keep. */
++    if (flags & ~(D3D10_CREATE_DEVICE_SINGLETHREADED | D3D10_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
++            | D3D10_CREATE_DEVICE_BGRA_SUPPORT | D3D10_CREATE_DEVICE_PREVENT_ALTERING_LAYER_SETTINGS_FROM_REGISTRY))
+         FIXME("Ignoring flags %#x.\n", flags);
+ 
+     if (TRACE_ON(dxgi))
+diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
+index 363b52af0f1..61d15c1ebac 100644
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -228,6 +228,9 @@ struct dxgi_resource
+     struct wined3d_resource *wined3d_resource;
+     unsigned int subresource_idx;
+     HDC dc;
++    /* while the DC is out: its bits, and the contents they had when GetDC handed it out */
++    BYTE *dc_bits, *dc_contents;
++    unsigned int dc_pitch, dc_width, dc_height, dc_bpp;
+ 
+     /* IDXGIKeyedMutex.  A resource created with D3D11_RESOURCE_MISC_SHARED_-
+      * KEYEDMUTEX carries one, and its users synchronise on it rather than on
+diff --git a/dlls/dxgi/resource.c b/dlls/dxgi/resource.c
+index 36c6522effa..3a5ecbd0914 100644
+--- a/dlls/dxgi/resource.c
++++ b/dlls/dxgi/resource.c
+@@ -86,6 +86,7 @@ static ULONG STDMETHODCALLTYPE dxgi_resource_inner_Release(IUnknown *iface)
+ 
+     if (!refcount)
+     {
++        free(resource->dc_contents);
+         if (resource->parent_resource)
+             IDXGIResource1_Release(resource->parent_resource);
+         wined3d_private_store_cleanup(&resource->private_store);
+@@ -224,22 +225,76 @@ static HRESULT STDMETHODCALLTYPE dxgi_surface_Unmap(IDXGISurface2 *iface)
+ static HRESULT STDMETHODCALLTYPE dxgi_surface_GetDC(IDXGISurface2 *iface, BOOL discard, HDC *hdc)
+ {
+     struct dxgi_resource *resource = impl_from_IDXGISurface2(iface);
++    DIBSECTION dib;
+     HRESULT hr;
++    HDC dc;
+ 
+-    FIXME("iface %p, discard %d, hdc %p semi-stub!\n", iface, discard, hdc);
++    TRACE("iface %p, discard %d, hdc %p.\n", iface, discard, hdc);
+ 
+     if (!hdc)
+         return E_INVALIDARG;
++    /* one at a time, and a surface that is not GDI compatible has none; the caller's handle stays as it was */
++    if (resource->dc)
++        return DXGI_ERROR_INVALID_CALL;
+ 
+     wined3d_mutex_lock();
+     hr = wined3d_texture_get_dc(wined3d_texture_from_resource(resource->wined3d_resource),
+-            resource->subresource_idx, hdc);
++            resource->subresource_idx, &dc);
+     wined3d_mutex_unlock();
++    if (FAILED(hr))
++    {
++        WARN("Failed to get a DC, hr %#lx.\n", hr);
++        return DXGI_ERROR_INVALID_CALL;
++    }
+ 
+-    if (SUCCEEDED(hr))
+-       resource->dc = *hdc;
++    /* GDI draws on the surface's own bits.  What they held is kept: ReleaseDC takes from GDI only what is in its
++     * dirty rectangle, and a discarding GetDC starts GDI on nothing at all. */
++    if (GetObjectW(GetCurrentObject(dc, OBJ_BITMAP), sizeof(dib), &dib) == sizeof(dib) && dib.dsBm.bmBits)
++    {
++        size_t size = (size_t)dib.dsBm.bmWidthBytes * dib.dsBm.bmHeight;
++
++        resource->dc_bits = dib.dsBm.bmBits;
++        resource->dc_pitch = dib.dsBm.bmWidthBytes;
++        resource->dc_width = dib.dsBm.bmWidth;
++        resource->dc_height = dib.dsBm.bmHeight;
++        resource->dc_bpp = dib.dsBm.bmBitsPixel / 8;
++        if ((resource->dc_contents = malloc(size)))
++            memcpy(resource->dc_contents, resource->dc_bits, size);
++        if (discard)
++            memset(resource->dc_bits, 0, size);
++    }
+ 
+-    return hr;
++    resource->dc = *hdc = dc;
++    return S_OK;
++}
++
++/* put back what the surface held, but for the dirty rectangle */
++static void dxgi_surface_keep_outside(struct dxgi_resource *resource, const RECT *dirty_rect)
++{
++    unsigned int left, right, top, bottom, y;
++    const BYTE *src;
++    BYTE *dst;
++
++    left = min(max(dirty_rect->left, 0), resource->dc_width);
++    right = min(max(dirty_rect->right, (LONG)left), resource->dc_width);
++    top = min(max(dirty_rect->top, 0), resource->dc_height);
++    bottom = min(max(dirty_rect->bottom, (LONG)top), resource->dc_height);
++    if (left == right || top == bottom)
++        top = bottom = resource->dc_height;
++
++    for (y = 0; y < resource->dc_height; ++y)
++    {
++        dst = resource->dc_bits + (size_t)y * resource->dc_pitch;
++        src = resource->dc_contents + (size_t)y * resource->dc_pitch;
++        if (y < top || y >= bottom)
++        {
++            memcpy(dst, src, resource->dc_width * resource->dc_bpp);
++            continue;
++        }
++        memcpy(dst, src, left * resource->dc_bpp);
++        memcpy(dst + right * resource->dc_bpp, src + right * resource->dc_bpp,
++                (resource->dc_width - right) * resource->dc_bpp);
++    }
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_surface_ReleaseDC(IDXGISurface2 *iface, RECT *dirty_rect)
+@@ -249,15 +304,23 @@ static HRESULT STDMETHODCALLTYPE dxgi_surface_ReleaseDC(IDXGISurface2 *iface, RE
+ 
+     TRACE("iface %p, rect %s\n", iface, wine_dbgstr_rect(dirty_rect));
+ 
+-    if (!IsRectEmpty(dirty_rect))
+-        FIXME("dirty rectangle is ignored.\n");
++    if (!resource->dc)
++        return DXGI_ERROR_INVALID_CALL;
++
++    /* no rectangle is all of it, an empty one none */
++    if (dirty_rect && resource->dc_contents)
++        dxgi_surface_keep_outside(resource, dirty_rect);
+ 
+     wined3d_mutex_lock();
+     hr = wined3d_texture_release_dc(wined3d_texture_from_resource(resource->wined3d_resource),
+             resource->subresource_idx, resource->dc);
+     wined3d_mutex_unlock();
+ 
+-    return hr;
++    free(resource->dc_contents);
++    resource->dc_contents = NULL;
++    resource->dc_bits = NULL;
++    resource->dc = NULL;
++    return SUCCEEDED(hr) ? S_OK : DXGI_ERROR_INVALID_CALL;
+ }
+ 
+ /* IDXGISurface2 methods */
+@@ -685,6 +748,7 @@ HRESULT dxgi_resource_init(struct dxgi_resource *resource, IDXGIDevice *device,
+     resource->device = device;
+     resource->wined3d_resource = wined3d_resource;
+     resource->dc = NULL;
++    resource->dc_bits = resource->dc_contents = NULL;
+     if (is_subresource)
+     {
+         resource->parent_resource = parent_resource;
+diff --git a/dlls/dxgi/tests/dxgi.c b/dlls/dxgi/tests/dxgi.c
+index 8c74d6b664e..5e8bfe3d877 100644
+--- a/dlls/dxgi/tests/dxgi.c
++++ b/dlls/dxgi/tests/dxgi.c
+@@ -5030,7 +5030,6 @@ static void test_swapchain_resize(IUnknown *device, BOOL is_d3d12)
+     if (hr == S_OK)
+     {
+         hr = IDXGISurface1_GetDC(surface1, FALSE, &hdc);
+-        todo_wine_if(hr == 0x8876086c)
+         ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+         IDXGISurface1_Release(surface1);
+     }

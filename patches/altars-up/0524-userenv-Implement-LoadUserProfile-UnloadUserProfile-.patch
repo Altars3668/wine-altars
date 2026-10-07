@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 09:40:31 -0400
+Subject: [PATCH] userenv: Implement LoadUserProfile, UnloadUserProfile and
+ GetProfileType.
+
+The profile handle is the token user's key under HKEY_USERS, as on
+Windows 11, after the same checks of the structure; unloading closes
+it, and the profile is a local one (tools/prefixupdateprobe userprofile
+in wine-altars, from a Claudex run).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/userenv/tests/userenv.c b/dlls/userenv/tests/userenv.c
+index 9ffaef4d799..28eeb6c936a 100644
+--- a/dlls/userenv/tests/userenv.c
++++ b/dlls/userenv/tests/userenv.c
+@@ -26,6 +26,8 @@
+ #include "winbase.h"
+ #include "winnls.h"
+ #include "winreg.h"
++#include "winternl.h"
++#include "sddl.h"
+ 
+ #include "userenv.h"
+ 
+@@ -457,6 +459,145 @@ static void test_get_user_profile_dir(void)
+     CloseHandle( token );
+ }
+ 
++static BOOL enable_profile_privilege(HANDLE token, const char *name, TOKEN_PRIVILEGES *previous)
++{
++    TOKEN_PRIVILEGES privileges;
++    DWORD size;
++    BOOL ret;
++
++    memset(previous, 0, sizeof(*previous));
++    if (!LookupPrivilegeValueA(NULL, name, &privileges.Privileges[0].Luid)) return FALSE;
++    privileges.PrivilegeCount = 1;
++    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
++    SetLastError(ERROR_SUCCESS);
++    ret = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(*previous), previous, &size);
++    return ret && GetLastError() == ERROR_SUCCESS;
++}
++
++static BOOL check_profile_handle(HANDLE token, HANDLE profile, const WCHAR *sid)
++{
++    union { KEY_NAME_INFORMATION info; BYTE bytes[1024]; } buffer;
++    WCHAR expected[256];
++    NTSTATUS status;
++    DWORD error;
++    ULONG size;
++    BOOL ret;
++    LONG result;
++
++    ok(!!profile, "no profile handle\n");
++    if (!profile) return TRUE;
++    ok(profile != HKEY_CURRENT_USER, "got predefined HKEY_CURRENT_USER\n");
++    lstrcpyW(expected, L"\\REGISTRY\\USER\\");
++    lstrcatW(expected, sid);
++    status = NtQueryKey(profile, KeyNameInformation, &buffer, sizeof(buffer), &size);
++    ok(!status, "got status %#lx\n", status);
++    if (!status)
++    {
++        ok(buffer.info.NameLength == lstrlenW(expected) * sizeof(WCHAR),
++           "got name length %lu, expected %u\n", buffer.info.NameLength, (unsigned int)(lstrlenW(expected) * sizeof(WCHAR)));
++        ok(buffer.info.NameLength == lstrlenW(expected) * sizeof(WCHAR) &&
++           CompareStringOrdinal(buffer.info.Name, buffer.info.NameLength / sizeof(WCHAR), expected, -1, TRUE) == CSTR_EQUAL,
++           "unexpected profile key\n");
++    }
++    result = RegQueryInfoKeyW(profile, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
++    ok(!result, "got registry error %ld\n", result);
++    SetLastError(0xdeadbeef);
++    ret = UnloadUserProfile(token, profile);
++    error = GetLastError();
++    ok(ret, "UnloadUserProfile failed, error %lu\n", error);
++    if (ret) ok(error == ERROR_NO_TOKEN, "got error %lu\n", error);
++    return ret;
++}
++
++static void test_user_profile(void)
++{
++    union { TOKEN_USER user; BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]; } buffer;
++    TOKEN_PRIVILEGES backup, restore;
++    PROFILEINFOA profileA;
++    PROFILEINFOW profileW;
++    WCHAR usernameW[256], *sid = NULL;
++    char usernameA[512];
++    HANDLE token;
++    HKEY key;
++    DWORD size, flags, error, i, variant;
++    BOOL ret;
++
++    flags = 0xdeadbeef;
++    SetLastError(0xdeadbeef);
++    ret = GetProfileType(&flags);
++    error = GetLastError();
++    ok(ret, "GetProfileType failed, error %lu\n", error);
++    ok(!error, "got error %lu\n", error);
++    ok(!(flags & ~(PT_TEMPORARY | PT_ROAMING | PT_MANDATORY)), "got flags %#lx\n", flags);
++
++    ret = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE |
++                          TOKEN_ADJUST_PRIVILEGES, &token);
++    ok(ret, "OpenProcessToken failed, error %lu\n", GetLastError());
++    if (!ret) return;
++    memset(&backup, 0, sizeof(backup));
++    memset(&restore, 0, sizeof(restore));
++    ret = GetTokenInformation(token, TokenUser, &buffer, sizeof(buffer), &size);
++    ok(ret, "GetTokenInformation failed, error %lu\n", GetLastError());
++    if (!ret) goto done;
++    ret = ConvertSidToStringSidW(buffer.user.User.Sid, &sid);
++    ok(ret, "ConvertSidToStringSid failed, error %lu\n", GetLastError());
++    if (!ret) goto done;
++    size = ARRAY_SIZE(usernameW);
++    ret = GetUserNameW(usernameW, &size);
++    ok(ret, "GetUserName failed, error %lu\n", GetLastError());
++    if (!ret) goto done;
++    ret = WideCharToMultiByte(CP_ACP, 0, usernameW, -1, usernameA, sizeof(usernameA), NULL, NULL);
++    ok(ret, "username conversion failed\n");
++    if (!ret) goto done;
++    if (RegOpenKeyExW(HKEY_USERS, sid, 0, KEY_READ, &key))
++    {
++        win_skip("Current user's profile is not already mounted\n");
++        goto done;
++    }
++    RegCloseKey(key);
++    if (!enable_profile_privilege(token, "SeBackupPrivilege", &backup) ||
++        !enable_profile_privilege(token, "SeRestorePrivilege", &restore))
++    {
++        win_skip("Profile privileges are not available\n");
++        goto done;
++    }
++
++    for (variant = 0; variant < 2; ++variant)
++    {
++        size = variant ? sizeof(profileW) : sizeof(profileA);
++        for (i = 0; i < 6; ++i)
++        {
++            DWORD sizes[] = {0, size - 1, size + 1, size, size, size};
++            HANDLE profile;
++
++            memset(&profileA, 0, sizeof(profileA));
++            memset(&profileW, 0, sizeof(profileW));
++            profileA.dwSize = profileW.dwSize = sizes[i];
++            profileA.dwFlags = profileW.dwFlags = PI_NOUI | (i == 4 ? 0x80000000 : 0);
++            profileA.lpUserName = i == 3 ? (char *)"" : usernameA;
++            profileW.lpUserName = i == 3 ? (WCHAR *)L"" : usernameW;
++            SetLastError(0xdeadbeef);
++            ret = variant ? LoadUserProfileW(token, &profileW) : LoadUserProfileA(token, &profileA);
++            error = GetLastError();
++            profile = variant ? profileW.hProfile : profileA.hProfile;
++            ok(ret == (i >= 4), "%c case %lu: got %d, error %lu\n", variant ? 'W' : 'A', i, ret, error);
++            if (i < 4)
++            {
++                ok(error == ERROR_INVALID_PARAMETER, "got error %lu\n", error);
++                ok(!profile, "unexpected profile handle %p\n", profile);
++            }
++            else if (ret) ok(error == ERROR_NO_TOKEN, "got error %lu\n", error);
++            if (ret && !check_profile_handle(token, profile, sid)) goto done;
++        }
++    }
++
++done:
++    if (restore.PrivilegeCount) AdjustTokenPrivileges(token, FALSE, &restore, 0, NULL, NULL);
++    if (backup.PrivilegeCount) AdjustTokenPrivileges(token, FALSE, &backup, 0, NULL, NULL);
++    LocalFree(sid);
++    CloseHandle(token);
++}
++
+ START_TEST(userenv)
+ {
+     pIsWow64Process = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process");
+@@ -464,4 +605,5 @@ START_TEST(userenv)
+     test_create_env();
+     test_get_profiles_dir();
+     test_get_user_profile_dir();
++    test_user_profile();
+ }
+diff --git a/dlls/userenv/userenv_main.c b/dlls/userenv/userenv_main.c
+index 54f713e6d95..e2bf9544f18 100644
+--- a/dlls/userenv/userenv_main.c
++++ b/dlls/userenv/userenv_main.c
+@@ -593,23 +593,61 @@ BOOL WINAPI GetAllUsersProfileDirectoryW( LPWSTR lpProfileDir, LPDWORD lpcchSize
+ 
+ BOOL WINAPI GetProfileType( DWORD *pdwFlags )
+ {
+-    FIXME("%p\n", pdwFlags );
++    TRACE("%p\n", pdwFlags );
++    if (!pdwFlags)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
+     *pdwFlags = 0;
++    SetLastError(ERROR_SUCCESS);
+     return TRUE;
+ }
+ 
+-BOOL WINAPI LoadUserProfileA( HANDLE hToken, LPPROFILEINFOA lpProfileInfo )
++static BOOL open_profile_key( HANDLE token, HANDLE *profile )
+ {
+-    FIXME("%p %p\n", hToken, lpProfileInfo );
+-    lpProfileInfo->hProfile = HKEY_CURRENT_USER;
++    union { TOKEN_USER user; BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]; } buffer;
++    WCHAR *sid;
++    DWORD size;
++    HKEY key;
++    LONG ret;
++
++    if (!GetTokenInformation(token, TokenUser, &buffer, sizeof(buffer), &size)) return FALSE;
++    if (!ConvertSidToStringSidW(buffer.user.User.Sid, &sid)) return FALSE;
++    ret = RegOpenKeyExW(HKEY_USERS, sid, 0, KEY_ALL_ACCESS, &key);
++    LocalFree(sid);
++    if (ret)
++    {
++        SetLastError(ret);
++        return FALSE;
++    }
++    *profile = key;
++    SetLastError(ERROR_NO_TOKEN);
+     return TRUE;
+ }
+ 
++BOOL WINAPI LoadUserProfileA( HANDLE hToken, LPPROFILEINFOA lpProfileInfo )
++{
++    TRACE("%p %p\n", hToken, lpProfileInfo );
++    if (!lpProfileInfo || lpProfileInfo->dwSize != sizeof(*lpProfileInfo) ||
++        !lpProfileInfo->lpUserName || !lpProfileInfo->lpUserName[0])
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    return open_profile_key(hToken, &lpProfileInfo->hProfile);
++}
++
+ BOOL WINAPI LoadUserProfileW( HANDLE hToken, LPPROFILEINFOW lpProfileInfo )
+ {
+-    FIXME("%p %p\n", hToken, lpProfileInfo );
+-    lpProfileInfo->hProfile = HKEY_CURRENT_USER;
+-    return TRUE;
++    TRACE("%p %p\n", hToken, lpProfileInfo );
++    if (!lpProfileInfo || lpProfileInfo->dwSize != sizeof(*lpProfileInfo) ||
++        !lpProfileInfo->lpUserName || !lpProfileInfo->lpUserName[0])
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    return open_profile_key(hToken, &lpProfileInfo->hProfile);
+ }
+ 
+ BOOL WINAPI RegisterGPNotification( HANDLE event, BOOL machine )
+@@ -626,8 +664,26 @@ BOOL WINAPI UnregisterGPNotification( HANDLE event )
+ 
+ BOOL WINAPI UnloadUserProfile( HANDLE hToken, HANDLE hProfile )
+ {
+-    FIXME("(%p, %p): stub\n", hToken, hProfile);
+-    return FALSE;
++    KEY_BASIC_INFORMATION key_info;
++    TOKEN_STATISTICS stats;
++    NTSTATUS status;
++    DWORD size;
++
++    TRACE("(%p, %p)\n", hToken, hProfile);
++    if (!GetTokenInformation(hToken, TokenStatistics, &stats, sizeof(stats), &size)) return FALSE;
++    status = NtQueryKey(hProfile, KeyBasicInformation, &key_info, sizeof(key_info), &size);
++    if (status && status != STATUS_BUFFER_OVERFLOW)
++    {
++        SetLastError(RtlNtStatusToDosError(status));
++        return FALSE;
++    }
++    if ((status = NtClose(hProfile)))
++    {
++        SetLastError(RtlNtStatusToDosError(status));
++        return FALSE;
++    }
++    SetLastError(ERROR_NO_TOKEN);
++    return TRUE;
+ }
+ 
+ HANDLE WINAPI EnterCriticalPolicySection(BOOL bMachine)
+diff --git a/include/profinfo.h b/include/profinfo.h
+index e8f4d559294..04a0306579a 100644
+--- a/include/profinfo.h
++++ b/include/profinfo.h
+@@ -19,6 +19,8 @@
+ #ifndef __WINE_PROFINFO_H
+ #define __WINE_PROFINFO_H
+ 
++#define PI_NOUI 0x00000001
++
+ typedef struct _PROFILEINFOA {
+     DWORD dwSize;
+     DWORD dwFlags;

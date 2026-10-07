@@ -1,0 +1,880 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 05:12:18 -0400
+Subject: [PATCH] combase: Implement RoGetParameterizedTypeInstanceIID.
+
+The IID of a Windows Runtime type instance, such as IVector<String>, is
+the version 5 (SHA-1) UUID of its signature in the namespace the type
+system names; .NET's Windows Runtime support asks for it, and Wine
+answered E_NOTIMPL.  As on Windows 11 (tools/paramiidprobe in
+wine-altars): the fourteen fundamental types are known by name, case
+sensitive, and every other name goes to the caller's locator, in order;
+a struct's fields, an enum's base type and a class or group's default
+interface by name are types too; the type need not be parameterized.
+Missing or extra arguments are E_INVALIDARG, no names or no fields
+E_UNEXPECTED, and a locator's error is passed on, with the IID cleared
+and the signature so far still handed out.  A locator that describes
+nothing is E_UNEXPECTED here, where Windows makes up a type.
+
+RoParameterizedTypeExtraGetTypeSignature and
+RoFreeParameterizedTypeExtra give out and free the signature.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/combase/Makefile.in b/dlls/combase/Makefile.in
+index f3d10bb9f00..09f201f5ec5 100644
+--- a/dlls/combase/Makefile.in
++++ b/dlls/combase/Makefile.in
+@@ -2,7 +2,7 @@ EXTRADEFS = -DWINOLE32API=
+ MODULE    = combase.dll
+ IMPORTLIB = combase
+ IMPORTS   = advapi32 ole32 user32 gdi32 uuid rpcrt4
+-DELAYIMPORTS = oleaut32
++DELAYIMPORTS = oleaut32 bcrypt
+ 
+ SOURCES = \
+ 	apartment.c \
+@@ -15,6 +15,7 @@ SOURCES = \
+ 	irpcss.idl \
+ 	malloc.c \
+ 	marshal.c \
++	paramiid.c \
+ 	roapi.c \
+ 	rpc.c \
+ 	string.c \
+diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
+index 0b21bb70265..c3e0d7ab650 100644
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -292,7 +292,7 @@
+ @ stdcall RoCaptureErrorContext(long)
+ @ stdcall RoClearError()
+ @ stdcall RoFailFastWithErrorContext(long)
+-@ stub RoFreeParameterizedTypeExtra
++@ stdcall RoFreeParameterizedTypeExtra(ptr)
+ @ stub RoGetActivatableClassRegistration
+ @ stdcall RoGetActivationFactory(ptr ptr ptr)
+ @ stdcall RoGetAgileReference(long ptr ptr ptr)
+@@ -307,7 +307,7 @@
+ @ stdcall RoOriginateError(long ptr)
+ @ stdcall RoOriginateErrorW(long long ptr)
+ @ stdcall RoOriginateLanguageException(long ptr ptr)
+-@ stub RoParameterizedTypeExtraGetTypeSignature
++@ stdcall RoParameterizedTypeExtraGetTypeSignature(ptr)
+ @ stdcall RoRegisterActivationFactories(ptr ptr long ptr)
+ @ stdcall RoRegisterForApartmentShutdown(ptr ptr ptr)
+ @ stub RoReportCapabilityCheckFailure
+diff --git a/dlls/combase/paramiid.c b/dlls/combase/paramiid.c
+new file mode 100644
+index 00000000000..344176bf731
+--- /dev/null
++++ b/dlls/combase/paramiid.c
+@@ -0,0 +1,501 @@
++/*
++ * Interface IDs of parameterized Windows Runtime types
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdio.h>
++
++#define COBJMACROS
++#include "objbase.h"
++#include "bcrypt.h"
++#include "roparameterizediid.h"
++
++#include "combase_private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(combase);
++
++/* A type instance's IID is the name-based (SHA-1) UUID of its signature, as the Windows Runtime
++ * type system describes it, in this namespace; the locator describes each name that is not a
++ * fundamental type. */
++static const BYTE pinterface_namespace[] =
++{
++    0x11, 0xf4, 0x7a, 0xd5, 0x7b, 0x73, 0x42, 0xc0, 0xab, 0xae, 0x87, 0x8b, 0x1e, 0x16, 0xad, 0xee
++};
++
++static const struct
++{
++    const WCHAR *name;
++    const char *signature;
++}
++fundamental_types[] =
++{
++    { L"Boolean", "b1" },
++    { L"UInt8",   "u1" },
++    { L"Int16",   "i2" },
++    { L"UInt16",  "u2" },
++    { L"Int32",   "i4" },
++    { L"UInt32",  "u4" },
++    { L"Int64",   "i8" },
++    { L"UInt64",  "u8" },
++    { L"Single",  "f4" },
++    { L"Double",  "f8" },
++    { L"Char16",  "c2" },
++    { L"String",  "string" },
++    { L"Guid",    "g16" },
++    { L"Object",  "cinterface(IInspectable)" },
++};
++
++enum type_kind
++{
++    TYPE_NONE,
++    TYPE_INTERFACE,
++    TYPE_DELEGATE,
++    TYPE_PARAMETERIZED,
++    TYPE_GROUP,
++    TYPE_CLASS,
++    TYPE_STRUCT,
++    TYPE_ENUM,
++};
++
++/* what the locator said about one name */
++struct type_builder
++{
++    IRoSimpleMetaDataBuilder IRoSimpleMetaDataBuilder_iface;
++    enum type_kind kind;
++    GUID iid;
++    BOOL has_iid;
++    WCHAR *name;
++    /* the arguments of a parameterized type */
++    UINT32 arg_count;
++    /* the default interface of a class or group by name, the fields of a struct, the base type of an enum */
++    WCHAR **elements;
++    UINT32 count;
++};
++
++static inline struct type_builder *impl_from_IRoSimpleMetaDataBuilder(IRoSimpleMetaDataBuilder *iface)
++{
++    return CONTAINING_RECORD(iface, struct type_builder, IRoSimpleMetaDataBuilder_iface);
++}
++
++static HRESULT builder_set_names(struct type_builder *builder, enum type_kind kind, const WCHAR *name,
++                                 UINT32 count, const WCHAR **elements)
++{
++    WCHAR *copy, **copies = NULL;
++    UINT32 i;
++
++    if (builder->kind != TYPE_NONE) return E_INVALIDARG;
++    if (!name || (count && !elements)) return E_INVALIDARG;
++    for (i = 0; i < count; i++) if (!elements[i]) return E_INVALIDARG;
++
++    if (!(copy = wcsdup(name))) return E_OUTOFMEMORY;
++    if (count && !(copies = calloc(count, sizeof(*copies))))
++    {
++        free(copy);
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < count; i++)
++    {
++        if ((copies[i] = wcsdup(elements[i]))) continue;
++        while (i) free(copies[--i]);
++        free(copies);
++        free(copy);
++        return E_OUTOFMEMORY;
++    }
++    builder->kind = kind;
++    builder->name = copy;
++    builder->elements = copies;
++    builder->count = count;
++    return S_OK;
++}
++
++static HRESULT builder_set_iid(struct type_builder *builder, enum type_kind kind, const GUID *iid, UINT32 arg_count)
++{
++    if (builder->kind != TYPE_NONE) return E_INVALIDARG;
++    builder->kind = kind;
++    builder->iid = *iid;
++    builder->has_iid = TRUE;
++    builder->arg_count = arg_count;
++    return S_OK;
++}
++
++static HRESULT builder_set_default(struct type_builder *builder, enum type_kind kind, const WCHAR *name,
++                                   const WCHAR *default_name, const GUID *default_iid)
++{
++    HRESULT hr;
++
++    if (default_iid)
++    {
++        if (FAILED(hr = builder_set_names(builder, kind, name, 0, NULL))) return hr;
++        builder->iid = *default_iid;
++        builder->has_iid = TRUE;
++        return S_OK;
++    }
++    if (!default_name) return E_INVALIDARG;
++    return builder_set_names(builder, kind, name, 1, &default_name);
++}
++
++static HRESULT WINAPI builder_SetWinRtInterface(IRoSimpleMetaDataBuilder *iface, GUID iid)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s.\n", iface, debugstr_guid(&iid));
++
++    return builder_set_iid(builder, TYPE_INTERFACE, &iid, 0);
++}
++
++static HRESULT WINAPI builder_SetDelegate(IRoSimpleMetaDataBuilder *iface, GUID iid)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s.\n", iface, debugstr_guid(&iid));
++
++    return builder_set_iid(builder, TYPE_DELEGATE, &iid, 0);
++}
++
++static HRESULT WINAPI builder_SetInterfaceGroupSimpleDefault(IRoSimpleMetaDataBuilder *iface, const WCHAR *name,
++                                                             const WCHAR *default_name, const GUID *default_iid)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %s, %s.\n", iface, debugstr_w(name), debugstr_w(default_name), debugstr_guid(default_iid));
++
++    return builder_set_default(builder, TYPE_GROUP, name, default_name, default_iid);
++}
++
++static HRESULT WINAPI builder_SetInterfaceGroupParameterizedDefault(IRoSimpleMetaDataBuilder *iface,
++                                                                    const WCHAR *name, UINT32 count,
++                                                                    const WCHAR **elements)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %u, %p.\n", iface, debugstr_w(name), count, elements);
++
++    return builder_set_names(builder, TYPE_GROUP, name, count, elements);
++}
++
++static HRESULT WINAPI builder_SetRuntimeClassSimpleDefault(IRoSimpleMetaDataBuilder *iface, const WCHAR *name,
++                                                           const WCHAR *default_name, const GUID *default_iid)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %s, %s.\n", iface, debugstr_w(name), debugstr_w(default_name), debugstr_guid(default_iid));
++
++    return builder_set_default(builder, TYPE_CLASS, name, default_name, default_iid);
++}
++
++static HRESULT WINAPI builder_SetRuntimeClassParameterizedDefault(IRoSimpleMetaDataBuilder *iface,
++                                                                  const WCHAR *name, UINT32 count,
++                                                                  const WCHAR **elements)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %u, %p.\n", iface, debugstr_w(name), count, elements);
++
++    return builder_set_names(builder, TYPE_CLASS, name, count, elements);
++}
++
++static HRESULT WINAPI builder_SetStruct(IRoSimpleMetaDataBuilder *iface, const WCHAR *name, UINT32 count,
++                                        const WCHAR **fields)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %u, %p.\n", iface, debugstr_w(name), count, fields);
++
++    return builder_set_names(builder, TYPE_STRUCT, name, count, fields);
++}
++
++static HRESULT WINAPI builder_SetEnum(IRoSimpleMetaDataBuilder *iface, const WCHAR *name, const WCHAR *base_type)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %s.\n", iface, debugstr_w(name), debugstr_w(base_type));
++
++    if (!base_type) return E_INVALIDARG;
++    return builder_set_names(builder, TYPE_ENUM, name, 1, &base_type);
++}
++
++static HRESULT WINAPI builder_SetParameterizedInterface(IRoSimpleMetaDataBuilder *iface, GUID iid, UINT32 count)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %u.\n", iface, debugstr_guid(&iid), count);
++
++    return builder_set_iid(builder, TYPE_PARAMETERIZED, &iid, count);
++}
++
++static HRESULT WINAPI builder_SetParameterizedDelegate(IRoSimpleMetaDataBuilder *iface, GUID iid, UINT32 count)
++{
++    struct type_builder *builder = impl_from_IRoSimpleMetaDataBuilder(iface);
++
++    TRACE("%p, %s, %u.\n", iface, debugstr_guid(&iid), count);
++
++    return builder_set_iid(builder, TYPE_PARAMETERIZED, &iid, count);
++}
++
++static const IRoSimpleMetaDataBuilderVtbl builder_vtbl =
++{
++    builder_SetWinRtInterface,
++    builder_SetDelegate,
++    builder_SetInterfaceGroupSimpleDefault,
++    builder_SetInterfaceGroupParameterizedDefault,
++    builder_SetRuntimeClassSimpleDefault,
++    builder_SetRuntimeClassParameterizedDefault,
++    builder_SetStruct,
++    builder_SetEnum,
++    builder_SetParameterizedInterface,
++    builder_SetParameterizedDelegate,
++};
++
++static void builder_cleanup(struct type_builder *builder)
++{
++    UINT32 i;
++
++    for (i = 0; i < builder->count; i++) free(builder->elements[i]);
++    free(builder->elements);
++    free(builder->name);
++}
++
++struct signature
++{
++    IRoMetaDataLocator *locator;
++    unsigned int depth;
++    char *data;
++    size_t len, size;
++};
++
++static HRESULT append(struct signature *sig, const char *str, size_t len)
++{
++    if (sig->len + len + 1 > sig->size)
++    {
++        size_t size = max(max(sig->size * 2, sig->len + len + 1), 64);
++        char *data;
++
++        if (!(data = realloc(sig->data, size))) return E_OUTOFMEMORY;
++        sig->data = data;
++        sig->size = size;
++    }
++    memcpy(sig->data + sig->len, str, len);
++    sig->len += len;
++    sig->data[sig->len] = 0;
++    return S_OK;
++}
++
++static HRESULT append_str(struct signature *sig, const char *str)
++{
++    return append(sig, str, strlen(str));
++}
++
++static HRESULT append_name(struct signature *sig, const WCHAR *name)
++{
++    char buffer[256], *str = buffer;
++    int len;
++    HRESULT hr;
++
++    len = WideCharToMultiByte(CP_UTF8, 0, name, -1, NULL, 0, NULL, NULL);
++    if (len > sizeof(buffer) && !(str = malloc(len))) return E_OUTOFMEMORY;
++    WideCharToMultiByte(CP_UTF8, 0, name, -1, str, len, NULL, NULL);
++    hr = append(sig, str, len - 1);
++    if (str != buffer) free(str);
++    return hr;
++}
++
++static HRESULT append_guid(struct signature *sig, const GUID *guid)
++{
++    char str[39];
++
++    sprintf(str, "{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", guid->Data1, guid->Data2, guid->Data3,
++            guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3], guid->Data4[4], guid->Data4[5],
++            guid->Data4[6], guid->Data4[7]);
++    return append_str(sig, str);
++}
++
++static HRESULT append_type(struct signature *sig, UINT32 count, const WCHAR *const *elements, UINT32 *pos);
++
++/* elements that make up one type, as a whole */
++static HRESULT append_whole_type(struct signature *sig, UINT32 count, const WCHAR *const *elements)
++{
++    UINT32 pos = 0;
++    HRESULT hr;
++
++    if (!count) return E_UNEXPECTED;
++    if (FAILED(hr = append_type(sig, count, elements, &pos))) return hr;
++    return pos == count ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT append_located_type(struct signature *sig, struct type_builder *builder, UINT32 count,
++                                   const WCHAR *const *elements, UINT32 *pos)
++{
++    static const char *const prefixes[] = { NULL, NULL, "delegate(", "pinterface(", "ig(", "rc(", "struct(", "enum(" };
++    HRESULT hr;
++    UINT32 i;
++
++    if (builder->kind == TYPE_NONE) return E_UNEXPECTED;
++    if (prefixes[builder->kind] && FAILED(hr = append_str(sig, prefixes[builder->kind]))) return hr;
++
++    switch (builder->kind)
++    {
++    case TYPE_INTERFACE:
++        return append_guid(sig, &builder->iid);
++
++    case TYPE_DELEGATE:
++        if (FAILED(hr = append_guid(sig, &builder->iid))) return hr;
++        break;
++
++    case TYPE_PARAMETERIZED:
++        if (FAILED(hr = append_guid(sig, &builder->iid))) return hr;
++        for (i = 0; i < builder->arg_count; i++)
++        {
++            if (FAILED(hr = append_str(sig, ";"))) return hr;
++            if (FAILED(hr = append_type(sig, count, elements, pos))) return hr;
++        }
++        break;
++
++    case TYPE_GROUP:
++    case TYPE_CLASS:
++    case TYPE_ENUM:
++        if (FAILED(hr = append_name(sig, builder->name))) return hr;
++        if (FAILED(hr = append_str(sig, ";"))) return hr;
++        if (builder->has_iid) hr = append_guid(sig, &builder->iid);
++        else hr = append_whole_type(sig, builder->count, (const WCHAR *const *)builder->elements);
++        if (FAILED(hr)) return hr;
++        break;
++
++    case TYPE_STRUCT:
++        if (FAILED(hr = append_name(sig, builder->name))) return hr;
++        /* the fields' types follow one another, each with the arguments it takes */
++        if (!builder->count) return E_UNEXPECTED;
++        for (i = 0; i < builder->count;)
++        {
++            if (FAILED(hr = append_str(sig, ";"))) return hr;
++            if (FAILED(hr = append_type(sig, builder->count, (const WCHAR *const *)builder->elements, &i)))
++                return hr;
++        }
++        break;
++
++    case TYPE_NONE:
++        break;
++    }
++    return append_str(sig, ")");
++}
++
++/* the type at elements[*pos], with its arguments */
++static HRESULT append_type(struct signature *sig, UINT32 count, const WCHAR *const *elements, UINT32 *pos)
++{
++    struct type_builder builder = {{&builder_vtbl}};
++    const WCHAR *name;
++    HRESULT hr;
++    UINT32 i;
++
++    if (*pos >= count) return E_INVALIDARG;
++    if (!(name = elements[(*pos)++])) return E_INVALIDARG;
++
++    for (i = 0; i < ARRAY_SIZE(fundamental_types); i++)
++        if (!wcscmp(name, fundamental_types[i].name)) return append_str(sig, fundamental_types[i].signature);
++
++    if (sig->depth >= 64) return E_UNEXPECTED;
++    hr = IRoMetaDataLocator_Locate(sig->locator, name, &builder.IRoSimpleMetaDataBuilder_iface);
++    TRACE("locator answers %#lx for %s.\n", hr, debugstr_w(name));
++    if (SUCCEEDED(hr))
++    {
++        sig->depth++;
++        hr = append_located_type(sig, &builder, count, elements, pos);
++        sig->depth--;
++    }
++    builder_cleanup(&builder);
++    return hr;
++}
++
++static HRESULT signature_iid(const struct signature *sig, GUID *iid)
++{
++    BYTE *data, hash[20];
++    NTSTATUS status;
++
++    if (!(data = malloc(sizeof(pinterface_namespace) + sig->len))) return E_OUTOFMEMORY;
++    memcpy(data, pinterface_namespace, sizeof(pinterface_namespace));
++    memcpy(data + sizeof(pinterface_namespace), sig->data, sig->len);
++    status = BCryptHash(BCRYPT_SHA1_ALG_HANDLE, NULL, 0, data, sizeof(pinterface_namespace) + sig->len,
++                        hash, sizeof(hash));
++    free(data);
++    if (status) return HRESULT_FROM_NT(status);
++
++    /* a version 5 UUID, from the hash in network order */
++    iid->Data1 = (DWORD)hash[0] << 24 | hash[1] << 16 | hash[2] << 8 | hash[3];
++    iid->Data2 = hash[4] << 8 | hash[5];
++    iid->Data3 = ((hash[6] << 8 | hash[7]) & 0x0fff) | 0x5000;
++    iid->Data4[0] = (hash[8] & 0x3f) | 0x80;
++    memcpy(iid->Data4 + 1, hash + 9, 7);
++    return S_OK;
++}
++
++/***********************************************************************
++ *      RoGetParameterizedTypeInstanceIID (combase.@)
++ */
++HRESULT WINAPI RoGetParameterizedTypeInstanceIID(UINT32 name_element_count, const WCHAR **name_elements,
++                                                 const IRoMetaDataLocator *meta_data_locator, GUID *iid,
++                                                 ROPARAMIIDHANDLE *hiid)
++{
++    struct signature sig = { (IRoMetaDataLocator *)meta_data_locator };
++    HRESULT hr;
++
++    TRACE("%u, %p, %p, %p, %p.\n", name_element_count, name_elements, meta_data_locator, iid, hiid);
++
++    if (hiid) *hiid = NULL;
++    if (!iid) return E_INVALIDARG;
++    *iid = GUID_NULL;
++    if (!meta_data_locator || (name_element_count && !name_elements)) return E_INVALIDARG;
++
++    if (SUCCEEDED(hr = append_whole_type(&sig, name_element_count, name_elements)) &&
++        FAILED(hr = signature_iid(&sig, iid)))
++        *iid = GUID_NULL;
++    TRACE("signature %s, iid %s.\n", debugstr_a(sig.data), debugstr_guid(iid));
++
++    /* Windows hands out the signature it got to even when the type is wrong */
++    if (hiid)
++    {
++        if (!sig.data && FAILED(append(&sig, "", 0)))
++        {
++            *iid = GUID_NULL;
++            return E_OUTOFMEMORY;
++        }
++        *hiid = sig.data;
++    }
++    else free(sig.data);
++    return hr;
++}
++
++/***********************************************************************
++ *      RoParameterizedTypeExtraGetTypeSignature (combase.@)
++ */
++const char * WINAPI RoParameterizedTypeExtraGetTypeSignature(ROPARAMIIDHANDLE extra)
++{
++    TRACE("%p.\n", extra);
++
++    return extra;
++}
++
++/***********************************************************************
++ *      RoFreeParameterizedTypeExtra (combase.@)
++ */
++void WINAPI RoFreeParameterizedTypeExtra(ROPARAMIIDHANDLE extra)
++{
++    TRACE("%p.\n", extra);
++
++    free(extra);
++}
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index af3b087efa6..2bef2611c82 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -232,19 +232,6 @@ done:
+     return hr;
+ }
+ 
+-/***********************************************************************
+- *      RoGetParameterizedTypeInstanceIID (combase.@)
+- */
+-HRESULT WINAPI RoGetParameterizedTypeInstanceIID(UINT32 name_element_count, const WCHAR **name_elements,
+-                                                 const IRoMetaDataLocator *meta_data_locator, GUID *iid,
+-                                                 ROPARAMIIDHANDLE *hiid)
+-{
+-    FIXME("stub: %d %p %p %p %p\n", name_element_count, name_elements, meta_data_locator, iid, hiid);
+-    if (iid) *iid = GUID_NULL;
+-    if (hiid) *hiid = INVALID_HANDLE_VALUE;
+-    return E_NOTIMPL;
+-}
+-
+ /***********************************************************************
+  *      RoActivateInstance (combase.@)
+  */
+diff --git a/dlls/combase/tests/roapi.c b/dlls/combase/tests/roapi.c
+index fc5530c9064..75b9cfbc7df 100644
+--- a/dlls/combase/tests/roapi.c
++++ b/dlls/combase/tests/roapi.c
+@@ -17,6 +17,7 @@
+  */
+ #define COBJMACROS
+ #include <stdarg.h>
++#include <stdio.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -27,6 +28,7 @@
+ #include "initguid.h"
+ #include "roapi.h"
+ #include "roerrorapi.h"
++#include "roparameterizediid.h"
+ #define COBJMACROS
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Diagnostics
+@@ -995,6 +997,241 @@ done:
+     RoUninitialize();
+ }
+ 
++static char locate_calls[1024];
++static BOOL locate_twice;
++
++static GUID guid_from_string(const char *str)
++{
++    unsigned int d[11];
++    GUID guid;
++    int i;
++
++    sscanf(str, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6],
++           &d[7], &d[8], &d[9], &d[10]);
++    guid.Data1 = d[0];
++    guid.Data2 = d[1];
++    guid.Data3 = d[2];
++    for (i = 0; i < 8; i++) guid.Data4[i] = d[3 + i];
++    return guid;
++}
++
++static HRESULT WINAPI locator_Locate(IRoMetaDataLocator *iface, const WCHAR *name, IRoSimpleMetaDataBuilder *builder)
++{
++    static const WCHAR *map_default[] = { L"Windows.Foundation.Collections.IMap`2", L"String", L"Object" };
++    static const WCHAR *point_fields[] = { L"Single", L"Single" };
++    static const WCHAR *nested_fields[] = { L"Windows.Foundation.Point", L"Windows.Foundation.AsyncStatus", L"String" };
++    static const WCHAR *vector_fields[] = { L"Windows.Foundation.Collections.IVector`1", L"String" };
++    static const GUID group_iid = {0x00000000, 0x1111, 0x2222, {0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x66, 0x66}};
++    static const GUID uri_iid = {0x9e365e57, 0x48b2, 0x4160, {0x95, 0x6f, 0xc7, 0x38, 0x51, 0x20, 0xbb, 0xfc}};
++    char buffer[128];
++    HRESULT hr;
++
++    sprintf(buffer, "%s%s", *locate_calls ? "," : "", wine_dbgstr_w(name));
++    strcat(locate_calls, buffer);
++
++    if (!wcscmp(name, L"Windows.Foundation.Collections.IVector`1"))
++    {
++        hr = IRoSimpleMetaDataBuilder_SetParameterizedInterface(builder,
++                guid_from_string("913337e9-11a1-4345-a3a2-4e7f956e222d"), 1);
++        ok(hr == S_OK, "got %#lx\n", hr);
++        if (locate_twice)
++        {
++            hr = IRoSimpleMetaDataBuilder_SetWinRtInterface(builder, group_iid);
++            ok(hr == E_INVALIDARG, "got %#lx\n", hr);
++            return S_OK;
++        }
++        return hr;
++    }
++    if (!wcscmp(name, L"Windows.Foundation.Collections.IIterable`1"))
++        return IRoSimpleMetaDataBuilder_SetParameterizedInterface(builder,
++                guid_from_string("faa585ea-6214-4217-afda-7f46de5869b3"), 1);
++    if (!wcscmp(name, L"Windows.Foundation.Collections.IMap`2"))
++        return IRoSimpleMetaDataBuilder_SetParameterizedInterface(builder,
++                guid_from_string("3c2925fe-8519-45c1-aa79-197b6718c1c1"), 2);
++    if (!wcscmp(name, L"Windows.Foundation.Collections.IKeyValuePair`2"))
++        return IRoSimpleMetaDataBuilder_SetParameterizedInterface(builder,
++                guid_from_string("02b51929-c1c4-4a7e-8940-0312b5c18500"), 2);
++    if (!wcscmp(name, L"Windows.Foundation.IReference`1"))
++        return IRoSimpleMetaDataBuilder_SetParameterizedInterface(builder,
++                guid_from_string("61c17706-2d65-11e0-9ae8-d48564015472"), 1);
++    if (!wcscmp(name, L"Windows.Foundation.AsyncOperationCompletedHandler`1"))
++        return IRoSimpleMetaDataBuilder_SetParameterizedDelegate(builder,
++                guid_from_string("fcdcf02c-e5d8-4478-915a-4d90b74b83a5"), 1);
++    if (!wcscmp(name, L"Windows.Foundation.IAsyncAction"))
++        return IRoSimpleMetaDataBuilder_SetWinRtInterface(builder, guid_from_string("5a648006-843a-4da9-865b-9d26e5dfad7b"));
++    if (!wcscmp(name, L"Windows.Foundation.AsyncActionCompletedHandler"))
++        return IRoSimpleMetaDataBuilder_SetDelegate(builder, guid_from_string("a4ed5c81-76c9-40bd-8be6-b1d90fb20ae7"));
++    if (!wcscmp(name, L"Windows.Foundation.Uri"))
++        return IRoSimpleMetaDataBuilder_SetRuntimeClassSimpleDefault(builder, name,
++                L"Windows.Foundation.IUriRuntimeClass", &uri_iid);
++    if (!wcscmp(name, L"Test.ClassNoIid"))
++        return IRoSimpleMetaDataBuilder_SetRuntimeClassSimpleDefault(builder, name, L"Windows.Foundation.IAsyncAction", NULL);
++    if (!wcscmp(name, L"Windows.Foundation.Collections.PropertySet"))
++        return IRoSimpleMetaDataBuilder_SetRuntimeClassParameterizedDefault(builder, name, 3, map_default);
++    if (!wcscmp(name, L"Test.Group"))
++        return IRoSimpleMetaDataBuilder_SetInterfaceGroupSimpleDefault(builder, name, L"Windows.Foundation.IAsyncAction", &group_iid);
++    if (!wcscmp(name, L"Test.PGroup"))
++        return IRoSimpleMetaDataBuilder_SetInterfaceGroupParameterizedDefault(builder, name, 3, map_default);
++    if (!wcscmp(name, L"Windows.Foundation.Point"))
++        return IRoSimpleMetaDataBuilder_SetStruct(builder, name, 2, point_fields);
++    if (!wcscmp(name, L"Test.Nested"))
++        return IRoSimpleMetaDataBuilder_SetStruct(builder, name, 3, nested_fields);
++    if (!wcscmp(name, L"Test.BadStruct"))
++        return IRoSimpleMetaDataBuilder_SetStruct(builder, name, 2, vector_fields);
++    if (!wcscmp(name, L"Test.EmptyStruct"))
++        return IRoSimpleMetaDataBuilder_SetStruct(builder, name, 0, NULL);
++    if (!wcscmp(name, L"Windows.Foundation.AsyncStatus"))
++        return IRoSimpleMetaDataBuilder_SetEnum(builder, name, L"Int32");
++    if (!wcscmp(name, L"Test.Flags"))
++        return IRoSimpleMetaDataBuilder_SetEnum(builder, name, L"UInt32");
++    if (!wcscmp(name, L"Test.Failing"))
++        return E_FAIL;
++    return 0x80073d54;
++}
++
++static const IRoMetaDataLocatorVtbl locator_vtbl = { locator_Locate };
++
++static void test_RoGetParameterizedTypeInstanceIID(void)
++{
++    static const struct
++    {
++        const WCHAR *names[5];
++        HRESULT hr;
++        const char *iid, *signature, *calls;
++    }
++    tests[] =
++    {
++        {{L"Windows.Foundation.Collections.IVector`1", L"String"}, S_OK, "98b9acc1-4b56-532e-ac73-03d5291cca90",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};string)", "L\"Windows.Foundation.Collections.IVector`1\""},
++        {{L"Windows.Foundation.Collections.IMap`2", L"String", L"Object"}, S_OK, "1b0d3570-0877-5ec2-8a2c-3b9539506aca",
++         "pinterface({3c2925fe-8519-45c1-aa79-197b6718c1c1};string;cinterface(IInspectable))"},
++        {{L"Windows.Foundation.Collections.IIterable`1", L"Windows.Foundation.Collections.IKeyValuePair`2", L"String",
++          L"String"}, S_OK, "e9bdaaf0-cbf6-5c72-be90-29cbf3a1319b",
++         "pinterface({faa585ea-6214-4217-afda-7f46de5869b3};pinterface({02b51929-c1c4-4a7e-8940-0312b5c18500};string;string))",
++         "L\"Windows.Foundation.Collections.IIterable`1\",L\"Windows.Foundation.Collections.IKeyValuePair`2\""},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Windows.Foundation.IAsyncAction"}, S_OK,
++         "5e594ee2-222f-5bf0-a5dd-04e8d04f6623",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};{5a648006-843a-4da9-865b-9d26e5dfad7b})"},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Windows.Foundation.Uri"}, S_OK,
++         "0d82bd8d-fe62-5d67-a7b9-7886dd75bc4e",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};rc(Windows.Foundation.Uri;{9e365e57-48b2-4160-956f-c7385120bbfc}))"},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Test.ClassNoIid"}, S_OK, "711a1e4d-9f57-5276-82fd-2e7575a05803",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};rc(Test.ClassNoIid;{5a648006-843a-4da9-865b-9d26e5dfad7b}))",
++         "L\"Windows.Foundation.Collections.IVector`1\",L\"Test.ClassNoIid\",L\"Windows.Foundation.IAsyncAction\""},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Windows.Foundation.Collections.PropertySet"}, S_OK,
++         "32223a9e-47a2-5dbf-8014-2d65e3de98db",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};rc(Windows.Foundation.Collections.PropertySet;"
++         "pinterface({3c2925fe-8519-45c1-aa79-197b6718c1c1};string;cinterface(IInspectable))))"},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Test.Group"}, S_OK, "3ee92641-b727-5358-8c01-a1e043107e71",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};ig(Test.Group;{00000000-1111-2222-3333-444455556666}))"},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Test.PGroup"}, S_OK, "695bfd30-5e12-53f0-97cf-8fc901c7e5d7",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};ig(Test.PGroup;"
++         "pinterface({3c2925fe-8519-45c1-aa79-197b6718c1c1};string;cinterface(IInspectable))))"},
++        {{L"Windows.Foundation.IReference`1", L"Windows.Foundation.Point"}, S_OK, "84f14c22-a00a-5272-8d3d-82112e66df00",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};struct(Windows.Foundation.Point;f4;f4))"},
++        {{L"Windows.Foundation.IReference`1", L"Test.Nested"}, S_OK, "2cb071de-1b61-5847-b9f9-b192695e9fa3",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};struct(Test.Nested;struct(Windows.Foundation.Point;f4;f4);"
++         "enum(Windows.Foundation.AsyncStatus;i4);string))"},
++        /* a field's type takes the names after it as its arguments */
++        {{L"Windows.Foundation.IReference`1", L"Test.BadStruct"}, S_OK, "e4171242-6949-5e9a-a876-978cde405eb8",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};struct(Test.BadStruct;"
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};string)))"},
++        {{L"Windows.Foundation.IReference`1", L"Test.Flags"}, S_OK, "91cbf137-6464-5842-b105-28ce3d62f5ba",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};enum(Test.Flags;u4))"},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Windows.Foundation.AsyncActionCompletedHandler"}, S_OK,
++         "5dafe591-86dc-59aa-bfda-07f5d59fc708",
++         "pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};delegate({a4ed5c81-76c9-40bd-8be6-b1d90fb20ae7}))"},
++        {{L"Windows.Foundation.AsyncOperationCompletedHandler`1", L"Boolean"}, S_OK,
++         "c1d3d1a2-ae17-5a5f-b5a2-bdcc8844889a", "pinterface({fcdcf02c-e5d8-4478-915a-4d90b74b83a5};b1)"},
++        {{L"Windows.Foundation.IReference`1", L"UInt8"}, S_OK, "e5198cc8-2873-55f5-b0a1-84ff9e4aad62",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};u1)"},
++        {{L"Windows.Foundation.IReference`1", L"Int16"}, S_OK, "6ec9e41b-6709-5647-9918-a1270110fc4e",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};i2)"},
++        {{L"Windows.Foundation.IReference`1", L"UInt16"}, S_OK, "5ab7d2c3-6b62-5e71-a4b6-2d49c4f238fd",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};u2)"},
++        {{L"Windows.Foundation.IReference`1", L"Int32"}, S_OK, "548cefbd-bc8a-5fa0-8df2-957440fc8bf4",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};i4)"},
++        {{L"Windows.Foundation.IReference`1", L"UInt32"}, S_OK, "513ef3af-e784-5325-a91e-97c2b8111cf3",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};u4)"},
++        {{L"Windows.Foundation.IReference`1", L"Int64"}, S_OK, "4dda9e24-e69f-5c6a-a0a6-93427365af2a",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};i8)"},
++        {{L"Windows.Foundation.IReference`1", L"UInt64"}, S_OK, "6755e376-53bb-568b-a11d-17239868309e",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};u8)"},
++        {{L"Windows.Foundation.IReference`1", L"Single"}, S_OK, "719cc2ba-3e76-5def-9f1a-38d85a145ea8",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};f4)"},
++        {{L"Windows.Foundation.IReference`1", L"Double"}, S_OK, "2f2d6c29-5473-5f3e-92e7-96572bb990e2",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};f8)"},
++        {{L"Windows.Foundation.IReference`1", L"Char16"}, S_OK, "fb393ef3-bbac-5bd5-9144-84f23576f415",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};c2)"},
++        {{L"Windows.Foundation.IReference`1", L"Guid"}, S_OK, "7d50f649-632c-51f9-849a-ee49428933ea",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};g16)"},
++        {{L"Windows.Foundation.IReference`1", L"Boolean"}, S_OK, "3c00fd60-2950-5939-a21a-2d12c5a01b8a",
++         "pinterface({61c17706-2d65-11e0-9ae8-d48564015472};b1)"},
++        /* names are case sensitive, and not every type is fundamental */
++        {{L"Windows.Foundation.IReference`1", L"string"}, 0x80073d54, NULL, NULL,
++         "L\"Windows.Foundation.IReference`1\",L\"string\""},
++        {{L"Windows.Foundation.IReference`1", L"Int8"}, 0x80073d54, NULL, NULL,
++         "L\"Windows.Foundation.IReference`1\",L\"Int8\""},
++        /* the type need not be parameterized */
++        {{L"String"}, S_OK, "cce04bc6-88c4-5a4a-925a-9c344cf5ea2e", "string", ""},
++        {{L"Windows.Foundation.IAsyncAction"}, S_OK, "4a4fb820-773d-5595-b741-58297f08b7ca",
++         "{5a648006-843a-4da9-865b-9d26e5dfad7b}"},
++        {{L"Windows.Foundation.Collections.IMap`2", L"String"}, E_INVALIDARG},
++        {{L"Windows.Foundation.Collections.IVector`1", L"String", L"String"}, E_INVALIDARG},
++        {{L"Windows.Foundation.Collections.IVector`1"}, E_INVALIDARG},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Test.Unknown"}, 0x80073d54},
++        {{L"Windows.Foundation.Collections.IVector`1", L"Test.Failing"}, E_FAIL},
++        {{L"Windows.Foundation.IReference`1", L"Test.EmptyStruct"}, E_UNEXPECTED},
++        {{L"Test.Failing"}, E_FAIL, NULL, NULL, "L\"Test.Failing\""},
++    };
++    IRoMetaDataLocator locator = { &locator_vtbl };
++    const WCHAR *names[] = { L"Windows.Foundation.Collections.IVector`1", L"String" };
++    ROPARAMIIDHANDLE extra;
++    unsigned int i, count;
++    const char *signature;
++    GUID iid, expect;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context("%u", i);
++        for (count = 0; count < ARRAY_SIZE(tests[i].names) && tests[i].names[count]; count++) ;
++        *locate_calls = 0;
++        memset(&iid, 0xcc, sizeof(iid));
++        extra = (ROPARAMIIDHANDLE)0xdeadbeef;
++        hr = RoGetParameterizedTypeInstanceIID(count, (const WCHAR **)tests[i].names, &locator, &iid, &extra);
++        ok(hr == tests[i].hr, "got %#lx\n", hr);
++        if (tests[i].iid)
++        {
++            expect = guid_from_string(tests[i].iid);
++            ok(IsEqualGUID(&iid, &expect), "got %s\n", wine_dbgstr_guid(&iid));
++        }
++        else ok(IsEqualGUID(&iid, &GUID_NULL), "got %s\n", wine_dbgstr_guid(&iid));
++        /* a handle comes back when the type is wrong too */
++        ok(extra && extra != (ROPARAMIIDHANDLE)0xdeadbeef, "got %p\n", extra);
++        signature = RoParameterizedTypeExtraGetTypeSignature(extra);
++        ok(!!signature, "got NULL signature\n");
++        if (tests[i].signature && signature)
++            ok(!strcmp(signature, tests[i].signature), "got %s\n", debugstr_a(signature));
++        RoFreeParameterizedTypeExtra(extra);
++        if (tests[i].calls)
++            ok(!strcmp(locate_calls, tests[i].calls), "got calls %s\n", locate_calls);
++        winetest_pop_context();
++    }
++
++    hr = RoGetParameterizedTypeInstanceIID(0, names, &locator, &iid, NULL);
++    ok(hr == E_UNEXPECTED, "got %#lx\n", hr);
++    ok(IsEqualGUID(&iid, &GUID_NULL), "got %s\n", wine_dbgstr_guid(&iid));
++
++    /* a second description does not count */
++    locate_twice = TRUE;
++    hr = RoGetParameterizedTypeInstanceIID(2, names, &locator, &iid, NULL);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    expect = guid_from_string(tests[0].iid);
++    ok(IsEqualGUID(&iid, &expect), "got %s\n", wine_dbgstr_guid(&iid));
++    locate_twice = FALSE;
++}
++
+ START_TEST(roapi)
+ {
+     BOOL ret;
+@@ -1006,6 +1243,7 @@ START_TEST(roapi)
+     test_RoGetAgileReference();
+     test_RoGetErrorReportingFlags();
+     test_AsyncCausalityTracer();
++    test_RoGetParameterizedTypeInstanceIID();
+ 
+     SetLastError(0xdeadbeef);
+     ret = DeleteFileW(L"wine.combase.test.dll");
+diff --git a/include/roparameterizediid.idl b/include/roparameterizediid.idl
+index 85ee57d6f94..7ac8319b3fc 100644
+--- a/include/roparameterizediid.idl
++++ b/include/roparameterizediid.idl
+@@ -93,3 +93,8 @@ interface IRoMetaDataLocator
+         IRoSimpleMetaDataBuilder *out
+     );
+ }
++
++cpp_quote("HRESULT WINAPI RoGetParameterizedTypeInstanceIID(UINT32 name_element_count, const WCHAR **name_elements,")
++cpp_quote("        const IRoMetaDataLocator *meta_data_locator, GUID *iid, ROPARAMIIDHANDLE *extra);")
++cpp_quote("void WINAPI RoFreeParameterizedTypeExtra(ROPARAMIIDHANDLE extra);")
++cpp_quote("const char * WINAPI RoParameterizedTypeExtraGetTypeSignature(ROPARAMIIDHANDLE extra);")

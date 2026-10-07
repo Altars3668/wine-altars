@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 15:11:53 -0400
+Subject: [PATCH] wineps.drv: the stored DEVMODE is a set of choices, not a
+ copy of the PPD.
+
+PSDRV_FindPrinterInfo kept both in one buffer and saved the whole thing back
+to the spooler on every open.  Because the PPD half was re-derived each time
+and written over the other half, a setting only had to be derived differently
+once to be lost for good.  "Print on both sides" was the clearest case: the
+duplex fix-up ran unconditionally, so a printer whose PPD has no *Duplex had
+dmDuplex forced back to DMDUP_SIMPLEX every single open.  Set it as the
+printer's default, open the printer again, and it reads simplex.
+
+Separate the two.  The tables past the public DEVMODE describe the printer, so
+they are rebuilt from the PPD every time instead of being trusted from the
+registry -- doing that only when their length had changed left a printer whose
+PPD had been replaced answering out of a stale copy.  The public fields are
+choices, so the PPD and the locale only reach a devmode nobody has chosen
+anything in; a stored one is left alone, beyond clamping a duplex value that
+is not one of the three.  And the result is written back only when it is not
+already what the spooler has, so an open stops being a write.
+
+The unix side of the devmode merge dropped a duplex request unless the PPD had
+a duplexer, which PSDRV_MergeDevmodes on the PE side no longer does; with the
+two disagreeing a request made through ResetDC survived on one side of the
+call and not the other.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 02ada1dd37c88b82dd7b6a7583a5be89ac1bd736)
+
+diff --git a/dlls/wineps.drv/init.c b/dlls/wineps.drv/init.c
+index 583368d73e5..bde0f0a72f7 100644
+--- a/dlls/wineps.drv/init.c
++++ b/dlls/wineps.drv/init.c
+@@ -524,6 +524,12 @@ static PSDRV_DEVMODE *get_printer_devmode( HANDLE printer, int size )
+ 
+     dm = (PSDRV_DEVMODE*)info;
+     memmove( dm, info->pDevMode, dm_size );
++    /* The caller rebuilds everything past the stored bytes and then asks
++     * whether the result differs from what came out of the spooler.  Leaving
++     * the rest of the buffer at whatever the heap held would make that
++     * question unanswerable. */
++    if (dm_size < size)
++        memset( (char *)dm + dm_size, 0, size - dm_size );
+     return dm;
+ }
+ 
+@@ -545,6 +551,7 @@ static PSDRV_DEVMODE *get_devmode( HANDLE printer, const WCHAR *name, BOOL *is_d
+         dm = HeapAlloc( PSDRV_Heap, 0, size );
+     if (dm)
+     {
++        memset( dm, 0, size );
+         memcpy( dm, &DefaultDevmode, min(sizeof(DefaultDevmode), size) );
+         lstrcpynW( (WCHAR *)dm->dmPublic.dmDeviceName, name, CCHDEVICENAME );
+         *is_default = TRUE;
+@@ -590,6 +597,7 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+     WCHAR *ppd_filename = NULL;
+     char *nameA = NULL;
+     BOOL using_default_devmode = FALSE;
++    PSDRV_DEVMODE *stored = NULL;
+     int i, len, input_slots, resolutions, page_sizes, font_subs, installed_fonts, size;
+     struct input_slot *dm_slot;
+     struct resolution *dm_res;
+@@ -650,6 +658,9 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+     pi->Devmode = get_devmode( hPrinter, name, &using_default_devmode, size );
+     if (!pi->Devmode) goto fail;
+ 
++    stored = HeapAlloc( GetProcessHeap(), 0, size );
++    if (stored) memcpy( stored, pi->Devmode, size );
++
+     /* Only a devmode nobody has chosen anything in takes the PPD's default.
+      * Applying it to a stored one as well undid the choice every time the
+      * printer was opened -- the paper size went back to whatever the PPD says
+@@ -689,7 +700,12 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+ 	}
+     }
+ 
+-    if (pi->Devmode->dmPublic.dmDriverExtra != size - pi->Devmode->dmPublic.dmSize)
++    /* Everything past the public DEVMODE is a description of the printer --
++     * its trays, resolutions, paper sizes and fonts, straight out of the PPD.
++     * It is not a setting, so it is rebuilt here every time rather than read
++     * back from the registry.  Refreshing it only when the tables had changed
++     * length left a printer whose PPD had been replaced answering out of the
++     * stale copy for as long as the two happened to be the same size. */
+     {
+         pi->Devmode->dmPublic.dmDriverExtra = size - pi->Devmode->dmPublic.dmSize;
+         pi->Devmode->default_resolution = pi->ppd->DefaultResolution;
+@@ -756,31 +772,45 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+         }
+     }
+ 
+-    /* Duplex is indicated by the setting of the DM_DUPLEX bit in dmFields.
++    /* Whether this printer can print both sides at all comes from the PPD.
+        WinDuplex == 0 is a special case which means that the ppd has a
+-       *DefaultDuplex: NotCapable entry.  In this case we'll try not to confuse
+-       apps and set dmDuplex to DMDUP_SIMPLEX but leave the DM_DUPLEX clear.
++       *DefaultDuplex: NotCapable entry: the model says it cannot, and names no
++       *Duplex to drive, so the bit stays clear and dmDuplex reads SIMPLEX.
+        PSDRV_WriteHeader understands this and copes.
+ 
+        A ppd with no *Duplex at all is a different case and gets the bit: the
+        printer has no duplexer, but the print processor can still print both
+-       sides by hand, sending the second one through the manual feeder.  With
+-       the bit clear the request never survives as far as the DEVMODE the
+-       processor is handed, and there is no way to ask for it. */
+-    pi->Devmode->dmPublic.dmFields &= ~DM_DUPLEX;
+-    if(pi->ppd->DefaultDuplex) {
+-        pi->Devmode->dmPublic.dmDuplex = pi->ppd->DefaultDuplex->WinDuplex;
+-        if(pi->Devmode->dmPublic.dmDuplex != 0)
+-            pi->Devmode->dmPublic.dmFields |= DM_DUPLEX;
+-        else
+-            pi->Devmode->dmPublic.dmDuplex = DMDUP_SIMPLEX;
+-    }
+-    else if (list_empty( &pi->ppd->Duplexes )) {
++       sides, sending the second one through the manual feeder.  With the bit
++       clear the request never survives as far as the DEVMODE the processor is
++       handed, and there is no way to ask for it.
++
++       Which of the two a person wants, though, is a choice and not a capability,
++       so only a devmode nobody has chosen anything in takes the PPD's.  Setting
++       it here every time is what put DMDUP_SIMPLEX back over the stored choice
++       on every open -- "print on both sides" could be made the printer's
++       default and would never once come back. */
++    if (pi->ppd->DefaultDuplex && pi->ppd->DefaultDuplex->WinDuplex == 0)
++    {
++        pi->Devmode->dmPublic.dmFields &= ~DM_DUPLEX;
+         pi->Devmode->dmPublic.dmDuplex = DMDUP_SIMPLEX;
++    }
++    else
++    {
+         pi->Devmode->dmPublic.dmFields |= DM_DUPLEX;
++        if (using_default_devmode)
++            pi->Devmode->dmPublic.dmDuplex = pi->ppd->DefaultDuplex ?
++                pi->ppd->DefaultDuplex->WinDuplex : DMDUP_SIMPLEX;
++        else if (pi->Devmode->dmPublic.dmDuplex < DMDUP_SIMPLEX ||
++                 pi->Devmode->dmPublic.dmDuplex > DMDUP_HORIZONTAL)
++            pi->Devmode->dmPublic.dmDuplex = DMDUP_SIMPLEX;
+     }
+ 
+-    set_devmode( hPrinter, pi->Devmode );
++    /* Writing this back on every open is what made the stored copy a moving
++     * target: each open re-derived it from the PPD and saved the result, so a
++     * setting only had to be derived differently once to be gone for good.
++     * Save it when it is not already what the spooler has, and not otherwise. */
++    if (!stored || memcmp( stored, pi->Devmode, size ))
++        set_devmode( hPrinter, pi->Devmode );
+ 
+     LIST_FOR_EACH_ENTRY( font, &pi->ppd->InstalledFonts, FONTNAME, entry )
+     {
+@@ -799,6 +829,7 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+ 
+     }
+     ClosePrinter( hPrinter );
++    HeapFree( GetProcessHeap(), 0, stored );
+     HeapFree( GetProcessHeap(), 0, nameA );
+     HeapFree( GetProcessHeap(), 0, ppd_filename );
+     list_add_head( &printer_list, &pi->entry );
+@@ -806,6 +837,7 @@ PRINTERINFO *PSDRV_FindPrinterInfo(LPCWSTR name)
+ 
+ fail:
+     if (hPrinter) ClosePrinter( hPrinter );
++    HeapFree( GetProcessHeap(), 0, stored );
+     HeapFree(PSDRV_Heap, 0, pi->FontSubTable);
+     HeapFree(PSDRV_Heap, 0, pi->friendly_name);
+     HeapFree(PSDRV_Heap, 0, pi->Devmode);
+diff --git a/dlls/wineps.drv/unixlib.c b/dlls/wineps.drv/unixlib.c
+index 1a8355e2181..b5fe1dc5977 100644
+--- a/dlls/wineps.drv/unixlib.c
++++ b/dlls/wineps.drv/unixlib.c
+@@ -426,7 +426,12 @@ static void merge_devmodes(PSDRV_DEVMODE *dm1, const DEVMODEW *dm2,
+         dm1->dmPublic.dmPrintQuality = dm2->dmPrintQuality;
+     if (dm2->dmFields & DM_COLOR)
+         dm1->dmPublic.dmColor = dm2->dmColor;
+-    if (dm2->dmFields & DM_DUPLEX && pi->devmode->duplex)
++    /* Take a duplex request whether or not the printer has a duplexer of its
++     * own: without one the print processor prints the two halves itself.  This
++     * is the unix side of the rule PSDRV_MergeDevmodes already follows; with
++     * the two disagreeing, a request made through ResetDC survived on one side
++     * of the call and not the other. */
++    if (dm2->dmFields & DM_DUPLEX)
+         dm1->dmPublic.dmDuplex = dm2->dmDuplex;
+     if (dm2->dmFields & DM_YRESOLUTION)
+         dm1->dmPublic.dmYResolution = dm2->dmYResolution;

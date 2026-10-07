@@ -1,0 +1,1046 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 03:01:26 -0400
+Subject: [PATCH] amsi: scan with the host's scanner instead of answering
+ "nothing detected".
+
+Office asks AMSI to look at a macro before it runs it, and asks for the
+Antimalware class by CLSID to do so.  The stub answered every scan with
+AMSI_RESULT_NOT_DETECTED and had no class at all, which is the worst of
+both: an application that does get an answer is entitled to believe
+something examined the content, and one that cannot create the class
+treats it as a scan it could not perform and refuses the macro outright.
+
+Put a real scanner behind it.  The unix side speaks clamd's INSTREAM
+protocol over its local socket -- found from WINE_AMSI_CLAMD_SOCKET, then
+clamd's own configuration, then the paths distributions use -- and reports
+what the engine actually said.
+
+Nothing here may turn "could not scan" into "clean".  With no scanner
+reachable AmsiInitialize and the class factory both fail, so the caller
+learns it has no scanning available rather than being handed a verdict
+that means nothing; a connection that drops, a size limit, or a protocol
+error likewise comes back as a failure with the verdict untouched.
+Handles come from the caller, so validating them is guarded against being
+given something that was never ours.
+
+Word reaches this as OFFICE_VBA and the scanner answers: the EICAR test
+string comes back DETECTED and ordinary macro text NOT_DETECTED, over both
+the flat API and the COM surface.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 79ff09dcc41bfcde6a309e8ec656f6539cf1f3d1)
+
+diff --git a/dlls/amsi/Makefile.in b/dlls/amsi/Makefile.in
+index 03475856c3a..5b37e63e878 100644
+--- a/dlls/amsi/Makefile.in
++++ b/dlls/amsi/Makefile.in
+@@ -1,4 +1,8 @@
+ MODULE    = amsi.dll
++UNIXLIB   = amsi.so
++IMPORTS   = uuid ole32
+ 
+ SOURCES = \
+-	main.c
++	classes.idl \
++	main.c \
++	unixlib.c
+diff --git a/dlls/amsi/amsi.spec b/dlls/amsi/amsi.spec
+index 3cbf1c6d121..709617e619a 100644
+--- a/dlls/amsi/amsi.spec
++++ b/dlls/amsi/amsi.spec
+@@ -8,6 +8,6 @@
+ @ stub AmsiUacUninitialize
+ @ stdcall AmsiUninitialize(ptr)
+ @ stdcall -private DllCanUnloadNow()
+-@ stub DllGetClassObject
++@ stdcall -private DllGetClassObject(ptr ptr ptr)
+ @ stdcall -private DllRegisterServer()
+ @ stdcall -private DllUnregisterServer()
+diff --git a/dlls/amsi/classes.idl b/dlls/amsi/classes.idl
+new file mode 100644
+index 00000000000..2e0853d69ca
+--- /dev/null
++++ b/dlls/amsi/classes.idl
+@@ -0,0 +1,28 @@
++/*
++ * COM class registration for amsi
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++
++[
++    helpstring("Antimalware Scan Interface"),
++    threading(both),
++    uuid(fdb00e52-a214-4aa1-8fba-4357bb0072ec)
++]
++coclass Antimalware { interface IAntimalware; }
+diff --git a/dlls/amsi/main.c b/dlls/amsi/main.c
+index 2c1db4c482b..1db8900a87b 100644
+--- a/dlls/amsi/main.c
++++ b/dlls/amsi/main.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2019 Hans Leidekker for CodeWeavers
++ * Copyright 2026 the Wine Altars project
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -17,49 +18,423 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
++
++#define COBJMACROS
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "objbase.h"
++#include "rpcproxy.h"
++#include "initguid.h"
+ #include "amsi.h"
++#include "unixlib.h"
+ #include "wine/debug.h"
++#include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(amsi);
+ 
++#define AMSI_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
++
++/* Content bigger than this is not buffered up to be scanned.  The limit is
++ * generous for anything AMSI is asked about (scripts, macro projects) and the
++ * failure is reported as a failure, never as a clean result. */
++#define MAX_SCAN_SIZE (64 * 1024 * 1024)
++
++#define CONTEXT_MAGIC 0x69736d61  /* "amsi" */
++#define SESSION_MAGIC 0x73736573  /* "sess" */
++
++struct amsi_context
++{
++    DWORD magic;
++};
++
++struct amsi_session
++{
++    DWORD magic;
++};
++
++/* A scan that could not be carried out must not look like one that came back
++ * clean, so the failure is passed on as a failure.  Callers that treat any
++ * error as "do not run this" then behave correctly, and callers that ignore
++ * the return value at least do not get a forged verdict. */
++static HRESULT hresult_from_scan_status( NTSTATUS status )
++{
++    switch (status)
++    {
++    case STATUS_NOT_SUPPORTED:     return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
++    case STATUS_DEVICE_NOT_READY:  return HRESULT_FROM_WIN32( ERROR_NOT_READY );
++    case STATUS_INVALID_PARAMETER: return E_INVALIDARG;
++    default:                       return E_FAIL;
++    }
++}
++
++static HRESULT scan_bytes( const void *data, ULONG size, AMSI_RESULT *result )
++{
++    struct scan_params params;
++    NTSTATUS status;
++
++    params.buffer = (UINT_PTR)data;
++    params.size = size;
++    params.verdict = SCAN_VERDICT_DETECTED;   /* never read unless the call succeeds */
++    params.detection[0] = 0;
++
++    if ((status = AMSI_CALL( scan, &params )))
++    {
++        WARN( "scan failed, status %#lx\n", (DWORD)status );
++        return hresult_from_scan_status( status );
++    }
++
++    if (params.verdict == SCAN_VERDICT_DETECTED)
++    {
++        WARN( "content identified as %s\n", debugstr_a(params.detection) );
++        *result = AMSI_RESULT_DETECTED;
++    }
++    else *result = AMSI_RESULT_NOT_DETECTED;
++
++    return S_OK;
++}
++
++/* Asking the engine whether it is there is the whole point of initialising:
++ * an application that gets a context is entitled to believe its later scans
++ * mean something.  With nothing to scan with, say so and hand back nothing. */
+ HRESULT WINAPI AmsiInitialize( const WCHAR *appname, HAMSICONTEXT *context )
+ {
+-    FIXME( "%s, %p\n", debugstr_w(appname), context );
+-    *context = (HAMSICONTEXT)0xdeadbeef;
++    struct amsi_context *ctx;
++    NTSTATUS status;
++
++    TRACE( "%s, %p\n", debugstr_w(appname), context );
++
++    if (!appname || !context) return E_INVALIDARG;
++
++    if ((status = AMSI_CALL( probe, NULL )))
++    {
++        WARN( "no scanner available, status %#lx\n", (DWORD)status );
++        return hresult_from_scan_status( status );
++    }
++
++    if (!(ctx = malloc( sizeof(*ctx) ))) return E_OUTOFMEMORY;
++    ctx->magic = CONTEXT_MAGIC;
++    *context = (HAMSICONTEXT)ctx;
+     return S_OK;
+ }
+ 
++/* The handle came from the caller, so reading it has to survive being handed
++ * something that was never one of ours. */
++static BOOL magic_matches( const void *handle, DWORD magic )
++{
++    BOOL matches = FALSE;
++
++    if (!handle) return FALSE;
++    __TRY
++    {
++        matches = *(const DWORD *)handle == magic;
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        matches = FALSE;
++    }
++    __ENDTRY
++    return matches;
++}
++
++static BOOL valid_context( HAMSICONTEXT context )
++{
++    return magic_matches( context, CONTEXT_MAGIC );
++}
++
++void WINAPI AmsiUninitialize( HAMSICONTEXT context )
++{
++    struct amsi_context *ctx = (struct amsi_context *)context;
++
++    TRACE( "%p\n", context );
++
++    if (!valid_context( context )) return;
++    ctx->magic = 0;
++    free( ctx );
++}
++
++/* Sessions let a provider correlate several scans that belong together.  The
++ * engine behind this one looks at each buffer on its own, so the session is
++ * just a token -- but it has to be a real one the caller can hold and close. */
+ HRESULT WINAPI AmsiOpenSession( HAMSICONTEXT context, HAMSISESSION *session )
+ {
+-    FIXME( "%p, %p\n", context, session );
+-    *session = (HAMSISESSION)0xdeadbeef;
++    struct amsi_session *ses;
++
++    TRACE( "%p, %p\n", context, session );
++
++    if (!valid_context( context ) || !session) return E_INVALIDARG;
++
++    if (!(ses = malloc( sizeof(*ses) ))) return E_OUTOFMEMORY;
++    ses->magic = SESSION_MAGIC;
++    *session = (HAMSISESSION)ses;
+     return S_OK;
+ }
+ 
+ void WINAPI AmsiCloseSession( HAMSICONTEXT context, HAMSISESSION session )
+ {
+-    FIXME( "%p, %p\n", context, session );
++    struct amsi_session *ses = (struct amsi_session *)session;
++
++    TRACE( "%p, %p\n", context, session );
++
++    if (!valid_context( context ) || !magic_matches( ses, SESSION_MAGIC )) return;
++    ses->magic = 0;
++    free( ses );
+ }
+ 
+ HRESULT WINAPI AmsiScanBuffer( HAMSICONTEXT context, void *buffer, ULONG length, const WCHAR *name,
+                                HAMSISESSION session, AMSI_RESULT *result )
+ {
+-    FIXME( "%p, %p, %lu, %s, %p, %p\n", context, buffer, length, debugstr_w(name), session, result );
+-    *result = AMSI_RESULT_NOT_DETECTED;
+-    return S_OK;
++    TRACE( "%p, %p, %lu, %s, %p, %p\n", context, buffer, length, debugstr_w(name), session, result );
++
++    if (!valid_context( context ) || !result) return E_INVALIDARG;
++    if (!buffer && length) return E_INVALIDARG;
++    if (length > MAX_SCAN_SIZE) return E_INVALIDARG;
++
++    return scan_bytes( buffer, length, result );
+ }
+ 
++/* The engine matches on the bytes a script is actually written in, so the
++ * UTF-16 the caller holds is converted rather than handed over raw. */
+ HRESULT WINAPI AmsiScanString( HAMSICONTEXT context, const WCHAR *string, const WCHAR *name,
+                                HAMSISESSION session, AMSI_RESULT *result )
+ {
+-    FIXME( "%p, %s, %s, %p, %p\n", context, debugstr_w(string), debugstr_w(name), session, result );
+-    *result = AMSI_RESULT_NOT_DETECTED;
++    HRESULT hr;
++    char *utf8;
++    int len;
++
++    TRACE( "%p, %s, %s, %p, %p\n", context, debugstr_w(string), debugstr_w(name), session, result );
++
++    if (!valid_context( context ) || !string || !result) return E_INVALIDARG;
++
++    len = WideCharToMultiByte( CP_UTF8, 0, string, -1, NULL, 0, NULL, NULL );
++    if (len <= 0) return E_INVALIDARG;
++    if (!(utf8 = malloc( len ))) return E_OUTOFMEMORY;
++    WideCharToMultiByte( CP_UTF8, 0, string, -1, utf8, len, NULL, NULL );
++
++    hr = scan_bytes( utf8, len - 1, result );
++    free( utf8 );
++    return hr;
++}
++
++/* The COM surface callers reach AMSI through.  Office asks for it by CLSID
++ * before running a macro and treats a failure to create it as a failed scan --
++ * the macro is then refused whatever the user says, because the application
++ * cannot tell "scanned and clean" from "never scanned".  Behind it is the
++ * host's own scanner, reached over the unix side. */
++
++struct antimalware
++{
++    IAntimalware IAntimalware_iface;
++    LONG ref;
++};
++
++static struct antimalware *impl_from_IAntimalware( IAntimalware *iface )
++{
++    return CONTAINING_RECORD( iface, struct antimalware, IAntimalware_iface );
++}
++
++static HRESULT WINAPI antimalware_QueryInterface( IAntimalware *iface, REFIID iid, void **out )
++{
++    struct antimalware *impl = impl_from_IAntimalware( iface );
++
++    TRACE( "%p, %s, %p\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_IAntimalware ))
++    {
++        *out = &impl->IAntimalware_iface;
++        IAntimalware_AddRef( &impl->IAntimalware_iface );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI antimalware_AddRef( IAntimalware *iface )
++{
++    struct antimalware *impl = impl_from_IAntimalware( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI antimalware_Release( IAntimalware *iface )
++{
++    struct antimalware *impl = impl_from_IAntimalware( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref) free( impl );
++    return ref;
++}
++
++/* Pull the whole content out of the caller's stream so the engine sees exactly
++ * what the application is about to act on. */
++static HRESULT read_stream( IAmsiStream *stream, void **data, ULONG *size )
++{
++    ULONGLONG content_size = 0;
++    ULONG got = 0, offset = 0;
++    BYTE *buffer;
++    HRESULT hr;
++
++    hr = IAmsiStream_GetAttribute( stream, AMSI_ATTRIBUTE_CONTENT_SIZE,
++                                   sizeof(content_size), (BYTE *)&content_size, &got );
++    if (FAILED(hr)) return hr;
++    if (got != sizeof(content_size)) return E_UNEXPECTED;
++    if (content_size > MAX_SCAN_SIZE)
++    {
++        WARN( "content of %s bytes is too large to scan\n", wine_dbgstr_longlong(content_size) );
++        return E_OUTOFMEMORY;
++    }
++
++    if (!(buffer = malloc( content_size ? content_size : 1 ))) return E_OUTOFMEMORY;
++
++    while (offset < content_size)
++    {
++        ULONG want = content_size - offset, read = 0;
++
++        hr = IAmsiStream_Read( stream, offset, want, buffer + offset, &read );
++        if (FAILED(hr))
++        {
++            free( buffer );
++            return hr;
++        }
++        if (!read) break;   /* stream ended early; scan what it did give */
++        offset += read;
++    }
++
++    *data = buffer;
++    *size = offset;
+     return S_OK;
+ }
+ 
+-void WINAPI AmsiUninitialize( HAMSICONTEXT context )
++static HRESULT WINAPI antimalware_Scan( IAntimalware *iface, IAmsiStream *stream,
++                                        AMSI_RESULT *result, IAntimalwareProvider **provider )
++{
++    ULONG size = 0;
++    void *data;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %p, %p\n", iface, stream, result, provider );
++
++    if (!stream || !result) return E_INVALIDARG;
++    if (provider) *provider = NULL;
++
++    if (TRACE_ON(amsi))
++    {
++        unsigned char name[256];
++        ULONG got = 0;
++
++        if (SUCCEEDED(IAmsiStream_GetAttribute( stream, AMSI_ATTRIBUTE_CONTENT_NAME,
++                                                sizeof(name), name, &got )) && got)
++            TRACE( "content name %s\n", debugstr_w((const WCHAR *)name) );
++    }
++
++    if (FAILED(hr = read_stream( stream, &data, &size ))) return hr;
++
++    hr = scan_bytes( data, size, result );
++    free( data );
++    return hr;
++}
++
++static void WINAPI antimalware_CloseSession( IAntimalware *iface, ULONGLONG session )
++{
++    TRACE( "%p, %s\n", iface, wine_dbgstr_longlong(session) );
++}
++
++static const IAntimalwareVtbl antimalware_vtbl =
++{
++    antimalware_QueryInterface,
++    antimalware_AddRef,
++    antimalware_Release,
++    antimalware_Scan,
++    antimalware_CloseSession,
++};
++
++static HRESULT antimalware_create( REFIID iid, void **out )
++{
++    struct antimalware *impl;
++    NTSTATUS status;
++    HRESULT hr;
++
++    /* Same contract as AmsiInitialize: without an engine there is nothing to
++     * hand out, and the caller is told so instead of being given an object
++     * whose answers would mean nothing. */
++    if ((status = AMSI_CALL( probe, NULL )))
++    {
++        WARN( "no scanner available, status %#lx\n", (DWORD)status );
++        return hresult_from_scan_status( status );
++    }
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAntimalware_iface.lpVtbl = &antimalware_vtbl;
++    impl->ref = 1;
++
++    hr = IAntimalware_QueryInterface( &impl->IAntimalware_iface, iid, out );
++    IAntimalware_Release( &impl->IAntimalware_iface );
++    return hr;
++}
++
++struct class_factory
++{
++    IClassFactory IClassFactory_iface;
++};
++
++static HRESULT WINAPI factory_QueryInterface( IClassFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_IClassFactory ))
++    {
++        *out = iface;
++        IClassFactory_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IClassFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IClassFactory *iface ) { return 1; }
++
++static HRESULT WINAPI factory_CreateInstance( IClassFactory *iface, IUnknown *outer,
++                                              REFIID iid, void **out )
++{
++    TRACE( "%p, %p, %s, %p\n", iface, outer, debugstr_guid(iid), out );
++
++    if (outer) return CLASS_E_NOAGGREGATION;
++    return antimalware_create( iid, out );
++}
++
++static HRESULT WINAPI factory_LockServer( IClassFactory *iface, BOOL lock ) { return S_OK; }
++
++static const IClassFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateInstance,
++    factory_LockServer,
++};
++
++static struct class_factory antimalware_factory = {{&factory_vtbl}};
++
++HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID iid, void **out )
++{
++    TRACE( "%s, %s, %p\n", debugstr_guid(clsid), debugstr_guid(iid), out );
++
++    if (IsEqualCLSID( clsid, &CLSID_Antimalware ))
++        return IClassFactory_QueryInterface( &antimalware_factory.IClassFactory_iface, iid, out );
++
++    FIXME( "%s not implemented\n", debugstr_guid(clsid) );
++    *out = NULL;
++    return CLASS_E_CLASSNOTAVAILABLE;
++}
++
++BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
+ {
+-    FIXME( "%p\n", context );
++    if (reason == DLL_PROCESS_ATTACH)
++    {
++        DisableThreadLibraryCalls( inst );
++        if (__wine_init_unix_call()) return FALSE;
++    }
++    return TRUE;
+ }
+diff --git a/dlls/amsi/unixlib.c b/dlls/amsi/unixlib.c
+new file mode 100644
+index 00000000000..591107c216c
+--- /dev/null
++++ b/dlls/amsi/unixlib.c
+@@ -0,0 +1,340 @@
++/*
++ * Hand content to a real scanner on the host side.
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <errno.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/un.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "unixlib.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(amsi);
++
++/* clamd holds the connection open while it scans, and a large macro project
++ * can take a while on a cold cache. */
++#define REPLY_TIMEOUT_MS 60000
++#define IO_TIMEOUT_MS    15000
++
++/* clamd's own INSTREAM chunk ceiling is well above this; staying small keeps
++ * the write loop honest about partial writes. */
++#define CHUNK_SIZE (64 * 1024)
++
++static char socket_path[108];  /* fits sockaddr_un.sun_path on every target */
++
++/* Where clamd listens.  WINE_AMSI_CLAMD_SOCKET wins, so a system that keeps
++ * the socket somewhere unusual -- or a different scanner speaking the same
++ * protocol -- can be pointed at without touching the code.  Otherwise take
++ * clamd's own configuration as the source of truth, and only fall back to the
++ * paths distributions actually use. */
++static const char *find_socket(void)
++{
++    static const char *const candidates[] =
++    {
++        "/var/run/clamav/clamd.ctl",
++        "/run/clamav/clamd.ctl",
++        "/var/run/clamd.scan/clamd.sock",
++        "/run/clamd.scan/clamd.sock",
++        "/tmp/clamd.socket",
++    };
++    static const char *const configs[] =
++    {
++        "/etc/clamav/clamd.conf",
++        "/etc/clamd.d/scan.conf",
++        "/etc/clamd.conf",
++    };
++    const char *env;
++    unsigned int i;
++
++    if (socket_path[0]) return socket_path;
++
++    if ((env = getenv( "WINE_AMSI_CLAMD_SOCKET" )) && *env)
++    {
++        if (strlen( env ) >= sizeof(socket_path))
++        {
++            ERR( "WINE_AMSI_CLAMD_SOCKET is too long for a unix socket path\n" );
++            return NULL;
++        }
++        strcpy( socket_path, env );
++        return socket_path;
++    }
++
++    for (i = 0; i < ARRAYSIZE(configs); i++)
++    {
++        char line[512];
++        FILE *f = fopen( configs[i], "r" );
++
++        if (!f) continue;
++        while (fgets( line, sizeof(line), f ))
++        {
++            char *value, *end;
++
++            if (strncmp( line, "LocalSocket", 11 ) || !isspace( (unsigned char)line[11] )) continue;
++            value = line + 11;
++            while (isspace( (unsigned char)*value )) value++;
++            end = value + strlen( value );
++            while (end > value && isspace( (unsigned char)end[-1] )) end--;
++            *end = 0;
++            if (*value && (size_t)(end - value) < sizeof(socket_path))
++            {
++                strcpy( socket_path, value );
++                fclose( f );
++                return socket_path;
++            }
++        }
++        fclose( f );
++    }
++
++    for (i = 0; i < ARRAYSIZE(candidates); i++)
++    {
++        if (access( candidates[i], F_OK )) continue;
++        strcpy( socket_path, candidates[i] );
++        return socket_path;
++    }
++
++    return NULL;
++}
++
++static void set_timeout( int fd, int option, int ms )
++{
++    struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
++    setsockopt( fd, SOL_SOCKET, option, &tv, sizeof(tv) );
++}
++
++static int connect_engine(void)
++{
++    struct sockaddr_un addr;
++    const char *path = find_socket();
++    int fd;
++
++    if (!path) return -1;
++
++    if ((fd = socket( AF_UNIX, SOCK_STREAM, 0 )) < 0) return -1;
++
++    /* The socket stays blocking; these bound the wait so a wedged scanner
++     * cannot hang the application that asked for the scan. */
++    set_timeout( fd, SO_SNDTIMEO, IO_TIMEOUT_MS );
++    set_timeout( fd, SO_RCVTIMEO, REPLY_TIMEOUT_MS );
++
++    memset( &addr, 0, sizeof(addr) );
++    addr.sun_family = AF_UNIX;
++    strcpy( addr.sun_path, path );
++
++    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ))
++    {
++        close( fd );
++        return -1;
++    }
++    return fd;
++}
++
++static int write_all( int fd, const void *data, size_t size )
++{
++    const char *ptr = data;
++
++    while (size)
++    {
++        ssize_t written = write( fd, ptr, size );
++
++        if (written > 0)
++        {
++            ptr += written;
++            size -= written;
++            continue;
++        }
++        if (written < 0 && errno == EINTR) continue;
++        return 0;   /* a send timeout lands here too, and counts as a failure */
++    }
++    return 1;
++}
++
++/* Replies are NUL-terminated in the "z" command dialect. */
++static int read_reply( int fd, char *reply, size_t size )
++{
++    size_t used = 0;
++
++    for (;;)
++    {
++        ssize_t got;
++
++        got = read( fd, reply + used, size - used - 1 );
++        if (got < 0)
++        {
++            if (errno == EINTR) continue;
++            return 0;
++        }
++        if (!got) break;               /* clamd closed after answering */
++        used += got;
++        if (memchr( reply, 0, used )) break;
++        if (used + 1 >= size) return 0;
++    }
++    reply[used] = 0;
++    return used > 0;
++}
++
++static NTSTATUS probe( void *args )
++{
++    char reply[64];
++    int fd;
++
++    if ((fd = connect_engine()) < 0)
++    {
++        WARN( "no scanner reachable; AMSI will report that it cannot scan\n" );
++        return STATUS_NOT_SUPPORTED;
++    }
++
++    if (!write_all( fd, "zPING", 6 ) || !read_reply( fd, reply, sizeof(reply) ))
++    {
++        close( fd );
++        WARN( "scanner did not answer PING\n" );
++        return STATUS_DEVICE_NOT_READY;
++    }
++    close( fd );
++
++    if (strncmp( reply, "PONG", 4 ))
++    {
++        WARN( "unexpected answer to PING: %s\n", debugstr_a(reply) );
++        return STATUS_DEVICE_NOT_READY;
++    }
++    TRACE( "scanner ready at %s\n", debugstr_a(find_socket()) );
++    return STATUS_SUCCESS;
++}
++
++/* Feed the bytes to clamd over INSTREAM and report what it says.  Every
++ * failure path returns an error status without touching params->verdict --
++ * the caller must never be able to read "clean" out of a scan that did not
++ * complete. */
++static NTSTATUS scan( void *args )
++{
++    struct scan_params *params = args;
++    const char *data = (const char *)(UINT_PTR)params->buffer;
++    UINT32 offset = 0;
++    char reply[512], *found;
++    unsigned char trailer[4] = { 0 };
++    size_t len;
++    int fd;
++
++    if (!data && params->size) return STATUS_INVALID_PARAMETER;
++
++    if ((fd = connect_engine()) < 0) return STATUS_NOT_SUPPORTED;
++
++    if (!write_all( fd, "zINSTREAM", 10 ))
++    {
++        close( fd );
++        return STATUS_DEVICE_NOT_READY;
++    }
++
++    while (offset < params->size)
++    {
++        UINT32 chunk = params->size - offset;
++        unsigned char header[4];
++
++        if (chunk > CHUNK_SIZE) chunk = CHUNK_SIZE;
++        header[0] = chunk >> 24;
++        header[1] = chunk >> 16;
++        header[2] = chunk >> 8;
++        header[3] = chunk;
++
++        if (!write_all( fd, header, sizeof(header) ) || !write_all( fd, data + offset, chunk ))
++        {
++            close( fd );
++            return STATUS_DEVICE_NOT_READY;
++        }
++        offset += chunk;
++    }
++
++    /* A zero-length chunk ends the stream. */
++    if (!write_all( fd, trailer, sizeof(trailer) ) || !read_reply( fd, reply, sizeof(reply) ))
++    {
++        close( fd );
++        return STATUS_DEVICE_NOT_READY;
++    }
++    close( fd );
++
++    if ((found = strstr( reply, " FOUND" )))
++    {
++        const char *name = strchr( reply, ':' );
++
++        name = name ? name + 1 : reply;
++        while (*name == ' ') name++;
++        *found = 0;
++        len = strlen( name );
++        if (len >= sizeof(params->detection)) len = sizeof(params->detection) - 1;
++        memcpy( params->detection, name, len );
++        params->detection[len] = 0;
++        params->verdict = SCAN_VERDICT_DETECTED;
++        WARN( "scanner reported %s\n", debugstr_a(params->detection) );
++        return STATUS_SUCCESS;
++    }
++
++    if (strstr( reply, "ERROR" ))
++    {
++        /* Size limits and read errors land here.  Refusing to answer is the
++         * only honest outcome: nothing examined the content. */
++        WARN( "scanner could not scan the content: %s\n", debugstr_a(reply) );
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    if (!strstr( reply, "OK" ))
++    {
++        WARN( "unexpected answer from scanner: %s\n", debugstr_a(reply) );
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    params->detection[0] = 0;
++    params->verdict = SCAN_VERDICT_CLEAN;
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    probe,
++    scan,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
++
++#ifdef _WIN64
++
++/* Every field is fixed-width and the 64-bit one comes first, so a 32-bit
++ * caller hands over exactly the same layout. */
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    probe,
++    scan,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
++
++#endif /* _WIN64 */
+diff --git a/dlls/amsi/unixlib.h b/dlls/amsi/unixlib.h
+new file mode 100644
+index 00000000000..c68d5dffa12
+--- /dev/null
++++ b/dlls/amsi/unixlib.h
+@@ -0,0 +1,58 @@
++/*
++ * Interface between the PE and Unix sides of amsi.
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_AMSI_UNIXLIB_H
++#define __WINE_AMSI_UNIXLIB_H
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "wine/unixlib.h"
++
++/* What the engine concluded about the content.  There is deliberately no value
++ * for "could not scan": a call that fails returns a failing status and leaves
++ * the verdict untouched, so a scan that did not happen can never be mistaken
++ * for one that came back clean. */
++enum scan_verdict
++{
++    SCAN_VERDICT_CLEAN,
++    SCAN_VERDICT_DETECTED,
++};
++
++/* Fixed-width throughout and 64-bit fields first, so the layout is the same
++ * for 32- and 64-bit callers and the wow64 entries need no thunk. */
++struct scan_params
++{
++    UINT64 buffer;           /* in: the bytes to scan */
++    UINT32 size;             /* in */
++    UINT32 verdict;          /* out: enum scan_verdict, only on success */
++    char   detection[128];   /* out: what the engine named it, empty if clean */
++};
++
++enum amsi_funcs
++{
++    unix_probe,   /* is an engine actually there and answering */
++    unix_scan,
++    unix_funcs_count
++};
++
++#endif /* __WINE_AMSI_UNIXLIB_H */
+diff --git a/include/amsi.idl b/include/amsi.idl
+index 31303a36290..eb67582a230 100644
+--- a/include/amsi.idl
++++ b/include/amsi.idl
+@@ -16,6 +16,8 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++import "unknwn.idl";
++
+ cpp_quote("DECLARE_HANDLE(HAMSICONTEXT);")
+ cpp_quote("DECLARE_HANDLE(HAMSISESSION);")
+ 
+@@ -29,6 +31,82 @@ typedef [v1_enum] enum AMSI_RESULT
+ } AMSI_RESULT;
+ 
+ cpp_quote("void WINAPI AmsiCloseSession(HAMSICONTEXT,HAMSISESSION);")
++typedef [v1_enum] enum AMSI_ATTRIBUTE
++{
++    AMSI_ATTRIBUTE_APP_NAME              = 0,
++    AMSI_ATTRIBUTE_CONTENT_NAME          = 1,
++    AMSI_ATTRIBUTE_CONTENT_SIZE          = 2,
++    AMSI_ATTRIBUTE_CONTENT_ADDRESS       = 3,
++    AMSI_ATTRIBUTE_SESSION               = 4,
++    AMSI_ATTRIBUTE_REDIRECT_CHAIN_SIZE   = 5,
++    AMSI_ATTRIBUTE_REDIRECT_CHAIN_ADDRESS= 6,
++    AMSI_ATTRIBUTE_ALL_SIZE              = 7,
++    AMSI_ATTRIBUTE_ALL_ADDRESS           = 8,
++    AMSI_ATTRIBUTE_QUIET                 = 9,
++} AMSI_ATTRIBUTE;
++
++[
++    object,
++    uuid(3e47f2e5-81d4-4d3b-897f-545096770373),
++    pointer_default(unique),
++    local
++]
++interface IAmsiStream : IUnknown
++{
++    HRESULT GetAttribute(
++        [in] AMSI_ATTRIBUTE attribute,
++        [in] ULONG data_size,
++        [out, size_is(data_size)] unsigned char *data,
++        [out] ULONG *ret_size);
++
++    HRESULT Read(
++        [in] ULONGLONG position,
++        [in] ULONG size,
++        [out, size_is(size)] unsigned char *buffer,
++        [out] ULONG *read_size);
++}
++
++[
++    object,
++    uuid(b2cabfe3-fe04-42b1-a5df-08d483d4d125),
++    pointer_default(unique),
++    local
++]
++interface IAntimalwareProvider : IUnknown
++{
++    HRESULT Scan(
++        [in] IAmsiStream *stream,
++        [out] AMSI_RESULT *result);
++
++    void CloseSession(
++        [in] ULONGLONG session);
++
++    HRESULT DisplayName(
++        [out] LPWSTR *display_name);
++}
++
++[
++    object,
++    uuid(82d29c2e-f062-44e6-b5c9-3d9a2f24a2df),
++    pointer_default(unique),
++    local
++]
++interface IAntimalware : IUnknown
++{
++    HRESULT Scan(
++        [in] IAmsiStream *stream,
++        [out] AMSI_RESULT *result,
++        [out] IAntimalwareProvider **provider);
++
++    void CloseSession(
++        [in] ULONGLONG session);
++}
++
++[
++    uuid(fdb00e52-a214-4aa1-8fba-4357bb0072ec)
++]
++coclass Antimalware { interface IAntimalware; }
++
+ cpp_quote("HRESULT WINAPI AmsiInitialize(const WCHAR*,HAMSICONTEXT*);")
+ cpp_quote("HRESULT WINAPI AmsiOpenSession(HAMSICONTEXT,HAMSISESSION*);")
+ cpp_quote("HRESULT WINAPI AmsiScanBuffer(HAMSICONTEXT,void*,ULONG,const WCHAR*,HAMSISESSION,AMSI_RESULT*);")

@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 15:47:58 -0400
+Subject: [PATCH] winex11: keep a shadow window with the window it belongs to.
+
+Office draws the soft border around its windows with four layered tool
+popups of class MSO_BORDEREFFECT_WINDOW_CLASS, and keeps each set right
+behind its window in the Z order with SetWindowPos().  Unmanaged, they were
+override-redirect windows, which the window manager keeps above every other
+window on the screen: the border of a window at the back showed over the
+window in front of it and over any other program's windows.
+
+A layered tool popup without a caption that is placed right after one of
+our managed windows is now managed itself and transient for that window,
+typed as a utility window, and not given the focus.  mutter keeps a
+transient right above its window and moves it with it, so the border is
+where Windows has it, and a window mapped without the focus is put below
+the focused one.  The window it follows is kept, also when the X window is
+made again for the ARGB visual that UpdateLayeredWindow() needs.
+
+The window manager keeps a managed window on the screen, which a shadow
+strip has no reason to be: one along a window at the edge of the screen is
+partly off it.  mutter keeps the top edge of a window inside the work area,
+a window thinner than ten pixels entirely inside it across its thickness,
+and on its first map moves one that would fit in the work area entirely
+inside -- measured, since its constraints are not all spelled out.  A strip
+that it would move stays unmapped, as the part off the screen would not be
+seen on Windows either; one along a window larger than the screen is left
+where it is and shown.
+
+Nothing changes in a virtual desktop, which has no window manager.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit a25275cf797a96281f57d5a0b66500bb12115221)
+
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index d7df0a85199..7ff2c51ffca 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -468,6 +468,108 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
+ }
+ 
+ 
++/***********************************************************************
++ *              get_satellite_anchor
++ *
++ * Shadow and border windows that a program keeps next to one of its windows,
++ * such as Office's MSO_BORDEREFFECT_WINDOW_CLASS: layered tool popups without
++ * a caption, placed right after that window with SetWindowPos().  Windows
++ * stacks them there, together with the window; as override-redirect windows
++ * they would be drawn above every managed window on the screen instead.
++ * Returns the window this one is placed after, following a chain of such
++ * windows placed after each other, if it is a managed window of ours.
++ */
++static HWND get_satellite_anchor( HWND hwnd, HWND insert_after, UINT swp_flags, DWORD style, DWORD ex_style )
++{
++    HWND anchor = insert_after;
++    unsigned int depth;
++
++    if (is_virtual_desktop()) return 0; /* no window manager to keep them apart */
++    if ((style & (WS_POPUP | WS_CHILD)) != WS_POPUP || (style & WS_CAPTION) == WS_CAPTION) return 0;
++    if ((ex_style & (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_APPWINDOW)) !=
++        (WS_EX_LAYERED | WS_EX_TOOLWINDOW)) return 0;
++    if (!anchor /* HWND_TOP */ || anchor == HWND_BOTTOM || anchor == HWND_TOPMOST || anchor == HWND_NOTOPMOST)
++        return 0;
++    /* a window already in place gets SWP_NOZORDER: it is still placed after that window */
++    if ((swp_flags & SWP_NOZORDER) && NtUserGetWindowRelative( anchor, GW_HWNDNEXT ) != hwnd) return 0;
++
++    for (depth = 0; depth < 16; depth++)
++    {
++        struct x11drv_win_data *data;
++        BOOL managed;
++        HWND next;
++
++        if (anchor == hwnd || !(data = get_win_data( anchor ))) return 0;
++        managed = data->managed;
++        next = data->anchor;
++        release_win_data( data );
++
++        if (!next) return managed && (NtUserGetWindowLongW( anchor, GWL_STYLE ) & WS_VISIBLE) ? anchor : 0;
++        anchor = next;
++    }
++    return 0;
++}
++
++
++/***********************************************************************
++ *              is_satellite_left_in_place
++ *
++ * Whether the window manager leaves a shadow strip where it is put.  mutter
++ * keeps the top edge of a normal window inside the work area, a window
++ * thinner than ten pixels entirely inside it across its thickness, and at
++ * least 75 pixels of a longer one on the screen; a window that would fit in
++ * the work area it moves entirely inside when it is mapped.  A strip moved
++ * away from its window is worse than none, so one the window manager would
++ * move stays unmapped: on Windows the part off the screen is not seen either.
++ */
++static BOOL is_satellite_left_in_place( const RECT *rect )
++{
++    POINT pos = virtual_screen_to_root( rect->left, rect->top );
++    LONG width = rect->right - rect->left, height = rect->bottom - rect->top;
++    LONG off_x = max( width - min( max( width / 4, 10 ), 75 ), 0 );
++    LONG off_y = max( height - min( max( height / 4, 10 ), 75 ), 0 );
++    RECT root_rect = {pos.x, pos.y, pos.x + width, pos.y + height};
++    unsigned long count, remaining, i;
++    BOOL fits = FALSE, kept = FALSE;
++    LONGLONG covered = 0;
++    long *areas;
++    int format;
++    Atom type;
++
++    if (!XGetWindowProperty( gdi_display, DefaultRootWindow( gdi_display ), x11drv_atom(_GTK_WORKAREAS_D0),
++                             0, ~0, False, XA_CARDINAL, &type, &format, &count, &remaining,
++                             (unsigned char **)&areas ) && type != XA_CARDINAL)
++    {
++        XFree( areas );
++        areas = NULL;
++    }
++    if (!areas && XGetWindowProperty( gdi_display, DefaultRootWindow( gdi_display ), x11drv_atom(_NET_WORKAREA),
++                                      0, 4, False, XA_CARDINAL, &type, &format, &count, &remaining,
++                                      (unsigned char **)&areas )) return TRUE;
++    if (!areas || type != XA_CARDINAL || format != 32 || count < 4)
++    {
++        if (areas) XFree( areas );
++        return TRUE; /* nothing to go by */
++    }
++
++    for (i = 0; i + 3 < count; i += 4)
++    {
++        RECT area = {areas[i], areas[i + 1], areas[i] + areas[i + 2], areas[i + 1] + areas[i + 3]}, part;
++
++        /* the work areas of different monitors do not overlap */
++        if (intersect_rect( &part, &root_rect, &area ))
++            covered += (LONGLONG)(part.right - part.left) * (part.bottom - part.top);
++        if (width <= area.right - area.left && height <= area.bottom - area.top) fits = TRUE;
++        if (root_rect.left >= area.left - off_x && root_rect.right <= area.right + off_x &&
++            root_rect.top >= area.top && root_rect.bottom <= area.bottom + off_y) kept = TRUE;
++    }
++    XFree( areas );
++
++    if (covered == (LONGLONG)width * height) return TRUE;
++    return !fits && kept;
++}
++
++
+ /***********************************************************************
+  *		is_window_resizable
+  *
+@@ -1115,6 +1217,30 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
+         owner = NtUserGetAncestor( owner, GA_ROOT );
+         owner_win = X11DRV_get_whole_window( owner );
+     }
++    else if (data->anchor)
++    {
++        /* keep a shadow or border window with the window it belongs to, and out of the focus */
++        Atom protocols[] = { x11drv_atom(WM_DELETE_WINDOW), x11drv_atom(_NET_WM_PING) };
++
++        owner_win = X11DRV_get_whole_window( data->anchor );
++        if (owner_win)
++        {
++            XSetTransientForHint( data->display, data->whole_window, owner_win );
++            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
++            XChangeProperty( data->display, data->whole_window, x11drv_atom(WM_PROTOCOLS), XA_ATOM, 32,
++                             PropModeReplace, (unsigned char *)protocols, ARRAY_SIZE(protocols) );
++            if ((wm_hints = XAllocWMHints()))
++            {
++                wm_hints->flags = InputHint | StateHint | WindowGroupHint;
++                wm_hints->input = False;
++                wm_hints->initial_state = NormalState;
++                wm_hints->window_group = owner_win;
++                window_set_wm_hints( data, wm_hints );
++                XFree( wm_hints );
++            }
++            return;
++        }
++    }
+ 
+     if (owner_win)
+     {
+@@ -2438,7 +2564,8 @@ static void create_whole_window( struct x11drv_win_data *data )
+     if (data->vis.visualid != default_visual.visualid)
+         data->whole_colormap = XCreateColormap( data->display, root_window, data->vis.visual, AllocNone );
+ 
+-    data->managed = is_window_managed( data->hwnd, SWP_NOACTIVATE, FALSE );
++    /* a shadow or border window stays managed when its X window is made again, for another visual */
++    data->managed = data->anchor || is_window_managed( data->hwnd, SWP_NOACTIVATE, FALSE );
+     mask = get_window_attributes( data, &attr ) | CWOverrideRedirect;
+     attr.override_redirect = !data->managed;
+ 
+@@ -3269,10 +3396,18 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     struct window_rects old_rects;
+     BOOL is_managed, was_fullscreen, activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
++    HWND anchor = get_satellite_anchor( hwnd, insert_after, swp_flags, new_style, ex_style );
++    UINT wm_state;
+ 
+-    if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
++    if ((is_managed = anchor || is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
+ 
+     if (!(data = get_win_data( hwnd ))) return;
++    if (anchor && data->anchor != anchor)
++    {
++        TRACE( "win %p/%lx kept next to %p\n", hwnd, data->whole_window, anchor );
++        data->anchor = anchor;
++        if (data->managed && data->pending_state.wm_state != WithdrawnState) set_wm_hints( data );
++    }
+     if (is_managed) window_set_managed( data, TRUE );
+ 
+     old_rects = data->rects;
+@@ -3328,7 +3463,14 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+ #endif
+     }
+ 
+-    window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
++    wm_state = get_desired_wm_state( new_style, new_rects );
++    if (data->anchor && wm_state == NormalState && !is_satellite_left_in_place( &new_rects->visible ))
++    {
++        TRACE( "win %p/%lx not mapped at %s, the window manager would move it\n", hwnd, data->whole_window,
++               wine_dbgstr_rect( &new_rects->visible ) );
++        wm_state = WithdrawnState;
++    }
++    window_set_wm_state( data, wm_state, activate );
+     if (!data->wm_state_serial && data->pending_state.wm_state != WithdrawnState)
+     {
+         if (swp_flags & (SWP_FRAMECHANGED | SWP_STATECHANGED)) set_wm_hints( data );
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index d72123638d0..86136b1cb88 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -695,6 +695,7 @@ struct x11drv_win_data
+     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
+     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
+     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
++    HWND        anchor;         /* window this one is kept next to, for shadow and border windows */
+     Window      embedder;       /* window id of embedder */
+     Pixmap         icon_pixmap;
+     Pixmap         icon_mask;

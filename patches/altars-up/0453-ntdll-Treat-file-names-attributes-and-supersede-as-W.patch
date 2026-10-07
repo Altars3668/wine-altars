@@ -1,0 +1,1011 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 11:55:49 -0400
+Subject: [PATCH] ntdll: Treat file names, attributes and supersede as Windows
+ 11 does.
+
+Measured on Windows 11 build 29671 with tools/finalpathprobe
+(trailingprobe.c, finalpathprobe.c) and tools/fileattrprobe
+(archiveprobe.c):
+
+- A file's name with a backslash after it is no directory's: opening,
+  creating, querying, copying, moving or deleting by it is
+  STATUS_NOT_A_DIRECTORY (ERROR_DIRECTORY), unless a directory was to
+  be created by it, which is STATUS_OBJECT_NAME_COLLISION; nothing but
+  a directory is created by a new name with one.  Wine said
+  STATUS_OBJECT_NAME_INVALID, as Windows before 11 did.
+- A file superseded is emptied even when no write access is asked
+  for, and even when it is read-only (wineserver).
+- The name a file is opened by comes back, from FileNameInformation,
+  NtQueryObject and GetFinalPathNameByHandle(FILE_NAME_OPENED), in the
+  case it has on disk; a short name in capitals, the drive letter too.
+  The loader's names keep the case they were asked for.
+- The archive attribute is kept: a new or written-over file has it, a
+  directory only when asked for; once cleared it comes back when the
+  file is written to, made larger or smaller, renamed or linked.  The
+  temporary, offline and not-indexed attributes are kept too; a file
+  with none says FILE_ATTRIBUTE_NORMAL.  The extended attribute that
+  keeps them is changed before a file is made read-only, and a
+  read-only file is made writable for the while: making a hidden file
+  read-only left it hidden.
+- Setting a valid data length needs SeManageVolumePrivilege enabled.
+- GetVolumePathName keeps the drive letter in the case it was given.
+- scrrun's MoveFolder takes ERROR_DIRECTORY as a path not found.
+
+Tests: new ones for the trailing backslash, supersede, the name case
+and the archive attribute; expectations moved to Windows 11's results
+(older ones kept as broken); todo_wine removed where Wine now passes,
+also for SeCreateSymbolicLinkPrivilege, which advapi32 knows.  On
+Windows the ntdll file and path, kernel32 file and volume, and scrrun
+filesystem tests have no failures.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/file.c b/dlls/kernel32/tests/file.c
+index 3517aa75d28..38ef5a355d1 100644
+--- a/dlls/kernel32/tests/file.c
++++ b/dlls/kernel32/tests/file.c
+@@ -432,7 +432,7 @@ static void test__lcreat( void )
+     filehandle=_lcreat (slashname, 0); /* illegal name */
+     ok( filehandle == HFILE_ERROR, "succeeded\n" );
+     err=GetLastError ();
+-    ok (err==ERROR_INVALID_NAME || err==ERROR_PATH_NOT_FOUND,
++    ok (err==ERROR_DIRECTORY || broken(err==ERROR_INVALID_NAME || err==ERROR_PATH_NOT_FOUND) /* before Windows 11 */,
+         "creating file \"%s\" failed with error %d\n", slashname, err);
+ 
+     filehandle=_lcreat (filename, 8); /* illegal attribute */
+@@ -5202,7 +5202,8 @@ static void test_SetFileValidData(void)
+     ret = pSetFileValidData(handle, 0);
+     error = GetLastError();
+     ok(!ret, "SetFileValidData succeeded\n");
+-    todo_wine ok(error == ERROR_PRIVILEGE_NOT_HELD, "got %lu\n", error);
++    ok(error == ERROR_PRIVILEGE_NOT_HELD || broken(error == ERROR_INVALID_PARAMETER) /* already enabled */,
++       "got %lu\n", error);
+     CloseHandle(handle);
+ 
+     privs.PrivilegeCount = 1;
+@@ -5285,6 +5286,96 @@ static void test_SetFileValidData(void)
+     DeleteFileA(filename);
+ }
+ 
++/* when a file is one to back up: the archive attribute that a new file has comes back once the file is
++ * written to, made larger or smaller, renamed or written over, not when it is only opened or read; a directory
++ * has it only when asked for */
++static void test_archive_attribute(void)
++{
++    char temp[MAX_PATH], path[MAX_PATH], path2[MAX_PATH], dir[MAX_PATH], buffer[4];
++    DWORD count;
++    HANDLE file;
++    BOOL ret;
++
++    GetTempPathA( sizeof(temp), temp );
++    sprintf( path, "%sarchive.tmp", temp );
++    sprintf( path2, "%sarchive2.tmp", temp );
++    sprintf( dir, "%sarchive.dir", temp );
++
++    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
++    ok( file != INVALID_HANDLE_VALUE, "failed to create %s, error %lu\n", path, GetLastError() );
++    WriteFile( file, "data", 4, &count, NULL );
++    CloseHandle( file );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_ARCHIVE, "got %#lx\n", GetFileAttributesA( path ) );
++
++    SetFileAttributesA( path, FILE_ATTRIBUTE_NORMAL );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_NORMAL, "got %#lx\n", GetFileAttributesA( path ) );
++    SetFileAttributesA( path, FILE_ATTRIBUTE_TEMPORARY );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_TEMPORARY, "got %#lx\n", GetFileAttributesA( path ) );
++    SetFileAttributesA( path, FILE_ATTRIBUTE_HIDDEN );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_HIDDEN, "got %#lx\n", GetFileAttributesA( path ) );
++    /* a hidden file made read-only is hidden no more, and a read-only one can be made hidden */
++    SetFileAttributesA( path, FILE_ATTRIBUTE_READONLY );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_READONLY, "got %#lx\n", GetFileAttributesA( path ) );
++    SetFileAttributesA( path, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN );
++    ok( GetFileAttributesA( path ) == (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN), "got %#lx\n",
++        GetFileAttributesA( path ) );
++    SetFileAttributesA( path, 0 );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_NORMAL, "got %#lx\n", GetFileAttributesA( path ) );
++
++    file = CreateFileA( path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL );
++    ok( file != INVALID_HANDLE_VALUE, "failed to open %s, error %lu\n", path, GetLastError() );
++    ReadFile( file, buffer, sizeof(buffer), &count, NULL );
++    CloseHandle( file );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_NORMAL, "got %#lx\n", GetFileAttributesA( path ) );
++
++    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL );
++    WriteFile( file, "x", 1, &count, NULL );
++    /* Windows says so once the file is flushed or closed */
++    todo_wine ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_NORMAL, "got %#lx\n", GetFileAttributesA( path ) );
++    CloseHandle( file );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_ARCHIVE, "got %#lx\n", GetFileAttributesA( path ) );
++
++    SetFileAttributesA( path, FILE_ATTRIBUTE_NORMAL );
++    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL );
++    SetFilePointer( file, 100, NULL, FILE_BEGIN );
++    ret = SetEndOfFile( file );
++    ok( ret, "SetEndOfFile failed, error %lu\n", GetLastError() );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_ARCHIVE, "got %#lx\n", GetFileAttributesA( path ) );
++    CloseHandle( file );
++
++    SetFileAttributesA( path, FILE_ATTRIBUTE_NORMAL );
++    ret = MoveFileA( path, path2 );
++    ok( ret, "MoveFile failed, error %lu\n", GetLastError() );
++    ok( GetFileAttributesA( path2 ) == FILE_ATTRIBUTE_ARCHIVE, "got %#lx\n", GetFileAttributesA( path2 ) );
++
++    /* a copy is a new file, the original stays as it was */
++    SetFileAttributesA( path2, FILE_ATTRIBUTE_HIDDEN );
++    ret = CopyFileA( path2, path, FALSE );
++    ok( ret, "CopyFile failed, error %lu\n", GetLastError() );
++    ok( GetFileAttributesA( path ) == (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE), "got %#lx\n",
++        GetFileAttributesA( path ) );
++    ok( GetFileAttributesA( path2 ) == FILE_ATTRIBUTE_HIDDEN, "got %#lx\n", GetFileAttributesA( path2 ) );
++
++    SetFileAttributesA( path, FILE_ATTRIBUTE_NORMAL );
++    file = CreateFileA( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
++    CloseHandle( file );
++    ok( GetFileAttributesA( path ) == FILE_ATTRIBUTE_ARCHIVE, "got %#lx\n", GetFileAttributesA( path ) );
++
++    ret = CreateDirectoryA( dir, NULL );
++    ok( ret, "CreateDirectory failed, error %lu\n", GetLastError() );
++    ok( GetFileAttributesA( dir ) == FILE_ATTRIBUTE_DIRECTORY, "got %#lx\n", GetFileAttributesA( dir ) );
++    SetFileAttributesA( dir, FILE_ATTRIBUTE_ARCHIVE );
++    ok( GetFileAttributesA( dir ) == (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_ARCHIVE), "got %#lx\n",
++        GetFileAttributesA( dir ) );
++    SetFileAttributesA( dir, FILE_ATTRIBUTE_NORMAL );
++    ok( GetFileAttributesA( dir ) == FILE_ATTRIBUTE_DIRECTORY, "got %#lx\n", GetFileAttributesA( dir ) );
++
++    RemoveDirectoryA( dir );
++    SetFileAttributesA( path2, FILE_ATTRIBUTE_NORMAL );
++    DeleteFileA( path );
++    DeleteFileA( path2 );
++}
++
+ static void test_ReOpenFile(void)
+ {
+     char path[MAX_PATH], filename[MAX_PATH], buffer[4];
+@@ -6069,7 +6160,7 @@ static void test_GetFinalPathNameByHandleW(void)
+     wcscat(test_path, L"link");
+     count = pGetFinalPathNameByHandleW(file, result_path, ARRAY_SIZE(result_path), 0);
+     ok(count == lstrlenW(test_path) + 4, "Expected length %u, got %lu\n", lstrlenW(test_path), count);
+-    todo_wine ok(wcscmp(test_path, result_path + 4) == 0, "Expected %s, got %s\n",
++    ok(wcscmp(test_path, result_path + 4) == 0, "Expected %s, got %s\n",
+        wine_dbgstr_w(test_path), wine_dbgstr_w(result_path));
+     CloseHandle(file);
+ 
+@@ -7040,7 +7131,7 @@ static void test_symbolic_link(void)
+     ret = OpenProcessToken( GetCurrentProcess(), TOKEN_ALL_ACCESS, &token );
+     ok( ret == TRUE, "got error %lu\n", GetLastError() );
+     ret = LookupPrivilegeValueA( NULL, "SeCreateSymbolicLinkPrivilege", &luid );
+-    todo_wine ok( ret == TRUE, "got error %lu\n", GetLastError() );
++    ok( ret == TRUE, "got error %lu\n", GetLastError() );
+     if (ret)
+     {
+         privs.PrivilegeCount = 1;
+@@ -7143,7 +7234,8 @@ static void test_symbolic_link(void)
+     SetLastError( 0xdeadbeef );
+     ret = CreateSymbolicLinkW( path, L".\\target\\", FALSE );
+     ok( !ret, "got %d\n", ret );
+-    ok( GetLastError() == ERROR_INVALID_NAME, "got error %lu\n", GetLastError() );
++    ok( GetLastError() == ERROR_DIRECTORY || broken(GetLastError() == ERROR_INVALID_NAME) /* before Windows 11 */,
++        "got error %lu\n", GetLastError() );
+ 
+     SetLastError( 0xdeadbeef );
+     swprintf( path, ARRAY_SIZE(path), L"%s/testsymlink", temp_path );
+@@ -7442,6 +7534,7 @@ START_TEST(file)
+     test_GetFileInformationByHandleEx_volume();
+     test_OpenFileById();
+     test_SetFileValidData();
++    test_archive_attribute();
+     test_WriteFileGather();
+     test_file_access();
+     test_GetFinalPathNameByHandleA();
+diff --git a/dlls/kernel32/tests/volume.c b/dlls/kernel32/tests/volume.c
+index 8b7a705e19d..a6c4dde7de8 100644
+--- a/dlls/kernel32/tests/volume.c
++++ b/dlls/kernel32/tests/volume.c
+@@ -798,8 +798,9 @@ static void test_GetVolumePathNameA(void)
+             "C:\\", "C:\\", sizeof(volume_path),
+             NO_ERROR, NO_ERROR
+         },
+-        { /* lowercase input, uppercase output, valid output length */
+-            "c:\\", "C:\\", sizeof(volume_path),
++        { /* lowercase input, the drive as given as Windows 11 has it (it was in capitals before),
++           * valid output length */
++            "c:\\", "c:\\", sizeof(volume_path),
+             NO_ERROR, NO_ERROR
+         },
+         { /* really bogus input, valid output, 1 output length */
+diff --git a/dlls/kernelbase/volume.c b/dlls/kernelbase/volume.c
+index edfd777c5b3..4bcb79eb861 100644
+--- a/dlls/kernelbase/volume.c
++++ b/dlls/kernelbase/volume.c
+@@ -899,8 +899,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetVolumePathNameW( const WCHAR *path, WCHAR *volu
+     }
+     else if (length >= (nt_name.Length / sizeof(WCHAR)) - 4)
+     {
++        /* the drive keeps the case it was given in */
+         lstrcpynW( volume_path, nt_name.Buffer + 4, length );
+-        volume_path[0] = towupper(volume_path[0]);
+ 
+         TRACE("%s -> %s\n", debugstr_w(path), debugstr_w(volume_path));
+ 
+diff --git a/dlls/ntdll/tests/file.c b/dlls/ntdll/tests/file.c
+index e10c5bdf346..4f3414ba9e1 100644
+--- a/dlls/ntdll/tests/file.c
++++ b/dlls/ntdll/tests/file.c
+@@ -1647,7 +1647,7 @@ static void test_file_basic_information(void)
+     memset(&fbi, 0, sizeof(fbi));
+     res = pNtQueryInformationFile(h, &io, &fbi, sizeof fbi, FileBasicInformation);
+     ok ( res == STATUS_SUCCESS, "can't get normal attribute\n");
+-    todo_wine ok ( (fbi.FileAttributes & attrib_mask) == FILE_ATTRIBUTE_NORMAL, "attribute %lx not 0\n", fbi.FileAttributes );
++    ok ( (fbi.FileAttributes & attrib_mask) == FILE_ATTRIBUTE_NORMAL, "attribute %lx not 0\n", fbi.FileAttributes );
+ 
+     CloseHandle( h );
+ }
+@@ -1897,7 +1897,7 @@ static void test_file_all_information(void)
+     memset(&fai_buf.fai, 0, sizeof(fai_buf.fai));
+     res = pNtQueryInformationFile(h, &io, &fai_buf.fai, sizeof fai_buf, FileAllInformation);
+     ok ( res == STATUS_SUCCESS, "can't get attributes\n");
+-    todo_wine ok ( (fai_buf.fai.BasicInformation.FileAttributes & attrib_mask) == FILE_ATTRIBUTE_NORMAL, "attribute %lx not FILE_ATTRIBUTE_NORMAL\n", fai_buf.fai.BasicInformation.FileAttributes );
++    ok ( (fai_buf.fai.BasicInformation.FileAttributes & attrib_mask) == FILE_ATTRIBUTE_NORMAL, "attribute %lx not FILE_ATTRIBUTE_NORMAL\n", fai_buf.fai.BasicInformation.FileAttributes );
+ 
+     CloseHandle( h );
+ }
+@@ -4356,6 +4356,53 @@ static void test_file_name_information(void)
+     HeapFree( GetProcessHeap(), 0, file_name );
+ }
+ 
++/* a file's name comes back in the case it has on disk, whatever case it was opened by */
++static void test_file_name_case(void)
++{
++    static const WCHAR name[] = L"MixedCase.Tmp";
++    const unsigned int name_len = ARRAY_SIZE(name) - 1;
++    char buffer[sizeof(OBJECT_NAME_INFORMATION) + MAX_PATH * sizeof(WCHAR)];
++    FILE_NAME_INFORMATION *info = (FILE_NAME_INFORMATION *)buffer;
++    OBJECT_NAME_INFORMATION *object = (OBJECT_NAME_INFORMATION *)buffer;
++    WCHAR temp[MAX_PATH], path[MAX_PATH], upper[MAX_PATH], result[MAX_PATH];
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++    HANDLE file;
++    ULONG len;
++
++    GetTempPathW( ARRAY_SIZE(temp), temp );
++    swprintf( path, ARRAY_SIZE(path), L"%s%s", temp, name );
++    file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    ok( file != INVALID_HANDLE_VALUE, "failed to create %s, error %lu\n", debugstr_w(path), GetLastError() );
++    CloseHandle( file );
++
++    wcscpy( upper, path );
++    CharUpperW( upper + wcslen( temp ) );
++    file = CreateFileW( upper, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                        OPEN_EXISTING, 0, NULL );
++    ok( file != INVALID_HANDLE_VALUE, "failed to open %s, error %lu\n", debugstr_w(upper), GetLastError() );
++
++    status = pNtQueryInformationFile( file, &io, info, sizeof(buffer), FileNameInformation );
++    ok( !status, "got %#lx\n", status );
++    len = info->FileNameLength / sizeof(WCHAR);
++    ok( len >= name_len && !memcmp( info->FileName + len - name_len, name, name_len * sizeof(WCHAR) ),
++        "got %s\n", debugstr_wn( info->FileName, len ) );
++
++    status = NtQueryObject( file, ObjectNameInformation, object, sizeof(buffer), &len );
++    ok( !status, "got %#lx\n", status );
++    len = object->Name.Length / sizeof(WCHAR);
++    ok( len >= name_len && !memcmp( object->Name.Buffer + len - name_len, name, name_len * sizeof(WCHAR) ),
++        "got %s\n", debugstr_wn( object->Name.Buffer, len ) );
++
++    len = GetFinalPathNameByHandleW( file, result, ARRAY_SIZE(result), FILE_NAME_OPENED );
++    ok( len >= name_len && !wcscmp( result + len - name_len, name ), "got %s\n", debugstr_w(result) );
++    len = GetFinalPathNameByHandleW( file, result, ARRAY_SIZE(result), FILE_NAME_NORMALIZED );
++    ok( len >= name_len && !wcscmp( result + len - name_len, name ), "got %s\n", debugstr_w(result) );
++
++    CloseHandle( file );
++    DeleteFileW( path );
++}
++
+ static void test_file_all_name_information(void)
+ {
+     WCHAR *file_name, *volume_prefix, *expected;
+@@ -4838,7 +4885,7 @@ static void test_file_attribute_tag_information(void)
+     memset(&info, 0x11, sizeof(info));
+     status = pNtQueryInformationFile( h, &io, &info, sizeof(info), FileAttributeTagInformation );
+     ok( status == STATUS_SUCCESS, "got %#lx\n", status );
+-    todo_wine ok( info.FileAttributes == FILE_ATTRIBUTE_SYSTEM, "got attributes %#lx\n", info.FileAttributes );
++    ok( info.FileAttributes == FILE_ATTRIBUTE_SYSTEM, "got attributes %#lx\n", info.FileAttributes );
+     ok( !info.ReparseTag, "got reparse tag %#lx\n", info.ReparseTag );
+ 
+     fbi.FileAttributes = FILE_ATTRIBUTE_HIDDEN;
+@@ -4848,7 +4895,7 @@ static void test_file_attribute_tag_information(void)
+     memset(&info, 0x11, sizeof(info));
+     status = pNtQueryInformationFile( h, &io, &info, sizeof(info), FileAttributeTagInformation );
+     ok( status == STATUS_SUCCESS, "got %#lx\n", status );
+-    todo_wine ok( info.FileAttributes == FILE_ATTRIBUTE_HIDDEN, "got attributes %#lx\n", info.FileAttributes );
++    ok( info.FileAttributes == FILE_ATTRIBUTE_HIDDEN, "got attributes %#lx\n", info.FileAttributes );
+     ok( !info.ReparseTag, "got reparse tag %#lx\n", info.ReparseTag );
+ 
+     CloseHandle( h );
+@@ -5254,7 +5301,24 @@ static void test_NtCreateFile(void)
+     /*17*/{ FILE_SUPERSEDE, FILE_ATTRIBUTE_READONLY, 0, FILE_SUPERSEDED, FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_READONLY, TRUE },
+     /*18*/{ FILE_SUPERSEDE, 0, 0, FILE_CREATED, FILE_ATTRIBUTE_ARCHIVE, TRUE }
+     };
++    static const struct
++    {
++        ULONG disposition, options;
++        NTSTATUS status;
++    } trailing[] =
++    {
++        { FILE_OPEN, 0, STATUS_NOT_A_DIRECTORY },
++        { FILE_OPEN, FILE_NON_DIRECTORY_FILE, STATUS_NOT_A_DIRECTORY },
++        { FILE_OPEN, FILE_DIRECTORY_FILE, STATUS_NOT_A_DIRECTORY },
++        { FILE_OPEN_IF, 0, STATUS_NOT_A_DIRECTORY },
++        { FILE_OPEN_IF, FILE_DIRECTORY_FILE, STATUS_NOT_A_DIRECTORY },
++        { FILE_OVERWRITE_IF, 0, STATUS_NOT_A_DIRECTORY },
++        { FILE_SUPERSEDE, 0, STATUS_NOT_A_DIRECTORY },
++        { FILE_CREATE, 0, STATUS_NOT_A_DIRECTORY },
++        { FILE_CREATE, FILE_DIRECTORY_FILE, STATUS_OBJECT_NAME_COLLISION },
++    };
+     static const WCHAR fooW[] = {'f','o','o',0};
++    FILE_BASIC_INFORMATION info;
+     NTSTATUS status;
+     HANDLE handle;
+     WCHAR path[MAX_PATH];
+@@ -5304,14 +5368,61 @@ static void test_NtCreateFile(void)
+ 
+     status = pNtCreateFile( &handle, GENERIC_READ, &attr, &io, NULL,
+                             0, FILE_SHARE_READ|FILE_SHARE_WRITE, FILE_CREATE, 0, NULL, 0);
+-    ok( status == STATUS_OBJECT_NAME_INVALID || status == STATUS_NOT_A_DIRECTORY,
++    ok( status == STATUS_NOT_A_DIRECTORY || broken(status == STATUS_OBJECT_NAME_INVALID) /* before Windows 11 */,
+         "failed %s %lx\n", debugstr_w(nameW.Buffer), status );
+     status = pNtCreateFile( &handle, GENERIC_READ, &attr, &io, NULL,
+                             0, FILE_SHARE_READ|FILE_SHARE_WRITE, FILE_CREATE,
+                             FILE_DIRECTORY_FILE, NULL, 0);
+     ok( !status, "failed %s %lx\n", debugstr_w(nameW.Buffer), status );
++    if (!status) CloseHandle( handle );
+     pRtlFreeUnicodeString( &nameW );
+     RemoveDirectoryW( path );
++
++    /* a file's name with a backslash after it is not a directory's, whatever is asked for */
++    path[wcslen( path ) - 1] = 0;
++    handle = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    ok( handle != INVALID_HANDLE_VALUE, "failed to create %s, error %lu\n", debugstr_w(path), GetLastError() );
++    WriteFile( handle, "data", 4, &ret, NULL );
++    CloseHandle( handle );
++    wcscat( path, L"\\" );
++    pRtlDosPathNameToNtPathName_U( path, &nameW, NULL, NULL );
++    for (i = 0; i < ARRAY_SIZE(trailing); i++)
++    {
++        status = pNtCreateFile( &handle, GENERIC_READ, &attr, &io, NULL, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                                trailing[i].disposition, trailing[i].options, NULL, 0 );
++        ok( status == trailing[i].status || broken(trailing[i].status == STATUS_NOT_A_DIRECTORY &&
++            (status == STATUS_OBJECT_NAME_INVALID || status == STATUS_OBJECT_NAME_COLLISION)) /* before Windows 11 */,
++            "%lu: got %#lx\n", i, status );
++        if (!status) CloseHandle( handle );
++    }
++    status = pNtQueryAttributesFile( &attr, &info );
++    ok( status == STATUS_NOT_A_DIRECTORY || broken(status == STATUS_OBJECT_NAME_INVALID) /* before Windows 11 */,
++        "got %#lx\n", status );
++    pRtlFreeUnicodeString( &nameW );
++    path[wcslen( path ) - 1] = 0;
++
++    /* a file superseded is replaced, with no write access asked for and read-only or not */
++    pRtlDosPathNameToNtPathName_U( path, &nameW, NULL, NULL );
++    for (i = 0; i < 2; i++)
++    {
++        handle = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++        WriteFile( handle, "data", 4, &ret, NULL );
++        CloseHandle( handle );
++        if (i) SetFileAttributesW( path, FILE_ATTRIBUTE_READONLY );
++        status = pNtCreateFile( &handle, GENERIC_READ, &attr, &io, NULL, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                                FILE_SUPERSEDE, 0, NULL, 0 );
++        ok( !status, "%lu: got %#lx\n", i, status );
++        ok( io.Information == FILE_SUPERSEDED, "%lu: got %#Ix\n", i, io.Information );
++        CloseHandle( handle );
++        handle = CreateFileW( path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
++        ok( GetFileSize( handle, NULL ) == 0, "%lu: got size %lu\n", i, GetFileSize( handle, NULL ) );
++        CloseHandle( handle );
++        ok( GetFileAttributesW( path ) == FILE_ATTRIBUTE_ARCHIVE, "%lu: got attributes %#lx\n",
++            i, GetFileAttributesW( path ) );
++    }
++    pRtlFreeUnicodeString( &nameW );
++    SetFileAttributesW( path, FILE_ATTRIBUTE_NORMAL );
++    DeleteFileW( path );
+ }
+ 
+ static void test_read_write(void)
+@@ -7042,7 +7153,7 @@ static void test_reparse_points(void)
+     ret = OpenProcessToken( GetCurrentProcess(), TOKEN_ALL_ACCESS, &token );
+     ok( ret == TRUE, "got error %lu\n", GetLastError() );
+     ret = LookupPrivilegeValueA( NULL, "SeCreateSymbolicLinkPrivilege", &luid );
+-    todo_wine ok( ret == TRUE, "got error %lu\n", GetLastError() );
++    ok( ret == TRUE, "got error %lu\n", GetLastError() );
+ 
+     if (ret)
+     {
+@@ -7088,7 +7199,8 @@ static void test_reparse_points(void)
+ 
+     status = NtCreateFile( &handle2, GENERIC_READ, &attr, &io, NULL, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            FILE_OPEN, 0, NULL, 0 );
+-    ok( status == STATUS_OBJECT_NAME_INVALID, "got %#lx\n", status );
++    ok( status == STATUS_NOT_A_DIRECTORY || broken(status == STATUS_OBJECT_NAME_INVALID) /* before Windows 11 */,
++        "got %#lx\n", status );
+ 
+     data_size = init_reparse_symlink( &data, L"\\Device\\NamedPipe\\", 0 );
+     status = NtFsControlFile( handle, NULL, NULL, NULL, &io, FSCTL_SET_REPARSE_POINT, data, data_size, NULL, 0 );
+@@ -7300,7 +7412,7 @@ static void test_reparse_points(void)
+     ok( ret == TRUE, "got error %lu\n", GetLastError() );
+ 
+     ret = GetFileAttributesW( path );
+-    todo_wine ok( ret == (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_REPARSE_POINT),
++    ok( ret == (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_REPARSE_POINT),
+         "got attributes %#x\n", ret );
+ 
+     ret = GetFileAttributesW( path2 );
+@@ -8776,6 +8888,7 @@ START_TEST(file)
+     test_file_all_information();
+     test_file_both_information();
+     test_file_name_information();
++    test_file_name_case();
+     test_file_full_size_information();
+     test_file_all_name_information();
+     test_file_rename_information(FileRenameInformation);
+diff --git a/dlls/ntdll/tests/path.c b/dlls/ntdll/tests/path.c
+index 901e772a704..3f8cf766b2d 100644
+--- a/dlls/ntdll/tests/path.c
++++ b/dlls/ntdll/tests/path.c
+@@ -665,9 +665,9 @@ static void test_nt_names(void)
+         { NULL, L"\\??\\C:\\windows\\SyStEm32\\", STATUS_FILE_IS_A_DIRECTORY },
+         { NULL, L"\\??\\C:\\windows\\system32\\\\", STATUS_OBJECT_NAME_INVALID },
+         { NULL, L"\\??\\C:\\windows\\system32\\foobar\\", STATUS_OBJECT_NAME_NOT_FOUND },
+-        { NULL, L"\\??\\C:\\windows\\system32\\kernel32.dll\\", STATUS_OBJECT_NAME_INVALID, STATUS_NOT_A_DIRECTORY },
++        { NULL, L"\\??\\C:\\windows\\system32\\kernel32.dll\\", STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_INVALID },
+         { NULL, L"\\??\\C:\\windows\\system32\\kernel32.dll\\foo", STATUS_OBJECT_PATH_NOT_FOUND },
+-        { NULL, L"\\??\\C:\\windows\\system32\\Kernel32.Dll\\", STATUS_OBJECT_NAME_INVALID, STATUS_NOT_A_DIRECTORY },
++        { NULL, L"\\??\\C:\\windows\\system32\\Kernel32.Dll\\", STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_INVALID },
+         { NULL, L"\\??\\C:\\windows\\system32\\Kernel32.Dll\\foo", STATUS_OBJECT_PATH_NOT_FOUND },
+         { NULL, L"\\??\\C:\\windows\\sys\001", STATUS_OBJECT_NAME_INVALID },
+         { L"\\??\\", NULL, STATUS_OBJECT_NAME_INVALID },
+@@ -691,9 +691,9 @@ static void test_nt_names(void)
+         { L"\\??\\C:\\windows\\", L"SyStEm32\\", STATUS_FILE_IS_A_DIRECTORY },
+         { L"\\??\\C:\\windows\\", L"system32\\\\", STATUS_OBJECT_NAME_INVALID },
+         { L"\\??\\C:\\windows\\", L"system32\\foobar\\", STATUS_OBJECT_NAME_NOT_FOUND },
+-        { L"\\??\\C:\\windows\\", L"system32\\kernel32.dll\\", STATUS_OBJECT_NAME_INVALID, STATUS_NOT_A_DIRECTORY },
++        { L"\\??\\C:\\windows\\", L"system32\\kernel32.dll\\", STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_INVALID },
+         { L"\\??\\C:\\windows\\", L"system32\\kernel32.dll\\foo", STATUS_OBJECT_PATH_NOT_FOUND },
+-        { L"\\??\\C:\\windows\\", L"system32\\Kernel32.Dll\\", STATUS_OBJECT_NAME_INVALID, STATUS_NOT_A_DIRECTORY },
++        { L"\\??\\C:\\windows\\", L"system32\\Kernel32.Dll\\", STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_INVALID },
+         { L"\\??\\C:\\windows\\", L"system32\\Kernel32.Dll\\foo", STATUS_OBJECT_PATH_NOT_FOUND },
+         { L"\\??\\C:\\windows\\", L"\\system32\\kernel32.dll", STATUS_INVALID_PARAMETER },
+         { L"\\??\\C:\\windows\\", L"/system32\\kernel32.dll", STATUS_OBJECT_NAME_INVALID },
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index bf9ed7c0e36..f204b0b7305 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -182,7 +182,10 @@ typedef struct
+ #endif
+ 
+ #define SAMBA_XATTR_DOS_ATTRIB  XATTR_USER_PREFIX "DOSATTRIB"
+-#define XATTR_ATTRIBS_MASK      (FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM)
++/* the attributes kept in the extended attribute; read-only is the mode, directory the type */
++#define XATTR_ATTRIBS_MASK      (FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_ARCHIVE|\
++                                 FILE_ATTRIBUTE_TEMPORARY|FILE_ATTRIBUTE_OFFLINE|\
++                                 FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
+ 
+ #define XATTR_REPARSE XATTR_USER_PREFIX "WINEREPARSE"
+ 
+@@ -1626,22 +1629,42 @@ static BOOL append_entry( struct dir_data *data, const char *long_name,
+ }
+ 
+ 
+-/* fetch the attributes of a file */
++/* fetch the attributes of a file that its mode and type give */
+ static inline ULONG get_file_attributes( const struct stat *st )
+ {
+-    ULONG attr;
++    ULONG attr = 0;
+ 
+     if (S_ISDIR(st->st_mode))
+         attr = FILE_ATTRIBUTE_DIRECTORY;
+-    else
+-        attr = FILE_ATTRIBUTE_ARCHIVE;
+     if (!(st->st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
+         attr |= FILE_ATTRIBUTE_READONLY;
+     return attr;
+ }
+ 
+ 
+-/* decode the xattr-stored DOS attributes */
++/* the attributes a file has with none kept for it: a file is one to back up until that is cleared, which
++ * it is again once written to, a directory is not */
++static inline ULONG default_dos_attrib( const struct stat *st )
++{
++    return S_ISDIR( st->st_mode ) ? 0 : FILE_ATTRIBUTE_ARCHIVE;
++}
++
++
++/* whether reading an extended attribute failed only for want of one */
++static inline BOOL no_xattr( int err )
++{
++    if (err == ENOTSUP) return TRUE;
++#ifdef ENODATA
++    if (err == ENODATA) return TRUE;
++#endif
++#ifdef ENOATTR
++    if (err == ENOATTR) return TRUE;
++#endif
++    return FALSE;
++}
++
++
++/* decode the xattr-stored DOS attributes; -1 for a value in another form, Samba 4's binary one, say */
+ static int parse_samba_dos_attrib_data( char *data, int len )
+ {
+     char *end;
+@@ -1658,7 +1681,54 @@ static int parse_samba_dos_attrib_data( char *data, int len )
+         static BOOL once;
+         if (!once++) FIXME( "Unhandled " SAMBA_XATTR_DOS_ATTRIB " extended attribute value.\n" );
+     }
+-    return 0;
++    return -1;
++}
++
++
++/* keep the attributes in the extended attribute, or remove it where they are those a file has without one.
++ * Changing it needs write permission, which a read-only file is given for the while; it is done before the
++ * mode changes, so that a file being made read-only gets its attributes still. */
++static int fd_write_dos_attrib( int fd, const struct stat *st, UINT attr, BOOL force_set )
++{
++    BOOL restore = FALSE;
++    int ret;
++
++    attr &= XATTR_ATTRIBS_MASK;
++    if (!(st->st_mode & S_IWUSR)) restore = !fchmod( fd, st->st_mode | S_IWUSR );
++    if (force_set || attr != default_dos_attrib( st ))
++    {
++        /* encode the attributes in Samba 3 ASCII format. Samba 4 has extended
++         * this format with more features, but retains compatibility with the
++         * earlier format. */
++        char data[11];
++        int len = snprintf( data, sizeof(data), "0x%x", attr );
++        ret = xattr_fset( fd, SAMBA_XATTR_DOS_ATTRIB, data, len );
++    }
++    else
++    {
++        ret = xattr_fremove( fd, SAMBA_XATTR_DOS_ATTRIB );
++        if (ret == -1 && errno != ENOTSUP && no_xattr( errno )) ret = 0;
++    }
++    if (restore) fchmod( fd, st->st_mode );
++    return ret;
++}
++
++
++/* a file written to, made larger or smaller, renamed or given another name is one to back up again: where
++ * that was cleared, the archive attribute comes back */
++static void fd_set_archive( int fd )
++{
++    char data[65];
++    struct stat st;
++    int len, attr;
++
++    if ((len = xattr_fget( fd, SAMBA_XATTR_DOS_ATTRIB, data, sizeof(data) - 1 )) == -1) return;
++    if ((attr = parse_samba_dos_attrib_data( data, len )) == -1 || (attr & FILE_ATTRIBUTE_ARCHIVE)) return;
++    if (fstat( fd, &st ) == -1 || S_ISDIR( st.st_mode )) return;
++    /* the extended attribute stays, as it may be what keeps a dot file from looking hidden */
++    if (fd_write_dos_attrib( fd, &st, attr | FILE_ATTRIBUTE_ARCHIVE, TRUE ) == -1 && errno != ENOTSUP)
++        WARN( "Failed to set extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)\n",
++              errno, strerror( errno ) );
+ }
+ 
+ 
+@@ -1679,7 +1749,7 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
+ {
+     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+     char attr_data[65];
+-    int attr_len, ret;
++    int attr_len, dos, ret;
+ 
+     *attr = 0;
+     ret = fstat( fd, st );
+@@ -1704,69 +1774,51 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
+     }
+ 
+     attr_len = xattr_fget( fd, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
+-    if (attr_len != -1)
+-        *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
++    if (attr_len != -1 && (dos = parse_samba_dos_attrib_data( attr_data, attr_len )) != -1)
++        *attr |= dos;
+     else
+     {
+-        if (errno == ENOTSUP) return ret;
+-#ifdef ENODATA
+-        if (errno == ENODATA) return ret;
+-#endif
+-#ifdef ENOATTR
+-        if (errno == ENOATTR) return ret;
+-#endif
+-        WARN( "Failed to get extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)\n",
+-              errno, strerror( errno ) );
++        *attr |= default_dos_attrib( st );
++        if (attr_len == -1 && !no_xattr( errno ))
++            WARN( "Failed to get extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)\n",
++                  errno, strerror( errno ) );
+     }
++    /* a file with no attributes says so */
++    if (!*attr) *attr = FILE_ATTRIBUTE_NORMAL;
+     return ret;
+ }
+ 
+ 
+-static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
+-{
+-    /* we only store the HIDDEN and SYSTEM attributes */
+-    attr &= XATTR_ATTRIBS_MASK;
+-    if (force_set || attr != 0)
+-    {
+-        /* encode the attributes in Samba 3 ASCII format. Samba 4 has extended
+-         * this format with more features, but retains compatibility with the
+-         * earlier format. */
+-        char data[11];
+-        int len = snprintf( data, sizeof(data), "0x%x", attr );
+-        return xattr_fset( fd, SAMBA_XATTR_DOS_ATTRIB, data, len );
+-    }
+-    else return xattr_fremove( fd, SAMBA_XATTR_DOS_ATTRIB );
+-}
+-
+-
+ /* set the stat info and file attributes for a file (by file descriptor) */
+ static NTSTATUS fd_set_file_info( int fd, UINT attr, BOOL force_set_xattr )
+ {
+     struct stat st;
++    mode_t mode;
+ 
+     if (fstat( fd, &st ) == -1) return errno_to_status( errno );
++    mode = st.st_mode;
+     if (attr & FILE_ATTRIBUTE_READONLY)
+     {
+         if (S_ISDIR( st.st_mode))
+             WARN("FILE_ATTRIBUTE_READONLY ignored for directory.\n");
+         else
+-            st.st_mode &= ~0222; /* clear write permission bits */
++            mode &= ~0222; /* clear write permission bits */
+     }
+     else
+     {
+         /* add write permission only where we already have read permission */
+-        st.st_mode |= (0600 | ((st.st_mode & 044) >> 1)) & (~start_umask);
++        mode |= (0600 | ((st.st_mode & 044) >> 1)) & (~start_umask);
+     }
+-    if (fchmod( fd, st.st_mode ) == -1) return errno_to_status( errno );
+ 
+     /* if the file has multiple names, we can't be sure that it is safe to not
+        set the extended attribute, since any of the names could start with a dot */
+     force_set_xattr = force_set_xattr || st.st_nlink > 1;
+ 
+-    if (fd_set_dos_attrib( fd, attr, force_set_xattr ) == -1 && errno != ENOTSUP)
++    if (fd_write_dos_attrib( fd, &st, attr, force_set_xattr ) == -1 && errno != ENOTSUP)
+         WARN( "Failed to set extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)\n",
+               errno, strerror( errno ) );
+ 
++    if (fchmod( fd, mode ) == -1) return errno_to_status( errno );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1778,7 +1830,7 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG
+     size_t len = strlen( path );
+     char *parent_path;
+     char attr_data[65];
+-    int attr_len, ret;
++    int attr_len, dos, ret;
+ 
+     *attr = 0;
+     ret = lstat( path, st );
+@@ -1821,22 +1873,19 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG
+     }
+ 
+     attr_len = xattr_get( path, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
+-    if (attr_len != -1)
+-        *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
++    if (attr_len != -1 && (dos = parse_samba_dos_attrib_data( attr_data, attr_len )) != -1)
++        *attr |= dos;
+     else
+     {
++        *attr |= default_dos_attrib( st );
+         if (is_hidden_file( path ))
+             *attr |= FILE_ATTRIBUTE_HIDDEN;
+-        if (errno == ENOTSUP) return ret;
+-#ifdef ENODATA
+-        if (errno == ENODATA) return ret;
+-#endif
+-#ifdef ENOATTR
+-        if (errno == ENOATTR) return ret;
+-#endif
+-        WARN( "Failed to get extended attribute " SAMBA_XATTR_DOS_ATTRIB " from %s. errno %d (%s)\n",
+-              debugstr_a(path), errno, strerror( errno ) );
++        if (attr_len == -1 && !no_xattr( errno ))
++            WARN( "Failed to get extended attribute " SAMBA_XATTR_DOS_ATTRIB " from %s. errno %d (%s)\n",
++                  debugstr_a(path), errno, strerror( errno ) );
+     }
++    /* a file with no attributes says so */
++    if (!*attr) *attr = FILE_ATTRIBUTE_NORMAL;
+     return ret;
+ }
+ 
+@@ -3882,7 +3931,14 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
+             {
+                 status = STATUS_OBJECT_NAME_COLLISION;
+             }
+-            if (end < next) strcat( unix_name, "/" );
++            if (end < next)
++            {
++                strcat( unix_name, "/" );
++                /* a backslash after the name makes it a directory's, which a file's is not */
++                if ((status == STATUS_SUCCESS || status == STATUS_OBJECT_NAME_COLLISION) &&
++                    fstatat( root_fd, unix_name, &st, 0 ) == -1 && errno == ENOTDIR)
++                    status = STATUS_NOT_A_DIRECTORY;
++            }
+         }
+         else if (status == STATUS_OBJECT_NAME_NOT_FOUND) status = STATUS_OBJECT_PATH_NOT_FOUND;
+ 
+@@ -4548,6 +4604,61 @@ static void remove_trailing_backslash( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *
+     nt_name->Buffer[len - 1] = 0;
+ }
+ 
++/* the name a file is opened by goes back to the program as the file system has it: each element in the case
++ * it has on disk, a short name in capitals as it is stored, and the drive letter in capitals; helper for
++ * NtCreateFile, which gives the server the name.  A module's name keeps the case it was asked for, so the
++ * name the loader looks up is left alone. */
++static void set_name_case( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name, const char *unix_name )
++{
++    static const WCHAR prefixW[] = {'\\','?','?','\\'};
++    UNICODE_STRING *name = attr->ObjectName;
++    unsigned int len = name->Length / sizeof(WCHAR), first = 0;
++    WCHAR comp[MAX_DIR_ENTRY_LEN + 1], *buffer, *start, *end, *p;
++    const char *unix_start, *unix_end;
++    int ret;
++
++    if (!attr->RootDirectory)
++    {
++        /* only the names of drives, \??\X: */
++        if (len < 6 || memcmp( name->Buffer, prefixW, sizeof(prefixW) ) || name->Buffer[5] != ':') return;
++        first = 6;
++    }
++    if (name != nt_name)  /* not already redirected, make a copy */
++    {
++        if (!(buffer = malloc( name->Length ))) return;
++        memcpy( buffer, name->Buffer, name->Length );
++        nt_name->Buffer = buffer;
++        nt_name->Length = nt_name->MaximumLength = name->Length;
++        attr->ObjectName = name = nt_name;
++    }
++    buffer = name->Buffer;
++    if (first) buffer[4] = ntdll_towupper( buffer[4] );
++
++    /* the elements of the two names are the same from the end */
++    end = buffer + len;
++    unix_end = unix_name + strlen( unix_name );
++    for (;;)
++    {
++        while (end > buffer + first && end[-1] == '\\') end--;
++        while (unix_end > unix_name && unix_end[-1] == '/') unix_end--;
++        if (end == buffer + first) break;
++        for (start = end; start > buffer + first && start[-1] != '\\'; start--) ;
++        for (unix_start = unix_end; unix_start > unix_name && unix_start[-1] != '/'; unix_start--) ;
++        if (unix_start == unix_name) break;
++
++        ret = ntdll_umbstowcs( unix_start, unix_end - unix_start, comp, MAX_DIR_ENTRY_LEN );
++        if (ret > 0 && comp[ret - 1] == '?') ret--;  /* stored as a reparse point */
++        if (ret == end - start && !wcsnicmp( comp, start, ret )) memcpy( start, comp, ret * sizeof(WCHAR) );
++        else
++        {
++            for (p = start; p < end; p++) if (*p == '~') break;
++            if (p < end) for (p = start; p < end; p++) *p = ntdll_towupper( *p );
++        }
++        end = start;
++        unix_end = unix_start;
++    }
++}
++
+ /***********************************************************************
+  *           get_nt_and_unix_names
+  *
+@@ -4872,6 +4983,14 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
+     else status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
+                                          options & FILE_OPEN_REPARSE_POINT );
+ 
++    /* a name with a backslash after it can only be a directory's: nothing else is created by it,
++     * and a file by that name is not one, unless it was to be a new directory */
++    if (status == STATUS_NO_SUCH_FILE && !(options & FILE_DIRECTORY_FILE) &&
++        unix_name[strlen( unix_name ) - 1] == '/')
++        status = STATUS_NOT_A_DIRECTORY;
++    else if (status == STATUS_NOT_A_DIRECTORY && disposition == FILE_CREATE && (options & FILE_DIRECTORY_FILE))
++        status = STATUS_OBJECT_NAME_COLLISION;
++
+     /* a directory where a file is to be created is that before it is a name already taken */
+     if (status == STATUS_OBJECT_NAME_COLLISION && (options & FILE_NON_DIRECTORY_FILE))
+     {
+@@ -4913,12 +5032,14 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
+          * for; a dot file only looks hidden, and a directory is not written over at all */
+         if (!stat( unix_name, &st ) && !S_ISDIR( st.st_mode ) &&
+             (len = xattr_get( unix_name, SAMBA_XATTR_DOS_ATTRIB, data, sizeof(data) - 1 )) != -1 &&
+-            (parse_samba_dos_attrib_data( data, len ) & ~attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
++            (len = parse_samba_dos_attrib_data( data, len )) != -1 &&
++            (len & ~attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
+             status = STATUS_ACCESS_DENIED;
+     }
+ 
+     if (status == STATUS_SUCCESS)
+     {
++        set_name_case( &new_attr, &nt_name, unix_name );
+         name_hidden = is_hidden_file( unix_name );
+         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
+                                  sharing, disposition, options, ea_buffer, ea_length );
+@@ -4946,15 +5067,20 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
+             break;
+         }
+ 
++        /* a new file is one to back up, a new directory is not unless asked for */
++        if (!(options & FILE_DIRECTORY_FILE)) attributes |= FILE_ATTRIBUTE_ARCHIVE;
++
+         if (io->Information == FILE_CREATED &&
+-            ((attributes & XATTR_ATTRIBS_MASK) || name_hidden))
++            ((attributes & XATTR_ATTRIBS_MASK) != ((options & FILE_DIRECTORY_FILE) ? 0 : FILE_ATTRIBUTE_ARCHIVE) ||
++             name_hidden))
+         {
+             int fd, needs_close;
++            struct stat st;
+ 
+             /* set any DOS extended attributes */
+             if (!server_get_unix_fd( *handle, 0, &fd, &needs_close, NULL, NULL ))
+             {
+-                if (fd_set_dos_attrib( fd, attributes, TRUE ) == -1 && errno != ENOTSUP)
++                if (!fstat( fd, &st ) && fd_write_dos_attrib( fd, &st, attributes, TRUE ) == -1 && errno != ENOTSUP)
+                     WARN( "Failed to set extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)",
+                           errno, strerror( errno ) );
+                 if (needs_close) close( fd );
+@@ -5521,6 +5647,27 @@ static unsigned int set_fd_name( HANDLE handle, OBJECT_ATTRIBUTES *attr, const c
+ }
+ 
+ 
++/* whether the caller's token has a privilege enabled */
++static BOOL privilege_enabled( ULONG privilege )
++{
++    PRIVILEGE_SET privs;
++    BOOLEAN ret = FALSE;
++    HANDLE token;
++
++    if (NtOpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token ) &&
++        NtOpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token ))
++        return FALSE;
++    privs.PrivilegeCount = 1;
++    privs.Control = PRIVILEGE_SET_ALL_NECESSARY;
++    privs.Privilege[0].Luid.LowPart = privilege;
++    privs.Privilege[0].Luid.HighPart = 0;
++    privs.Privilege[0].Attributes = 0;
++    if (NtPrivilegeCheck( token, &privs, &ret )) ret = FALSE;
++    NtClose( token );
++    return ret;
++}
++
++
+ /******************************************************************************
+  *              NtSetInformationFile   (NTDLL.@)
+  */
+@@ -5591,6 +5738,11 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+                 status = wine_server_call( req );
+             }
+             SERVER_END_REQ;
++            if (!status && !server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
++            {
++                fd_set_archive( fd );
++                if (needs_close) close( fd );
++            }
+         }
+         else status = STATUS_INFO_LENGTH_MISMATCH;
+         break;
+@@ -5734,7 +5886,10 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             if ((status = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL )))
+                 return status;
+ 
+-            if (fstat( fd, &st ) == -1) status = errno_to_status( errno );
++            /* the I/O manager asks for the privilege once it has the handle, before the file system
++             * looks at the length */
++            if (!privilege_enabled( SE_MANAGE_VOLUME_PRIVILEGE )) status = STATUS_PRIVILEGE_NOT_HELD;
++            else if (fstat( fd, &st ) == -1) status = errno_to_status( errno );
+             else if (info->ValidDataLength.QuadPart <= 0 || (off_t)info->ValidDataLength.QuadPart > st.st_size)
+                 status = STATUS_INVALID_PARAMETER;
+             else
+@@ -5836,6 +5991,11 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+                 status = set_fd_name( handle, &attr, unix_name, FALSE, flags );
+                 if (!status && asked) status = set_fd_name( handle, &attr, asked, FALSE, flags );
+                 free( asked );
++                if (!status && !server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
++                {
++                    fd_set_archive( fd );
++                    if (needs_close) close( fd );
++                }
+             }
+             free( unix_name );
+             free( nt_name.Buffer );
+@@ -5874,6 +6034,11 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
+             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+                 status = set_fd_name( handle, &attr, unix_name, TRUE, flags );
++            if (!status && !server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
++            {
++                fd_set_archive( fd );
++                if (needs_close) close( fd );
++            }
+             free( unix_name );
+             free( nt_name.Buffer );
+         }
+@@ -6940,6 +7105,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
+ 
+ done:
+     send_completion = cvalue != 0;
++    /* written to, the file is one to back up */
++    if (type == FD_TYPE_FILE && status == STATUS_SUCCESS && total) fd_set_archive( unix_handle );
+ 
+ err:
+     if (needs_close) close( unix_handle );
+@@ -7030,6 +7197,7 @@ NTSTATUS WINAPI NtWriteFileGather( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
+     }
+ 
+  done:
++    if (status == STATUS_SUCCESS && total) fd_set_archive( unix_handle );
+     if (needs_close) close( unix_handle );
+     if (status == STATUS_SUCCESS)
+     {
+diff --git a/dlls/scrrun/filesystem.c b/dlls/scrrun/filesystem.c
+index d75876b2e55..62d5096ec21 100644
+--- a/dlls/scrrun/filesystem.c
++++ b/dlls/scrrun/filesystem.c
+@@ -4064,7 +4064,10 @@ static HRESULT WINAPI filesys_MoveFolder(IFileSystem3 *iface, BSTR src, BSTR dst
+         free(src_copy);
+         if (ret)
+             return S_OK;
+-        if (GetLastError() == ERROR_INVALID_NAME || GetLastError() == ERROR_FILE_NOT_FOUND)
++        /* a file's name with a backslash after it is no folder's: Windows 11 says so with ERROR_DIRECTORY,
++         * earlier versions with ERROR_INVALID_NAME */
++        if (GetLastError() == ERROR_INVALID_NAME || GetLastError() == ERROR_DIRECTORY ||
++            GetLastError() == ERROR_FILE_NOT_FOUND)
+             return CTL_E_PATHNOTFOUND;
+         return create_error(GetLastError());
+     }
+diff --git a/server/fd.c b/server/fd.c
+index 29c8dcd4ec3..45a15eab433 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2017,6 +2017,27 @@ struct unicode_str get_nt_name( struct fd *fd )
+     return name;
+ }
+ 
++/* empty a file superseded with no write access asked for: it is replaced all the same, read-only or
++ * not (its mode says which), and takes the attributes it is given afterwards */
++static int truncate_superseded( int unix_fd, const char *name, mode_t mode )
++{
++    int fd, ret = 0;
++
++    if (!(mode & S_IWUSR) && fchmod( unix_fd, mode | S_IWUSR ) == -1)
++    {
++        file_set_error();
++        return 0;
++    }
++    if ((fd = open( name, O_WRONLY | O_NONBLOCK )) != -1)
++    {
++        if (!(ret = !ftruncate( fd, 0 ))) file_set_error();
++        close( fd );
++    }
++    else file_set_error();
++    if (!(mode & S_IWUSR)) fchmod( unix_fd, mode );
++    return ret;
++}
++
+ /* open() wrapper that returns a struct fd with no fd user set */
+ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
+                     int flags, mode_t *mode, unsigned int access,
+@@ -2182,7 +2203,8 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+                 set_error( STATUS_OBJECT_NAME_COLLISION );
+                 goto error;
+             }
+-            ftruncate( fd->unix_fd, 0 );
++            if (rw_mode != O_RDONLY) ftruncate( fd->unix_fd, 0 );
++            else if (!truncate_superseded( fd->unix_fd, name, st.st_mode )) goto error;
+         }
+     }
+     else  /* special file */

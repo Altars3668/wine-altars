@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 01:24:00 -0400
+Subject: [PATCH] d2d1: Compile the shape shaders once per process.
+
+The shape shaders compile to the same bytecode for every device, and
+compiling them with vkd3d-shader takes a few hundred milliseconds. Office
+creates a Direct2D device for each Windows.Graphics.Capture session it
+starts to animate a popup, so every flyout and dropdown waited about
+400 ms before it appeared. Keep the compiled blobs for the lifetime of the
+module and hand each device a reference.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 79c1bf8dd61..079e9767f54 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -1015,6 +1015,7 @@ void d2d_factory_register_effect(struct d2d_factory *factory,
+         struct d2d_effect_registration *effect);
+ HRESULT d2d_effect_property_get_uint32_value(const struct d2d_effect_properties *properties,
+         const struct d2d_effect_property *prop, UINT32 *value);
++void d2d_device_release_shape_shaders(void);
+ HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
+         bool allow_get_dxgi_device);
+ 
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index a37aa2168de..1f7866dd015 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -6504,42 +6504,81 @@ struct d2d_device *unsafe_impl_from_ID2D1Device(ID2D1Device1 *iface)
+     return CONTAINING_RECORD(iface, struct d2d_device, ID2D1Device6_iface);
+ }
+ 
+-HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
+-    bool allow_get_dxgi_device)
++/* The shape shaders compile to the same bytecode for every device, and compiling them takes a
++ * few hundred milliseconds.  Applications may create a device for each window they animate, as
++ * Office does for every popup it fades in, so they are compiled once per process. */
++static SRWLOCK shape_shaders_lock = SRWLOCK_INIT;
++static ID3D10Blob *shape_vs_blobs[ARRAY_SIZE(shape_info)];
++static ID3D10Blob *shape_ps_blob;
++
++static HRESULT d2d_get_shape_shaders(ID3D10Blob **vs, ID3D10Blob **ps)
+ {
+-    HRESULT hr;
+-    ID3D10Blob *compiled;
++    HRESULT hr = S_OK;
++    unsigned int i;
+ 
+-    device->ID2D1Device6_iface.lpVtbl = &d2d_device_vtbl;
+-    device->refcount = 1;
+-    device->factory = factory;
+-    ID2D1Factory1_AddRef(device->factory);
+-    device->dxgi_device = dxgi_device;
+-    IDXGIDevice_AddRef(device->dxgi_device);
+-    device->allow_get_dxgi_device = allow_get_dxgi_device;
++    AcquireSRWLockExclusive(&shape_shaders_lock);
+ 
+-    for (unsigned int i = 0; i < ARRAY_SIZE(shape_info); ++i)
++    for (i = 0; i < ARRAY_SIZE(shape_info); ++i)
+     {
+         const struct shape_info *si = &shape_info[i];
+ 
++        if (shape_vs_blobs[i])
++            continue;
+         if (FAILED(hr = D3DCompile(si->vs_code, si->vs_code_size, si->name, NULL, NULL,
+-                "main", "vs_4_0", 0, 0, &compiled, NULL)))
++                "main", "vs_4_0", 0, 0, &shape_vs_blobs[i], NULL)))
+         {
+             WARN("Failed to compile shader for shape type %#x, hr %#lx.\n", si->shape_type, hr);
+-            return hr;
++            goto done;
+         }
+-        device->precompiled_shape_vs[i] = compiled;
+     }
+ 
+-    if (FAILED(hr = D3DCompile(shape_ps_code, sizeof(shape_ps_code) - 1, "ps", NULL, NULL,
+-            "main", "ps_4_1", 0, 0, &compiled, NULL)))
++    if (!shape_ps_blob && FAILED(hr = D3DCompile(shape_ps_code, sizeof(shape_ps_code) - 1, "ps", NULL, NULL,
++            "main", "ps_4_1", 0, 0, &shape_ps_blob, NULL)))
+     {
+         WARN("Failed to compile the pixel shader, hr %#lx.\n", hr);
+-        return hr;
++        goto done;
+     }
+-    device->precompiled_shape_ps = compiled;
+ 
+-    return S_OK;
++    for (i = 0; i < ARRAY_SIZE(shape_info); ++i)
++    {
++        vs[i] = shape_vs_blobs[i];
++        ID3D10Blob_AddRef(vs[i]);
++    }
++    *ps = shape_ps_blob;
++    ID3D10Blob_AddRef(*ps);
++
++done:
++    ReleaseSRWLockExclusive(&shape_shaders_lock);
++    return hr;
++}
++
++void d2d_device_release_shape_shaders(void)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(shape_info); ++i)
++    {
++        if (shape_vs_blobs[i])
++            ID3D10Blob_Release(shape_vs_blobs[i]);
++        shape_vs_blobs[i] = NULL;
++    }
++    if (shape_ps_blob)
++        ID3D10Blob_Release(shape_ps_blob);
++    shape_ps_blob = NULL;
++}
++
++HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
++    bool allow_get_dxgi_device)
++{
++    device->ID2D1Device6_iface.lpVtbl = &d2d_device_vtbl;
++    device->refcount = 1;
++    device->factory = factory;
++    ID2D1Factory1_AddRef(device->factory);
++    device->dxgi_device = dxgi_device;
++    IDXGIDevice_AddRef(device->dxgi_device);
++    device->allow_get_dxgi_device = allow_get_dxgi_device;
++
++    return d2d_get_shape_shaders(device->precompiled_shape_vs, &device->precompiled_shape_ps);
+ }
+ 
+ HRESULT d2d_device_add_indexed_object(struct d2d_indexed_objects *objects,
+diff --git a/dlls/d2d1/factory.c b/dlls/d2d1/factory.c
+index 95ccd3ce544..e58b5d8095c 100644
+--- a/dlls/d2d1/factory.c
++++ b/dlls/d2d1/factory.c
+@@ -1766,5 +1766,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
+ {
+     if (reason == DLL_PROCESS_ATTACH)
+         d2d_settings_init();
++    else if (reason == DLL_PROCESS_DETACH && !reserved)
++        d2d_device_release_shape_shaders();
+     return TRUE;
+ }

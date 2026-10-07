@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 03:40:20 -0400
+Subject: [PATCH] win32u, server: the work area has to follow the screen too.
+
+Picking a resolution left a strip along one edge that nothing drew into: the
+monitor rectangle had moved but the work area inside it had not, so every
+window laid out from the free area kept the shape a screen that is gone used to
+give it.
+
+Two things held it there.
+
+The work area is worked out once per process and kept behind an spi_loaded
+flag that nothing ever cleared, so after the first query it never changed again
+whatever the screen did.  It is dropped on a display change now, and
+WM_SETTINGCHANGE goes out for it as Windows sends one, because a program that
+lays itself out from the free area and never hears it has moved keeps the old
+shape regardless of what the next query would have said.
+
+Underneath that, the work area belongs to the window manager, and it publishes
+it after it has finished with a screen change -- not while the RandR event is
+being handled, which is when Wine last read it.  Reading it then gets the area
+the previous screen left free; nothing comes back for the real one.  Measured
+here: the manager had already published 1440x2944 while every Wine process went
+on answering 1440x1032, the area a 1920x1080 screen had left.
+
+So the key the driver answers with folds in the work area as well as the
+screen, and it is published to the shared desktop beside the monitors it was
+read from rather than kept per process.  A process that did not read the
+monitors itself has no other way of telling which host they came from -- the
+registry copy cannot say -- and keeping it privately meant the first process to
+look armed nothing and compared against nothing.  It is read from the same
+place the monitor serial already is, so the comparison costs a shared memory
+read.
+
+The key reads whichever of _GTK_WORKAREAS_D0 and _NET_WORKAREA get_work_area()
+would use, in the order it prefers them: watching the one it does not read
+would miss a change it sees, or report one it does not.
+
+Measured against a nested server resized twice under a held-open session: the
+monitor rectangle and the work area both follow, 1600x1200 to 1024x768 to
+1280x1024.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+(cherry picked from commit 05eed9863b6409f77047b195a8d6dcff2fc10c22)
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 5fed7ec6ca8..0320a839ce1 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -162,10 +162,9 @@ static struct list gpus = LIST_INIT(gpus);
+ static struct list sources = LIST_INIT(sources);
+ static struct list monitors = LIST_INIT(monitors);
+ static INT64 last_query_display_time;
+-/* What the driver answered when the configuration in use was read, and when it
+- * was last asked since.  See host_display_changed(). */
+-static UINT64 last_host_display_key;
+-static BOOL have_host_display_key;
++/* When the driver was last asked about the host.  What it answered when the
++ * monitors in use were read lives in the shared desktop, beside them.  See
++ * host_display_changed(). */
+ static ULONG last_host_display_check;
+ static UINT64 monitor_update_serial;
+ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -2462,6 +2461,7 @@ static void set_winstation_monitors( BOOL increment )
+ {
+     struct monitor_info *infos, *info;
+     struct monitor *monitor;
++    UINT64 host_key = 0;
+     struct ratio x, y;
+     UINT count;
+ 
+@@ -2469,6 +2469,8 @@ static void set_winstation_monitors( BOOL increment )
+     if (!(info = infos = calloc( count, sizeof(*infos) ))) return;
+ 
+     TRACE( "increment %u\n", increment );
++    user_driver->pGetHostDisplayKey( &host_key );
++
+     LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
+     {
+         if (is_monitor_primary( monitor )) info->flags |= MONITOR_FLAG_PRIMARY;
+@@ -2486,6 +2488,10 @@ static void set_winstation_monitors( BOOL increment )
+     SERVER_START_REQ( set_winstation_monitors )
+     {
+         req->increment = increment;
++        /* Recorded beside the monitors it belongs to: a process that did not
++         * read them itself has no other way of telling which host they came
++         * from, and the registry copy alone cannot say. */
++        req->host_key = host_key;
+         wine_server_add_data( req, infos, count * sizeof(*infos) );
+         if (!wine_server_call( req )) monitor_update_serial = reply->serial;
+     }
+@@ -2915,19 +2921,32 @@ void reset_monitor_update_serial(void)
+  * used to last for the life of the session. */
+ #define HOST_DISPLAY_CHECK_INTERVAL 500 /* ms */
+ 
++static UINT64 get_published_host_display_key(void)
++{
++    struct object_lock lock = OBJECT_LOCK_INIT;
++    const desktop_shm_t *desktop_shm;
++    UINT64 key = 0;
++    NTSTATUS status;
++
++    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
++        key = desktop_shm->host_display_key;
++
++    return status ? 0 : key;
++}
++
+ static BOOL host_display_changed(void)
+ {
+     ULONG now = NtGetTickCount();
+-    UINT64 key;
++    UINT64 key, published;
+ 
+-    if (!have_host_display_key) return FALSE;
+     if (now - last_host_display_check < HOST_DISPLAY_CHECK_INTERVAL) return FALSE;
+     last_host_display_check = now;
+ 
++    if (!(published = get_published_host_display_key())) return FALSE;
+     if (!user_driver->pGetHostDisplayKey( &key )) return FALSE;
+-    if (key == last_host_display_key) return FALSE;
++    if (key == published) return FALSE;
+ 
+-    TRACE( "host display key changed from %#I64x to %#I64x.\n", last_host_display_key, key );
++    TRACE( "host display key %#I64x no longer matches the published %#I64x.\n", key, published );
+     return TRUE;
+ }
+ 
+@@ -2988,11 +3007,6 @@ static BOOL lock_display_devices( BOOL force )
+         else WARN( "Failed to update display devices, status %#x\n", status );
+         release_display_manager_ctx( &ctx );
+ 
+-        /* Taken now, beside the configuration it belongs to: a key read at any
+-         * other moment describes a host this configuration was not read from. */
+-        have_host_display_key = user_driver->pGetHostDisplayKey( &last_host_display_key );
+-        last_host_display_check = NtGetTickCount();
+-
+         ret = update_display_cache_from_registry( serial );
+     }
+ 
+@@ -4535,6 +4549,13 @@ static BOOL get_primary_source_mode( DEVMODEW *mode )
+     return ret;
+ }
+ 
++/* The work area is worked out once and kept.  Nothing invalidated it when the
++ * screen changed, so every process went on placing maximised windows and
++ * dialogs against the area a screen that is gone used to leave free -- a strip
++ * along one edge that nothing draws into and nothing can be dragged out of.
++ * Windows recomputes it with the screen and tells applications so. */
++static void invalidate_work_area(void);
++
+ static void display_mode_changed( BOOL broadcast )
+ {
+     DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
+@@ -4550,6 +4571,13 @@ static void display_mode_changed( BOOL broadcast )
+         return;
+     }
+ 
++    invalidate_work_area();
++    /* Windows tells applications the work area moved as well as the screen;
++     * one that lays its window out from the free area and never hears about it
++     * keeps the shape the old screen gave it. */
++    send_message_timeout( HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWORKAREA, 0,
++                          SMTO_ABORTIFHUNG, 2000, FALSE );
++
+     if (!broadcast)
+     {
+         HWND desktop = get_desktop_window();
+@@ -5935,6 +5963,13 @@ enum spi_index
+ /* indicators whether system parameter value is loaded */
+ static char spi_loaded[SPI_INDEX_COUNT];
+ 
++/* Drop the remembered work area so the next caller works it out from the
++ * screen that is there now.  Called from display_mode_changed(). */
++static void invalidate_work_area(void)
++{
++    spi_loaded[SPI_SETWORKAREA_IDX] = FALSE;
++}
++
+ static struct sysparam_rgb_entry system_colors[] =
+ {
+ #define RGB_ENTRY(name,val,reg) { { get_rgb_entry, set_rgb_entry, init_rgb_entry, COLORS_KEY, reg }, (val) }
+diff --git a/dlls/winex11.drv/display.c b/dlls/winex11.drv/display.c
+index 8b6c73f6390..6e3447858bc 100644
+--- a/dlls/winex11.drv/display.c
++++ b/dlls/winex11.drv/display.c
+@@ -304,6 +304,40 @@ BOOL X11DRV_GetHostDisplayKey( UINT64 *key )
+         return FALSE;
+ 
+     *key = ((UINT64)width << 32) | height;
++
++    /* The work area belongs to the window manager, and it publishes it after
++     * it has finished with a screen change -- not while the RandR event is
++     * being handled, which is when the work areas were last read.  Reading it
++     * then gets the area the previous screen left free and nothing comes back
++     * for the real one, so maximised windows and dialogs keep the shape of a
++     * screen that is gone.  Folding it in here is what notices that, without
++     * having to guess when the window manager settles. */
++    {
++        /* The same two properties get_work_area() reads, in the order it
++         * prefers them: watching the one it does not use would miss a change
++         * it does see, or report one it does not. */
++        static const unsigned int atoms[] = { XATOM__GTK_WORKAREAS_D0, XATOM__NET_WORKAREA };
++        unsigned long count, remaining;
++        int format, i;
++        Atom type;
++        long *area;
++
++        for (i = 0; i < ARRAY_SIZE(atoms); i++)
++        {
++            if (XGetWindowProperty( gdi_display, DefaultRootWindow( gdi_display ),
++                                    X11DRV_Atoms[atoms[i] - FIRST_XATOM], 0, 4, False, XA_CARDINAL,
++                                    &type, &format, &count, &remaining, (unsigned char **)&area ))
++                continue;
++            if (type == XA_CARDINAL && format == 32 && count >= 4)
++            {
++                *key ^= ((UINT64)(area[2] & 0xffff) << 48) | ((UINT64)(area[3] & 0xffff) << 16);
++                XFree( area );
++                break;
++            }
++            if (area) XFree( area );
++        }
++    }
++
+     return TRUE;
+ }
+ 
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index e2ef2f54e3f..d12c1dd3ac3 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1004,6 +1004,7 @@ typedef volatile struct
+     struct shared_cursor cursor;
+     unsigned char        keystate[256];
+     unsigned __int64     monitor_serial;
++    unsigned __int64     host_display_key;
+     unsigned __int64     keystate_serial;
+ } desktop_shm_t;
+ 
+@@ -4071,6 +4072,7 @@ struct set_winstation_monitors_request
+ {
+     struct request_header __header;
+     int              increment;
++    unsigned __int64 host_key;
+     /* VARARG(infos,monitor_infos); */
+ };
+ struct set_winstation_monitors_reply
+@@ -7184,6 +7186,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 962
++#define SERVER_PROTOCOL_VERSION 963
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/protocol.def b/server/protocol.def
+index 59aaa22ba58..040f65a1ad8 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1020,6 +1020,7 @@ typedef volatile struct
+     struct shared_cursor cursor;           /* global cursor information */
+     unsigned char        keystate[256];    /* asynchronous key state */
+     unsigned __int64     monitor_serial;   /* winstation monitor update counter */
++    unsigned __int64     host_display_key; /* driver's view of the host when the monitors were read */
+     unsigned __int64     keystate_serial;  /* keystate update counter */
+ } desktop_shm_t;
+ 
+@@ -3009,6 +3010,7 @@ enum coords_relative
+ /* Update the process current window station monitors */
+ @REQ(set_winstation_monitors)
+     int              increment;   /* force increment the monitor update counter */
++    unsigned __int64 host_key;    /* driver's view of the host these were read from */
+     VARARG(infos,monitor_infos);  /* window station monitors */
+ @REPLY
+     unsigned __int64 serial;      /* winstation monitor update counter */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 950b1bb9a77..254946c009b 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -1679,7 +1679,8 @@ C_ASSERT( sizeof(struct open_winstation_reply) == 16 );
+ C_ASSERT( offsetof(struct close_winstation_request, handle) == 12 );
+ C_ASSERT( sizeof(struct close_winstation_request) == 16 );
+ C_ASSERT( offsetof(struct set_winstation_monitors_request, increment) == 12 );
+-C_ASSERT( sizeof(struct set_winstation_monitors_request) == 16 );
++C_ASSERT( offsetof(struct set_winstation_monitors_request, host_key) == 16 );
++C_ASSERT( sizeof(struct set_winstation_monitors_request) == 24 );
+ C_ASSERT( offsetof(struct set_winstation_monitors_reply, serial) == 8 );
+ C_ASSERT( sizeof(struct set_winstation_monitors_reply) == 16 );
+ C_ASSERT( sizeof(struct get_process_winstation_request) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index f6acb476209..3a926132780 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -2066,6 +2066,7 @@ static void dump_close_winstation_request( const struct close_winstation_request
+ static void dump_set_winstation_monitors_request( const struct set_winstation_monitors_request *req )
+ {
+     fprintf( stderr, " increment=%d", req->increment );
++    dump_uint64( ", host_key=", &req->host_key );
+     dump_varargs_monitor_infos( ", infos=", cur_size );
+ }
+ 
+diff --git a/server/winstation.c b/server/winstation.c
+index e2aad1edeb1..c0564feba4e 100644
+--- a/server/winstation.c
++++ b/server/winstation.c
+@@ -637,6 +637,7 @@ DECL_HANDLER(set_winstation_monitors)
+         SHARED_WRITE_BEGIN( desktop->shared, desktop_shm_t )
+         {
+             shared->monitor_serial = winstation->monitor_serial;
++            shared->host_display_key = req->host_key;
+         }
+         SHARED_WRITE_END;
+     }

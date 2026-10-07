@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 11:56:14 -0400
+Subject: [PATCH] user32, win32u: keep DPI hosting behaviors, and answer
+ EnableNonClientDpiScaling as Windows does.
+
+Word sets its threads' DPI hosting behavior and asks EnableNonClientDpiScaling
+for its windows, and all three answered from stubs.
+
+SetThreadDpiHostingBehavior keeps the behavior in the thread's info and
+hands back the one before, and refuses anything but default and mixed
+with DPI_HOSTING_BEHAVIOR_INVALID and ERROR_INVALID_PARAMETER.  A window
+keeps the behavior its thread had as it was made, which is what
+GetWindowDpiHostingBehavior says; for what is no window it says invalid.
+
+EnableNonClientDpiScaling succeeds only for a thread aware of each
+monitor's DPI, only in the WM_NCCREATE of the window it names, which
+win32u now marks while it sends it.  As on Windows, the first version of
+that awareness also sets the last error to 0, the second, which scales
+the frame anyway, leaves it alone, and anything else fails without a
+word; a handle that is no window fails with ERROR_INVALID_WINDOW_HANDLE.
+
+The errors are those of tools/dpihostprobe, which asks one call at a
+time; sysprobe had read GetLastError() in the argument list of the call
+it reported on, which x64 evaluates first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit d2a2350546a7f93de790cc56dd5988ba849a41e7)
+
+diff --git a/dlls/user32/sysparams.c b/dlls/user32/sysparams.c
+index da0e9f41374..7787ebb25bc 100644
+--- a/dlls/user32/sysparams.c
++++ b/dlls/user32/sysparams.c
+@@ -784,9 +784,23 @@ BOOL WINAPI IsProcessDPIAware(void)
+  */
+ BOOL WINAPI EnableNonClientDpiScaling( HWND hwnd )
+ {
+-    FIXME("(%p): stub\n", hwnd);
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    DPI_AWARENESS_CONTEXT context = GetThreadDpiAwarenessContext();
++
++    TRACE("(%p)\n", hwnd);
++
++    if (!IsWindow( hwnd ))
++    {
++        SetLastError( ERROR_INVALID_WINDOW_HANDLE );
++        return FALSE;
++    }
++    /* As on Windows: it is for a per monitor aware thread to call as it creates the window, in WM_NCCREATE,
++     * and fails without saying why otherwise.  The second version of that awareness scales the frame anyway,
++     * and the call changes nothing, not even the last error. */
++    if (GetAwarenessFromDpiAwarenessContext( context ) != DPI_AWARENESS_PER_MONITOR_AWARE ||
++        NtUserGetThreadInfo()->nccreate_window != HandleToUlong( hwnd ))
++        return FALSE;
++    if (NTUSER_DPI_CONTEXT_GET_VERSION( get_ntuser_dpi_context( context )) < 2) SetLastError( ERROR_SUCCESS );
++    return TRUE;
+ }
+ 
+ /***********************************************************************
+@@ -822,8 +836,8 @@ DPI_AWARENESS_CONTEXT WINAPI SetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT
+  */
+ DPI_HOSTING_BEHAVIOR WINAPI GetThreadDpiHostingBehavior( void )
+ {
+-    FIXME("(): stub\n");
+-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
++    TRACE("()\n");
++    return NtUserGetThreadInfo()->dpi_hosting;
+ }
+ 
+ /**********************************************************************
+@@ -831,8 +845,19 @@ DPI_HOSTING_BEHAVIOR WINAPI GetThreadDpiHostingBehavior( void )
+  */
+ DPI_HOSTING_BEHAVIOR WINAPI SetThreadDpiHostingBehavior( DPI_HOSTING_BEHAVIOR value )
+ {
+-    FIXME("(%d): stub\n", value);
+-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
++    struct ntuser_thread_info *info = NtUserGetThreadInfo();
++    DPI_HOSTING_BEHAVIOR old;
++
++    TRACE("(%d)\n", value);
++
++    if (value != DPI_HOSTING_BEHAVIOR_DEFAULT && value != DPI_HOSTING_BEHAVIOR_MIXED)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return DPI_HOSTING_BEHAVIOR_INVALID;
++    }
++    old = info->dpi_hosting;
++    info->dpi_hosting = value;
++    return old;
+ }
+ 
+ /***********************************************************************
+diff --git a/dlls/user32/tests/sysparams.c b/dlls/user32/tests/sysparams.c
+index 1c296448265..bc404afe9c4 100644
+--- a/dlls/user32/tests/sysparams.c
++++ b/dlls/user32/tests/sysparams.c
+@@ -51,6 +51,10 @@ static BOOL (WINAPI *pPhysicalToLogicalPointForPerMonitorDPI)(HWND,POINT*);
+ static LONG (WINAPI *pGetAutoRotationState)(PAR_STATE);
+ static BOOL (WINAPI *pAreDpiAwarenessContextsEqual)(DPI_AWARENESS_CONTEXT,DPI_AWARENESS_CONTEXT);
+ static LONG (WINAPI *pGetDpiFromDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
++static DPI_HOSTING_BEHAVIOR (WINAPI *pGetThreadDpiHostingBehavior)(void);
++static DPI_HOSTING_BEHAVIOR (WINAPI *pSetThreadDpiHostingBehavior)(DPI_HOSTING_BEHAVIOR);
++static DPI_HOSTING_BEHAVIOR (WINAPI *pGetWindowDpiHostingBehavior)(HWND);
++static BOOL (WINAPI *pEnableNonClientDpiScaling)(HWND);
+ 
+ static BOOL strict;
+ static int dpi, real_dpi;
+@@ -4512,6 +4516,128 @@ static LRESULT CALLBACK dpi_winproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
+     return DefWindowProcA( hwnd, msg, wp, lp );
+ }
+ 
++static void test_dpi_hosting_behavior(void)
++{
++    DPI_HOSTING_BEHAVIOR ret;
++    HWND hwnd, mixed;
++    int value;
++
++    if (!pGetThreadDpiHostingBehavior)
++    {
++        win_skip( "GetThreadDpiHostingBehavior is not available\n" );
++        return;
++    }
++
++    ret = pGetThreadDpiHostingBehavior();
++    ok( ret == DPI_HOSTING_BEHAVIOR_DEFAULT, "got %d\n", ret );
++    hwnd = CreateWindowA( "static", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ret = pSetThreadDpiHostingBehavior( DPI_HOSTING_BEHAVIOR_MIXED );
++    ok( ret == DPI_HOSTING_BEHAVIOR_DEFAULT, "got %d\n", ret );
++    ret = pGetThreadDpiHostingBehavior();
++    ok( ret == DPI_HOSTING_BEHAVIOR_MIXED, "got %d\n", ret );
++    /* a window keeps the behavior its thread had as it was made */
++    mixed = CreateWindowA( "static", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ret = pSetThreadDpiHostingBehavior( DPI_HOSTING_BEHAVIOR_DEFAULT );
++    ok( ret == DPI_HOSTING_BEHAVIOR_MIXED, "got %d\n", ret );
++
++    for (value = -1; value <= 2; value += 3)
++    {
++        SetLastError( 0xdeadbeef );
++        ret = pSetThreadDpiHostingBehavior( value );
++        ok( ret == DPI_HOSTING_BEHAVIOR_INVALID, "%d: got %d\n", value, ret );
++        ok( GetLastError() == ERROR_INVALID_PARAMETER, "%d: got error %lu\n", value, GetLastError() );
++        ret = pGetThreadDpiHostingBehavior();
++        ok( ret == DPI_HOSTING_BEHAVIOR_DEFAULT, "%d: got %d\n", value, ret );
++    }
++
++    ret = pGetWindowDpiHostingBehavior( hwnd );
++    ok( ret == DPI_HOSTING_BEHAVIOR_DEFAULT, "got %d\n", ret );
++    ret = pGetWindowDpiHostingBehavior( mixed );
++    ok( ret == DPI_HOSTING_BEHAVIOR_MIXED, "got %d\n", ret );
++    ret = pGetWindowDpiHostingBehavior( NULL );
++    ok( ret == DPI_HOSTING_BEHAVIOR_INVALID, "got %d\n", ret );
++    ret = pGetWindowDpiHostingBehavior( GetDesktopWindow() );
++    ok( ret == DPI_HOSTING_BEHAVIOR_DEFAULT, "got %d\n", ret );
++    DestroyWindow( mixed );
++    DestroyWindow( hwnd );
++}
++
++static BOOL nc_scaling_ret;
++static DWORD nc_scaling_error;
++
++static LRESULT CALLBACK nc_scaling_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    if (msg == WM_NCCREATE)
++    {
++        SetLastError( 0xdeadbeef );
++        nc_scaling_ret = pEnableNonClientDpiScaling( hwnd );
++        nc_scaling_error = GetLastError();
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static void test_EnableNonClientDpiScaling(void)
++{
++    DPI_AWARENESS_CONTEXT orig;
++    WNDCLASSW cls = {0};
++    HWND hwnd;
++    BOOL ret;
++
++    if (!pEnableNonClientDpiScaling)
++    {
++        win_skip( "EnableNonClientDpiScaling is not available\n" );
++        return;
++    }
++    cls.lpfnWndProc = nc_scaling_wndproc;
++    cls.lpszClassName = L"nc_scaling";
++    RegisterClassW( &cls );
++
++    /* only a window of a thread aware of each monitor's DPI scales its frame, and says so only as it is made */
++    orig = pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
++    nc_scaling_ret = 2;
++    hwnd = CreateWindowW( L"nc_scaling", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ok( !nc_scaling_ret, "got %d\n", nc_scaling_ret );
++    ok( nc_scaling_error == 0xdeadbeef, "got error %lu\n", nc_scaling_error );
++    SetLastError( 0xdeadbeef );
++    ret = pEnableNonClientDpiScaling( hwnd );
++    ok( !ret, "EnableNonClientDpiScaling succeeded\n" );
++    ok( GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError() );
++    DestroyWindow( hwnd );
++
++    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
++    nc_scaling_ret = 2;
++    hwnd = CreateWindowW( L"nc_scaling", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ok( !nc_scaling_ret, "got %d\n", nc_scaling_ret );
++    DestroyWindow( hwnd );
++
++    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE );
++    nc_scaling_ret = 2;
++    hwnd = CreateWindowW( L"nc_scaling", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ok( nc_scaling_ret == TRUE, "got %d, error %lu\n", nc_scaling_ret, nc_scaling_error );
++    ok( nc_scaling_error == ERROR_SUCCESS, "got error %lu\n", nc_scaling_error );
++    SetLastError( 0xdeadbeef );
++    ret = pEnableNonClientDpiScaling( hwnd );
++    ok( !ret, "EnableNonClientDpiScaling succeeded\n" );
++    ok( GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError() );
++    DestroyWindow( hwnd );
++
++    /* which scales its frame anyway */
++    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
++    nc_scaling_ret = 2;
++    hwnd = CreateWindowW( L"nc_scaling", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ok( nc_scaling_ret == TRUE, "got %d, error %lu\n", nc_scaling_ret, nc_scaling_error );
++    ok( nc_scaling_error == 0xdeadbeef, "got error %lu\n", nc_scaling_error );
++    DestroyWindow( hwnd );
++
++    SetLastError( 0xdeadbeef );
++    ret = pEnableNonClientDpiScaling( NULL );
++    ok( !ret, "EnableNonClientDpiScaling succeeded\n" );
++    ok( GetLastError() == ERROR_INVALID_WINDOW_HANDLE, "got error %lu\n", GetLastError() );
++
++    pSetThreadDpiAwarenessContext( orig );
++    UnregisterClassW( L"nc_scaling", NULL );
++}
++
+ static void test_dpi_window(void)
+ {
+     DPI_AWARENESS_CONTEXT context, orig;
+@@ -4716,6 +4842,10 @@ START_TEST(sysparams)
+     pGetAutoRotationState = (void*)GetProcAddress(hdll, "GetAutoRotationState");
+     pAreDpiAwarenessContextsEqual = (void*)GetProcAddress(hdll, "AreDpiAwarenessContextsEqual");
+     pGetDpiFromDpiAwarenessContext = (void*)GetProcAddress(hdll, "GetDpiFromDpiAwarenessContext");
++    pGetThreadDpiHostingBehavior = (void*)GetProcAddress(hdll, "GetThreadDpiHostingBehavior");
++    pSetThreadDpiHostingBehavior = (void*)GetProcAddress(hdll, "SetThreadDpiHostingBehavior");
++    pGetWindowDpiHostingBehavior = (void*)GetProcAddress(hdll, "GetWindowDpiHostingBehavior");
++    pEnableNonClientDpiScaling = (void*)GetProcAddress(hdll, "EnableNonClientDpiScaling");
+ 
+     hInstance = GetModuleHandleA( NULL );
+     hdc = GetDC(0);
+@@ -4787,6 +4917,8 @@ START_TEST(sysparams)
+         test_dpi_context();
+         test_dpi_mapping();
+         test_dpi_window();
++        test_dpi_hosting_behavior();
++        test_EnableNonClientDpiScaling();
+     }
+     else win_skip( "SetThreadDpiAwarenessContext not supported\n" );
+ 
+diff --git a/dlls/user32/win.c b/dlls/user32/win.c
+index bcf88ee21bd..9ed765732ef 100644
+--- a/dlls/user32/win.c
++++ b/dlls/user32/win.c
+@@ -593,8 +593,11 @@ DPI_AWARENESS_CONTEXT WINAPI GetDpiAwarenessContextForProcess(HANDLE process)
+  */
+ DPI_HOSTING_BEHAVIOR WINAPI GetWindowDpiHostingBehavior( HWND hwnd )
+ {
+-    FIXME("(%p): stub\n", hwnd);
+-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
++    TRACE("(%p)\n", hwnd);
++
++    /* what the thread that made the window said when it made it */
++    if (!IsWindow( hwnd )) return DPI_HOSTING_BEHAVIOR_INVALID;
++    return GetPropW( hwnd, L"__wine_dpi_hosting_mixed" ) ? DPI_HOSTING_BEHAVIOR_MIXED : DPI_HOSTING_BEHAVIOR_DEFAULT;
+ }
+ 
+ 
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index d436ceb877f..fc6d86fc8b8 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -6252,13 +6252,30 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
+     }
+     if (surface) window_surface_release( surface );
+ 
+-    /* send WM_NCCREATE */
++    /* the DPI hosting behavior of the thread is the window's */
++    if (get_user_thread_info()->client_info->dpi_hosting == DPI_HOSTING_BEHAVIOR_MIXED)
++    {
++        static const WCHAR dpi_hosting_mixed[] = {'_','_','w','i','n','e','_','d','p','i','_','h','o','s','t','i','n','g',
++                                                  '_','m','i','x','e','d',0};
++        NtUserSetProp( hwnd, dpi_hosting_mixed, (HANDLE)1 );
++    }
++
++    /* send WM_NCCREATE, the one time EnableNonClientDpiScaling can be called */
+ 
+     TRACE( "hwnd %p cs %d,%d %dx%d %s\n", hwnd, cs.x, cs.y, cs.cx, cs.cy, debugstr_window_rects(&new_rects) );
+-    if (!send_message_timeout( hwnd, WM_NCCREATE, 0, (LPARAM)&cs, SMTO_NORMAL, 0, ansi ))
+     {
+-        WARN( "%p: aborted by WM_NCCREATE\n", hwnd );
+-        goto failed;
++        struct ntuser_thread_info *thread_info = get_user_thread_info()->client_info;
++        UINT prev = thread_info->nccreate_window;
++        BOOL ret;
++
++        thread_info->nccreate_window = HandleToUlong( hwnd );
++        ret = send_message_timeout( hwnd, WM_NCCREATE, 0, (LPARAM)&cs, SMTO_NORMAL, 0, ansi );
++        thread_info->nccreate_window = prev;
++        if (!ret)
++        {
++            WARN( "%p: aborted by WM_NCCREATE\n", hwnd );
++            goto failed;
++        }
+     }
+ 
+     /* create default IME window */
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 58e50fac5c8..a761b378560 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -126,6 +126,8 @@ struct ntuser_thread_info
+     UINT           dpi_context;       /* DPI awareness context */
+     UINT64         client_imm;        /* client IMM thread info */
+     UINT64         wmchar_data;       /* client data for WM_CHAR mappings */
++    UINT           dpi_hosting;       /* DPI hosting behavior of the windows it creates */
++    UINT           nccreate_window;   /* window being sent WM_NCCREATE */
+ };
+ 
+ #ifndef WINE_UNIX_LIB

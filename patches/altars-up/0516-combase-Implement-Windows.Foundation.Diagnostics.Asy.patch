@@ -1,0 +1,569 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 00:29:55 -0400
+Subject: [PATCH] combase: Implement
+ Windows.Foundation.Diagnostics.AsyncCausalityTracer.
+
+Office's asynchronous operations ask for the tracer that tells a
+debugger where they begin and end, a class combase has on Windows; Wine
+had no such class.  As on Windows 11 the factory is the only object,
+agile, with the statics and no instances or class name; traces check
+their level and source and go nowhere, as nothing here listens for
+them, and status handlers are kept and dropped (tools/startupgapsprobe
+causality).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/combase/Makefile.in b/dlls/combase/Makefile.in
+index f0acc33751f..f3d10bb9f00 100644
+--- a/dlls/combase/Makefile.in
++++ b/dlls/combase/Makefile.in
+@@ -6,6 +6,8 @@ DELAYIMPORTS = oleaut32
+ 
+ SOURCES = \
+ 	apartment.c \
++	causality.c \
++	classes.idl \
+ 	combase.c \
+ 	dcom.idl \
+ 	errorinfo.c \
+diff --git a/dlls/combase/causality.c b/dlls/combase/causality.c
+new file mode 100644
+index 00000000000..d1c8c2bfd5e
+--- /dev/null
++++ b/dlls/combase/causality.c
+@@ -0,0 +1,301 @@
++/*
++ * Windows.Foundation.Diagnostics.AsyncCausalityTracer
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++#include "objbase.h"
++#include "winstring.h"
++#include "activation.h"
++#include "initguid.h"
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Foundation_Diagnostics
++#include "windows.foundation.diagnostics.h"
++
++#include "combase_private.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(combase);
++
++/*
++ * The tracer tells a debugger listening for it where asynchronous operations begin, end and continue.  Nothing here
++ * listens, so the traces go nowhere; what is checked is what Windows 11 checks: the level and the source.  The
++ * factory is the only object, it is agile, and it makes no instances.
++ */
++
++struct status_handler
++{
++    struct list entry;
++    IEventHandler_TracingStatusChangedEventArgs *handler;
++    EventRegistrationToken token;
++};
++
++static struct list status_handlers = LIST_INIT( status_handlers );
++static LONGLONG next_token = 1;
++static CRITICAL_SECTION handlers_cs;
++static CRITICAL_SECTION_DEBUG handlers_cs_debug =
++{
++    0, 0, &handlers_cs,
++    { &handlers_cs_debug.ProcessLocksList, &handlers_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": handlers_cs") }
++};
++static CRITICAL_SECTION handlers_cs = { &handlers_cs_debug, -1, 0, 0, 0, 0 };
++
++struct causality_tracer
++{
++    IActivationFactory IActivationFactory_iface;
++    IAsyncCausalityTracerStatics IAsyncCausalityTracerStatics_iface;
++};
++
++static struct causality_tracer *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct causality_tracer, IActivationFactory_iface );
++}
++
++static struct causality_tracer *impl_from_IAsyncCausalityTracerStatics( IAsyncCausalityTracerStatics *iface )
++{
++    return CONTAINING_RECORD( iface, struct causality_tracer, IAsyncCausalityTracerStatics_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct causality_tracer *tracer = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &tracer->IActivationFactory_iface;
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncCausalityTracerStatics ))
++    {
++        *out = &tracer->IAsyncCausalityTracerStatics_iface;
++        return S_OK;
++    }
++
++    WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    TRACE( "iface %p, count %p, iids %p.\n", iface, count, iids );
++
++    if (!(*iids = CoTaskMemAlloc( 2 * sizeof(IID) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = IID_IActivationFactory;
++    (*iids)[1] = IID_IAsyncCausalityTracerStatics;
++    *count = 2;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return E_ILLEGAL_METHOD_CALL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    *instance = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++static HRESULT WINAPI statics_QueryInterface( IAsyncCausalityTracerStatics *iface, REFIID iid, void **out )
++{
++    struct causality_tracer *tracer = impl_from_IAsyncCausalityTracerStatics( iface );
++    return IActivationFactory_QueryInterface( &tracer->IActivationFactory_iface, iid, out );
++}
++
++static ULONG WINAPI statics_AddRef( IAsyncCausalityTracerStatics *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI statics_Release( IAsyncCausalityTracerStatics *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI statics_GetIids( IAsyncCausalityTracerStatics *iface, ULONG *count, IID **iids )
++{
++    struct causality_tracer *tracer = impl_from_IAsyncCausalityTracerStatics( iface );
++    return IActivationFactory_GetIids( &tracer->IActivationFactory_iface, count, iids );
++}
++
++static HRESULT WINAPI statics_GetRuntimeClassName( IAsyncCausalityTracerStatics *iface, HSTRING *class_name )
++{
++    struct causality_tracer *tracer = impl_from_IAsyncCausalityTracerStatics( iface );
++    return IActivationFactory_GetRuntimeClassName( &tracer->IActivationFactory_iface, class_name );
++}
++
++static HRESULT WINAPI statics_GetTrustLevel( IAsyncCausalityTracerStatics *iface, TrustLevel *trust_level )
++{
++    struct causality_tracer *tracer = impl_from_IAsyncCausalityTracerStatics( iface );
++    return IActivationFactory_GetTrustLevel( &tracer->IActivationFactory_iface, trust_level );
++}
++
++static BOOL valid_trace( CausalityTraceLevel level, CausalitySource source )
++{
++    return level <= CausalityTraceLevel_Verbose && source <= CausalitySource_System;
++}
++
++static HRESULT WINAPI statics_TraceOperationCreation( IAsyncCausalityTracerStatics *iface, CausalityTraceLevel level,
++                                                      CausalitySource source, GUID platform_id, UINT64 operation_id,
++                                                      HSTRING operation_name, UINT64 related_context )
++{
++    TRACE( "iface %p, level %u, source %u, platform_id %s, operation_id %#I64x, operation_name %s, related_context %#I64x.\n",
++           iface, level, source, debugstr_guid(&platform_id), operation_id, debugstr_hstring(operation_name),
++           related_context );
++    return valid_trace( level, source ) ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI statics_TraceOperationCompletion( IAsyncCausalityTracerStatics *iface, CausalityTraceLevel level,
++                                                        CausalitySource source, GUID platform_id, UINT64 operation_id,
++                                                        AsyncStatus status )
++{
++    TRACE( "iface %p, level %u, source %u, platform_id %s, operation_id %#I64x, status %u.\n", iface, level, source,
++           debugstr_guid(&platform_id), operation_id, status );
++    return valid_trace( level, source ) ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI statics_TraceOperationRelation( IAsyncCausalityTracerStatics *iface, CausalityTraceLevel level,
++                                                      CausalitySource source, GUID platform_id, UINT64 operation_id,
++                                                      CausalityRelation relation )
++{
++    TRACE( "iface %p, level %u, source %u, platform_id %s, operation_id %#I64x, relation %u.\n", iface, level, source,
++           debugstr_guid(&platform_id), operation_id, relation );
++    return valid_trace( level, source ) ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI statics_TraceSynchronousWorkStart( IAsyncCausalityTracerStatics *iface, CausalityTraceLevel level,
++                                                         CausalitySource source, GUID platform_id, UINT64 operation_id,
++                                                         CausalitySynchronousWork work )
++{
++    TRACE( "iface %p, level %u, source %u, platform_id %s, operation_id %#I64x, work %u.\n", iface, level, source,
++           debugstr_guid(&platform_id), operation_id, work );
++    return valid_trace( level, source ) ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI statics_TraceSynchronousWorkCompletion( IAsyncCausalityTracerStatics *iface,
++                                                              CausalityTraceLevel level, CausalitySource source,
++                                                              CausalitySynchronousWork work )
++{
++    TRACE( "iface %p, level %u, source %u, work %u.\n", iface, level, source, work );
++    return valid_trace( level, source ) ? S_OK : E_INVALIDARG;
++}
++
++/* handlers are kept for a listener coming and going, which never happens here */
++static HRESULT WINAPI statics_add_TracingStatusChanged( IAsyncCausalityTracerStatics *iface,
++                                                        IEventHandler_TracingStatusChangedEventArgs *handler,
++                                                        EventRegistrationToken *token )
++{
++    struct status_handler *entry;
++
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++
++    if (!handler || !token) return E_INVALIDARG;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    IEventHandler_TracingStatusChangedEventArgs_AddRef( (entry->handler = handler) );
++    EnterCriticalSection( &handlers_cs );
++    entry->token.value = next_token++;
++    list_add_tail( &status_handlers, &entry->entry );
++    LeaveCriticalSection( &handlers_cs );
++    *token = entry->token;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_remove_TracingStatusChanged( IAsyncCausalityTracerStatics *iface,
++                                                           EventRegistrationToken token )
++{
++    struct status_handler *entry;
++
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++
++    EnterCriticalSection( &handlers_cs );
++    LIST_FOR_EACH_ENTRY( entry, &status_handlers, struct status_handler, entry )
++    {
++        if (entry->token.value != token.value) continue;
++        list_remove( &entry->entry );
++        LeaveCriticalSection( &handlers_cs );
++        IEventHandler_TracingStatusChangedEventArgs_Release( entry->handler );
++        free( entry );
++        return S_OK;
++    }
++    LeaveCriticalSection( &handlers_cs );
++    /* a token that is not there is no error */
++    return S_OK;
++}
++
++static const struct IAsyncCausalityTracerStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_TraceOperationCreation,
++    statics_TraceOperationCompletion,
++    statics_TraceOperationRelation,
++    statics_TraceSynchronousWorkStart,
++    statics_TraceSynchronousWorkCompletion,
++    statics_add_TracingStatusChanged,
++    statics_remove_TracingStatusChanged,
++};
++
++static struct causality_tracer causality_tracer =
++{
++    { &factory_vtbl },
++    { &statics_vtbl },
++};
++
++IActivationFactory *causality_tracer_factory = &causality_tracer.IActivationFactory_iface;
+diff --git a/dlls/combase/classes.idl b/dlls/combase/classes.idl
+new file mode 100644
+index 00000000000..0e88cc1a3c3
+--- /dev/null
++++ b/dlls/combase/classes.idl
+@@ -0,0 +1,33 @@
++/*
++ * The runtime classes combase has
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++#pragma winrt ns_prefix
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++import "windows.foundation.diagnostics.idl";
++
++namespace Windows.Foundation.Diagnostics {
++    runtimeclass AsyncCausalityTracer;
++}
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index 58682380937..af3b087efa6 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -33,6 +33,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(combase);
+ 
++extern IActivationFactory *causality_tracer_factory;
++
+ struct activatable_class_data
+ {
+     ULONG size;
+@@ -695,8 +697,19 @@ void WINAPI CleanupTlsOleState(void *unknown)
+  */
+ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **factory)
+ {
+-    FIXME("(%s, %p): stub\n", debugstr_hstring(classid), factory);
++    const WCHAR *name = WindowsGetStringRawBuffer(classid, NULL);
++
++    TRACE("(%s, %p)\n", debugstr_hstring(classid), factory);
++
++    if (!wcscmp(name, L"Windows.Foundation.Diagnostics.AsyncCausalityTracer"))
++    {
++        *factory = causality_tracer_factory;
++        IActivationFactory_AddRef(*factory);
++        return S_OK;
++    }
+ 
++    FIXME("class %s not implemented\n", debugstr_hstring(classid));
++    *factory = NULL;
+     return REGDB_E_CLASSNOTREG;
+ }
+ 
+diff --git a/dlls/combase/tests/roapi.c b/dlls/combase/tests/roapi.c
+index d436fa6ed3f..fc5530c9064 100644
+--- a/dlls/combase/tests/roapi.c
++++ b/dlls/combase/tests/roapi.c
+@@ -27,6 +27,10 @@
+ #include "initguid.h"
+ #include "roapi.h"
+ #include "roerrorapi.h"
++#define COBJMACROS
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Foundation_Diagnostics
++#include "windows.foundation.diagnostics.h"
+ 
+ #include "wine/test.h"
+ 
+@@ -861,6 +865,136 @@ static void test_RoGetErrorReportingFlags(void)
+     ok(flags == RO_ERROR_REPORTING_USESETERRORINFO, "Got unexpected flag %#x.\n", flags);
+ }
+ 
++static HRESULT WINAPI status_handler_QueryInterface(IEventHandler_TracingStatusChangedEventArgs *iface, REFIID iid,
++        void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAgileObject) ||
++        IsEqualGUID(iid, &IID_IEventHandler_TracingStatusChangedEventArgs))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI status_handler_AddRef(IEventHandler_TracingStatusChangedEventArgs *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI status_handler_Release(IEventHandler_TracingStatusChangedEventArgs *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI status_handler_Invoke(IEventHandler_TracingStatusChangedEventArgs *iface, IInspectable *sender,
++        ITracingStatusChangedEventArgs *args)
++{
++    return S_OK;
++}
++
++static const IEventHandler_TracingStatusChangedEventArgsVtbl status_handler_vtbl =
++{
++    status_handler_QueryInterface,
++    status_handler_AddRef,
++    status_handler_Release,
++    status_handler_Invoke,
++};
++
++static void test_AsyncCausalityTracer(void)
++{
++    static const WCHAR class_name[] = L"Windows.Foundation.Diagnostics.AsyncCausalityTracer";
++    IEventHandler_TracingStatusChangedEventArgs handler = { &status_handler_vtbl };
++    GUID platform_id = {0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
++    IAsyncCausalityTracerStatics *statics;
++    IActivationFactory *factory;
++    EventRegistrationToken token;
++    IInspectable *instance;
++    HSTRING str, name;
++    TrustLevel level;
++    ULONG count;
++    IID *iids;
++    void *agile;
++    HRESULT hr;
++
++    hr = RoInitialize(RO_INIT_MULTITHREADED);
++    ok(hr == S_OK || hr == S_FALSE, "RoInitialize returned %#lx.\n", hr);
++    WindowsCreateString(class_name, wcslen(class_name), &str);
++    hr = RoGetActivationFactory(str, &IID_IActivationFactory, (void **)&factory);
++    WindowsDeleteString(str);
++    ok(hr == S_OK, "RoGetActivationFactory returned %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    /* the factory is all there is: agile, with the statics, making no instances and with no class name */
++    hr = IActivationFactory_GetIids(factory, &count, &iids);
++    ok(hr == S_OK, "GetIids returned %#lx.\n", hr);
++    ok(count == 2, "got %lu IIDs.\n", count);
++    if (count == 2)
++    {
++        ok(IsEqualGUID(&iids[0], &IID_IActivationFactory), "got %s.\n", wine_dbgstr_guid(&iids[0]));
++        ok(IsEqualGUID(&iids[1], &IID_IAsyncCausalityTracerStatics), "got %s.\n", wine_dbgstr_guid(&iids[1]));
++    }
++    CoTaskMemFree(iids);
++    hr = IActivationFactory_GetRuntimeClassName(factory, &name);
++    ok(hr == E_ILLEGAL_METHOD_CALL, "GetRuntimeClassName returned %#lx.\n", hr);
++    hr = IActivationFactory_GetTrustLevel(factory, &level);
++    ok(hr == S_OK && level == BaseTrust, "GetTrustLevel returned %#lx, level %d.\n", hr, level);
++    hr = IActivationFactory_QueryInterface(factory, &IID_IAgileObject, &agile);
++    ok(hr == S_OK, "QueryInterface(IAgileObject) returned %#lx.\n", hr);
++    if (SUCCEEDED(hr)) IUnknown_Release((IUnknown *)agile);
++    instance = (IInspectable *)0xdeadbeef;
++    hr = IActivationFactory_ActivateInstance(factory, &instance);
++    ok(hr == E_NOTIMPL, "ActivateInstance returned %#lx.\n", hr);
++    ok(!instance, "got instance %p.\n", instance);
++
++    hr = IActivationFactory_QueryInterface(factory, &IID_IAsyncCausalityTracerStatics, (void **)&statics);
++    ok(hr == S_OK, "QueryInterface(IAsyncCausalityTracerStatics) returned %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    /* a trace takes any name, but only a known level and source */
++    WindowsCreateString(L"wine", 4, &str);
++    hr = IAsyncCausalityTracerStatics_TraceOperationCreation(statics, CausalityTraceLevel_Required,
++            CausalitySource_Application, platform_id, 1, str, 0);
++    ok(hr == S_OK, "TraceOperationCreation returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_TraceOperationCreation(statics, 7, CausalitySource_Application, platform_id, 1,
++            str, 0);
++    ok(hr == E_INVALIDARG, "TraceOperationCreation returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_TraceOperationCreation(statics, CausalityTraceLevel_Required, 7, platform_id, 1,
++            str, 0);
++    ok(hr == E_INVALIDARG, "TraceOperationCreation returned %#lx.\n", hr);
++    WindowsDeleteString(str);
++    hr = IAsyncCausalityTracerStatics_TraceOperationCreation(statics, CausalityTraceLevel_Required,
++            CausalitySource_Application, platform_id, 1, NULL, 0);
++    ok(hr == S_OK, "TraceOperationCreation returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_TraceOperationRelation(statics, CausalityTraceLevel_Required,
++            CausalitySource_Application, platform_id, 1, CausalityRelation_AssignDelegate);
++    ok(hr == S_OK, "TraceOperationRelation returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_TraceSynchronousWorkStart(statics, CausalityTraceLevel_Required,
++            CausalitySource_Application, platform_id, 1, CausalitySynchronousWork_Execution);
++    ok(hr == S_OK, "TraceSynchronousWorkStart returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_TraceSynchronousWorkCompletion(statics, CausalityTraceLevel_Required,
++            CausalitySource_Application, CausalitySynchronousWork_Execution);
++    ok(hr == S_OK, "TraceSynchronousWorkCompletion returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_TraceOperationCompletion(statics, CausalityTraceLevel_Required,
++            CausalitySource_Application, platform_id, 1, Completed);
++    ok(hr == S_OK, "TraceOperationCompletion returned %#lx.\n", hr);
++
++    hr = IAsyncCausalityTracerStatics_add_TracingStatusChanged(statics, NULL, &token);
++    ok(hr == E_INVALIDARG, "add_TracingStatusChanged returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_add_TracingStatusChanged(statics, &handler, &token);
++    ok(hr == S_OK, "add_TracingStatusChanged returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_remove_TracingStatusChanged(statics, token);
++    ok(hr == S_OK, "remove_TracingStatusChanged returned %#lx.\n", hr);
++    hr = IAsyncCausalityTracerStatics_remove_TracingStatusChanged(statics, token);
++    ok(hr == S_OK, "remove_TracingStatusChanged returned %#lx.\n", hr);
++
++    IAsyncCausalityTracerStatics_Release(statics);
++done:
++    if (factory) IActivationFactory_Release(factory);
++    RoUninitialize();
++}
++
+ START_TEST(roapi)
+ {
+     BOOL ret;
+@@ -871,6 +1005,7 @@ START_TEST(roapi)
+     test_ActivationFactories();
+     test_RoGetAgileReference();
+     test_RoGetErrorReportingFlags();
++    test_AsyncCausalityTracer();
+ 
+     SetLastError(0xdeadbeef);
+     ret = DeleteFileW(L"wine.combase.test.dll");

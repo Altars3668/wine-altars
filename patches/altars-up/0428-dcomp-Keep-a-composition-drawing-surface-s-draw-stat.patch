@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:33:18 -0400
+Subject: [PATCH] dcomp: Keep a composition drawing surface's draw states as
+ Windows 11 does.
+
+Measured on build 29671 with tools/drawsurfprobe through
+ICompositionDrawingSurfaceInterop: a new surface's first draw has to cover
+all of it, or BeginDraw says E_INVALIDARG; BeginDraw on a surface that has a
+draw going on, suspended or not, finishes that one first, so every update
+of AirSpace's begin, suspend, begin again lands; one surface is drawn at a
+time; Resize ends a draw; and what is out of order is
+COR_E_INVALIDOPERATION, not DirectComposition's own error codes.  The new
+test goes through those states.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/dcomp/private.h b/dlls/dcomp/private.h
+index 953ea3edc79..df8b6b76f14 100644
+--- a/dlls/dcomp/private.h
++++ b/dlls/dcomp/private.h
+@@ -528,6 +528,8 @@ struct drawing_surface
+     BOOL is_virtual;
+     struct list tiles;
+ 
++    BOOL drawn;                     /* once all of it has been drawn on */
++
+     /* between BeginDraw and EndDraw */
+     BOOL drawing;
+     BOOL suspended;
+diff --git a/dlls/dcomp/surface.c b/dlls/dcomp/surface.c
+index 3b2d344c118..61f26b45c00 100644
+--- a/dlls/dcomp/surface.c
++++ b/dlls/dcomp/surface.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "private.h"
++#include "corerror.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+ 
+@@ -352,6 +353,8 @@ static HRESULT surface_scroll( struct drawing_surface *surface, const RECT *scro
+     return hr;
+ }
+ 
++static HRESULT surface_finish_draw( struct drawing_surface *surface );
++
+ static HRESULT surface_resize( struct drawing_surface *surface, SIZE size )
+ {
+     struct tile *old = NULL, *tile, *next;
+@@ -359,7 +362,8 @@ static HRESULT surface_resize( struct drawing_surface *surface, SIZE size )
+     RECT keep;
+ 
+     if (size.cx < 0 || size.cy < 0) return E_INVALIDARG;
+-    if (surface->drawing) return DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED;
++    /* Windows 11 ends a draw going on, or suspended, and resizes */
++    if (surface->drawing) surface_finish_draw( surface );
+ 
+     if (surface->is_virtual)
+     {
+@@ -504,20 +508,26 @@ static HRESULT WINAPI surface_interop_BeginDraw( ICompositionDrawingSurfaceInter
+         WARN( "update rect %s outside of the surface's %s.\n", wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &bounds ) );
+         return E_INVALIDARG;
+     }
++    /* what a new surface holds is undefined, so its first draw has to cover all of it */
++    if (!surface->is_virtual && !surface->drawn && !EqualRect( &rect, &bounds ))
++    {
++        WARN( "first draw of %s only updates %s.\n", wine_dbgstr_rect( &bounds ), wine_dbgstr_rect( &rect ) );
++        return E_INVALIDARG;
++    }
+ 
+     graphics_device_lock( device );
+     compositor_lock( surface->base.compositor );
+-    /* Office's AirSpace begins a draw, suspends it and begins another on the same surface with another update
+-     * rectangle, and Excel's sheet tabs are drawn so on Windows: the suspended draw is finished first, as EndDraw
+-     * would. */
+-    if (surface->drawing && surface->suspended)
++    /* A draw the surface has going on is finished first, as EndDraw would, suspended or not: Office's AirSpace
++     * begins a draw, suspends it and begins others on the same surface with other update rectangles, and on
++     * Windows 11 every one of them lands. */
++    if (surface->drawing)
+     {
+         surface_finish_draw( surface );
+         compositor_changed( surface->base.compositor );
+     }
+-    if (surface->drawing || (device->drawing && !device->drawing->suspended))
++    if (device->drawing && !device->drawing->suspended)
+     {
+-        hr = DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED;
++        hr = COR_E_INVALIDOPERATION;
+         goto done;
+     }
+ 
+@@ -573,6 +583,7 @@ static HRESULT WINAPI surface_interop_BeginDraw( ICompositionDrawingSurfaceInter
+ 
+     surface->drawing = TRUE;
+     surface->suspended = FALSE;
++    surface->drawn = TRUE;
+     device->drawing = surface;
+     *update_offset = offset;
+ 
+@@ -594,7 +605,7 @@ static HRESULT WINAPI surface_interop_EndDraw( ICompositionDrawingSurfaceInterop
+     compositor_lock( surface->base.compositor );
+     if (!surface->drawing)
+     {
+-        hr = DCOMPOSITION_ERROR_SURFACE_NOT_BEING_RENDERED;
++        hr = COR_E_INVALIDOPERATION;
+         goto done;
+     }
+     hr = surface_finish_draw( surface );
+@@ -651,9 +662,9 @@ static HRESULT WINAPI surface_interop_ResumeDraw( ICompositionDrawingSurfaceInte
+ 
+     graphics_device_lock( device );
+     compositor_lock( surface->base.compositor );
+-    if (!surface->drawing || !surface->suspended) hr = DCOMPOSITION_ERROR_SURFACE_NOT_BEING_RENDERED;
++    if (!surface->drawing || !surface->suspended) hr = COR_E_INVALIDOPERATION;
+     else if (device->drawing && device->drawing != surface && !device->drawing->suspended)
+-        hr = DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED;
++        hr = COR_E_INVALIDOPERATION;
+     else
+     {
+         POINT offset = {0, 0};
+@@ -683,7 +694,7 @@ static HRESULT WINAPI surface_interop_SuspendDraw( ICompositionDrawingSurfaceInt
+ 
+     graphics_device_lock( device );
+     compositor_lock( surface->base.compositor );
+-    if (!surface->drawing || surface->suspended) hr = DCOMPOSITION_ERROR_SURFACE_NOT_BEING_RENDERED;
++    if (!surface->drawing || surface->suspended) hr = COR_E_INVALIDOPERATION;
+     else
+     {
+         if (surface->target) hr = surface_end_target( surface );
+diff --git a/dlls/dcomp/tests/Makefile.in b/dlls/dcomp/tests/Makefile.in
+index 7a8992e561c..14290b349f4 100644
+--- a/dlls/dcomp/tests/Makefile.in
++++ b/dlls/dcomp/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = dcomp.dll
+-IMPORTS   = combase coremessaging user32 gdi32
++IMPORTS   = combase coremessaging user32 gdi32 d3d11 d2d1 dxguid
+ 
+ SOURCES = \
+ 	composition.c
+diff --git a/dlls/dcomp/tests/composition.c b/dlls/dcomp/tests/composition.c
+index 41ff8222d0b..ae5671b26cf 100644
+--- a/dlls/dcomp/tests/composition.c
++++ b/dlls/dcomp/tests/composition.c
+@@ -49,6 +49,9 @@
+ #include "windows.ui.composition.interop.h"
+ #include "windows.graphics.effects.interop.h"
+ #include "dispatcherqueue.h"
++#include "d3d11.h"
++#include "d2d1_1.h"
++#include "corerror.h"
+ 
+ #include "wine/test.h"
+ 
+@@ -2723,6 +2726,162 @@ done:
+     if (queue) IDispatcherQueueController_Release( queue );
+ }
+ 
++static HRESULT begin_draw( ICompositionDrawingSurfaceInterop *surface, int left, int top, int right, int bottom )
++{
++    RECT rect = {left, top, right, bottom};
++    IUnknown *context = NULL;
++    POINT offset;
++    HRESULT hr;
++
++    hr = ICompositionDrawingSurfaceInterop_BeginDraw( surface, left < right ? &rect : NULL, &IID_ID2D1DeviceContext,
++                                                      (void **)&context, &offset );
++    if (context) IUnknown_Release( context );
++    return hr;
++}
++
++static ICompositionDrawingSurfaceInterop *create_drawing_surface( ICompositionGraphicsDevice *graphics )
++{
++    ICompositionDrawingSurfaceInterop *interop = NULL;
++    ICompositionDrawingSurface *surface;
++    Size size = {128, 64};
++    HRESULT hr;
++
++    hr = ICompositionGraphicsDevice_CreateDrawingSurface( graphics, size, DirectXPixelFormat_B8G8R8A8UIntNormalized,
++                                                          DirectXAlphaMode_Premultiplied, &surface );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    if (FAILED(hr)) return NULL;
++    hr = ICompositionDrawingSurface_QueryInterface( surface, &IID_ICompositionDrawingSurfaceInterop, (void **)&interop );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    ICompositionDrawingSurface_Release( surface );
++    return interop;
++}
++
++/* the states of a draw on a drawing surface, as Office's AirSpace goes through them */
++static void test_drawing_surface(void)
++{
++    static const D2D1_CREATION_PROPERTIES props = {D2D1_THREADING_MODE_MULTI_THREADED, D2D1_DEBUG_LEVEL_NONE, 0};
++    ICompositionDrawingSurfaceInterop *s1, *s2;
++    ICompositionGraphicsDevice *graphics;
++    ICompositorController *controller;
++    ICompositorInterop *interop;
++    ICompositor *compositor;
++    ID3D11Device *d3d = NULL;
++    ID2D1Device *d2d = NULL;
++    IDXGIDevice *dxgi;
++    SIZE size = {128, 64};
++    HRESULT hr;
++
++    if (!(controller = create_controller( &compositor ))) return;
++    hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
++                            D3D11_SDK_VERSION, &d3d, NULL, NULL );
++    if (FAILED(hr)) hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_WARP, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
++                                            D3D11_SDK_VERSION, &d3d, NULL, NULL );
++    if (FAILED(hr))
++    {
++        skip( "no Direct3D 11 device, hr %#lx.\n", hr );
++        goto done;
++    }
++    ID3D11Device_QueryInterface( d3d, &IID_IDXGIDevice, (void **)&dxgi );
++    hr = D2D1CreateDevice( dxgi, &props, &d2d );
++    IDXGIDevice_Release( dxgi );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    if (FAILED(hr)) goto done;
++    ICompositor_QueryInterface( compositor, &IID_ICompositorInterop, (void **)&interop );
++    hr = ICompositorInterop_CreateGraphicsDevice( interop, (IUnknown *)d2d, &graphics );
++    ICompositorInterop_Release( interop );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    if (FAILED(hr)) goto done;
++    s1 = create_drawing_surface( graphics );
++    s2 = create_drawing_surface( graphics );
++    if (!s1 || !s2) goto release;
++
++    /* what a new surface holds is undefined, so its first draw covers all of it */
++    hr = begin_draw( s1, 0, 0, 32, 32 );
++    ok( hr == E_INVALIDARG, "got %#lx.\n", hr );
++    hr = begin_draw( s1, 0, 0, 0, 0 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = begin_draw( s2, 0, 0, 128, 64 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s2 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++
++    /* nothing is being drawn */
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_SuspendDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_ResumeDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++
++    /* one surface at a time, but the same one again finishes the draw it has */
++    hr = begin_draw( s1, 0, 0, 32, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = begin_draw( s2, 0, 0, 32, 32 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s2 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = begin_draw( s1, 32, 0, 64, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++
++    /* a suspended draw lets another surface be drawn */
++    hr = begin_draw( s1, 0, 0, 32, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_ResumeDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_SuspendDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_SuspendDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = begin_draw( s2, 0, 0, 32, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s2 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_ResumeDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++
++    /* AirSpace suspends a draw and begins others on the same surface, and ends the last */
++    hr = begin_draw( s1, 0, 0, 32, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_SuspendDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = begin_draw( s1, 32, 0, 64, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = begin_draw( s1, 64, 0, 96, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_EndDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_ResumeDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++
++    /* Resize ends a draw; last, as Windows 11 refuses every draw on the device after that */
++    hr = begin_draw( s1, 0, 0, 32, 32 );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_Resize( s1, size );
++    ok( hr == S_OK, "got %#lx.\n", hr );
++    hr = ICompositionDrawingSurfaceInterop_SuspendDraw( s1 );
++    ok( hr == COR_E_INVALIDOPERATION, "got %#lx.\n", hr );
++
++release:
++    if (s1) ICompositionDrawingSurfaceInterop_Release( s1 );
++    if (s2) ICompositionDrawingSurfaceInterop_Release( s2 );
++    ICompositionGraphicsDevice_Release( graphics );
++done:
++    if (d2d) ID2D1Device_Release( d2d );
++    if (d3d) ID3D11Device_Release( d3d );
++    ICompositor_Release( compositor );
++    ICompositorController_Release( controller );
++}
++
+ START_TEST(composition)
+ {
+     IDispatcherQueueController *queue;
+@@ -2733,6 +2892,7 @@ START_TEST(composition)
+     test_effect_source_parameter();
+     queue = create_queue( DQTAT_COM_STA );
+     test_compositor();
++    test_drawing_surface();
+     if (queue) IDispatcherQueueController_Release( queue );
+     test_animations();
+     test_property_sets();

@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 09:11:23 -0400
+Subject: [PATCH] win32u: rasterize subpixel glyphs in strips when FreeType
+ refuses them.
+
+FT_Render_Glyph returns FT_Err_Raster_Overflow for some outlines in LCD mode
+and leaves the slot with no bitmap.  get_subpixel_glyph_bitmap ignored the
+return value and read the bitmap anyway, so it dereferenced NULL inside the
+syscall.  handle_syscall_fault turns that into a status for the PE caller and
+the unix frames are simply abandoned, which means font_GetGlyphOutline never
+reaches its unlock: font_lock is gone for the life of the process and the next
+SelectObject of a font on that thread waits for a lock it already holds.  Word
+freezes the first time it draws certain glyphs -- Office's font dropdown draws
+each font's name as one wide glyph, so scrolling it is enough.
+
+The refusal is not about the glyph being too large.  Pure FreeType 2.14.2
+refuses this one at 4 to 14 pixels and renders it happily at 16 and above, and
+the failing bitmaps (423x11) are smaller than the succeeding ones (480x12); it
+is about how much the rasterizer has to hold at once.  Rasterizing the same
+outline in 64-column strips gets it out at every size, so that is what this
+does: scale the outline three times along the subpixel axis, render it strip by
+strip into the box the caller already computed, and run the same five-tap
+filter FreeType applies to its own LCD bitmaps -- the padding it needs is
+already in that box.  The result is real subpixel coverage, not a grayscale
+stand-in: at 20 pixels, where FreeType gives up, the glyph comes out with the
+same shapes, position and antialiasing as the 28 pixel one FreeType renders
+itself.
+
+Found by wrapping font_lock's acquire sites in a timed lock that names the
+holder, then printing backtrace() from both sides when the holder turned out to
+be the waiting thread.  tools/previewglyphprobe reproduces the original call --
+glyph 0xce of Office's msofp_4_42 preview font, format 0x91, 7248 bytes -- and
+tools/lcdprobe shows ordinary fonts were never affected.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 00fe8fe687a08d4f59720624940ae839f07801da)
+
+diff --git a/dlls/win32u/freetype.c b/dlls/win32u/freetype.c
+index ce899122009..550623963e9 100644
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -2718,6 +2718,121 @@ static DWORD get_antialias_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT
+     return needed;
+ }
+ 
++
++/* FreeType's rasterizer refuses some outlines outright in subpixel mode --
++ * FT_Err_Raster_Overflow, whatever the glyph's size; Office's font dropdown
++ * draws each font's name as one very wide glyph and runs into it constantly.
++ * The refusal is about how much the rasterizer has to hold at once, not about
++ * the glyph, so rasterizing the same thing in strips gets the real coverage
++ * out of it.  That is what subpixel rendering is anyway: the outline scaled
++ * three times along the subpixel axis, sampled per subpixel.  The five-tap
++ * filter afterwards is the one FreeType applies to its own LCD bitmaps, and
++ * the padding it needs is already in the box the caller computed. */
++static const INT lcd_filter[5] = { 0x08, 0x4d, 0x56, 0x4d, 0x08 };  /* sums to 0x100 */
++
++static BYTE *render_outline_in_strips( FT_Outline *outline, FT_BBox bbox, FT_Render_Mode render_mode,
++                                       INT width, INT height, INT *ret_pitch )
++{
++    static const INT strip = 64;  /* columns the rasterizer copes with */
++    BOOL horizontal = render_mode == FT_RENDER_MODE_LCD;
++    FT_Matrix scale = { 0x10000, 0, 0, 0x10000 };
++    INT cols = horizontal ? width * 3 : width;
++    INT rows = horizontal ? height : height * 3;
++    FT_Pos org_x, org_y;
++    FT_Bitmap ft_bitmap;
++    BYTE *out, *tmp;
++    INT x, y, i;
++
++    if (cols <= 0 || rows <= 0) return NULL;
++    if (!(out = calloc( 1, cols * rows ))) return NULL;
++    if (!(tmp = calloc( 1, strip * rows ))) { free( out ); return NULL; }
++
++    if (horizontal) scale.xx = 3 * 0x10000;
++    else scale.yy = 3 * 0x10000;
++    pFT_Outline_Transform( outline, &scale );
++
++    /* put the top-left of the box the caller asked for at the bitmap origin */
++    org_x = horizontal ? bbox.xMin * 3 : bbox.xMin;
++    org_y = horizontal ? bbox.yMax - (height << 6) : (bbox.yMax - (height << 6)) * 3;
++    pFT_Outline_Translate( outline, -org_x, -org_y );
++
++    ft_bitmap.rows = rows;
++    ft_bitmap.num_grays = 256;
++    ft_bitmap.pixel_mode = FT_PIXEL_MODE_GRAY;
++
++    for (x = 0; x < cols; x += strip)
++    {
++        INT w = min( strip, cols - x );
++
++        memset( tmp, 0, strip * rows );
++        ft_bitmap.width = w;
++        ft_bitmap.pitch = w;
++        ft_bitmap.buffer = tmp;
++
++        pFT_Outline_Translate( outline, -((FT_Pos)x << 6), 0 );
++        if (pFT_Outline_Get_Bitmap( library, outline, &ft_bitmap ))
++        {
++            pFT_Outline_Translate( outline, (FT_Pos)x << 6, 0 );
++            WARN( "strip at %d still too much for the rasterizer\n", x );
++            free( tmp );
++            free( out );
++            return NULL;
++        }
++        pFT_Outline_Translate( outline, (FT_Pos)x << 6, 0 );
++
++        for (y = 0; y < rows; y++) memcpy( out + y * cols + x, tmp + y * w, w );
++    }
++    free( tmp );
++
++    /* the same five-tap filter FreeType runs over its own subpixel bitmaps */
++    if (horizontal)
++    {
++        for (y = 0; y < rows; y++)
++        {
++            BYTE *row = out + y * cols, prev[4] = { 0 };
++
++            for (x = 0; x < cols; x++)
++            {
++                INT sum = 0;
++                for (i = 0; i < 5; i++)
++                {
++                    INT sx = x + i - 2;
++                    BYTE v = sx < 0 ? 0 : (sx < x ? prev[4 + sx - x] : (sx < cols ? row[sx] : 0));
++                    sum += v * lcd_filter[i];
++                }
++                prev[0] = prev[1]; prev[1] = prev[2]; prev[2] = prev[3]; prev[3] = row[x];
++                row[x] = min( 0xff, sum >> 8 );
++            }
++        }
++    }
++    else
++    {
++        BYTE *col = malloc( rows );
++
++        if (col)
++        {
++            for (x = 0; x < cols; x++)
++            {
++                for (y = 0; y < rows; y++) col[y] = out[y * cols + x];
++                for (y = 0; y < rows; y++)
++                {
++                    INT sum = 0;
++                    for (i = 0; i < 5; i++)
++                    {
++                        INT sy = y + i - 2;
++                        sum += (sy < 0 || sy >= rows ? 0 : col[sy]) * lcd_filter[i];
++                    }
++                    out[y * cols + x] = min( 0xff, sum >> 8 );
++                }
++            }
++            free( col );
++        }
++    }
++
++    *ret_pitch = cols;
++    return out;
++}
++
+ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT format,
+                                         BOOL fake_bold, const FT_Matrix *matrices,
+                                         GLYPHMETRICS *gm, DWORD buflen, BYTE *buf )
+@@ -2763,6 +2878,9 @@ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT f
+       {
+         INT src_pitch, src_width, src_height, x_shift, y_shift;
+         INT sub_stride, hmul, vmul;
++        BYTE *strips = NULL;
++        INT strip_pitch = 0;
++        FT_Error err;
+         const INT *sub_order;
+         const INT rgb_order[3] = { 0, 1, 2 };
+         const INT bgr_order[3] = { 2, 1, 0 };
+@@ -2800,12 +2918,33 @@ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT f
+         if (matrices)
+             pFT_Outline_Transform( &glyph->outline, &matrices[matrix_vert] );
+ 
+-        pFT_Render_Glyph( glyph, render_mode );
++        if ((err = pFT_Render_Glyph( glyph, render_mode )))
++        {
++            WARN( "FT_Render_Glyph failed with error %#x, rasterizing in strips\n", err );
++            if (!(strips = render_outline_in_strips( &glyph->outline, bbox, render_mode,
++                                                     width, height, &strip_pitch )))
++                return GDI_ERROR;
++        }
++        else if (!glyph->bitmap.buffer)
++        {
++            WARN( "FT_Render_Glyph produced no bitmap\n" );
++            return GDI_ERROR;
++        }
+ 
+-        src_pitch = glyph->bitmap.pitch;
+-        src_width = glyph->bitmap.width;
+-        src_height = glyph->bitmap.rows;
+-        src = glyph->bitmap.buffer;
++        if (strips)
++        {
++            src_pitch = strip_pitch;
++            src_width = strip_pitch;
++            src_height = render_mode == FT_RENDER_MODE_LCD ? height : height * 3;
++            src = strips;
++        }
++        else
++        {
++            src_pitch = glyph->bitmap.pitch;
++            src_width = glyph->bitmap.width;
++            src_height = glyph->bitmap.rows;
++            src = glyph->bitmap.buffer;
++        }
+         dst = buf;
+         memset( buf, 0, buflen );
+ 
+@@ -2815,6 +2954,9 @@ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT f
+         hmul       = render_mode == FT_RENDER_MODE_LCD ? 3 : 1;
+         vmul       = render_mode == FT_RENDER_MODE_LCD ? 1 : 3;
+ 
++        /* the strips already cover exactly the box asked for */
++        if (strips) { x_shift = 0; y_shift = 0; goto copy_rows; }
++
+         x_shift = glyph->bitmap_left - (bbox.xMin >> 6);
+         if ( x_shift < 0 )
+         {
+@@ -2839,6 +2981,7 @@ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT f
+             height -= y_shift;
+         }
+ 
++    copy_rows:
+         w = min( width, src_width / hmul );
+         h = min( height, src_height / vmul );
+         while (h--)
+@@ -2853,6 +2996,7 @@ static DWORD get_subpixel_glyph_bitmap( FT_GlyphSlot glyph, FT_BBox bbox, UINT f
+             src += src_pitch * vmul;
+             dst += pitch;
+         }
++        free( strips );
+         break;
+       }
+     default:

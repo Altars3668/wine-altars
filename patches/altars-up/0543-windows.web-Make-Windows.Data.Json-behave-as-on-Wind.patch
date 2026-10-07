@@ -1,0 +1,1636 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 06:59:57 -0400
+Subject: [PATCH] windows.web: Make Windows.Data.Json behave as on Windows 11.
+
+All of this was measured on Windows 11 (build 29671) with a probe that
+asks each question directly, and the conformance test now passes there.
+
+An object keeps its members in the order they were added; a value given
+to a name it has takes the old one's place, and a name removed and
+added again comes last.  Stringify writes them in that order.  (Windows
+iterates over them in the order of its hash table; that order is not
+reproduced, iteration keeps the order of addition too.)  A view of up to
+16 members does not split, a bigger one gives its first 16.
+
+Any change to an object or an array ends the views and iterators taken
+before it: they answer E_CHANGED_STATE, and an iterator moved past its
+end answers E_BOUNDS.  Replacing a value counts, removing a name that is
+not there does not, and answers S_OK.  The other users of the vector
+helper keep their snapshots.
+
+A failed TryParse still hands out a value: an empty object, an empty
+array, a null.  A failed Parse leaves its out-parameter alone.  An array
+answers a NULL out-parameter with E_INVALIDARG, where the others answer
+E_POINTER.
+
+Numbers are written as printf's "%.15G" when that reads back as the
+same number, else "%.17G", with the exponent's leading zeros left out:
+1E+21, 1E-5, 0.33333333333333331, -0.  What is not a number comes out
+as the old C runtime wrote it, 1.#QNAN, -1.#IND, 1.#SNAN, 1.#INF.
+Strings escape control characters as \u00XX in capitals.  Both are read
+and written in the C locale.  A number that is too big, or too small to
+be anything but zero, is WEB_E_INVALID_JSON_NUMBER.
+
+Parse reads values nested 512 deep, Stringify writes arrays and objects
+1024 deep.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/windows.web/json_array.c b/dlls/windows.web/json_array.c
+index 035a92e1b42..9779ad5933e 100644
+--- a/dlls/windows.web/json_array.c
++++ b/dlls/windows.web/json_array.c
+@@ -72,6 +72,9 @@ static const struct vector_desc json_array_desc =
+     &IID_IIterator_IJsonValue,
+     json_array_query_interface,
+     json_array_to_string,
++    NULL,
++    NULL,
++    TRUE,
+ };
+ 
+ DEFINE_IINSPECTABLE( json_array, IJsonArray, struct json_array, vector.IVector_IInspectable_iface )
+@@ -189,7 +192,8 @@ static HRESULT WINAPI json_array_value_Stringify( IJsonValue *iface, HSTRING *va
+ {
+     TRACE( "iface %p, value %p\n", iface, value );
+ 
+-    if (!value) return E_POINTER;
++    /* an array's answer, where an object and a value give E_POINTER */
++    if (!value) return E_INVALIDARG;
+     return json_value_to_hstring( iface, value );
+ }
+ 
+@@ -413,7 +417,7 @@ static HRESULT WINAPI json_array_statics_Parse( IJsonArrayStatics *iface, HSTRIN
+ {
+     TRACE( "iface %p, input %s, array %p.\n", iface, debugstr_hstring( input ), array );
+ 
+-    if (!array) return E_POINTER;
++    if (!array) return E_INVALIDARG;
+     return json_array_parse( input, array );
+ }
+ 
+@@ -428,8 +432,9 @@ static HRESULT WINAPI json_array_statics_TryParse( IJsonArrayStatics *iface, HST
+     hr = json_array_parse( input, result );
+     *succeeded = SUCCEEDED(hr);
+     if (SUCCEEDED(hr)) return S_OK;
+-    *result = NULL;
+-    return hr == E_OUTOFMEMORY ? hr : S_OK;
++    /* what does not parse still gives an array, an empty one */
++    if (hr == E_OUTOFMEMORY) return hr;
++    return json_array_create( result );
+ }
+ 
+ static const struct IJsonArrayStaticsVtbl json_array_statics_vtbl =
+diff --git a/dlls/windows.web/json_object.c b/dlls/windows.web/json_object.c
+index d7ce98f63cb..c51f2aad464 100644
+--- a/dlls/windows.web/json_object.c
++++ b/dlls/windows.web/json_object.c
+@@ -27,10 +27,19 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(web);
+ 
+ /*
+- * A JsonObject is a map of names to IJsonValue, kept in the ordinal order of the names, and a
+- * JSON value itself.  Its views and iterators see the members as they were when they were made.
++ * A JsonObject is a map of names to IJsonValue, and a JSON value itself.  As on Windows (measured on
++ * build 29671), it keeps its members in the order they were added -- a value given to a name it has
++ * takes the old one's place, and a name removed and added again comes last -- and writes them out in
++ * that order.  Windows iterates over them in the order of its hash table; here iteration keeps the
++ * order of addition too.  Views and iterators see the members as they were when they were made,
++ * and any change to the object ends them: they answer E_CHANGED_STATE from then on.
+  */
+ 
++struct json_object;
++static BOOL json_object_changed_since( struct json_object *object, LONG version );
++static void json_object_hold( struct json_object *object );
++static void json_object_unhold( struct json_object *object );
++
+ struct json_member
+ {
+     HSTRING name;
+@@ -58,26 +67,19 @@ static void json_members_release( struct json_members *members )
+     free( members );
+ }
+ 
+-/* the index of the member of that name, or of where it would go; TRUE when it is there */
++/* the index of the member of that name; TRUE when it is there */
+ static BOOL json_members_find( const struct json_member *member, UINT32 count, HSTRING name, UINT32 *index )
+ {
+-    UINT32 low = 0, high = count;
++    INT32 order;
++    UINT32 i;
+ 
+-    while (low < high)
++    for (i = 0; i < count; i++)
+     {
+-        UINT32 mid = low + (high - low) / 2;
+-        INT32 order;
+-
+-        WindowsCompareStringOrdinal( member[mid].name, name, &order );
+-        if (!order)
+-        {
+-            *index = mid;
+-            return TRUE;
+-        }
+-        if (order < 0) low = mid + 1;
+-        else high = mid;
++        WindowsCompareStringOrdinal( member[i].name, name, &order );
++        if (order) continue;
++        *index = i;
++        return TRUE;
+     }
+-    *index = low;
+     return FALSE;
+ }
+ 
+@@ -220,6 +222,8 @@ struct json_iterator
+     struct json_members *members;
+     UINT32 index;
+     UINT32 end;
++    struct json_object *object;
++    LONG version;
+ };
+ 
+ static inline struct json_iterator *impl_from_IIterator_IKeyValuePair_HSTRING_IJsonValue( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface )
+@@ -265,6 +269,7 @@ static ULONG WINAPI iterator_Release( IIterator_IKeyValuePair_HSTRING_IJsonValue
+     if (!ref)
+     {
+         json_members_release( impl->members );
++        json_object_unhold( impl->object );
+         free( impl );
+     }
+     return ref;
+@@ -295,6 +300,7 @@ static HRESULT WINAPI iterator_get_Current( IIterator_IKeyValuePair_HSTRING_IJso
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
+     if (impl->index >= impl->end) return E_BOUNDS;
+     return pair_create( &impl->members->member[impl->index], value );
+ }
+@@ -317,8 +323,10 @@ static HRESULT WINAPI iterator_MoveNext( IIterator_IKeyValuePair_HSTRING_IJsonVa
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (impl->index < impl->end) impl->index++;
+-    *value = impl->index < impl->end;
++    *value = FALSE;
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
++    if (impl->index >= impl->end) return E_BOUNDS;
++    *value = ++impl->index < impl->end;
+     return S_OK;
+ }
+ 
+@@ -332,6 +340,7 @@ static HRESULT WINAPI iterator_GetMany( IIterator_IKeyValuePair_HSTRING_IJsonVal
+     TRACE( "iface %p, items_size %u, items %p, count %p.\n", iface, items_size, items, count );
+ 
+     if (!count) return E_POINTER;
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
+     for (i = 0; i < items_size && impl->index + i < impl->end; i++)
+     {
+         if (FAILED(hr = pair_create( &impl->members->member[impl->index + i], items + i )))
+@@ -361,8 +370,8 @@ static const struct IIterator_IKeyValuePair_HSTRING_IJsonValueVtbl iterator_vtbl
+     iterator_GetMany,
+ };
+ 
+-static HRESULT iterator_create( struct json_members *members, UINT32 start, UINT32 count,
+-                                IIterator_IKeyValuePair_HSTRING_IJsonValue **out )
++static HRESULT iterator_create( struct json_members *members, UINT32 start, UINT32 count, struct json_object *object,
++                                LONG version, IIterator_IKeyValuePair_HSTRING_IJsonValue **out )
+ {
+     struct json_iterator *impl;
+ 
+@@ -373,6 +382,8 @@ static HRESULT iterator_create( struct json_members *members, UINT32 start, UINT
+     impl->members = members;
+     impl->index = start;
+     impl->end = start + count;
++    json_object_hold( (impl->object = object) );
++    impl->version = version;
+     *out = &impl->IIterator_IKeyValuePair_HSTRING_IJsonValue_iface;
+     return S_OK;
+ }
+@@ -387,6 +398,8 @@ struct json_view
+     struct json_members *members;
+     UINT32 start;
+     UINT32 count;
++    struct json_object *object;
++    LONG version;
+ };
+ 
+ static inline struct json_view *impl_from_IMapView_HSTRING_IJsonValue( IMapView_HSTRING_IJsonValue *iface )
+@@ -438,6 +451,7 @@ static ULONG WINAPI view_Release( IMapView_HSTRING_IJsonValue *iface )
+     if (!ref)
+     {
+         json_members_release( impl->members );
++        json_object_unhold( impl->object );
+         free( impl );
+     }
+     return ref;
+@@ -470,6 +484,7 @@ static HRESULT WINAPI view_Lookup( IMapView_HSTRING_IJsonValue *iface, HSTRING k
+     TRACE( "iface %p, key %s, value %p.\n", iface, debugstr_hstring( key ), value );
+ 
+     if (!value) return E_POINTER;
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
+     if (!json_members_find( member, impl->count, key, &index ))
+     {
+         *value = NULL;
+@@ -486,6 +501,7 @@ static HRESULT WINAPI view_get_Size( IMapView_HSTRING_IJsonValue *iface, UINT32
+     TRACE( "iface %p, size %p.\n", iface, size );
+ 
+     if (!size) return E_POINTER;
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
+     *size = impl->count;
+     return S_OK;
+ }
+@@ -498,27 +514,31 @@ static HRESULT WINAPI view_HasKey( IMapView_HSTRING_IJsonValue *iface, HSTRING k
+     TRACE( "iface %p, key %s, found %p.\n", iface, debugstr_hstring( key ), found );
+ 
+     if (!found) return E_POINTER;
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
+     *found = json_members_find( impl->members->member + impl->start, impl->count, key, &index );
+     return S_OK;
+ }
+ 
+-static HRESULT view_create( struct json_members *members, UINT32 start, UINT32 count, IMapView_HSTRING_IJsonValue **out );
++static HRESULT view_create( struct json_members *members, UINT32 start, UINT32 count, struct json_object *object,
++                            LONG version, IMapView_HSTRING_IJsonValue **out );
+ 
+ static HRESULT WINAPI view_Split( IMapView_HSTRING_IJsonValue *iface, IMapView_HSTRING_IJsonValue **first,
+                                   IMapView_HSTRING_IJsonValue **second )
+ {
+     struct json_view *impl = impl_from_IMapView_HSTRING_IJsonValue( iface );
+-    UINT32 half = impl->count / 2;
++    UINT32 half = 16;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, first %p, second %p.\n", iface, first, second );
+ 
+     if (!first || !second) return E_POINTER;
+     *first = *second = NULL;
+-    /* a view of fewer than two cannot be split */
+-    if (impl->count < 2) return S_OK;
+-    if (FAILED(hr = view_create( impl->members, impl->start, half, first ))) return hr;
+-    if (FAILED(hr = view_create( impl->members, impl->start + half, impl->count - half, second )))
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
++    /* as on Windows: a view of up to 16 members is not split, a bigger one gives its first 16 */
++    if (impl->count <= half) return S_OK;
++    if (FAILED(hr = view_create( impl->members, impl->start, half, impl->object, impl->version, first ))) return hr;
++    if (FAILED(hr = view_create( impl->members, impl->start + half, impl->count - half, impl->object, impl->version,
++                                 second )))
+     {
+         IMapView_HSTRING_IJsonValue_Release( *first );
+         *first = NULL;
+@@ -553,7 +573,8 @@ static HRESULT WINAPI view_iterable_First( IIterable_IKeyValuePair_HSTRING_IJson
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    return iterator_create( impl->members, impl->start, impl->count, value );
++    if (json_object_changed_since( impl->object, impl->version )) return E_CHANGED_STATE;
++    return iterator_create( impl->members, impl->start, impl->count, impl->object, impl->version, value );
+ }
+ 
+ static const struct IIterable_IKeyValuePair_HSTRING_IJsonValueVtbl view_iterable_vtbl =
+@@ -569,7 +590,8 @@ static const struct IIterable_IKeyValuePair_HSTRING_IJsonValueVtbl view_iterable
+     view_iterable_First,
+ };
+ 
+-static HRESULT view_create( struct json_members *members, UINT32 start, UINT32 count, IMapView_HSTRING_IJsonValue **out )
++static HRESULT view_create( struct json_members *members, UINT32 start, UINT32 count, struct json_object *object,
++                            LONG version, IMapView_HSTRING_IJsonValue **out )
+ {
+     struct json_view *impl;
+ 
+@@ -581,6 +603,8 @@ static HRESULT view_create( struct json_members *members, UINT32 start, UINT32 c
+     impl->members = members;
+     impl->start = start;
+     impl->count = count;
++    json_object_hold( (impl->object = object) );
++    impl->version = version;
+     *out = &impl->IMapView_HSTRING_IJsonValue_iface;
+     return S_OK;
+ }
+@@ -598,9 +622,11 @@ struct json_object
+     LONG ref;
+ 
+     SRWLOCK lock;
+-    struct json_member *members; /* in the ordinal order of their names */
++    struct json_member *members; /* in the order they were added */
++    UINT32 *sorted;              /* their indices, in the ordinal order of their names */
+     UINT32 count;
+     UINT32 capacity;
++    LONG version;                /* counts the changes */
+ };
+ 
+ static const struct IJsonValueVtbl json_object_value_vtbl;
+@@ -610,58 +636,105 @@ static inline struct json_object *impl_from_IJsonObject( IJsonObject *iface )
+     return CONTAINING_RECORD( iface, struct json_object, IJsonObject_iface );
+ }
+ 
++static BOOL json_object_changed_since( struct json_object *object, LONG version )
++{
++    return ReadNoFence( &object->version ) != version;
++}
++
++static void json_object_hold( struct json_object *object )
++{
++    IJsonObject_AddRef( &object->IJsonObject_iface );
++}
++
++static void json_object_unhold( struct json_object *object )
++{
++    IJsonObject_Release( &object->IJsonObject_iface );
++}
++
++/* where in impl->sorted the member of that name is, or would go; TRUE when it is there */
++static BOOL json_object_find( struct json_object *impl, HSTRING name, UINT32 *pos )
++{
++    UINT32 low = 0, high = impl->count;
++
++    while (low < high)
++    {
++        UINT32 mid = low + (high - low) / 2;
++        INT32 order;
++
++        WindowsCompareStringOrdinal( impl->members[impl->sorted[mid]].name, name, &order );
++        if (!order)
++        {
++            *pos = mid;
++            return TRUE;
++        }
++        if (order < 0) low = mid + 1;
++        else high = mid;
++    }
++    *pos = low;
++    return FALSE;
++}
++
++static void json_object_changed( struct json_object *impl )
++{
++    WriteNoFence( &impl->version, impl->version + 1 );
++}
++
+ /* the value of that name, with a reference */
+ static BOOL json_object_lookup( struct json_object *impl, HSTRING name, IJsonValue **value )
+ {
+-    UINT32 index;
++    UINT32 pos;
+     BOOL found;
+ 
+     AcquireSRWLockShared( &impl->lock );
+-    if ((found = json_members_find( impl->members, impl->count, name, &index )))
+-        IJsonValue_AddRef( (*value = impl->members[index].value) );
++    if ((found = json_object_find( impl, name, &pos )))
++        IJsonValue_AddRef( (*value = impl->members[impl->sorted[pos]].value) );
+     ReleaseSRWLockShared( &impl->lock );
+     return found;
+ }
+ 
++static BOOL json_object_grow( struct json_object *impl )
++{
++    UINT32 capacity = max( 8, impl->capacity * 2 ), *sorted;
++    struct json_member *members;
++
++    if (!(members = realloc( impl->members, capacity * sizeof(*members) ))) return FALSE;
++    impl->members = members;
++    if (!(sorted = realloc( impl->sorted, capacity * sizeof(*sorted) ))) return FALSE;
++    impl->sorted = sorted;
++    impl->capacity = capacity;
++    return TRUE;
++}
++
+ static HRESULT json_object_insert( struct json_object *impl, HSTRING name, IJsonValue *value, boolean *replaced )
+ {
+     IJsonValue *old = NULL;
+     HRESULT hr = S_OK;
++    UINT32 pos, index;
+     HSTRING copy;
+-    UINT32 index;
+ 
+     if (FAILED(hr = WindowsDuplicateString( name, &copy ))) return hr;
+ 
+     AcquireSRWLockExclusive( &impl->lock );
+-    if (json_members_find( impl->members, impl->count, name, &index ))
++    if (json_object_find( impl, name, &pos ))
+     {
++        /* in the old one's place */
++        index = impl->sorted[pos];
+         old = impl->members[index].value;
+         IJsonValue_AddRef( (impl->members[index].value = value) );
++        json_object_changed( impl );
+         *replaced = TRUE;
+     }
++    else if (impl->count == impl->capacity && !json_object_grow( impl )) hr = E_OUTOFMEMORY;
+     else
+     {
+-        if (impl->count == impl->capacity)
+-        {
+-            UINT32 capacity = max( 8, impl->capacity * 2 );
+-            struct json_member *members;
+-
+-            if (!(members = realloc( impl->members, capacity * sizeof(*members) ))) hr = E_OUTOFMEMORY;
+-            else
+-            {
+-                impl->members = members;
+-                impl->capacity = capacity;
+-            }
+-        }
+-        if (SUCCEEDED(hr))
+-        {
+-            memmove( impl->members + index + 1, impl->members + index, (impl->count - index) * sizeof(*impl->members) );
+-            impl->members[index].name = copy;
+-            IJsonValue_AddRef( (impl->members[index].value = value) );
+-            impl->count++;
+-            copy = NULL;
+-            *replaced = FALSE;
+-        }
++        index = impl->count++;
++        impl->members[index].name = copy;
++        IJsonValue_AddRef( (impl->members[index].value = value) );
++        memmove( impl->sorted + pos + 1, impl->sorted + pos, (index - pos) * sizeof(*impl->sorted) );
++        impl->sorted[pos] = index;
++        json_object_changed( impl );
++        copy = NULL;
++        *replaced = FALSE;
+     }
+     ReleaseSRWLockExclusive( &impl->lock );
+ 
+@@ -673,15 +746,19 @@ static HRESULT json_object_insert( struct json_object *impl, HSTRING name, IJson
+ static BOOL json_object_remove( struct json_object *impl, HSTRING name )
+ {
+     struct json_member removed = {0};
+-    UINT32 index;
++    UINT32 pos, index, i;
+     BOOL found;
+ 
+     AcquireSRWLockExclusive( &impl->lock );
+-    if ((found = json_members_find( impl->members, impl->count, name, &index )))
++    if ((found = json_object_find( impl, name, &pos )))
+     {
++        index = impl->sorted[pos];
+         removed = impl->members[index];
+-        memmove( impl->members + index, impl->members + index + 1, (impl->count - index - 1) * sizeof(*impl->members) );
+         impl->count--;
++        memmove( impl->members + index, impl->members + index + 1, (impl->count - index) * sizeof(*impl->members) );
++        memmove( impl->sorted + pos, impl->sorted + pos + 1, (impl->count - pos) * sizeof(*impl->sorted) );
++        for (i = 0; i < impl->count; i++) if (impl->sorted[i] > index) impl->sorted[i]--;
++        json_object_changed( impl );
+     }
+     ReleaseSRWLockExclusive( &impl->lock );
+ 
+@@ -699,8 +776,11 @@ static void json_object_clear( struct json_object *impl )
+     AcquireSRWLockExclusive( &impl->lock );
+     members = impl->members;
+     count = impl->count;
++    free( impl->sorted );
+     impl->members = NULL;
++    impl->sorted = NULL;
+     impl->count = impl->capacity = 0;
++    json_object_changed( impl );
+     ReleaseSRWLockExclusive( &impl->lock );
+ 
+     for (i = 0; i < count; i++)
+@@ -711,12 +791,14 @@ static void json_object_clear( struct json_object *impl )
+     free( members );
+ }
+ 
+-static struct json_members *json_object_snapshot( struct json_object *impl )
++/* the members in their order, and the version of the object they are */
++static struct json_members *json_object_snapshot( struct json_object *impl, LONG *version )
+ {
+     struct json_members *members;
+     UINT32 i;
+ 
+     AcquireSRWLockShared( &impl->lock );
++    if (version) *version = impl->version;
+     if ((members = malloc( offsetof( struct json_members, member[impl->count] ) )))
+     {
+         members->ref = 1;
+@@ -1157,13 +1239,13 @@ static HRESULT WINAPI json_object_map_get_Size( IMap_HSTRING_IJsonValue *iface,
+ static HRESULT WINAPI json_object_map_HasKey( IMap_HSTRING_IJsonValue *iface, HSTRING key, boolean *found )
+ {
+     struct json_object *impl = impl_from_IMap_HSTRING_IJsonValue( iface );
+-    UINT32 index;
++    UINT32 pos;
+ 
+     TRACE( "iface %p, key %s, found %p.\n", iface, debugstr_hstring( key ), found );
+ 
+     if (!found) return E_POINTER;
+     AcquireSRWLockShared( &impl->lock );
+-    *found = json_members_find( impl->members, impl->count, key, &index );
++    *found = json_object_find( impl, key, &pos );
+     ReleaseSRWLockShared( &impl->lock );
+     return S_OK;
+ }
+@@ -1172,13 +1254,14 @@ static HRESULT WINAPI json_object_map_GetView( IMap_HSTRING_IJsonValue *iface, I
+ {
+     struct json_object *impl = impl_from_IMap_HSTRING_IJsonValue( iface );
+     struct json_members *members;
++    LONG version;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (!(members = json_object_snapshot( impl ))) return E_OUTOFMEMORY;
+-    hr = view_create( members, 0, members->count, value );
++    if (!(members = json_object_snapshot( impl, &version ))) return E_OUTOFMEMORY;
++    hr = view_create( members, 0, members->count, impl, version, value );
+     json_members_release( members );
+     return hr;
+ }
+@@ -1199,7 +1282,9 @@ static HRESULT WINAPI json_object_map_Remove( IMap_HSTRING_IJsonValue *iface, HS
+ 
+     TRACE( "iface %p, key %s.\n", iface, debugstr_hstring( key ) );
+ 
+-    return json_object_remove( impl, key ) ? S_OK : E_BOUNDS;
++    /* a name that is not there is removed without complaint, and without a change */
++    json_object_remove( impl, key );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI json_object_map_Clear( IMap_HSTRING_IJsonValue *iface )
+@@ -1240,13 +1325,14 @@ static HRESULT WINAPI json_object_iterable_First( IIterable_IKeyValuePair_HSTRIN
+ {
+     struct json_object *impl = impl_from_IIterable_IKeyValuePair_HSTRING_IJsonValue( iface );
+     struct json_members *members;
++    LONG version;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (!(members = json_object_snapshot( impl ))) return E_OUTOFMEMORY;
+-    hr = iterator_create( members, 0, members->count, value );
++    if (!(members = json_object_snapshot( impl, &version ))) return E_OUTOFMEMORY;
++    hr = iterator_create( members, 0, members->count, impl, version, value );
+     json_members_release( members );
+     return hr;
+ }
+@@ -1321,7 +1407,7 @@ HRESULT json_object_append_json( struct strbuf *buf, struct json_object *object,
+     UINT32 i, len;
+ 
+     if (depth >= JSON_MAX_DEPTH) return JSON_E_IMPLEMENTATION_LIMIT;
+-    if (!(members = json_object_snapshot( object ))) return E_OUTOFMEMORY;
++    if (!(members = json_object_snapshot( object, NULL ))) return E_OUTOFMEMORY;
+ 
+     strbuf_appendc( buf, '{' );
+     for (i = 0; i < members->count && SUCCEEDED(hr); i++)
+@@ -1473,8 +1559,9 @@ static HRESULT WINAPI json_object_statics_TryParse( IJsonObjectStatics *iface, H
+     hr = json_object_parse( input, result );
+     *succeeded = SUCCEEDED(hr);
+     if (SUCCEEDED(hr)) return S_OK;
+-    *result = NULL;
+-    return hr == E_OUTOFMEMORY ? hr : S_OK;
++    /* what does not parse still gives an object, an empty one */
++    if (hr == E_OUTOFMEMORY) return hr;
++    return json_object_create( result );
+ }
+ 
+ static const struct IJsonObjectStaticsVtbl json_object_statics_vtbl =
+diff --git a/dlls/windows.web/json_value.c b/dlls/windows.web/json_value.c
+index bce913a76d2..646877283ec 100644
+--- a/dlls/windows.web/json_value.c
++++ b/dlls/windows.web/json_value.c
+@@ -22,6 +22,7 @@
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <locale.h>
+ 
+ #include "private.h"
+ #include "wine/debug.h"
+@@ -303,12 +304,12 @@ static const struct IStringableVtbl json_value_stringable_vtbl =
+ 
+ /*** writing JSON ***/
+ 
+-/* As JavaScript writes it, where these classes come from: quotes, backslashes and the control
+- * characters escaped in strings, the fewest digits that read back as the same number. */
++/* As Windows writes it (measured on build 29671): in strings, quotes, backslashes and the control
++ * characters escaped, the last as \u00XX in capitals; numbers as below. */
+ 
+ void json_append_string( struct strbuf *buf, const WCHAR *str, UINT32 len )
+ {
+-    static const WCHAR hex[] = L"0123456789abcdef";
++    static const WCHAR hex[] = L"0123456789ABCDEF";
+     UINT32 i, start;
+ 
+     strbuf_appendc( buf, '"' );
+@@ -341,64 +342,50 @@ void json_append_string( struct strbuf *buf, const WCHAR *str, UINT32 len )
+     strbuf_appendc( buf, '"' );
+ }
+ 
++/* numbers are read and written in the C locale, whatever the process set */
++static _locale_t json_c_locale(void)
++{
++    static _locale_t locale;
++    _locale_t new;
++
++    if (!ReadPointerAcquire( (void **)&locale ) && (new = _create_locale( LC_ALL, "C" )) &&
++        InterlockedCompareExchangePointer( (void **)&locale, new, NULL ))
++        _free_locale( new );
++    return locale;
++}
++
++/* A number as printf's "%.15G" writes it when that reads back as the same number, else as
++ * "%.17G": 0.1, 0.33333333333333331, 1E+15, 1E-5 -- with the exponent's leading zeros left out.
++ * What is not a number comes out as the old C runtime printed it, JSON or not. */
+ static void json_append_number( struct strbuf *buf, double value )
+ {
+-    char str[32], digits[20], *p;
+-    int prec, count, exp, i;
++    _locale_t locale = json_c_locale();
++    char str[40], *p, *q;
++    UINT64 bits;
+ 
+-    /* what JSON cannot write, JavaScript writes as null */
+-    if (!isfinite( value ))
++    memcpy( &bits, &value, sizeof(bits) );
++    if (isnan( value ))
+     {
+-        strbuf_appendw( buf, L"null" );
++        if (bits >> 63) strbuf_appendc( buf, '-' );
++        if (bits == 0xfff8000000000000ull) strbuf_appendw( buf, L"1.#IND" );
++        else if (bits & 0x0008000000000000ull) strbuf_appendw( buf, L"1.#QNAN" );
++        else strbuf_appendw( buf, L"1.#SNAN" );
+         return;
+     }
+-    if (value == 0)
++    if (isinf( value ))
+     {
+-        strbuf_appendc( buf, '0' );
++        strbuf_appendw( buf, value < 0 ? L"-1.#INF" : L"1.#INF" );
+         return;
+     }
+-    if (value < 0)
+-    {
+-        strbuf_appendc( buf, '-' );
+-        value = -value;
+-    }
+-
+-    for (prec = 1; prec < 17; prec++)
+-    {
+-        sprintf( str, "%.*e", prec - 1, value );
+-        if (strtod( str, NULL ) == value) break;
+-    }
+-    if (prec == 17) sprintf( str, "%.16e", value );
+-
+-    /* str is d[.ddd]e[+-]xx; the value is 0.digits times ten to exp */
+-    for (p = str, count = 0; *p != 'e'; p++) if (*p != '.') digits[count++] = *p;
+-    exp = atoi( p + 1 ) + 1;
+-    while (count > 1 && digits[count - 1] == '0') count--;
+ 
+-    if (count <= exp && exp <= 21)
+-    {
+-        for (i = 0; i < count; i++) strbuf_appendc( buf, digits[i] );
+-        for (; i < exp; i++) strbuf_appendc( buf, '0' );
+-    }
+-    else if (0 < exp && exp <= 21)
+-    {
+-        for (i = 0; i < exp; i++) strbuf_appendc( buf, digits[i] );
+-        strbuf_appendc( buf, '.' );
+-        for (; i < count; i++) strbuf_appendc( buf, digits[i] );
+-    }
+-    else if (-6 < exp && exp <= 0)
+-    {
+-        strbuf_appendw( buf, L"0." );
+-        for (i = exp; i < 0; i++) strbuf_appendc( buf, '0' );
+-        for (i = 0; i < count; i++) strbuf_appendc( buf, digits[i] );
+-    }
+-    else
++    _sprintf_l( str, "%.15G", locale, value );
++    if (_strtod_l( str, NULL, locale ) != value) _sprintf_l( str, "%.17G", locale, value );
++    if ((p = strchr( str, 'E' )))
+     {
+-        strbuf_appendc( buf, digits[0] );
+-        if (count > 1) strbuf_appendc( buf, '.' );
+-        for (i = 1; i < count; i++) strbuf_appendc( buf, digits[i] );
+-        strbuf_appendf( buf, L"e%c%d", exp - 1 < 0 ? '-' : '+', abs( exp - 1 ) );
++        for (q = p += 2; *q == '0' && q[1]; q++) /* nothing */;
++        memmove( p, q, strlen( q ) + 1 );
+     }
++    for (p = str; *p; p++) strbuf_appendc( buf, *p );
+ }
+ 
+ HRESULT json_append_value( struct strbuf *buf, IJsonValue *value, UINT depth )
+@@ -457,7 +444,9 @@ HRESULT json_value_to_hstring( IJsonValue *value, HSTRING *out )
+ 
+ /*** reading JSON ***/
+ 
+-/* RFC 8259, as JavaScript's JSON.parse reads it */
++/* RFC 8259, as JavaScript's JSON.parse reads it, but for two things measured on Windows: a value
++ * nested deeper than 512 is too deep, and a number too big or too small to be a double other than
++ * zero is no number at all. */
+ 
+ struct json_reader
+ {
+@@ -586,7 +575,7 @@ static HRESULT json_read_number( struct json_reader *reader, double *value )
+     str[len] = 0;
+ 
+     errno = 0;
+-    *value = strtod( str, NULL );
++    *value = _strtod_l( str, NULL, json_c_locale() );
+     if (str != tmp) free( str );
+     reader->ptr = ptr;
+     return errno == ERANGE ? WEB_E_INVALID_JSON_NUMBER : S_OK;
+@@ -601,7 +590,6 @@ static HRESULT json_read_array( struct json_reader *reader, IJsonValue **value )
+     IJsonArray *array;
+     HRESULT hr = S_OK;
+ 
+-    if (++reader->depth > JSON_MAX_DEPTH) return JSON_E_IMPLEMENTATION_LIMIT;
+     if (FAILED(hr = json_array_create( &array ))) return hr;
+ 
+     if (!json_take( reader, ']' ))
+@@ -615,7 +603,6 @@ static HRESULT json_read_array( struct json_reader *reader, IJsonValue **value )
+         } while (json_take( reader, ',' ));
+         if (SUCCEEDED(hr) && !json_take( reader, ']' )) hr = WEB_E_INVALID_JSON_STRING;
+     }
+-    reader->depth--;
+ 
+     if (SUCCEEDED(hr) && SUCCEEDED(hr = IJsonArray_QueryInterface( array, &IID_IJsonValue, (void **)&inner )))
+     {
+@@ -634,7 +621,6 @@ static HRESULT json_read_object( struct json_reader *reader, IJsonValue **value
+     HRESULT hr = S_OK;
+     HSTRING name;
+ 
+-    if (++reader->depth > JSON_MAX_DEPTH) return JSON_E_IMPLEMENTATION_LIMIT;
+     if (FAILED(hr = json_object_create( &object ))) return hr;
+ 
+     if (!json_take( reader, '}' ))
+@@ -659,7 +645,6 @@ static HRESULT json_read_object( struct json_reader *reader, IJsonValue **value
+         } while (json_take( reader, ',' ));
+         if (SUCCEEDED(hr) && !json_take( reader, '}' )) hr = WEB_E_INVALID_JSON_STRING;
+     }
+-    reader->depth--;
+ 
+     if (SUCCEEDED(hr) && SUCCEEDED(hr = IJsonObject_QueryInterface( object, &IID_IJsonValue, (void **)&inner )))
+     {
+@@ -670,7 +655,7 @@ static HRESULT json_read_object( struct json_reader *reader, IJsonValue **value
+     return hr;
+ }
+ 
+-static HRESULT json_read_value( struct json_reader *reader, IJsonValue **value )
++static HRESULT json_read_nested_value( struct json_reader *reader, IJsonValue **value )
+ {
+     double number;
+     HSTRING str;
+@@ -708,9 +693,21 @@ static HRESULT json_read_value( struct json_reader *reader, IJsonValue **value )
+     return WEB_E_INVALID_JSON_STRING;
+ }
+ 
++static HRESULT json_read_value( struct json_reader *reader, IJsonValue **value )
++{
++    HRESULT hr;
++
++    if (++reader->depth > JSON_MAX_PARSE_DEPTH) hr = JSON_E_IMPLEMENTATION_LIMIT;
++    else hr = json_read_nested_value( reader, value );
++    reader->depth--;
++    return hr;
++}
++
++/* the value is set only when the input is one, as on Windows */
+ HRESULT json_parse( HSTRING input, IJsonValue **value )
+ {
+     struct json_reader reader;
++    IJsonValue *result;
+     UINT32 len;
+     HRESULT hr;
+ 
+@@ -718,12 +715,14 @@ HRESULT json_parse( HSTRING input, IJsonValue **value )
+     reader.end = reader.ptr + len;
+     reader.depth = 0;
+ 
+-    if (FAILED(hr = json_read_value( &reader, value ))) return hr;
++    if (FAILED(hr = json_read_value( &reader, &result ))) return hr;
+     json_skip_space( &reader );
+-    if (reader.ptr == reader.end) return S_OK;
+-
+-    IJsonValue_Release( *value );
+-    *value = NULL;
++    if (reader.ptr == reader.end)
++    {
++        *value = result;
++        return S_OK;
++    }
++    IJsonValue_Release( result );
+     return WEB_E_INVALID_JSON_STRING;
+ }
+ 
+@@ -857,8 +856,9 @@ static HRESULT WINAPI json_value_statics_TryParse( IJsonValueStatics *iface, HST
+     hr = json_parse( input, result );
+     *succeeded = SUCCEEDED(hr);
+     if (SUCCEEDED(hr)) return S_OK;
+-    *result = NULL;
+-    return hr == E_OUTOFMEMORY ? hr : S_OK;
++    /* what does not parse still gives a value, a null one */
++    if (hr == E_OUTOFMEMORY) return hr;
++    return json_value_create_simple( JsonValueType_Null, FALSE, 0, result );
+ }
+ 
+ static HRESULT WINAPI json_value_statics_CreateBooleanValue( IJsonValueStatics *iface, boolean input, IJsonValue **value )
+diff --git a/dlls/windows.web/private.h b/dlls/windows.web/private.h
+index a74a7a7cd8d..d9f1b43c3a0 100644
+--- a/dlls/windows.web/private.h
++++ b/dlls/windows.web/private.h
+@@ -272,6 +272,9 @@ struct vector_desc
+     void (*destroy)( struct vector *vector );
+     /* called with the lock held after every change */
+     void (*changed)( struct vector *vector );
++    /* when set, a change ends the views and iterators taken before it: they answer E_CHANGED_STATE,
++     * and an iterator moved past its end answers E_BOUNDS, as Windows' own collections do */
++    BOOL changes_invalidate;
+ };
+ 
+ struct vector
+@@ -285,6 +288,7 @@ struct vector
+     UINT32 size;
+     UINT32 capacity;
+     IInspectable **elements;
++    LONG version;                 /* counts the changes */
+ };
+ 
+ extern HRESULT vector_create( const struct vector_desc *desc, size_t size, struct vector **out );
+@@ -301,7 +305,9 @@ extern HRESULT enum_vector_view_create( const UINT32 *values, UINT32 count, IIns
+ /*** json_value.c, json_array.c, json_object.c ***/
+ 
+ /* how deep arrays and objects may nest, in what is read and what is written */
++/* how deep Stringify writes arrays and objects, and how deep Parse reads values */
+ #define JSON_MAX_DEPTH 1024
++#define JSON_MAX_PARSE_DEPTH 512
+ /* what going deeper fails with */
+ #define JSON_E_IMPLEMENTATION_LIMIT __HRESULT_FROM_WIN32( ERROR_IMPLEMENTATION_LIMIT )
+ 
+diff --git a/dlls/windows.web/tests/web.c b/dlls/windows.web/tests/web.c
+index df4edeeec22..3956a4d0a04 100644
+--- a/dlls/windows.web/tests/web.c
++++ b/dlls/windows.web/tests/web.c
+@@ -902,6 +902,7 @@ static void check_hstring_( unsigned int line, HSTRING str, const WCHAR *expect
+ static void check_stringify_( unsigned int line, IUnknown *obj, const WCHAR *expect )
+ {
+     IStringable *stringable;
++    IJsonArray *array;
+     IJsonValue *value;
+     HSTRING str;
+     HRESULT hr;
+@@ -916,8 +917,14 @@ static void check_stringify_( unsigned int line, IUnknown *obj, const WCHAR *exp
+         check_hstring_( line, str, expect );
+         WindowsDeleteString( str );
+     }
++    /* an array answers differently from an object and a value */
+     hr = IJsonValue_Stringify( value, NULL );
+-    ok_(__FILE__, line)( hr == E_POINTER, "got hr %#lx.\n", hr );
++    if (SUCCEEDED(IUnknown_QueryInterface( obj, &IID_IJsonArray, (void **)&array )))
++    {
++        ok_(__FILE__, line)( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++        IJsonArray_Release( array );
++    }
++    else ok_(__FILE__, line)( hr == E_POINTER, "got hr %#lx.\n", hr );
+ 
+     hr = IJsonValue_QueryInterface( value, &IID_IStringable, (void **)&stringable );
+     ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
+@@ -980,7 +987,8 @@ static void test_JsonParseStatics(void)
+     if (SUCCEEDED(hr))
+     {
+         check_class_name( object, L"Windows.Data.Json.JsonObject" );
+-        check_stringify( object, L"{\"a\":{\"c\":null},\"b\":[1,2]}" );
++        /* the members in the order they came */
++        check_stringify( object, L"{\"b\":[1,2],\"a\":{\"c\":null}}" );
+         hr = IJsonObject_GetNamedArray( object, NULL, &array );
+         ok( hr == WEB_E_JSON_VALUE_NOT_FOUND, "got hr %#lx.\n", hr );
+         IJsonObject_Release( object );
+@@ -998,19 +1006,26 @@ static void test_JsonParseStatics(void)
+     ok( hr == E_POINTER, "got hr %#lx.\n", hr );
+     WindowsDeleteString( str );
+ 
+-    /* valid JSON that is not an object */
++    /* valid JSON that is not an object; what does not parse still gives an empty object */
+     str = create_hstring( L"[1]" );
++    object = (void *)0xdeadbeef;
+     hr = IJsonObjectStatics_Parse( object_statics, str, &object );
+     ok( hr == WEB_E_INVALID_JSON_STRING, "got hr %#lx.\n", hr );
++    ok( object == (void *)0xdeadbeef, "got object %p.\n", object );
+     succeeded = TRUE;
+     object = (void *)0xdeadbeef;
+     hr = IJsonObjectStatics_TryParse( object_statics, str, &object, &succeeded );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( succeeded == FALSE, "got succeeded %d.\n", succeeded );
+-    ok( !object, "got object %p.\n", object );
++    ok( object && object != (void *)0xdeadbeef, "got object %p.\n", object );
++    if (object && object != (void *)0xdeadbeef)
++    {
++        check_stringify( object, L"{}" );
++        IJsonObject_Release( object );
++    }
+ 
+     hr = IJsonArrayStatics_Parse( array_statics, str, NULL );
+-    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
+     hr = IJsonArrayStatics_Parse( array_statics, str, &array );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     if (SUCCEEDED(hr))
+@@ -1034,7 +1049,12 @@ static void test_JsonParseStatics(void)
+     hr = IJsonArrayStatics_TryParse( array_statics, str, &array, &succeeded );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( succeeded == FALSE, "got succeeded %d.\n", succeeded );
+-    ok( !array, "got array %p.\n", array );
++    ok( array && array != (void *)0xdeadbeef, "got array %p.\n", array );
++    if (array && array != (void *)0xdeadbeef)
++    {
++        check_stringify( array, L"[]" );
++        IJsonArray_Release( array );
++    }
+     WindowsDeleteString( str );
+ 
+     /* not JSON at all */
+@@ -1042,21 +1062,38 @@ static void test_JsonParseStatics(void)
+     hr = IJsonObjectStatics_Parse( object_statics, str, &object );
+     ok( hr == WEB_E_INVALID_JSON_STRING, "got hr %#lx.\n", hr );
+     succeeded = TRUE;
++    object = NULL;
+     hr = IJsonObjectStatics_TryParse( object_statics, str, &object, &succeeded );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( succeeded == FALSE, "got succeeded %d.\n", succeeded );
++    if (object) IJsonObject_Release( object );
+     succeeded = TRUE;
+     value = (void *)0xdeadbeef;
+     hr = IJsonValueStatics_TryParse( value_statics, str, &value, &succeeded );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( succeeded == FALSE, "got succeeded %d.\n", succeeded );
+-    ok( !value, "got value %p.\n", value );
++    ok( value && value != (void *)0xdeadbeef, "got value %p.\n", value );
++    if (value && value != (void *)0xdeadbeef)
++    {
++        check_stringify( value, L"null" );
++        IJsonValue_Release( value );
++    }
++    WindowsDeleteString( str );
++
++    /* the value is set only when the input is one */
++    str = create_hstring( L"1 2" );
++    value = (void *)0xdeadbeef;
++    hr = IJsonValueStatics_Parse( value_statics, str, &value );
++    ok( hr == WEB_E_INVALID_JSON_STRING, "got hr %#lx.\n", hr );
++    ok( value == (void *)0xdeadbeef, "got value %p.\n", value );
+     WindowsDeleteString( str );
+ 
+     succeeded = TRUE;
++    object = NULL;
+     hr = IJsonObjectStatics_TryParse( object_statics, NULL, &object, &succeeded );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( succeeded == FALSE, "got succeeded %d.\n", succeeded );
++    if (object) IJsonObject_Release( object );
+ 
+     str = create_hstring( L" \"Wine\" " );
+     hr = IJsonValueStatics_TryParse( value_statics, str, NULL, &succeeded );
+@@ -1072,8 +1109,6 @@ static void test_JsonParseStatics(void)
+     }
+     WindowsDeleteString( str );
+ 
+-    hr = IJsonValueStatics2_CreateNullValue( value_statics2, NULL );
+-    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
+     hr = IJsonValueStatics2_CreateNullValue( value_statics2, &value );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     hr = IJsonValue_get_ValueType( value, &type );
+@@ -1097,20 +1132,43 @@ static void test_JsonStringify(void)
+         double value;
+         const WCHAR *json;
+     }
++    /* printf's "%.15G" when it reads back as the number, else "%.17G", the exponent's zeros left out */
+     numbers[] =
+     {
+         {0, L"0"},
+-        {-0.0, L"0"},
++        {-0.0, L"-0"},
+         {1, L"1"},
+         {-1.5, L"-1.5"},
+         {0.1, L"0.1"},
+         {3.14159, L"3.14159"},
+-        {1e21, L"1e+21"},
+-        {123456789012345680000.0, L"123456789012345680000"},
+-        {1e-6, L"0.000001"},
+-        {1e-7, L"1e-7"},
+-        {1.5e300, L"1.5e+300"},
++        {0.0001, L"0.0001"},
++        {0.00001, L"1E-5"},
++        {1e-6, L"1E-6"},
++        {-2.5e-5, L"-2.5E-5"},
++        {1e14, L"100000000000000"},
++        {1e15, L"1E+15"},
++        {1e21, L"1E+21"},
++        {123456789012345680000.0, L"1.2345678901234568E+20"},
++        {1.5e300, L"1.5E+300"},
+         {9007199254740993.0, L"9007199254740992"},
++        {1 / 3.0, L"0.33333333333333331"},
++        {0.1 + 0.2, L"0.30000000000000004"},
++        {5e-324, L"4.94065645841247E-324"},
++    };
++    /* and what is not a number, as the old C runtime wrote it */
++    static const struct
++    {
++        UINT64 bits;
++        const WCHAR *json;
++    }
++    specials[] =
++    {
++        {0x7ff0000000000000ull, L"1.#INF"},
++        {0xfff0000000000000ull, L"-1.#INF"},
++        {0x7ff8000000000000ull, L"1.#QNAN"},
++        {0xfff8000000000000ull, L"-1.#IND"},
++        {0xfff8000000000001ull, L"-1.#QNAN"},
++        {0x7ff4000000000000ull, L"1.#SNAN"},
+     };
+     IJsonValueStatics *value_statics;
+     IJsonValue *value;
+@@ -1142,11 +1200,23 @@ static void test_JsonStringify(void)
+         IJsonValue_Release( value );
+         winetest_pop_context();
+     }
++    for (i = 0; i < ARRAY_SIZE(specials); i++)
++    {
++        double number;
++
++        winetest_push_context( "%#I64x", specials[i].bits );
++        memcpy( &number, &specials[i].bits, sizeof(number) );
++        hr = IJsonValueStatics_CreateNumberValue( value_statics, number, &value );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        check_stringify( value, specials[i].json );
++        IJsonValue_Release( value );
++        winetest_pop_context();
++    }
+ 
+     str = create_hstring( L"a\"b\\c/\b\f\n\r\t\x01\x1f\x7f\x00e9\x2028" );
+     hr = IJsonValueStatics_CreateStringValue( value_statics, str, &value );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    check_stringify( value, L"\"a\\\"b\\\\c/\\b\\f\\n\\r\\t\\u0001\\u001f\x7f\x00e9\x2028\"" );
++    check_stringify( value, L"\"a\\\"b\\\\c/\\b\\f\\n\\r\\t\\u0001\\u001F\x7f\x00e9\x2028\"" );
+     IJsonValue_Release( value );
+     WindowsDeleteString( str );
+ 
+@@ -1164,7 +1234,7 @@ static void test_JsonStringify(void)
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     if (SUCCEEDED(hr))
+     {
+-        check_stringify( value, L"{\"\":\"eA\",\"A\":[],\"a\":[true,false,null,\"x\",-2500],\"m\":{},\"z\":1}" );
++        check_stringify( value, L"{\"z\":1,\"a\":[true,false,null,\"x\",-2500],\"m\":{},\"A\":[],\"\":\"eA\"}" );
+         IJsonValue_Release( value );
+     }
+     WindowsDeleteString( str );
+@@ -1191,11 +1261,14 @@ static void test_JsonObjectCollection(void)
+     IMapView_HSTRING_IJsonValue *view, *first, *second;
+     IKeyValuePair_HSTRING_IJsonValue *pair;
+     IJsonValueStatics *value_statics;
+-    IMap_HSTRING_IJsonValue *map;
++    IMap_HSTRING_IJsonValue *map, *big_map;
+     IJsonValue *value, *one, *two;
+     IJsonObject *object, *other;
+     HSTRING a, b, x, key;
+     boolean found, replaced;
++    BOOL seen_a, seen_b;
++    IJsonArray *array;
++    INT32 order;
+     JsonValueType type;
+     UINT32 size;
+     DOUBLE number;
+@@ -1233,8 +1306,8 @@ static void test_JsonObjectCollection(void)
+     ok( hr == E_ILLEGAL_METHOD_CALL, "got hr %#lx.\n", hr );
+     hr = IJsonValue_GetNumber( value, &number );
+     ok( hr == E_ILLEGAL_METHOD_CALL, "got hr %#lx.\n", hr );
+-    hr = IJsonValue_GetArray( value, NULL );
+-    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
++    hr = IJsonValue_GetArray( value, &array );
++    ok( hr == E_ILLEGAL_METHOD_CALL, "got hr %#lx.\n", hr );
+     IJsonValue_Release( value );
+ 
+     hr = IJsonObject_QueryInterface( object, &IID_IMap_HSTRING_IJsonValue, (void **)&map );
+@@ -1263,7 +1336,8 @@ static void test_JsonObjectCollection(void)
+     hr = IMap_HSTRING_IJsonValue_get_Size( map, &size );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( size == 2, "got size %u.\n", size );
+-    check_stringify( object, L"{\"a\":2,\"b\":2}" );
++    /* in the order they were added: a value given again keeps its place */
++    check_stringify( object, L"{\"b\":2,\"a\":2}" );
+ 
+     hr = IMap_HSTRING_IJsonValue_Lookup( map, a, &value );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+@@ -1280,41 +1354,43 @@ static void test_JsonObjectCollection(void)
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( found == TRUE, "got found %d.\n", found );
+ 
+-    /* the members come in the order of their names */
++    /* the members, in an order that is the hash table's on Windows */
+     hr = IJsonObject_QueryInterface( object, &IID_IIterable_IKeyValuePair_HSTRING_IJsonValue, (void **)&iterable );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     hr = IIterable_IKeyValuePair_HSTRING_IJsonValue_First( iterable, &iterator );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     IIterable_IKeyValuePair_HSTRING_IJsonValue_Release( iterable );
++    seen_a = seen_b = FALSE;
+     hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_HasCurrent( iterator, &found );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( found == TRUE, "got found %d.\n", found );
+-    hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_Current( iterator, &pair );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    hr = IKeyValuePair_HSTRING_IJsonValue_get_Key( pair, &key );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    check_hstring( key, L"a" );
+-    WindowsDeleteString( key );
+-    IKeyValuePair_HSTRING_IJsonValue_Release( pair );
+-    hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_MoveNext( iterator, &found );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( found == TRUE, "got found %d.\n", found );
++    while (found)
++    {
++        hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_Current( iterator, &pair );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        if (FAILED(hr)) break;
++        hr = IKeyValuePair_HSTRING_IJsonValue_get_Key( pair, &key );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = IKeyValuePair_HSTRING_IJsonValue_get_Value( pair, &value );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( value == two, "got value %p, expected %p.\n", value, two );
++        IJsonValue_Release( value );
++        WindowsCompareStringOrdinal( key, a, &order );
++        if (!order) seen_a = TRUE;
++        WindowsCompareStringOrdinal( key, b, &order );
++        if (!order) seen_b = TRUE;
++        WindowsDeleteString( key );
++        IKeyValuePair_HSTRING_IJsonValue_Release( pair );
++        hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_MoveNext( iterator, &found );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++    }
++    ok( seen_a && seen_b, "got a %d, b %d.\n", seen_a, seen_b );
+     hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_Current( iterator, &pair );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    hr = IKeyValuePair_HSTRING_IJsonValue_get_Key( pair, &key );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    check_hstring( key, L"b" );
+-    WindowsDeleteString( key );
+-    hr = IKeyValuePair_HSTRING_IJsonValue_get_Value( pair, &value );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( value == two, "got value %p, expected %p.\n", value, two );
+-    IJsonValue_Release( value );
+-    IKeyValuePair_HSTRING_IJsonValue_Release( pair );
++    ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    /* moved past its end */
++    found = TRUE;
+     hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_MoveNext( iterator, &found );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( found == FALSE, "got found %d.\n", found );
+-    hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_Current( iterator, &pair );
+     ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    ok( found == FALSE, "got found %d.\n", found );
+     IIterator_IKeyValuePair_HSTRING_IJsonValue_Release( iterator );
+ 
+     hr = IMap_HSTRING_IJsonValue_GetView( map, &view );
+@@ -1327,34 +1403,49 @@ static void test_JsonObjectCollection(void)
+     IJsonValue_Release( value );
+     hr = IMapView_HSTRING_IJsonValue_Lookup( view, x, &value );
+     ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    /* a view of up to 16 members is not split */
++    first = second = (void *)0xdeadbeef;
+     hr = IMapView_HSTRING_IJsonValue_Split( view, &first, &second );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( first && second, "got first %p, second %p.\n", first, second );
+-    if (first && second)
+-    {
+-        hr = IMapView_HSTRING_IJsonValue_HasKey( first, a, &found );
+-        ok( hr == S_OK, "got hr %#lx.\n", hr );
+-        ok( found == TRUE, "got found %d.\n", found );
+-        hr = IMapView_HSTRING_IJsonValue_HasKey( second, a, &found );
+-        ok( hr == S_OK, "got hr %#lx.\n", hr );
+-        ok( found == FALSE, "got found %d.\n", found );
+-        IMapView_HSTRING_IJsonValue_Release( first );
+-        IMapView_HSTRING_IJsonValue_Release( second );
+-    }
++    ok( !first && !second, "got first %p, second %p.\n", first, second );
+ 
++    /* a name that is not there is removed without complaint, and without a change */
+     hr = IMap_HSTRING_IJsonValue_Remove( map, x );
+-    ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IMapView_HSTRING_IJsonValue_get_Size( view, &size );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( size == 2, "got size %u.\n", size );
+     hr = IMap_HSTRING_IJsonValue_Remove( map, a );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     hr = IMap_HSTRING_IJsonValue_get_Size( map, &size );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( size == 1, "got size %u.\n", size );
+-    /* the view is what the object was */
++    /* a change ends the views taken before it */
+     hr = IMapView_HSTRING_IJsonValue_get_Size( view, &size );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( size == 2, "got size %u.\n", size );
++    ok( hr == E_CHANGED_STATE, "got hr %#lx.\n", hr );
++    hr = IMapView_HSTRING_IJsonValue_Lookup( view, b, &value );
++    ok( hr == E_CHANGED_STATE, "got hr %#lx.\n", hr );
+     IMapView_HSTRING_IJsonValue_Release( view );
+ 
++    /* and the iterators, even when the change gives a name the value it has */
++    hr = IJsonObject_QueryInterface( object, &IID_IIterable_IKeyValuePair_HSTRING_IJsonValue, (void **)&iterable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IIterable_IKeyValuePair_HSTRING_IJsonValue_First( iterable, &iterator );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IIterable_IKeyValuePair_HSTRING_IJsonValue_Release( iterable );
++    hr = IJsonObject_SetNamedValue( object, b, two );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_HasCurrent( iterator, &found );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( found == TRUE, "got found %d.\n", found );
++    hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_get_Current( iterator, &pair );
++    ok( hr == E_CHANGED_STATE, "got hr %#lx.\n", hr );
++    found = TRUE;
++    hr = IIterator_IKeyValuePair_HSTRING_IJsonValue_MoveNext( iterator, &found );
++    ok( hr == E_CHANGED_STATE, "got hr %#lx.\n", hr );
++    ok( found == FALSE, "got found %d.\n", found );
++    IIterator_IKeyValuePair_HSTRING_IJsonValue_Release( iterator );
++
+     hr = IJsonObject_QueryInterface( object, &IID_IJsonObjectWithDefaultValues, (void **)&defaults );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     hr = IJsonObjectWithDefaultValues_GetNamedNumberOrDefault( defaults, x, 5, &number );
+@@ -1373,9 +1464,6 @@ static void test_JsonObjectCollection(void)
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( value == one, "got value %p, expected %p.\n", value, one );
+     IJsonValue_Release( value );
+-    hr = IJsonObjectWithDefaultValues_GetNamedObjectOrDefault( defaults, x, NULL, &other );
+-    ok( hr == S_OK, "got hr %#lx.\n", hr );
+-    ok( !other, "got object %p.\n", other );
+     IJsonObjectWithDefaultValues_Release( defaults );
+ 
+     hr = IMap_HSTRING_IJsonValue_Clear( map );
+@@ -1399,6 +1487,40 @@ static void test_JsonObjectCollection(void)
+     IJsonObject_Release( object );
+     IJsonObject_Release( other );
+ 
++    /* a bigger one gives its first 16 */
++    other = activate_json( L"Windows.Data.Json.JsonObject", &IID_IJsonObject );
++    for (size = 0; size < 20; size++)
++    {
++        WCHAR name[8];
++
++        swprintf( name, ARRAY_SIZE(name), L"m%02u", size );
++        key = create_hstring( name );
++        hr = IJsonObject_SetNamedValue( other, key, one );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        WindowsDeleteString( key );
++    }
++    hr = IJsonObject_QueryInterface( other, &IID_IMap_HSTRING_IJsonValue, (void **)&big_map );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IMap_HSTRING_IJsonValue_GetView( big_map, &view );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IMapView_HSTRING_IJsonValue_Split( view, &first, &second );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( first && second, "got first %p, second %p.\n", first, second );
++    if (first && second)
++    {
++        hr = IMapView_HSTRING_IJsonValue_get_Size( first, &size );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( size == 16, "got size %u.\n", size );
++        hr = IMapView_HSTRING_IJsonValue_get_Size( second, &size );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( size == 4, "got size %u.\n", size );
++        IMapView_HSTRING_IJsonValue_Release( first );
++        IMapView_HSTRING_IJsonValue_Release( second );
++    }
++    IMapView_HSTRING_IJsonValue_Release( view );
++    IMap_HSTRING_IJsonValue_Release( big_map );
++    IJsonObject_Release( other );
++
+     WindowsDeleteString( a );
+     WindowsDeleteString( b );
+     WindowsDeleteString( x );
+@@ -1411,11 +1533,15 @@ static void test_JsonObjectCollection(void)
+ 
+ static void test_JsonArrayCollection(void)
+ {
++    IVectorView_IJsonValue *view;
++    IIterable_IJsonValue *iterable;
++    IIterator_IJsonValue *iterator;
+     IJsonValueStatics *value_statics;
+     IVector_IJsonValue *vector;
+     IJsonValue *value, *item;
+     IJsonArray *array, *other;
+     JsonValueType type;
++    boolean flag;
+     HSTRING str;
+     UINT32 size;
+     HRESULT hr;
+@@ -1446,7 +1572,7 @@ static void test_JsonArrayCollection(void)
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     ok( other == array, "got array %p, expected %p.\n", other, array );
+     IJsonArray_Release( other );
+-    hr = IJsonValue_GetBoolean( value, NULL );
++    hr = IJsonValue_GetBoolean( value, &flag );
+     ok( hr == E_ILLEGAL_METHOD_CALL, "got hr %#lx.\n", hr );
+     IJsonValue_Release( value );
+ 
+@@ -1476,6 +1602,29 @@ static void test_JsonArrayCollection(void)
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     check_stringify( array, L"[\"x\"]" );
+ 
++    /* a change ends the views and iterators taken before it */
++    hr = IVector_IJsonValue_GetView( vector, &view );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IJsonArray_QueryInterface( array, &IID_IIterable_IJsonValue, (void **)&iterable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IIterable_IJsonValue_First( iterable, &iterator );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IIterable_IJsonValue_Release( iterable );
++    hr = IVectorView_IJsonValue_get_Size( view, &size );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( size == 1, "got size %u.\n", size );
++    hr = IJsonValueStatics_CreateNumberValue( value_statics, 2, &item );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IVector_IJsonValue_Append( vector, item );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IJsonValue_Release( item );
++    hr = IVectorView_IJsonValue_get_Size( view, &size );
++    ok( hr == E_CHANGED_STATE, "got hr %#lx.\n", hr );
++    hr = IIterator_IJsonValue_get_Current( iterator, &item );
++    ok( hr == E_CHANGED_STATE, "got hr %#lx.\n", hr );
++    IIterator_IJsonValue_Release( iterator );
++    IVectorView_IJsonValue_Release( view );
++
+     IVector_IJsonValue_Release( vector );
+     IJsonArray_Release( array );
+     IJsonValueStatics_Release( value_statics );
+@@ -1521,23 +1670,26 @@ static void test_JsonError(void)
+         ok( status == statuses[i].status, "%u: got status %d.\n", i, status );
+     }
+ 
+-    /* arrays and objects nest 1024 deep */
+-    json = malloc( 2 * 1025 * sizeof(WCHAR) + sizeof(WCHAR) );
+-    for (i = 0; i < 1024; i++) json[i] = '[';
+-    for (i = 0; i < 1024; i++) json[1024 + i] = ']';
+-    json[2048] = 0;
++    /* Parse reads values 512 deep, a value inside 511 arrays or objects ... */
++    json = malloc( 2 * 1025 * sizeof(WCHAR) + 2 * sizeof(WCHAR) );
++    for (i = 0; i < 511; i++) json[i] = '[';
++    json[511] = '1';
++    for (i = 0; i < 511; i++) json[512 + i] = ']';
++    json[1023] = 0;
+     str = create_hstring( json );
+     hr = IJsonValueStatics_Parse( value_statics, str, &value );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     if (SUCCEEDED(hr)) IJsonValue_Release( value );
+     WindowsDeleteString( str );
+ 
+-    for (i = 0; i < 1025; i++) json[i] = '[';
+-    for (i = 0; i < 1025; i++) json[1025 + i] = ']';
+-    json[2050] = 0;
++    /* ... but not inside 512 */
++    for (i = 0; i < 512; i++) json[i] = '[';
++    json[512] = '1';
++    for (i = 0; i < 512; i++) json[513 + i] = ']';
++    json[1025] = 0;
+     str = create_hstring( json );
+     hr = IJsonValueStatics_Parse( value_statics, str, &value );
+-    ok( FAILED(hr), "got hr %#lx.\n", hr );
++    ok( hr == __HRESULT_FROM_WIN32( ERROR_IMPLEMENTATION_LIMIT ), "got hr %#lx.\n", hr );
+     if (SUCCEEDED(hr)) IJsonValue_Release( value );
+     hr = IJsonErrorStatics2_GetJsonStatus( error_statics, hr, &status );
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+diff --git a/dlls/windows.web/vector.c b/dlls/windows.web/vector.c
+index 7eee0f007c8..d67b24d8897 100644
+--- a/dlls/windows.web/vector.c
++++ b/dlls/windows.web/vector.c
+@@ -30,9 +30,21 @@ WINE_DEFAULT_DEBUG_CHANNEL(web);
+  * vector with one more interface of its own and a way to write itself out;
+  * the desc gives those too.
+  *
+- * Iterators and views are taken from a copy of the elements.
++ * Iterators and views are taken from a copy of the elements.  When the desc asks for it, a change to
++ * the vector ends those taken before it, which then answer E_CHANGED_STATE.
+  */
+ 
++/* the vector a view or iterator was taken from, when a change there ends it; NULL otherwise */
++static BOOL source_changed( struct vector *source, LONG version )
++{
++    return source && ReadNoFence( &source->version ) != version;
++}
++
++static void source_release( struct vector *source )
++{
++    if (source) IVector_IInspectable_Release( &source->IVector_IInspectable_iface );
++}
++
+ /*** iterator ***/
+ 
+ struct iterator
+@@ -43,6 +55,8 @@ struct iterator
+     IInspectable **elements;
+     UINT32 size;
+     UINT32 index;
++    struct vector *source;
++    LONG version;
+ };
+ 
+ static inline struct iterator *impl_from_IIterator_IInspectable( IIterator_IInspectable *iface )
+@@ -83,6 +97,7 @@ static ULONG WINAPI iterator_Release( IIterator_IInspectable *iface )
+     if (!ref)
+     {
+         vector_free_snapshot( impl->elements, impl->size );
++        source_release( impl->source );
+         free( impl );
+     }
+     return ref;
+@@ -113,6 +128,7 @@ static HRESULT WINAPI iterator_get_Current( IIterator_IInspectable *iface, IInsp
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     if (impl->index >= impl->size) return E_BOUNDS;
+     IInspectable_AddRef( (*value = impl->elements[impl->index]) );
+     return S_OK;
+@@ -136,7 +152,17 @@ static HRESULT WINAPI iterator_MoveNext( IIterator_IInspectable *iface, boolean
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
++    if (source_changed( impl->source, impl->version ))
++    {
++        *value = FALSE;
++        return E_CHANGED_STATE;
++    }
+     if (impl->index < impl->size) impl->index++;
++    else if (impl->source)
++    {
++        *value = FALSE;
++        return E_BOUNDS;
++    }
+     *value = impl->index < impl->size;
+     return S_OK;
+ }
+@@ -150,6 +176,7 @@ static HRESULT WINAPI iterator_GetMany( IIterator_IInspectable *iface, UINT32 it
+     TRACE( "iface %p, items_size %u, items %p, count %p.\n", iface, items_size, items, count );
+ 
+     if (!count) return E_POINTER;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     for (i = 0; i < items_size && impl->index < impl->size; i++, impl->index++)
+         IInspectable_AddRef( (items[i] = impl->elements[impl->index]) );
+     *count = i;
+@@ -172,7 +199,8 @@ static const struct IIterator_IInspectableVtbl iterator_vtbl =
+     iterator_GetMany,
+ };
+ 
+-static HRESULT iterator_create( const GUID *iid, IInspectable **elements, UINT32 size, IIterator_IInspectable **out )
++static HRESULT iterator_create( const GUID *iid, IInspectable **elements, UINT32 size, struct vector *source,
++                                LONG version, IIterator_IInspectable **out )
+ {
+     struct iterator *impl;
+ 
+@@ -186,6 +214,8 @@ static HRESULT iterator_create( const GUID *iid, IInspectable **elements, UINT32
+     impl->iid = iid;
+     impl->elements = elements;
+     impl->size = size;
++    if ((impl->source = source)) IVector_IInspectable_AddRef( &source->IVector_IInspectable_iface );
++    impl->version = version;
+     *out = &impl->IIterator_IInspectable_iface;
+     return S_OK;
+ }
+@@ -200,6 +230,8 @@ struct view
+     const struct vector_desc *desc;
+     IInspectable **elements;
+     UINT32 size;
++    struct vector *source;
++    LONG version;
+ };
+ 
+ static inline struct view *impl_from_IVectorView_IInspectable( IVectorView_IInspectable *iface )
+@@ -246,6 +278,7 @@ static ULONG WINAPI view_Release( IVectorView_IInspectable *iface )
+     if (!ref)
+     {
+         vector_free_snapshot( impl->elements, impl->size );
++        source_release( impl->source );
+         free( impl );
+     }
+     return ref;
+@@ -279,6 +312,7 @@ static HRESULT WINAPI view_GetAt( IVectorView_IInspectable *iface, UINT32 index,
+ 
+     if (!value) return E_POINTER;
+     *value = NULL;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     if (index >= impl->size) return E_BOUNDS;
+     IInspectable_AddRef( (*value = impl->elements[index]) );
+     return S_OK;
+@@ -289,6 +323,7 @@ static HRESULT WINAPI view_get_Size( IVectorView_IInspectable *iface, UINT32 *va
+     struct view *impl = impl_from_IVectorView_IInspectable( iface );
+     TRACE( "iface %p, value %p.\n", iface, value );
+     if (!value) return E_POINTER;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     *value = impl->size;
+     return S_OK;
+ }
+@@ -301,6 +336,7 @@ static HRESULT WINAPI view_IndexOf( IVectorView_IInspectable *iface, IInspectabl
+     TRACE( "iface %p, element %p, index %p, found %p.\n", iface, element, index, found );
+ 
+     if (!index || !found) return E_POINTER;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     for (i = 0; i < impl->size; i++) if (impl->elements[i] == element) break;
+     *found = i < impl->size;
+     *index = *found ? i : 0;
+@@ -316,6 +352,7 @@ static HRESULT WINAPI view_GetMany( IVectorView_IInspectable *iface, UINT32 star
+     TRACE( "iface %p, start_index %u, items_size %u, items %p, count %p.\n", iface, start_index, items_size, items, count );
+ 
+     if (!count) return E_POINTER;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     if (start_index > impl->size) return E_BOUNDS;
+     for (i = 0; i < items_size && start_index + i < impl->size; i++)
+         IInspectable_AddRef( (items[i] = impl->elements[start_index + i]) );
+@@ -351,9 +388,10 @@ static HRESULT WINAPI view_iterable_First( IIterable_IInspectable *iface, IItera
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
++    if (source_changed( impl->source, impl->version )) return E_CHANGED_STATE;
+     if (impl->size && !(elements = malloc( impl->size * sizeof(*elements) ))) return E_OUTOFMEMORY;
+     for (i = 0; i < impl->size; i++) IInspectable_AddRef( (elements[i] = impl->elements[i]) );
+-    return iterator_create( impl->desc->iterator, elements, impl->size, value );
++    return iterator_create( impl->desc->iterator, elements, impl->size, impl->source, impl->version, value );
+ }
+ 
+ static const struct IIterable_IInspectableVtbl view_iterable_vtbl =
+@@ -369,7 +407,8 @@ static const struct IIterable_IInspectableVtbl view_iterable_vtbl =
+     view_iterable_First,
+ };
+ 
+-HRESULT vector_view_create( const struct vector_desc *desc, IInspectable **items, UINT32 count, IInspectable **out )
++static HRESULT view_create( const struct vector_desc *desc, IInspectable **items, UINT32 count, struct vector *source,
++                            LONG version, IInspectable **out )
+ {
+     struct view *impl;
+ 
+@@ -384,10 +423,31 @@ HRESULT vector_view_create( const struct vector_desc *desc, IInspectable **items
+     impl->desc = desc;
+     impl->elements = items;
+     impl->size = count;
++    if ((impl->source = source)) IVector_IInspectable_AddRef( &source->IVector_IInspectable_iface );
++    impl->version = version;
+     *out = (IInspectable *)&impl->IVectorView_IInspectable_iface;
+     return S_OK;
+ }
+ 
++HRESULT vector_view_create( const struct vector_desc *desc, IInspectable **items, UINT32 count, IInspectable **out )
++{
++    return view_create( desc, items, count, NULL, 0, out );
++}
++
++/* a copy of the elements, and the version of the vector they are; ~0u when out of memory */
++static UINT32 snapshot_version( struct vector *impl, IInspectable ***items, LONG *version )
++{
++    UINT32 count, i;
++
++    EnterCriticalSection( &impl->cs );
++    count = impl->size;
++    *version = impl->version;
++    if (!(*items = malloc( max( count, 1 ) * sizeof(**items) ))) count = ~0u;
++    else for (i = 0; i < count; i++) IInspectable_AddRef( ((*items)[i] = impl->elements[i]) );
++    LeaveCriticalSection( &impl->cs );
++    return count;
++}
++
+ /*** vector ***/
+ 
+ static inline struct vector *impl_from_IVector_IInspectable( IVector_IInspectable *iface )
+@@ -511,14 +571,16 @@ static HRESULT WINAPI vector_GetView( IVector_IInspectable *iface, IVectorView_I
+ {
+     struct vector *impl = impl_from_IVector_IInspectable( iface );
+     IInspectable **items;
++    LONG version;
+     UINT32 count;
+ 
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    count = vector_snapshot( impl, &items );
++    count = snapshot_version( impl, &items, &version );
+     if (count == ~0u) return E_OUTOFMEMORY;
+-    return vector_view_create( impl->desc, items, count, (IInspectable **)value );
++    return view_create( impl->desc, items, count, impl->desc->changes_invalidate ? impl : NULL, version,
++                        (IInspectable **)value );
+ }
+ 
+ static HRESULT WINAPI vector_IndexOf( IVector_IInspectable *iface, IInspectable *element, UINT32 *index, BOOLEAN *found )
+@@ -552,6 +614,7 @@ static BOOL vector_grow( struct vector *impl, UINT32 size )
+ 
+ static void vector_changed( struct vector *impl )
+ {
++    WriteNoFence( &impl->version, impl->version + 1 );
+     if (impl->desc->changed) impl->desc->changed( impl );
+ }
+ 
+@@ -733,14 +796,16 @@ static HRESULT WINAPI iterable_First( IIterable_IInspectable *iface, IIterator_I
+ {
+     struct vector *impl = impl_from_IIterable_IInspectable( iface );
+     IInspectable **items;
++    LONG version;
+     UINT32 count;
+ 
+     TRACE( "iface %p, value %p.\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    count = vector_snapshot( impl, &items );
++    count = snapshot_version( impl, &items, &version );
+     if (count == ~0u) return E_OUTOFMEMORY;
+-    return iterator_create( impl->desc->iterator, items, count, value );
++    return iterator_create( impl->desc->iterator, items, count, impl->desc->changes_invalidate ? impl : NULL, version,
++                            value );
+ }
+ 
+ static const struct IIterable_IInspectableVtbl iterable_vtbl =

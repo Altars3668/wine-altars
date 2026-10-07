@@ -1,0 +1,504 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 15:34:04 -0400
+Subject: [PATCH] ntdll: Implement FileProcessIdsUsingFileInformation.
+
+The server walks every process's handles and views for the same inode, leaving out the file object the query goes
+through.  As on Windows 11, the buffer has to hold the header and one id, a buffer too small for all of them gets
+STATUS_INFO_LENGTH_MISMATCH with the size it takes in Information, and image mappings count.  Wow64 gives 32-bit
+callers their ULONG list.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ntdll/tests/file.c b/dlls/ntdll/tests/file.c
+index 4f3414ba9e1..bdc82d5be23 100644
+--- a/dlls/ntdll/tests/file.c
++++ b/dlls/ntdll/tests/file.c
+@@ -4357,6 +4357,63 @@ static void test_file_name_information(void)
+ }
+ 
+ /* a file's name comes back in the case it has on disk, whatever case it was opened by */
++/* the processes that use a file, but for the file object asked through */
++static void test_file_process_ids(void)
++{
++    char buffer[sizeof(FILE_PROCESS_IDS_USING_FILE_INFORMATION) + 16 * sizeof(ULONG_PTR)];
++    FILE_PROCESS_IDS_USING_FILE_INFORMATION *info = (void *)buffer;
++    WCHAR path[MAX_PATH], temp[MAX_PATH];
++    HANDLE file, file2, image;
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++
++    GetTempPathW( ARRAY_SIZE(temp), temp );
++    GetTempFileNameW( temp, L"pid", 0, path );
++    file = CreateFileW( path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                        NULL, CREATE_ALWAYS, 0, NULL );
++    ok( file != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError() );
++
++    memset( buffer, 0xcc, sizeof(buffer) );
++    status = pNtQueryInformationFile( file, &io, buffer, sizeof(buffer), FileProcessIdsUsingFileInformation );
++    ok( !status, "got %#lx\n", status );
++    ok( !info->NumberOfProcessIdsInList, "got %lu\n", info->NumberOfProcessIdsInList );
++    ok( io.Information == offsetof( FILE_PROCESS_IDS_USING_FILE_INFORMATION, ProcessIdList ),
++        "got %Iu\n", io.Information );
++
++    status = pNtQueryInformationFile( file, &io, buffer, sizeof(FILE_PROCESS_IDS_USING_FILE_INFORMATION) - 1,
++                                      FileProcessIdsUsingFileInformation );
++    ok( status == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", status );
++
++    /* the first handle is ours */
++    file2 = CreateFileW( path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                         OPEN_EXISTING, 0, NULL );
++    ok( file2 != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError() );
++    memset( buffer, 0xcc, sizeof(buffer) );
++    status = pNtQueryInformationFile( file2, &io, buffer, sizeof(buffer), FileProcessIdsUsingFileInformation );
++    ok( !status, "got %#lx\n", status );
++    ok( info->NumberOfProcessIdsInList == 1, "got %lu\n", info->NumberOfProcessIdsInList );
++    ok( info->ProcessIdList[0] == GetCurrentProcessId(), "got %Iu\n", info->ProcessIdList[0] );
++    CloseHandle( file2 );
++    CloseHandle( file );
++    DeleteFileW( path );
++
++    /* an image is used where it is mapped */
++    GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) );
++    image = CreateFileW( path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                         OPEN_EXISTING, 0, NULL );
++    ok( image != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError() );
++    memset( buffer, 0xcc, sizeof(buffer) );
++    status = pNtQueryInformationFile( image, &io, buffer, sizeof(buffer), FileProcessIdsUsingFileInformation );
++    ok( !status, "got %#lx\n", status );
++    ok( info->NumberOfProcessIdsInList >= 1, "got %lu\n", info->NumberOfProcessIdsInList );
++    /* a buffer too small for all of them gets none, and the size it takes */
++    status = pNtQueryInformationFile( image, &io, buffer, sizeof(FILE_PROCESS_IDS_USING_FILE_INFORMATION),
++                                      FileProcessIdsUsingFileInformation );
++    if (info->NumberOfProcessIdsInList > 1)
++        ok( status == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", status );
++    CloseHandle( image );
++}
++
+ static void test_file_name_case(void)
+ {
+     static const WCHAR name[] = L"MixedCase.Tmp";
+@@ -8889,6 +8946,7 @@ START_TEST(file)
+     test_file_both_information();
+     test_file_name_information();
+     test_file_name_case();
++    test_file_process_ids();
+     test_file_full_size_information();
+     test_file_all_name_information();
+     test_file_rename_information(FileRenameInformation);
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index f204b0b7305..497dbb72d86 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2519,6 +2519,38 @@ static unsigned int server_open_file_object( HANDLE *ret_handle, ACCESS_MASK acc
+                                              ULONG sharing, ULONG options );
+ 
+ 
++/* The processes that have the file open, through a handle or a view, but for the file object asked through.  A
++ * buffer too small for all of them gets none, and the size it takes. */
++static NTSTATUS get_file_users( HANDLE handle, IO_STATUS_BLOCK *io, FILE_PROCESS_IDS_USING_FILE_INFORMATION *info,
++                                ULONG len )
++{
++    ULONG max = (len - offsetof( FILE_PROCESS_IDS_USING_FILE_INFORMATION, ProcessIdList )) / sizeof(ULONG_PTR);
++    unsigned int *pids, total = 0, i;
++    NTSTATUS status;
++
++    if (!(pids = malloc( (max + 1) * sizeof(*pids) ))) return STATUS_NO_MEMORY;
++    SERVER_START_REQ( get_file_users )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        wine_server_set_reply( req, pids, max * sizeof(*pids) );
++        if (!(status = wine_server_call( req ))) total = reply->total;
++    }
++    SERVER_END_REQ;
++    if (!status)
++    {
++        io->Information = offsetof( FILE_PROCESS_IDS_USING_FILE_INFORMATION, ProcessIdList[total] );
++        if (total > max) status = STATUS_INFO_LENGTH_MISMATCH;
++        else
++        {
++            info->NumberOfProcessIdsInList = total;
++            for (i = 0; i < total; i++) info->ProcessIdList[i] = pids[i];
++        }
++    }
++    free( pids );
++    return status;
++}
++
++
+ /* retrieve device/inode number for all the drives */
+ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
+ {
+@@ -5356,7 +5388,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+         0,                                             /* FileSfioReserveInformation */
+         0,                                             /* FileSfioVolumeInformation */
+         0,                                             /* FileHardLinkInformation */
+-        0,                                             /* FileProcessIdsUsingFileInformation */
++        sizeof(FILE_PROCESS_IDS_USING_FILE_INFORMATION), /* FileProcessIdsUsingFileInformation */
+         sizeof(FILE_NAME_INFORMATION),                 /* FileNormalizedNameInformation */
+         0,                                             /* FileNetworkPhysicalNameInformation */
+         0,                                             /* FileIdGlobalTxDirectoryInformation */
+@@ -5410,6 +5442,8 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+         return server_get_file_info( handle, io, ptr, len, class );
+     if (len < info_sizes[class])
+         return io->Status = STATUS_INFO_LENGTH_MISMATCH;
++    if (class == FileProcessIdsUsingFileInformation)
++        return io->Status = get_file_users( handle, io, ptr, len );
+ 
+     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
+     {
+diff --git a/dlls/wow64/file.c b/dlls/wow64/file.c
+index 4ad490cbfc4..e66252b407d 100644
+--- a/dlls/wow64/file.c
++++ b/dlls/wow64/file.c
+@@ -633,6 +633,32 @@ NTSTATUS WINAPI wow64_NtQueryInformationFile( UINT *args )
+     IO_STATUS_BLOCK io;
+     NTSTATUS status;
+ 
++    if (class == FileProcessIdsUsingFileInformation)
++    {
++        /* ULONG count, then a ULONG_PTR per process */
++        ULONG max, *info32 = info, i;
++        FILE_PROCESS_IDS_USING_FILE_INFORMATION *info64;
++
++        if (len < 2 * sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
++        max = len / sizeof(ULONG) - 1;
++        if (!(info64 = Wow64AllocateTemp( offsetof( FILE_PROCESS_IDS_USING_FILE_INFORMATION, ProcessIdList[max] ))))
++            return STATUS_NO_MEMORY;
++        status = NtQueryInformationFile( handle, iosb_32to64( &io, io32 ), info64,
++                                         offsetof( FILE_PROCESS_IDS_USING_FILE_INFORMATION, ProcessIdList[max] ),
++                                         class );
++        if (!status || status == STATUS_INFO_LENGTH_MISMATCH)
++            io.Information = sizeof(ULONG) + (io.Information -
++                             offsetof( FILE_PROCESS_IDS_USING_FILE_INFORMATION, ProcessIdList )) / sizeof(ULONG_PTR) *
++                             sizeof(ULONG);
++        if (!status)
++        {
++            info32[0] = info64->NumberOfProcessIdsInList;
++            for (i = 0; i < info64->NumberOfProcessIdsInList; i++) info32[i + 1] = info64->ProcessIdList[i];
++        }
++        put_iosb( io32, &io );
++        return status;
++    }
++
+     status = NtQueryInformationFile( handle, iosb_32to64( &io, io32 ), info, len, class );
+     put_iosb( io32, &io );
+     return status;
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index bf57d3eb910..1016c0f8231 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -2063,6 +2063,20 @@ struct get_file_info_reply
+ };
+ 
+ 
++struct get_file_users_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++};
++struct get_file_users_reply
++{
++    struct reply_header __header;
++    data_size_t  total;
++    /* VARARG(pids,uints); */
++    char __pad_12[4];
++};
++
++
+ struct get_volume_info_request
+ {
+     struct request_header __header;
+@@ -6423,6 +6437,7 @@ enum request
+     REQ_get_directory_cache_entry,
+     REQ_flush,
+     REQ_get_file_info,
++    REQ_get_file_users,
+     REQ_get_volume_info,
+     REQ_lock_file,
+     REQ_unlock_file,
+@@ -6745,6 +6760,7 @@ union generic_request
+     struct get_directory_cache_entry_request get_directory_cache_entry_request;
+     struct flush_request flush_request;
+     struct get_file_info_request get_file_info_request;
++    struct get_file_users_request get_file_users_request;
+     struct get_volume_info_request get_volume_info_request;
+     struct lock_file_request lock_file_request;
+     struct unlock_file_request unlock_file_request;
+@@ -7065,6 +7081,7 @@ union generic_reply
+     struct get_directory_cache_entry_reply get_directory_cache_entry_reply;
+     struct flush_reply flush_reply;
+     struct get_file_info_reply get_file_info_reply;
++    struct get_file_users_reply get_file_users_reply;
+     struct get_volume_info_reply get_volume_info_reply;
+     struct lock_file_reply lock_file_reply;
+     struct unlock_file_reply unlock_file_reply;
+@@ -7328,6 +7345,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 971
++#define SERVER_PROTOCOL_VERSION 972
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/include/winternl.h b/include/winternl.h
+index 0661f0f1245..46445d93741 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -1777,6 +1777,11 @@ typedef struct _FILE_STAT_INFORMATION {
+     ULONG EffectiveAccess;
+ } FILE_STAT_INFORMATION, *PFILE_STAT_INFORMATION;
+ 
++typedef struct _FILE_PROCESS_IDS_USING_FILE_INFORMATION {
++    ULONG NumberOfProcessIdsInList;
++    ULONG_PTR ProcessIdList[1];
++} FILE_PROCESS_IDS_USING_FILE_INFORMATION, *PFILE_PROCESS_IDS_USING_FILE_INFORMATION;
++
+ typedef struct _FILE_IO_COMPLETION_NOTIFICATION_INFORMATION {
+     ULONG Flags;
+ } FILE_IO_COMPLETION_NOTIFICATION_INFORMATION, *PFILE_IO_COMPLETION_NOTIFICATION_INFORMATION;
+diff --git a/server/fd.c b/server/fd.c
+index 45a15eab433..8f9a9dacfc1 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2309,6 +2309,12 @@ int is_same_file_fd( struct fd *fd1, struct fd *fd2 )
+     return fd1->inode == fd2->inode;
+ }
+ 
++/* check if two file descriptors are for the same file, both being files */
++int is_same_inode_fd( struct fd *fd1, struct fd *fd2 )
++{
++    return fd1->inode && fd1->inode == fd2->inode;
++}
++
+ /* allow the fd to be cached (can't be reset once set) */
+ void allow_fd_caching( struct fd *fd )
+ {
+diff --git a/server/file.h b/server/file.h
+index 065a791740f..7a6312f62e0 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -101,6 +101,7 @@ extern int get_unix_fd( struct fd *fd );
+ extern client_ptr_t get_fd_map_address( struct fd *fd );
+ extern void set_fd_map_address( struct fd *fd, client_ptr_t addr, mem_size_t size );
+ extern int is_same_file_fd( struct fd *fd1, struct fd *fd2 );
++extern int is_same_inode_fd( struct fd *fd1, struct fd *fd2 );
+ extern int is_fd_removable( struct fd *fd );
+ extern int check_fd_events( struct fd *fd, int events );
+ extern void set_fd_events( struct fd *fd, int events );
+@@ -176,6 +177,7 @@ extern int grow_file( int unix_fd, file_pos_t new_size );
+ extern void free_map_addr( client_ptr_t base, mem_size_t size );
+ extern struct memory_view *find_mapped_view( struct process *process, client_ptr_t base );
+ extern struct memory_view *get_exe_view( struct process *process );
++extern int is_file_mapped( struct process *process, struct fd *fd );
+ extern struct file *get_view_file( const struct memory_view *view, unsigned int access, unsigned int sharing );
+ extern const struct pe_image_info *get_view_image_info( const struct memory_view *view, client_ptr_t *base );
+ extern int get_view_nt_name( const struct memory_view *view, struct unicode_str *name );
+diff --git a/server/handle.c b/server/handle.c
+index 1933b2f6a43..4e59c701648 100644
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -33,6 +33,7 @@
+ #include "winternl.h"
+ 
+ #include "handle.h"
++#include "file.h"
+ #include "process.h"
+ #include "thread.h"
+ #include "security.h"
+@@ -913,6 +914,78 @@ void enum_handles_of_type( const struct object_ops *ops,
+     enum_processes( enum_process_handles_cb, &info );
+ }
+ 
++struct file_users_info
++{
++    struct fd     *fd;          /* the file asked about */
++    struct object *queried;     /* the object asked through, not counted */
++    unsigned int  *pids;
++    unsigned int   count;
++    unsigned int   max;         /* the size of pids */
++};
++
++/* whether a process has the file open, through a handle or a view of it */
++static int find_file_user( struct process *process, void *user )
++{
++    struct file_users_info *info = user;
++    struct handle_table *table = process->handles;
++    struct handle_entry *entry;
++    int i, used = 0;
++
++    for (i = 0, entry = table ? table->entries : NULL; table && !used && i <= table->last; i++, entry++)
++    {
++        struct fd *fd;
++
++        if (!entry->ptr || entry->ptr == info->queried) continue;
++        if (!(fd = get_obj_fd( entry->ptr )))
++        {
++            clear_error();
++            continue;
++        }
++        used = is_same_inode_fd( fd, info->fd );
++        release_object( fd );
++    }
++    if (!used) used = is_file_mapped( process, info->fd );
++    if (used)
++    {
++        if (info->pids && info->count < info->max) info->pids[info->count] = process->id;
++        info->count++;
++    }
++    return 0;
++}
++
++DECL_HANDLER(get_file_users)
++{
++    struct file_users_info info;
++    unsigned int max = get_reply_max_size() / sizeof(unsigned int);
++    struct object *obj;
++
++    if (!(obj = get_handle_obj( current->process, req->handle, 0, NULL ))) return;
++    if ((info.fd = get_obj_fd( obj )))
++    {
++        unsigned int total;
++
++        info.queried = obj;
++        info.pids = NULL;
++        info.count = 0;
++        enum_processes( find_file_user, &info );
++        total = info.count;
++        reply->total = total;
++        if (total && total <= max && (info.pids = mem_alloc( total * sizeof(unsigned int) )))
++        {
++            info.max = total;
++            info.count = 0;
++            enum_processes( find_file_user, &info );
++            /* nothing runs in between in the server, but keep to what was counted */
++            if (info.count > total) info.count = total;
++            set_reply_data( info.pids, info.count * sizeof(unsigned int) );
++            reply->total = info.count;
++            free( info.pids );
++        }
++        release_object( info.fd );
++    }
++    release_object( obj );
++}
++
+ DECL_HANDLER(set_object_permanence)
+ {
+     const unsigned int access = req->permanent ? 0 : DELETE;
+diff --git a/server/mapping.c b/server/mapping.c
+index 161ee2646e2..3696d3ce25e 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -399,6 +399,16 @@ static int is_valid_view_addr( struct process *process, client_ptr_t addr, mem_s
+     return 1;
+ }
+ 
++/* whether a process has a view of the file */
++int is_file_mapped( struct process *process, struct fd *fd )
++{
++    struct memory_view *view;
++
++    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
++        if (view->fd && is_same_inode_fd( view->fd, fd )) return 1;
++    return 0;
++}
++
+ /* get the main exe memory view */
+ struct memory_view *get_exe_view( struct process *process )
+ {
+diff --git a/server/protocol.def b/server/protocol.def
+index 1185e0ebd83..5845980d1fc 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1749,6 +1749,14 @@ enum server_fd_type
+     VARARG(data,bytes);         /* file info data */
+ @END
+ 
++/* Get the processes that use a file, but for the object the handle is to */
++@REQ(get_file_users)
++    obj_handle_t handle;        /* handle to the file */
++@REPLY
++    data_size_t  total;         /* how many processes use it */
++    VARARG(pids,uints);         /* the ids of as many as fit */
++@END
++
+ /* Query volume information */
+ @REQ(get_volume_info)
+     obj_handle_t handle;        /* handle to the file */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 0bd9de139c5..2ef544e94d6 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -61,6 +61,7 @@ DECL_HANDLER(get_handle_fd);
+ DECL_HANDLER(get_directory_cache_entry);
+ DECL_HANDLER(flush);
+ DECL_HANDLER(get_file_info);
++DECL_HANDLER(get_file_users);
+ DECL_HANDLER(get_volume_info);
+ DECL_HANDLER(lock_file);
+ DECL_HANDLER(unlock_file);
+@@ -380,6 +381,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_get_directory_cache_entry,
+     (req_handler)req_flush,
+     (req_handler)req_get_file_info,
++    (req_handler)req_get_file_users,
+     (req_handler)req_get_volume_info,
+     (req_handler)req_lock_file,
+     (req_handler)req_unlock_file,
+@@ -1042,6 +1044,10 @@ C_ASSERT( offsetof(struct get_file_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct get_file_info_request, info_class) == 16 );
+ C_ASSERT( sizeof(struct get_file_info_request) == 24 );
+ C_ASSERT( sizeof(struct get_file_info_reply) == 8 );
++C_ASSERT( offsetof(struct get_file_users_request, handle) == 12 );
++C_ASSERT( sizeof(struct get_file_users_request) == 16 );
++C_ASSERT( offsetof(struct get_file_users_reply, total) == 8 );
++C_ASSERT( sizeof(struct get_file_users_reply) == 16 );
+ C_ASSERT( offsetof(struct get_volume_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct get_volume_info_request, async) == 16 );
+ C_ASSERT( offsetof(struct get_volume_info_request, info_class) == 56 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 6a719d193e7..fc08d92b37a 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -749,6 +749,17 @@ static void dump_get_file_info_reply( const struct get_file_info_reply *req )
+     dump_varargs_bytes( " data=", cur_size );
+ }
+ 
++static void dump_get_file_users_request( const struct get_file_users_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_get_file_users_reply( const struct get_file_users_reply *req )
++{
++    fprintf( stderr, " total=%u", req->total );
++    dump_varargs_uints( ", pids=", cur_size );
++}
++
+ static void dump_get_volume_info_request( const struct get_volume_info_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+@@ -3670,6 +3681,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_directory_cache_entry_request,
+     (dump_func)dump_flush_request,
+     (dump_func)dump_get_file_info_request,
++    (dump_func)dump_get_file_users_request,
+     (dump_func)dump_get_volume_info_request,
+     (dump_func)dump_lock_file_request,
+     (dump_func)dump_unlock_file_request,
+@@ -3989,6 +4001,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_directory_cache_entry_reply,
+     (dump_func)dump_flush_reply,
+     (dump_func)dump_get_file_info_reply,
++    (dump_func)dump_get_file_users_reply,
+     (dump_func)dump_get_volume_info_reply,
+     (dump_func)dump_lock_file_reply,
+     NULL,
+@@ -4308,6 +4321,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "get_directory_cache_entry",
+     "flush",
+     "get_file_info",
++    "get_file_users",
+     "get_volume_info",
+     "lock_file",
+     "unlock_file",

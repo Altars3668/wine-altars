@@ -1,0 +1,797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 08:21:02 -0400
+Subject: [PATCH] msxml3: Give the namespace manager node contexts, as MSXML
+ does.
+
+pushNodeContext() was a stub.  Office resolves the prefixes in a Print
+Schema document with it: a feature's name is a QName such as
+psk:JobDuplexAllDocumentsContiguously, and MSO pushes the element's
+context and asks getURI() what psk means, so with the stub Word never
+saw the duplex feature a printer offers.
+
+Measured against MSXML 6 on Windows 11: a pushed context holds the
+binding the node's own name makes, then its xmlns declarations and, when
+deep, the same for each ancestor, nearest first; a name in no namespace
+and xmlns="" leave the prefix unbound.  getURI() with a node looks at
+explicit declarations only; lookups go down the whole stack of contexts;
+the bottom context only ever holds "xml", so declaring on it opens a new
+one; getPrefix()'s index picks among the prefixes bound to a URI;
+reset() works; and a buffer has to leave room for the terminator.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/msxml_dispex.h b/dlls/msxml3/msxml_dispex.h
+index e907e9ba56c..22ef70af4c1 100644
+--- a/dlls/msxml3/msxml_dispex.h
++++ b/dlls/msxml3/msxml_dispex.h
+@@ -149,6 +149,11 @@ static inline HRESULT return_bstrn(const WCHAR *value, int len, BSTR *p)
+ 
+ extern HRESULT dom_document_create(MSXML_VERSION class_version, void **document);
+ 
++typedef HRESULT (*namespace_binding_callback)(void *ctx, const WCHAR *prefix, const WCHAR *uri);
++extern HRESULT node_get_namespace_bindings(IXMLDOMNode *node, BOOL deep,
++        namespace_binding_callback callback, void *ctx);
++extern HRESULT node_lookup_namespace(IXMLDOMNode *node, const WCHAR *prefix, BSTR *uri);
++
+ typedef struct bsc_t bsc_t;
+ 
+ HRESULT create_moniker_from_url(LPCWSTR, IMoniker**);
+diff --git a/dlls/msxml3/mxnamespace.c b/dlls/msxml3/mxnamespace.c
+index 68e2953af4d..adc209fb820 100644
+--- a/dlls/msxml3/mxnamespace.c
++++ b/dlls/msxml3/mxnamespace.c
+@@ -37,7 +37,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(msxml);
+ struct ns
+ {
+     BSTR prefix;
+-    BSTR uri;
++    BSTR uri;   /* NULL when the prefix is bound to no namespace */
+ };
+ 
+ struct nscontext
+@@ -73,30 +73,105 @@ static inline namespacemanager *impl_from_IVBMXNamespaceManager( IVBMXNamespaceM
+     return CONTAINING_RECORD(iface, namespacemanager, IVBMXNamespaceManager_iface);
+ }
+ 
+-static HRESULT declare_prefix(namespacemanager *This, const WCHAR *prefix, const WCHAR *uri)
++static const WCHAR xml_uri[] = L"http://www.w3.org/XML/1998/namespace";
++
++static struct nscontext* alloc_ns_context(void)
++{
++    struct nscontext *ctxt;
++
++    ctxt = malloc(sizeof(*ctxt));
++    if (!ctxt) return NULL;
++
++    ctxt->count = 0;
++    ctxt->max_alloc = DEFAULT_PREFIX_ALLOC_COUNT;
++    ctxt->ns = malloc(ctxt->max_alloc * sizeof(*ctxt->ns));
++    if (!ctxt->ns)
++    {
++        free(ctxt);
++        return NULL;
++    }
++
++    /* first allocated prefix is always 'xml' */
++    ctxt->ns[0].prefix = SysAllocString(L"xml");
++    ctxt->ns[0].uri = SysAllocString(xml_uri);
++    ctxt->count++;
++    if (!ctxt->ns[0].prefix || !ctxt->ns[0].uri)
++    {
++        free(ctxt->ns);
++        free(ctxt);
++        return NULL;
++    }
++
++    return ctxt;
++}
++
++static void free_ns_context(struct nscontext *ctxt)
+ {
+-    struct nscontext *ctxt = LIST_ENTRY(list_head(&This->ctxts), struct nscontext, entry);
+-    static const WCHAR emptyW[] = {0};
+-    struct ns *ns;
+     int i;
+ 
+-    if (ctxt->count == ctxt->max_alloc)
++    for (i = 0; i < ctxt->count; i++)
+     {
+-        ctxt->max_alloc *= 2;
+-        ctxt->ns = realloc(ctxt->ns, ctxt->max_alloc * sizeof(*ctxt->ns));
++        SysFreeString(ctxt->ns[i].prefix);
++        SysFreeString(ctxt->ns[i].uri);
+     }
+ 
+-    if (!prefix) prefix = emptyW;
++    free(ctxt->ns);
++    free(ctxt);
++}
++
++static struct ns *find_prefix(const struct nscontext *ctxt, const WCHAR *prefix)
++{
++    int i;
+ 
+-    ns = NULL;
+     for (i = 0; i < ctxt->count; i++)
+         if (!wcscmp(ctxt->ns[i].prefix, prefix))
+-        {
+-            ns = &ctxt->ns[i];
+-            break;
+-        }
++            return &ctxt->ns[i];
++
++    return NULL;
++}
++
++static HRESULT add_prefix(struct nscontext *ctxt, const WCHAR *prefix, const WCHAR *uri)
++{
++    struct ns *ns;
+ 
+-    if (ns)
++    if (ctxt->count == ctxt->max_alloc)
++    {
++        if (!(ns = realloc(ctxt->ns, 2 * ctxt->max_alloc * sizeof(*ns)))) return E_OUTOFMEMORY;
++        ctxt->ns = ns;
++        ctxt->max_alloc *= 2;
++    }
++
++    ns = &ctxt->ns[ctxt->count];
++    ns->prefix = SysAllocString(prefix);
++    ns->uri = SysAllocString(uri);
++    if (!ns->prefix || (uri && !ns->uri))
++    {
++        SysFreeString(ns->prefix);
++        SysFreeString(ns->uri);
++        return E_OUTOFMEMORY;
++    }
++
++    ctxt->count++;
++    return S_OK;
++}
++
++static HRESULT declare_prefix(namespacemanager *This, const WCHAR *prefix, const WCHAR *uri)
++{
++    struct nscontext *ctxt;
++    struct ns *ns;
++
++    /* The bottom context only ever holds "xml": declaring on it opens a new
++     * one, which popContext() can then remove. */
++    if (!list_next(&This->ctxts, list_head(&This->ctxts)))
++    {
++        if (!(ctxt = alloc_ns_context())) return E_OUTOFMEMORY;
++        list_add_head(&This->ctxts, &ctxt->entry);
++    }
++
++    ctxt = LIST_ENTRY(list_head(&This->ctxts), struct nscontext, entry);
++    if (!prefix) prefix = L"";
++
++    if ((ns = find_prefix(ctxt, prefix)))
+     {
+         if (This->override == VARIANT_TRUE)
+         {
+@@ -107,106 +182,135 @@ static HRESULT declare_prefix(namespacemanager *This, const WCHAR *prefix, const
+         else
+             return E_FAIL;
+     }
+-    else
+-    {
+-        ctxt->ns[ctxt->count].prefix = SysAllocString(prefix);
+-        ctxt->ns[ctxt->count].uri = SysAllocString(uri);
+-        ctxt->count++;
+-    }
+ 
+-    return S_OK;
++    return add_prefix(ctxt, prefix, uri);
+ }
+ 
+-/* returned stored pointer, caller needs to copy it */
+-static HRESULT get_declared_prefix_idx(const struct nscontext *ctxt, LONG index, BSTR *prefix)
++/* A context pushed later hides what the ones below it bind a prefix to. */
++static const struct ns *lookup_prefix(namespacemanager *This, const WCHAR *prefix)
+ {
+-    *prefix = NULL;
+-
+-    if (index >= ctxt->count || index < 0) return E_FAIL;
++    struct nscontext *ctxt;
++    struct ns *ns;
+ 
+-    if (index > 0) index = ctxt->count - index;
+-    *prefix = ctxt->ns[index].prefix;
++    LIST_FOR_EACH_ENTRY(ctxt, &This->ctxts, struct nscontext, entry)
++        if ((ns = find_prefix(ctxt, prefix))) return ns;
+ 
+-    return S_OK;
++    return NULL;
+ }
+ 
+-/* returned stored pointer, caller needs to copy it */
+-static HRESULT get_declared_prefix_uri(const struct list *ctxts, const WCHAR *uri, BSTR *prefix)
++static BOOL prefix_hidden(namespacemanager *This, const struct nscontext *outer, const WCHAR *prefix)
+ {
+     struct nscontext *ctxt;
+ 
+-    LIST_FOR_EACH_ENTRY(ctxt, ctxts, struct nscontext, entry)
++    LIST_FOR_EACH_ENTRY(ctxt, &This->ctxts, struct nscontext, entry)
+     {
+-        int i;
+-        for (i = 0; i < ctxt->count; i++)
+-            if (!wcscmp(ctxt->ns[i].uri, uri))
+-            {
+-                *prefix = ctxt->ns[i].prefix;
+-                return S_OK;
+-            }
++        if (ctxt == outer) break;
++        if (find_prefix(ctxt, prefix)) return TRUE;
+     }
+ 
+-    *prefix = NULL;
+-    return E_FAIL;
++    return FALSE;
+ }
+ 
+-static HRESULT get_uri_from_prefix(const struct nscontext *ctxt, const WCHAR *prefix, BSTR *uri)
++/* "xml" always comes first, then every prefix in effect, the ones declared
++ * last first. */
++static const struct ns *get_declared_prefix_idx(namespacemanager *This, LONG index)
+ {
++    struct nscontext *ctxt;
+     int i;
+ 
+-    for (i = 0; i < ctxt->count; i++)
+-        if (!wcscmp(ctxt->ns[i].prefix, prefix))
++    LIST_FOR_EACH_ENTRY(ctxt, &This->ctxts, struct nscontext, entry)
++    {
++        if (!index) return &ctxt->ns[0];
++
++        for (i = ctxt->count - 1; i > 0; i--)
+         {
+-            *uri = ctxt->ns[i].uri;
+-            return S_OK;
++            if (!ctxt->ns[i].uri || prefix_hidden(This, ctxt, ctxt->ns[i].prefix)) continue;
++            if (!--index) return &ctxt->ns[i];
+         }
++    }
+ 
+-    *uri = NULL;
+-    return S_FALSE;
++    return NULL;
+ }
+ 
+-static struct nscontext* alloc_ns_context(void)
++/* The prefixes bound to a uri, in the same order; one hidden by a later
++ * context still counts. */
++static const struct ns *get_uri_prefix_idx(namespacemanager *This, const WCHAR *uri, LONG index)
+ {
+     struct nscontext *ctxt;
++    int i;
+ 
+-    ctxt = malloc(sizeof(*ctxt));
+-    if (!ctxt) return NULL;
+-
+-    ctxt->count = 0;
+-    ctxt->max_alloc = DEFAULT_PREFIX_ALLOC_COUNT;
+-    ctxt->ns = malloc(ctxt->max_alloc * sizeof(*ctxt->ns));
+-    if (!ctxt->ns)
++    LIST_FOR_EACH_ENTRY(ctxt, &This->ctxts, struct nscontext, entry)
+     {
+-        free(ctxt);
+-        return NULL;
++        for (i = ctxt->count - 1; i >= 0; i--)
++        {
++            /* every context starts with "xml", it only counts once */
++            if (!i && &ctxt->entry != list_head(&This->ctxts)) continue;
++            if (!ctxt->ns[i].uri || wcscmp(ctxt->ns[i].uri, uri)) continue;
++            if (!index--) return &ctxt->ns[i];
++        }
+     }
+ 
+-    /* first allocated prefix is always 'xml' */
+-    ctxt->ns[0].prefix = SysAllocString(L"xml");
+-    ctxt->ns[0].uri = SysAllocString(L"http://www.w3.org/XML/1998/namespace");
+-    ctxt->count++;
+-    if (!ctxt->ns[0].prefix || !ctxt->ns[0].uri)
++    return NULL;
++}
++
++static HRESULT return_prefix(const WCHAR *value, WCHAR *prefix, int *prefix_len)
++{
++    int len = lstrlenW(value);
++
++    if (prefix)
+     {
+-        free(ctxt->ns);
+-        free(ctxt);
+-        return NULL;
++        /* the terminator has to fit as well */
++        if (*prefix_len <= len) return E_XML_BUFFERTOOSMALL;
++        memcpy(prefix, value, (len + 1) * sizeof(WCHAR));
+     }
+ 
+-    return ctxt;
++    *prefix_len = len;
++    return S_OK;
+ }
+ 
+-static void free_ns_context(struct nscontext *ctxt)
++static HRESULT return_uri(const WCHAR *value, WCHAR *uri, int *uri_len)
+ {
+-    int i;
++    int len;
+ 
+-    for (i = 0; i < ctxt->count; i++)
++    if (!value)
+     {
+-        SysFreeString(ctxt->ns[i].prefix);
+-        SysFreeString(ctxt->ns[i].uri);
++        if (uri) *uri = 0;
++        *uri_len = 0;
++        return S_FALSE;
+     }
+ 
+-    free(ctxt->ns);
+-    free(ctxt);
++    len = lstrlenW(value);
++    if (uri)
++    {
++        /* the terminator has to fit as well */
++        if (*uri_len <= len) return E_XML_BUFFERTOOSMALL;
++        memcpy(uri, value, (len + 1) * sizeof(WCHAR));
++    }
++
++    *uri_len = len;
++    return S_OK;
++}
++
++static HRESULT return_uri_variant(const WCHAR *value, VARIANT *uri)
++{
++    if (!value)
++    {
++        V_VT(uri) = VT_NULL;
++        return S_FALSE;
++    }
++
++    V_VT(uri) = VT_BSTR;
++    V_BSTR(uri) = SysAllocString(value);
++    return V_BSTR(uri) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT lookup_node_prefix(IXMLDOMNode *node, const WCHAR *prefix, BSTR *uri)
++{
++    HRESULT hr = node_lookup_namespace(node, prefix, uri);
++
++    if (hr == S_OK && !*uri && !wcscmp(prefix, L"xml") && !(*uri = SysAllocString(xml_uri)))
++        return E_OUTOFMEMORY;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI namespacemanager_QueryInterface(IMXNamespaceManager *iface, REFIID riid, void **ppvObject)
+@@ -273,66 +377,44 @@ static HRESULT WINAPI namespacemanager_declarePrefix(IMXNamespaceManager *iface,
+ 
+     TRACE("(%p)->(%s %s)\n", This, debugstr_w(prefix), debugstr_w(namespaceURI));
+ 
+-    if (prefix && (!wcscmp(prefix, L"xml") || !wcscmp(prefix, L"xmlns") || !namespaceURI))
++    if (prefix && *prefix &&
++            (!wcscmp(prefix, L"xml") || !wcscmp(prefix, L"xmlns") || !namespaceURI || !*namespaceURI))
+         return E_INVALIDARG;
+ 
+-    return declare_prefix(This, prefix, namespaceURI);
++    /* an empty uri leaves the default prefix unbound */
++    return declare_prefix(This, prefix, namespaceURI && *namespaceURI ? namespaceURI : NULL);
+ }
+ 
+ static HRESULT WINAPI namespacemanager_getDeclaredPrefix(IMXNamespaceManager *iface,
+     LONG index, WCHAR *prefix, int *prefix_len)
+ {
+     namespacemanager *This = impl_from_IMXNamespaceManager( iface );
+-    struct nscontext *ctxt;
+-    HRESULT hr;
+-    BSTR prfx;
++    const struct ns *ns;
+ 
+     TRACE("%p, %ld, %p, %p.\n", This, index, prefix, prefix_len);
+ 
++    if (index < 0) return E_FAIL;
+     if (!prefix_len) return E_POINTER;
+ 
+-    ctxt = LIST_ENTRY(list_head(&This->ctxts), struct nscontext, entry);
+-    hr = get_declared_prefix_idx(ctxt, index, &prfx);
+-    if (hr != S_OK) return hr;
+-
+-    if (prefix)
+-    {
+-        if (*prefix_len < (INT)SysStringLen(prfx)) return E_XML_BUFFERTOOSMALL;
+-        lstrcpyW(prefix, prfx);
+-    }
+-
+-    *prefix_len = SysStringLen(prfx);
+-
+-    return S_OK;
++    if (!(ns = get_declared_prefix_idx(This, index))) return E_FAIL;
++    return return_prefix(ns->prefix, prefix, prefix_len);
+ }
+ 
+ static HRESULT WINAPI namespacemanager_getPrefix(IMXNamespaceManager *iface,
+     const WCHAR *uri, LONG index, WCHAR *prefix, int *prefix_len)
+ {
+     namespacemanager *manager = impl_from_IMXNamespaceManager(iface);
++    const struct ns *ns;
+     HRESULT hr;
+-    BSTR prfx;
+ 
+     TRACE("%p, %s, %ld, %p, %p.\n", iface, debugstr_w(uri), index, prefix, prefix_len);
+ 
+     if (!uri || !*uri || !prefix_len) return E_INVALIDARG;
+ 
+-    hr = get_declared_prefix_uri(&manager->ctxts, uri, &prfx);
+-    if (hr == S_OK)
+-    {
+-        /* TODO: figure out what index argument is for */
+-        if (index) return E_FAIL;
+-
+-        if (prefix)
+-        {
+-            if (*prefix_len < (INT)SysStringLen(prfx)) return E_XML_BUFFERTOOSMALL;
+-            lstrcpyW(prefix, prfx);
+-        }
+-
+-        *prefix_len = SysStringLen(prfx);
+-        TRACE("prefix=%s\n", debugstr_w(prfx));
+-    }
++    if (index < 0 || !(ns = get_uri_prefix_idx(manager, uri, index))) return E_FAIL;
+ 
++    hr = return_prefix(ns->prefix, prefix, prefix_len);
++    TRACE("prefix=%s\n", debugstr_w(ns->prefix));
+     return hr;
+ }
+ 
+@@ -340,7 +422,7 @@ static HRESULT WINAPI namespacemanager_getURI(IMXNamespaceManager *iface,
+     const WCHAR *prefix, IXMLDOMNode *node, WCHAR *uri, int *uri_len)
+ {
+     namespacemanager *This = impl_from_IMXNamespaceManager( iface );
+-    struct nscontext *ctxt;
++    const struct ns *ns;
+     HRESULT hr;
+     BSTR urib;
+ 
+@@ -351,26 +433,14 @@ static HRESULT WINAPI namespacemanager_getURI(IMXNamespaceManager *iface,
+ 
+     if (node)
+     {
+-        FIXME("namespaces from DOM node not supported\n");
+-        return E_NOTIMPL;
++        if (FAILED(hr = lookup_node_prefix(node, prefix, &urib))) return hr;
++        hr = return_uri(urib, uri, uri_len);
++        SysFreeString(urib);
++        return hr;
+     }
+ 
+-    ctxt = LIST_ENTRY(list_head(&This->ctxts), struct nscontext, entry);
+-    hr = get_uri_from_prefix(ctxt, prefix, &urib);
+-    if (hr == S_OK)
+-    {
+-        if (uri)
+-        {
+-           if (*uri_len < (INT)SysStringLen(urib)) return E_XML_BUFFERTOOSMALL;
+-           lstrcpyW(uri, urib);
+-        }
+-    }
+-    else
+-        if (uri) *uri = 0;
+-
+-    *uri_len = SysStringLen(urib);
+-
+-    return hr;
++    ns = lookup_prefix(This, prefix);
++    return return_uri(ns ? ns->uri : NULL, uri, uri_len);
+ }
+ 
+ static const struct IMXNamespaceManagerVtbl MXNamespaceManagerVtbl =
+@@ -510,8 +580,20 @@ static HRESULT WINAPI vbnamespacemanager_get_allowOverride(IVBMXNamespaceManager
+ static HRESULT WINAPI vbnamespacemanager_reset(IVBMXNamespaceManager *iface)
+ {
+     namespacemanager *This = impl_from_IVBMXNamespaceManager( iface );
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    struct nscontext *ctxt, *ctxt2, *base;
++
++    TRACE("(%p)\n", This);
++
++    if (!(base = alloc_ns_context())) return E_OUTOFMEMORY;
++
++    LIST_FOR_EACH_ENTRY_SAFE(ctxt, ctxt2, &This->ctxts, struct nscontext, entry)
++    {
++        list_remove(&ctxt->entry);
++        free_ns_context(ctxt);
++    }
++    list_add_head(&This->ctxts, &base->entry);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI vbnamespacemanager_pushContext(IVBMXNamespaceManager *iface)
+@@ -529,12 +611,36 @@ static HRESULT WINAPI vbnamespacemanager_pushContext(IVBMXNamespaceManager *ifac
+     return S_OK;
+ }
+ 
++static HRESULT push_node_binding(void *ctx, const WCHAR *prefix, const WCHAR *uri)
++{
++    struct nscontext *ctxt = ctx;
++
++    /* the binding nearest to the node wins */
++    if (find_prefix(ctxt, prefix)) return S_OK;
++    return add_prefix(ctxt, prefix, uri);
++}
++
+ static HRESULT WINAPI vbnamespacemanager_pushNodeContext(IVBMXNamespaceManager *iface,
+     IXMLDOMNode *node, VARIANT_BOOL deep)
+ {
+     namespacemanager *This = impl_from_IVBMXNamespaceManager( iface );
+-    FIXME("(%p)->(%p %d): stub\n", This, node, deep);
+-    return E_NOTIMPL;
++    struct nscontext *ctxt;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p %d)\n", This, node, deep);
++
++    if (!node) return E_INVALIDARG;
++
++    if (!(ctxt = alloc_ns_context())) return E_OUTOFMEMORY;
++
++    if (FAILED(hr = node_get_namespace_bindings(node, !!deep, push_node_binding, ctxt)))
++    {
++        free_ns_context(ctxt);
++        return hr;
++    }
++
++    list_add_head(&This->ctxts, &ctxt->entry);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI vbnamespacemanager_popContext(IVBMXNamespaceManager *iface)
+@@ -583,16 +689,32 @@ static HRESULT WINAPI vbnamespacemanager_getURI(IVBMXNamespaceManager *iface,
+     BSTR prefix, VARIANT* uri)
+ {
+     namespacemanager *This = impl_from_IVBMXNamespaceManager( iface );
+-    FIXME("(%p)->(%s %p): stub\n", This, debugstr_w(prefix), uri);
+-    return E_NOTIMPL;
++    const struct ns *ns;
++
++    TRACE("(%p)->(%s %p)\n", This, debugstr_w(prefix), uri);
++
++    if (!uri) return E_POINTER;
++
++    ns = lookup_prefix(This, prefix ? prefix : L"");
++    return return_uri_variant(ns ? ns->uri : NULL, uri);
+ }
+ 
+ static HRESULT WINAPI vbnamespacemanager_getURIFromNode(IVBMXNamespaceManager *iface,
+     BSTR prefix, IXMLDOMNode *node, VARIANT *uri)
+ {
+     namespacemanager *This = impl_from_IVBMXNamespaceManager( iface );
+-    FIXME("(%p)->(%s %p %p): stub\n", This, debugstr_w(prefix), node, uri);
+-    return E_NOTIMPL;
++    HRESULT hr;
++    BSTR urib;
++
++    TRACE("(%p)->(%s %p %p)\n", This, debugstr_w(prefix), node, uri);
++
++    if (!node) return E_INVALIDARG;
++    if (!uri) return E_POINTER;
++
++    if (FAILED(hr = lookup_node_prefix(node, prefix ? prefix : L"", &urib))) return hr;
++    hr = return_uri_variant(urib, uri);
++    SysFreeString(urib);
++    return hr;
+ }
+ 
+ static const struct IVBMXNamespaceManagerVtbl VBMXNamespaceManagerVtbl =
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index 709f3a7a60f..cfa44500a14 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -566,6 +566,30 @@ static void domnode_add_refs(struct domnode *node, unsigned int count)
+     }
+ }
+ 
++static HRESULT domnode_lookup_namespace_uri(struct domnode *node, const WCHAR *prefix, BSTR *uri)
++{
++    struct domnode *attr;
++
++    *uri = NULL;
++    for (; node; node = node->parent)
++    {
++        if (node->type != NODE_ELEMENT) continue;
++
++        LIST_FOR_EACH_ENTRY(attr, &node->attributes, struct domnode, entry)
++        {
++            if (prefix && *prefix)
++            {
++                if (attr->prefix && !wcscmp(attr->prefix, L"xmlns") && !wcscmp(attr->name, prefix))
++                    return node_get_text(attr, uri);
++            }
++            else if (!wcscmp(attr->qname, L"xmlns"))
++                return node_get_text(attr, uri);
++        }
++    }
++
++    return S_FALSE;
++}
++
+ static void domnode_insert_domnode(struct domnode *node, struct domnode *child, struct domnode *ref_child)
+ {
+     struct domnode *n, *next;
+@@ -3366,6 +3390,79 @@ HRESULT node_select_singlenode(struct domnode *node, BSTR query, IXMLDOMNode **r
+     return hr;
+ }
+ 
++static HRESULT report_name_binding(struct domnode *node, namespace_binding_callback callback, void *ctx)
++{
++    return callback(ctx, node->prefix ? node->prefix : L"", node->uri && *node->uri ? node->uri : NULL);
++}
++
++static HRESULT report_element_bindings(struct domnode *node, namespace_binding_callback callback, void *ctx)
++{
++    struct domnode *attr;
++    HRESULT hr;
++    BSTR uri;
++
++    if (FAILED(hr = report_name_binding(node, callback, ctx))) return hr;
++
++    LIST_FOR_EACH_ENTRY(attr, &node->attributes, struct domnode, entry)
++    {
++        if (!domnode_is_namespace_declaration(attr)) continue;
++        if (FAILED(hr = node_get_text(attr, &uri))) return hr;
++        hr = callback(ctx, !wcscmp(attr->qname, L"xmlns") ? L"" : attr->name,
++                uri && *uri ? uri : NULL);
++        SysFreeString(uri);
++        if (FAILED(hr)) return hr;
++    }
++
++    return S_OK;
++}
++
++HRESULT node_get_namespace_bindings(IXMLDOMNode *iface, BOOL deep, namespace_binding_callback callback, void *ctx)
++{
++    struct domnode *node;
++    HRESULT hr = S_OK;
++
++    if (!iface || !(node = get_node_obj(iface))) return E_INVALIDARG;
++
++    switch (node->type)
++    {
++        case NODE_ELEMENT:
++            hr = report_element_bindings(node, callback, ctx);
++            break;
++        case NODE_ATTRIBUTE:
++        case NODE_PROCESSING_INSTRUCTION:
++            hr = report_name_binding(node, callback, ctx);
++            break;
++        default:
++            break;
++    }
++
++    if (!deep) return hr;
++
++    for (node = node->parent; node && SUCCEEDED(hr); node = node->parent)
++        if (node->type == NODE_ELEMENT)
++            hr = report_element_bindings(node, callback, ctx);
++
++    return hr;
++}
++
++HRESULT node_lookup_namespace(IXMLDOMNode *iface, const WCHAR *prefix, BSTR *uri)
++{
++    struct domnode *node;
++    HRESULT hr;
++
++    if (!iface || !(node = get_node_obj(iface))) return E_INVALIDARG;
++    if (!uri) return E_POINTER;
++
++    hr = domnode_lookup_namespace_uri(node, prefix, uri);
++    if (hr == S_FALSE) return S_OK;
++    if (SUCCEEDED(hr) && *uri && !**uri)
++    {
++        SysFreeString(*uri);
++        *uri = NULL;
++    }
++    return hr;
++}
++
+ HRESULT node_get_namespaceURI(struct domnode *node, BSTR *uri)
+ {
+     if (!uri)
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index c4535a306f0..d61d0e3a404 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -12360,10 +12360,8 @@ static void test_mxnamespacemanager(void)
+ 
+     hr = IMXNamespaceManager_declarePrefix(nsmgr, _bstr_("xmlns"), _bstr_("uri1"));
+     ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
+-todo_wine {
+     hr = IMXNamespaceManager_getDeclaredPrefix(nsmgr, -1, NULL, NULL);
+     ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
+-}
+     hr = IMXNamespaceManager_getDeclaredPrefix(nsmgr, 0, NULL, NULL);
+     ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
+ 
+@@ -12734,7 +12732,7 @@ static void test_mxnamespacemanager_override(void)
+     ok(!lstrcmpW(buffW, L"ns1"), "got prefix %s\n", wine_dbgstr_w(buffW));
+ 
+     hr = IMXNamespaceManager_declarePrefix(nsmgr, _bstr_(""), NULL);
+-    todo_wine ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++    ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IMXNamespaceManager_declarePrefix(nsmgr, NULL, NULL);
+     ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
+@@ -12765,6 +12763,61 @@ static void test_mxnamespacemanager_override(void)
+     free_bstrs();
+ }
+ 
++static void test_mxnamespace_node_context(void)
++{
++    IXMLDOMDocument2 *doc;
++    IXMLDOMElement *root;
++    IMXNamespaceManager *manager;
++    IXMLDOMNode *inner;
++    VARIANT_BOOL loaded;
++    WCHAR uri[64];
++    HRESULT hr;
++    int length;
++
++    if (!is_clsid_supported(&CLSID_DOMDocument60, &IID_IXMLDOMDocument2)) return;
++
++    doc = create_document_version(60, &IID_IXMLDOMDocument2);
++    hr = IXMLDOMDocument2_loadXML(doc, _bstr_("<outer xmlns:psk='urn:outer'><inner xmlns:psk='urn:inner'/></outer>"), &loaded);
++    ok(hr == S_OK && loaded == VARIANT_TRUE, "Unexpected load %#lx, %d.\n", hr, loaded);
++    hr = IXMLDOMDocument2_get_documentElement(doc, &root);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXMLDOMElement_get_firstChild(root, &inner);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = CoCreateInstance(&CLSID_MXNamespaceManager40, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IMXNamespaceManager, (void **)&manager);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    hr = IMXNamespaceManager_pushNodeContext(manager, inner, VARIANT_TRUE);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    length = ARRAY_SIZE(uri);
++    hr = IMXNamespaceManager_getURI(manager, L"psk", NULL, uri, &length);
++    ok(hr == S_OK && !wcscmp(uri, L"urn:inner"), "Unexpected URI %#lx, %s.\n", hr, debugstr_w(uri));
++    length = ARRAY_SIZE(uri);
++    hr = IMXNamespaceManager_getURI(manager, L"psk", (IXMLDOMNode *)root, uri, &length);
++    ok(hr == S_OK && !wcscmp(uri, L"urn:outer"), "Unexpected node URI %#lx, %s.\n", hr, debugstr_w(uri));
++    length = wcslen(L"urn:inner");
++    hr = IMXNamespaceManager_getURI(manager, L"psk", NULL, uri, &length);
++    ok(hr == E_XML_BUFFERTOOSMALL, "Unexpected hr %#lx.\n", hr);
++
++    hr = IMXNamespaceManager_popContext(manager);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    length = ARRAY_SIZE(uri);
++    hr = IMXNamespaceManager_getURI(manager, L"psk", NULL, uri, &length);
++    ok(hr == S_FALSE && !length, "Unexpected URI %#lx, length %d.\n", hr, length);
++    hr = IMXNamespaceManager_reset(manager);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    length = ARRAY_SIZE(uri);
++    hr = IMXNamespaceManager_getURI(manager, L"xml", NULL, uri, &length);
++    ok(hr == S_OK && !wcscmp(uri, L"http://www.w3.org/XML/1998/namespace"),
++            "Unexpected URI %#lx, %s.\n", hr, debugstr_w(uri));
++
++    IMXNamespaceManager_Release(manager);
++    IXMLDOMNode_Release(inner);
++    IXMLDOMElement_Release(root);
++    IXMLDOMDocument2_Release(doc);
++    free_bstrs();
++}
++
+ static const DOMNodeType nodetypes_test[] =
+ {
+     NODE_ELEMENT,
+@@ -19604,6 +19657,7 @@ START_TEST(domdoc)
+     {
+         test_mxnamespacemanager();
+         test_mxnamespacemanager_override();
++        test_mxnamespace_node_context();
+     }
+ 
+     CoUninitialize();

@@ -1,0 +1,1241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:12:58 -0400
+Subject: [PATCH] server, ntdll: Wait for in-process targets of wait completion
+ packets in a helper thread.
+
+With in-process synchronization (ntsync) the clients signal events and
+semaphores in the kernel, and the server sets its own internal syncs
+without wake_up(), so a wait completion packet associated with any of
+them never completed: ntdll's file tests failed 81 times with
+/dev/ntsync loaded.
+
+The server now satisfies a packet's wait for an in-process sync with a
+wait that does not block, and wakes the packets of a sync it signals
+itself.  An event or semaphore is signaled by the clients, so the
+process that associates the packet runs a packet watch: a thread outside
+the Windows threads that waits for the targets with NTSYNC_IOC_WAIT_ANY
+and reports the one it acquired on a socket the server polls.  The server
+gives the signal back when no packet waits for that target any more, and
+tells the thread on the same socket to let go of the targets of packets
+that were cancelled or closed.  An association returns once the thread
+waits for the target, and a cancel or a look at a completion port that
+must not block first waits until the watches have reported what was
+signaled, so the port shows it as it would on Windows.
+
+Office ships the Windows App SDK's CoreMessagingXP.dll, which imports
+NtAssociateWaitCompletionPacket.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ntdll/tests/file.c b/dlls/ntdll/tests/file.c
+index 5428b1d2dfb..e10c5bdf346 100644
+--- a/dlls/ntdll/tests/file.c
++++ b/dlls/ntdll/tests/file.c
+@@ -8637,6 +8637,76 @@ static void test_cancel_wait_completion_packet(void)
+     ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
+ }
+ 
++static void test_many_wait_completion_packets(void)
++{
++    FILE_IO_COMPLETION_INFORMATION info[100];
++    HANDLE completion, packets[100], events[100];
++    LARGE_INTEGER timeout = {{0}};
++    ULONG count, i;
++    BOOLEAN signaled;
++    NTSTATUS status;
++
++    if (!pNtCreateWaitCompletionPacket)
++    {
++        win_skip("NtCreateWaitCompletionPacket is unavailable.\n");
++        return;
++    }
++
++    status = pNtCreateIoCompletion(&completion, IO_COMPLETION_ALL_ACCESS, NULL, 0);
++    ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
++
++    /* more packets waiting at once than a single wait can take */
++    for (i = 0; i < ARRAY_SIZE(packets); i++)
++    {
++        status = pNtCreateEvent(&events[i], GENERIC_ALL, NULL, SynchronizationEvent, 0);
++        ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
++        status = pNtCreateWaitCompletionPacket(&packets[i], GENERIC_ALL, NULL);
++        ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
++        status = pNtAssociateWaitCompletionPacket(packets[i], completion, events[i], (void *)(ULONG_PTR)(i + 1),
++                                                  NULL, STATUS_SUCCESS, i, &signaled);
++        ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
++        ok(signaled == FALSE, "Got unexpected signaled %d.\n", signaled);
++    }
++    count = get_pending_msgs(completion);
++    ok(!count, "Got unexpected completion count %lu.\n", count);
++
++    for (i = 0; i < ARRAY_SIZE(packets); i += 2) pNtSetEvent(events[i], NULL);
++    count = get_pending_msgs(completion);
++    ok(count == ARRAY_SIZE(packets) / 2, "Got unexpected completion count %lu.\n", count);
++    for (i = 0; i < ARRAY_SIZE(packets); i += 2)
++        ok(!is_signaled(events[i]), "Expected event %lu not signaled.\n", i);
++
++    memset(info, 0, sizeof(info));
++    status = pNtRemoveIoCompletionEx(completion, info, ARRAY_SIZE(info), &count, &timeout, FALSE);
++    ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
++    ok(count == ARRAY_SIZE(packets) / 2, "Got unexpected count %lu.\n", count);
++    for (i = 0; i < count; i++)
++    {
++        ok(info[i].CompletionKey % 2 == 1, "Got unexpected completion key %Id.\n", info[i].CompletionKey);
++        ok(info[i].IoStatusBlock.Information == info[i].CompletionKey - 1,
++           "Got unexpected information %Id for key %Id.\n", info[i].IoStatusBlock.Information, info[i].CompletionKey);
++    }
++
++    /* the others stop waiting before their events are set */
++    for (i = 1; i < ARRAY_SIZE(packets); i += 2)
++    {
++        status = pNtCancelWaitCompletionPacket(packets[i], FALSE);
++        ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
++    }
++    for (i = 1; i < ARRAY_SIZE(packets); i += 2) pNtSetEvent(events[i], NULL);
++    count = get_pending_msgs(completion);
++    ok(!count, "Got unexpected completion count %lu.\n", count);
++    for (i = 1; i < ARRAY_SIZE(packets); i += 2)
++        ok(is_signaled(events[i]), "Expected event %lu signaled.\n", i);
++
++    for (i = 0; i < ARRAY_SIZE(packets); i++)
++    {
++        pNtClose(packets[i]);
++        pNtClose(events[i]);
++    }
++    pNtClose(completion);
++}
++
+ START_TEST(file)
+ {
+     HMODULE hkernel32 = GetModuleHandleA("kernel32.dll");
+@@ -8735,4 +8805,5 @@ START_TEST(file)
+     test_create_wait_completion_packet();
+     test_associate_wait_completion_packet();
+     test_cancel_wait_completion_packet();
++    test_many_wait_completion_packets();
+ }
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 6d25b0fa03b..24209741089 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -36,6 +36,7 @@
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/socket.h>
+ #ifdef HAVE_SYS_SYSCALL_H
+ #include <sys/syscall.h>
+ #endif
+@@ -2836,6 +2837,8 @@ NTSTATUS WINAPI NtSetIoCompletionEx( HANDLE completion_handle, HANDLE completion
+     return ret;
+ }
+ 
++static void flush_packet_watches(void);
++
+ /***********************************************************************
+  *             NtRemoveIoCompletion (NTDLL.@)
+  */
+@@ -2847,6 +2850,8 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
+ 
+     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+ 
++    if (timeout && !timeout->QuadPart) flush_packet_watches();
++
+     SERVER_START_REQ( remove_completion )
+     {
+         req->handle = wine_server_obj_handle( handle );
+@@ -2895,6 +2900,7 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
+     TRACE( "%p %p %u %p %p %u\n", handle, info, count, written, timeout, alertable );
+ 
+     if (!count) return STATUS_INVALID_PARAMETER;
++    if (timeout && !timeout->QuadPart) flush_packet_watches();
+ 
+     while (i < count)
+     {
+@@ -2969,6 +2975,7 @@ NTSTATUS WINAPI NtQueryIoCompletion( HANDLE handle, IO_COMPLETION_INFORMATION_CL
+         if (ret_len) *ret_len = sizeof(*info);
+         if (len == sizeof(*info))
+         {
++            flush_packet_watches();
+             SERVER_START_REQ( query_completion )
+             {
+                 req->handle = wine_server_obj_handle( handle );
+@@ -3702,6 +3709,300 @@ NTSTATUS WINAPI NtCreateTransaction( HANDLE *handle, ACCESS_MASK mask, OBJECT_AT
+     return STATUS_SUCCESS;
+ }
+ 
++/* A wait completion packet whose target is an event or semaphore signaled in-process is not seen
++ * signaled by the server, so a packet watch of the process that associated it waits for the target:
++ * a thread that reports each target it acquired on a socket to the server, and lets go of the ones the
++ * server tells it to on the same socket (see server/completion.c). */
++
++#ifdef NTSYNC_IOC_EVENT_READ
++
++#define PACKET_WATCH_RELEASED 0x80000000  /* reported for a target let go of without acquiring it */
++
++struct packet_watch
++{
++    struct list  entry;
++    unsigned int id;                                /* the server's id of the watch */
++    int          socket;                            /* to and from the server */
++    int          alert;                             /* event set when there is news for the thread */
++    BOOL         dead;                              /* the thread has stopped */
++    unsigned int gen;                               /* bumped for news the thread has to take in */
++    unsigned int armed;                             /* the gen the thread last started waiting at */
++    unsigned int quiet;                             /* the last gen at which no target was signaled */
++    unsigned int count;                             /* targets waited for */
++    unsigned int reserved;                          /* room taken by associations in progress */
++    unsigned int ids[NTSYNC_MAX_WAIT_COUNT];        /* the targets' ids */
++    int          fds[NTSYNC_MAX_WAIT_COUNT];        /* and their fds */
++    unsigned int dropped[NTSYNC_MAX_WAIT_COUNT];    /* ids let go of before they were added */
++    unsigned int next_dropped;
++};
++
++static struct list packet_watches = LIST_INIT( packet_watches );
++static pthread_mutex_t packet_watch_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t packet_watch_cond = PTHREAD_COND_INITIALIZER;  /* a thread started waiting */
++static LONG watched_target_count;
++
++/* packet_watch_mutex must be held */
++static BOOL remove_watched_target( struct packet_watch *watch, unsigned int id )
++{
++    unsigned int i;
++
++    for (i = 0; i < watch->count; i++)
++    {
++        if (watch->ids[i] != id) continue;
++        close( watch->fds[i] );
++        InterlockedDecrement( &watched_target_count );
++        watch->count--;
++        watch->ids[i] = watch->ids[watch->count];
++        watch->fds[i] = watch->fds[watch->count];
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static void *packet_watch_thread( void *arg )
++{
++    struct packet_watch *watch = arg;
++    unsigned int ids[NTSYNC_MAX_WAIT_COUNT], count, report, gen;
++    int fds[NTSYNC_MAX_WAIT_COUNT];
++    BOOL check;
++
++    for (;;)
++    {
++        struct ntsync_wait_args args = {0};
++
++        pthread_mutex_lock( &packet_watch_mutex );
++        count = watch->count;
++        memcpy( ids, watch->ids, count * sizeof(ids[0]) );
++        memcpy( fds, watch->fds, count * sizeof(fds[0]) );
++        gen = watch->armed = watch->gen;
++        check = watch->quiet != gen;
++        pthread_cond_broadcast( &packet_watch_cond );
++        pthread_mutex_unlock( &packet_watch_mutex );
++
++        /* after news, look without blocking first: a wait that times out shows that every target
++         * signaled before it has been reported, which is what a flush waits for */
++        args.timeout = check ? 0 : ~(__u64)0;
++        args.objs = (uintptr_t)fds;
++        args.count = count;
++        args.owner = ~0u;  /* only mutexes care, and they are never targets */
++        args.alert = watch->alert;
++        if (ioctl( inproc_device_fd, NTSYNC_IOC_WAIT_ANY, &args ) < 0)
++        {
++            if (errno == EINTR) continue;
++            if (errno == ETIMEDOUT)
++            {
++                pthread_mutex_lock( &packet_watch_mutex );
++                watch->quiet = gen;
++                pthread_cond_broadcast( &packet_watch_cond );
++                pthread_mutex_unlock( &packet_watch_mutex );
++                continue;
++            }
++            /* not a Windows thread: no debug channels here */
++            fprintf( stderr, "wine: waiting for wait completion packet targets failed, errno %d\n", errno );
++            pthread_mutex_lock( &packet_watch_mutex );
++            watch->dead = TRUE;
++            pthread_cond_broadcast( &packet_watch_cond );
++            pthread_mutex_unlock( &packet_watch_mutex );
++            return NULL;
++        }
++
++        if (args.index < count)
++        {
++            report = ids[args.index];
++            send( watch->socket, &report, sizeof(report), MSG_NOSIGNAL );
++            pthread_mutex_lock( &packet_watch_mutex );
++            remove_watched_target( watch, report );
++            pthread_mutex_unlock( &packet_watch_mutex );
++            continue;
++        }
++
++        /* the alert: targets to let go of, or new ones to wait for */
++        while (recv( watch->socket, &report, sizeof(report), MSG_DONTWAIT ) == sizeof(report))
++        {
++            pthread_mutex_lock( &packet_watch_mutex );
++            if (!remove_watched_target( watch, report ))
++            {
++                /* not added yet: the association adding it drops it */
++                watch->dropped[watch->next_dropped++ % ARRAY_SIZE(watch->dropped)] = report;
++            }
++            pthread_mutex_unlock( &packet_watch_mutex );
++            report |= PACKET_WATCH_RELEASED;
++            send( watch->socket, &report, sizeof(report), MSG_NOSIGNAL );
++        }
++    }
++}
++
++/* packet_watch_mutex must be held */
++static struct packet_watch *create_packet_watch(void)
++{
++    struct packet_watch *watch;
++    obj_handle_t key;
++    sigset_t sigset, all;
++    pthread_t thread;
++    unsigned int id;
++    NTSTATUS status;
++    int socket, alert;
++
++    /* the server sends the socket and the alert event's fd along with the reply */
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++    SERVER_START_REQ( create_completion_packet_watch )
++    {
++        status = wine_server_call( req );
++        id = reply->watch;
++    }
++    SERVER_END_REQ;
++    if (!status)
++    {
++        socket = wine_server_receive_fd( &key );
++        assert( key == id );
++        alert = wine_server_receive_fd( &key );
++        assert( key == id );
++    }
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++    if (status) return NULL;
++
++    if (!(watch = calloc( 1, sizeof(*watch) )))
++    {
++        close( socket );  /* the server lets go of the watch when its end hangs up */
++        close( alert );
++        return NULL;
++    }
++    watch->id = id;
++    watch->socket = socket;
++    watch->alert = alert;
++
++    /* no signals for the thread, it is not a Windows thread */
++    sigfillset( &all );
++    pthread_sigmask( SIG_SETMASK, &all, &sigset );
++    status = pthread_create( &thread, NULL, packet_watch_thread, watch );
++    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++    if (status)
++    {
++        close( socket );
++        close( alert );
++        free( watch );
++        return NULL;
++    }
++    pthread_detach( thread );
++    list_add_tail( &packet_watches, &watch->entry );
++    return watch;
++}
++
++/* take room for a target in a watch, or NULL */
++static struct packet_watch *reserve_packet_watch(void)
++{
++    struct packet_watch *watch;
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &packet_watch_mutex, &sigset );
++    LIST_FOR_EACH_ENTRY( watch, &packet_watches, struct packet_watch, entry )
++        if (!watch->dead && watch->count + watch->reserved < NTSYNC_MAX_WAIT_COUNT) goto done;
++    watch = create_packet_watch();
++done:
++    if (watch) watch->reserved++;
++    server_leave_uninterrupted_section( &packet_watch_mutex, &sigset );
++    return watch;
++}
++
++/* give the thread news; packet_watch_mutex must be held */
++static unsigned int alert_packet_watch( struct packet_watch *watch )
++{
++    unsigned int gen = ++watch->gen;
++    __u32 prev;
++
++    ioctl( watch->alert, NTSYNC_IOC_EVENT_SET, &prev );
++    return gen;
++}
++
++/* before a look at a completion port that must not wait: the watches have reported every target
++ * signaled so far (and the server reads their reports before it answers) */
++static void flush_packet_watches(void)
++{
++    struct packet_watch *watch;
++    unsigned int gen;
++    sigset_t sigset;
++
++    if (!ReadNoFence( &watched_target_count )) return;
++
++    server_enter_uninterrupted_section( &packet_watch_mutex, &sigset );
++    LIST_FOR_EACH_ENTRY( watch, &packet_watches, struct packet_watch, entry )
++    {
++        if (!watch->count || watch->dead) continue;
++        gen = alert_packet_watch( watch );
++        while (!watch->dead && (int)(watch->quiet - gen) < 0)
++            pthread_cond_wait( &packet_watch_cond, &packet_watch_mutex );
++    }
++    server_leave_uninterrupted_section( &packet_watch_mutex, &sigset );
++}
++
++/* give the target the server wants waited for (id != 0) to the watch, and the reserved room back;
++ * the association only returns once the thread waits for the target, as it waits from then on */
++static void watch_packet_target( struct packet_watch *watch, unsigned int id, HANDLE target )
++{
++    struct inproc_sync stack, *sync;
++    unsigned int i, report, gen;
++    sigset_t sigset;
++    int fd = -1;
++
++    if (id && !get_inproc_sync( target, INPROC_SYNC_UNKNOWN, 0, &stack, &sync ))
++    {
++        fd = fcntl( sync->fd, F_DUPFD_CLOEXEC, 0 );
++        release_inproc_sync( sync );
++    }
++
++    server_enter_uninterrupted_section( &packet_watch_mutex, &sigset );
++    watch->reserved--;
++    for (i = 0; id && i < ARRAY_SIZE(watch->dropped); i++)
++    {
++        if (watch->dropped[i] != id) continue;
++        watch->dropped[i] = 0;
++        id = 0;  /* let go of already */
++    }
++    if (id && fd != -1)
++    {
++        watch->ids[watch->count] = id;
++        watch->fds[watch->count] = fd;
++        watch->count++;
++        InterlockedIncrement( &watched_target_count );
++        fd = -1;
++        /* the thread waits for the target from here on */
++        gen = alert_packet_watch( watch );
++        while (!watch->dead && (int)(watch->armed - gen) < 0)
++            pthread_cond_wait( &packet_watch_cond, &packet_watch_mutex );
++    }
++    else if (id)
++    {
++        /* the target has gone: it cannot be waited for, so the server can forget it */
++        report = id | PACKET_WATCH_RELEASED;
++        send( watch->socket, &report, sizeof(report), MSG_NOSIGNAL );
++    }
++    server_leave_uninterrupted_section( &packet_watch_mutex, &sigset );
++
++    if (fd != -1) close( fd );
++}
++
++#else /* NTSYNC_IOC_EVENT_READ */
++
++struct packet_watch
++{
++    unsigned int id;
++};
++
++static struct packet_watch *reserve_packet_watch(void)
++{
++    return NULL;
++}
++
++static void flush_packet_watches(void)
++{
++}
++
++static void watch_packet_target( struct packet_watch *watch, unsigned int id, HANDLE target )
++{
++}
++
++#endif /* NTSYNC_IOC_EVENT_READ */
++
+ /***********************************************************************
+  *           NtAssociateWaitCompletionPacket (NTDLL.@)
+  */
+@@ -3709,11 +4010,16 @@ NTSTATUS WINAPI NtAssociateWaitCompletionPacket( HANDLE packet, HANDLE completio
+         void *key_context, void *apc_context, NTSTATUS status, ULONG_PTR information,
+         BOOLEAN *already_signaled )
+ {
++    struct packet_watch *watch = NULL;
++    unsigned int watch_id = 0;
+     NTSTATUS ret;
+ 
+     TRACE( "%p, %p, %p, %p, %p, %#x, %ld, %p\n", packet, completion, target, key_context,
+            apc_context, (int)status, information, already_signaled );
+ 
++    /* in-process synchronization: have room ready in a watch, in case the target needs it */
++    if (inproc_device_fd >= 0 && !(watch = reserve_packet_watch())) return STATUS_INSUFFICIENT_RESOURCES;
++
+     SERVER_START_REQ( associate_completion_packet )
+     {
+         req->packet = wine_server_obj_handle( packet );
+@@ -3723,10 +4029,16 @@ NTSTATUS WINAPI NtAssociateWaitCompletionPacket( HANDLE packet, HANDLE completio
+         req->cvalue = wine_server_client_ptr( apc_context );
+         req->information = information;
+         req->status = status;
+-        if (!(ret = wine_server_call( req )) && already_signaled)
+-            *already_signaled = reply->already_signaled;
++        req->watch = watch ? watch->id : 0;
++        if (!(ret = wine_server_call( req )))
++        {
++            if (already_signaled) *already_signaled = reply->already_signaled;
++            watch_id = reply->watch_id;
++        }
+     }
+     SERVER_END_REQ;
++
++    if (watch) watch_packet_target( watch, watch_id, target );
+     return ret;
+ }
+ 
+@@ -3739,6 +4051,9 @@ NTSTATUS WINAPI NtCancelWaitCompletionPacket( HANDLE packet, BOOLEAN remove_sign
+ 
+     TRACE( "%p, %d\n", packet, remove_signaled );
+ 
++    /* a watched target acquired so far signals the packet first, and one signaled after the cancel
++     * is not taken by the watch any more */
++    flush_packet_watches();
+     SERVER_START_REQ( cancel_completion_packet )
+     {
+         req->packet = wine_server_obj_handle( packet );
+@@ -3746,6 +4061,7 @@ NTSTATUS WINAPI NtCancelWaitCompletionPacket( HANDLE packet, BOOLEAN remove_sign
+         status = wine_server_call( req );
+     }
+     SERVER_END_REQ;
++    flush_packet_watches();
+     return status;
+ }
+ 
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 922ea8b3a67..e4d7e861671 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -5714,12 +5714,30 @@ struct associate_completion_packet_request
+     apc_param_t   cvalue;
+     apc_param_t   information;
+     unsigned int  status;
+-    char __pad_52[4];
++    unsigned int  watch;
+ };
+ struct associate_completion_packet_reply
+ {
+     struct reply_header __header;
+     int           already_signaled;
++    unsigned int  watch_id;
++};
++
++
++/* Create a packet watch: a helper thread of the client that waits for the targets of wait completion
++ * packets which the clients signal in-process, where the server cannot see it.  It reports a target it
++ * acquired by writing its id on the socket sent to it (or the id | 0x80000000 for a target it let go of
++ * when told to), and the server tells it to let go of targets by writing their ids there and setting
++ * the alert event sent after the socket. */
++struct create_completion_packet_watch_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct create_completion_packet_watch_reply
++{
++    struct reply_header __header;
++    unsigned int  watch;
+     char __pad_12[4];
+ };
+ 
+@@ -6614,6 +6632,7 @@ enum request
+     REQ_set_completion_info,
+     REQ_create_completion_packet,
+     REQ_associate_completion_packet,
++    REQ_create_completion_packet_watch,
+     REQ_cancel_completion_packet,
+     REQ_add_fd_completion,
+     REQ_set_fd_completion_mode,
+@@ -6934,6 +6953,7 @@ union generic_request
+     struct set_completion_info_request set_completion_info_request;
+     struct create_completion_packet_request create_completion_packet_request;
+     struct associate_completion_packet_request associate_completion_packet_request;
++    struct create_completion_packet_watch_request create_completion_packet_watch_request;
+     struct cancel_completion_packet_request cancel_completion_packet_request;
+     struct add_fd_completion_request add_fd_completion_request;
+     struct set_fd_completion_mode_request set_fd_completion_mode_request;
+@@ -7252,6 +7272,7 @@ union generic_reply
+     struct set_completion_info_reply set_completion_info_reply;
+     struct create_completion_packet_reply create_completion_packet_reply;
+     struct associate_completion_packet_reply associate_completion_packet_reply;
++    struct create_completion_packet_watch_reply create_completion_packet_watch_reply;
+     struct cancel_completion_packet_reply cancel_completion_packet_reply;
+     struct add_fd_completion_reply add_fd_completion_reply;
+     struct set_fd_completion_mode_reply set_fd_completion_mode_reply;
+@@ -7292,6 +7313,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 969
++#define SERVER_PROTOCOL_VERSION 970
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/completion.c b/server/completion.c
+index 941df9f5716..f6e7259f131 100644
+--- a/server/completion.c
++++ b/server/completion.c
+@@ -23,8 +23,13 @@
+ 
+ #include "config.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -33,7 +38,9 @@
+ #include "object.h"
+ #include "file.h"
+ #include "handle.h"
++#include "process.h"
+ #include "request.h"
++#include "thread.h"
+ 
+ static const WCHAR completion_name[] = {'I','o','C','o','m','p','l','e','t','i','o','n'};
+ 
+@@ -85,6 +92,7 @@ struct completion_packet
+     struct list        entry;                     /* list entry in the target object wait completion packet queue */
+     struct object     *target;                    /* target object this packet waits for */
+     struct completion *completion;                /* completion object */
++    struct watched_target *watched;               /* the watch waiting for the target for it, if any */
+     apc_param_t        ckey;                      /* key context */
+     apc_param_t        cvalue;                    /* apc context */
+     apc_param_t        information;               /* IO_STATUS_BLOCK information */
+@@ -94,6 +102,37 @@ struct completion_packet
+     unsigned int       pad: 30;                   /* padding */
+ };
+ 
++/* An event or semaphore that the clients signal in-process changes state where the server cannot see
++ * it, so a packet waiting for one is waited for by a packet watch: a helper thread of the process that
++ * associated the packet.  It reports a target it acquired by its id on a socket, and is told on the
++ * same socket to let go of targets no packet waits for any more.  A target stays listed until the
++ * thread has reported it one way or the other. */
++
++#define WATCH_RELEASED 0x80000000  /* the thread let go of the target without acquiring it */
++
++struct packet_watch
++{
++    struct object   obj;      /* object header */
++    struct fd      *fd;       /* the server end of the socket to the thread */
++    struct inproc_sync *alert; /* event telling the thread to read the socket */
++    unsigned int    id;       /* id of the watch */
++    struct process *process;  /* process the thread runs in */
++    struct list     entry;    /* entry in the list of watches */
++    struct list     targets;  /* targets the thread waits for */
++};
++
++struct watched_target
++{
++    struct list               entry;   /* entry in the watch's list */
++    struct packet_watch      *watch;   /* the watch */
++    unsigned int              id;      /* id the thread reports it by */
++    struct completion_packet *packet;  /* packet waiting for it, NULL once none does */
++    struct object            *sync;    /* the target's in-process sync */
++};
++
++static struct list packet_watches = LIST_INIT( packet_watches );
++static unsigned int last_watch_id, last_watched_target_id;
++
+ static void remove_completion_packet_msg( struct comp_msg *msg );
+ 
+ static void completion_wait_dump( struct object*, int );
+@@ -355,6 +394,7 @@ static bool completion_packet_init( struct object *obj, const void *init_data )
+ 
+     packet->target = NULL;
+     packet->completion = NULL;
++    packet->watched = NULL;
+     packet->ckey = 0;
+     packet->cvalue = 0;
+     packet->information = 0;
+@@ -364,38 +404,176 @@ static bool completion_packet_init( struct object *obj, const void *init_data )
+     return true;
+ }
+ 
++/* the packet's target was signaled: queue its completion */
++static void signal_completion_packet( struct completion_packet *packet )
++{
++    assert( packet->in_target_packet_queue );
++    assert( packet->target );
++    assert( !packet->in_completion_queue );
++    assert( packet->completion );
++
++    list_remove( &packet->entry );
++    release_object( packet->target );
++    packet->in_target_packet_queue = 0;
++    packet->target = NULL;
++    packet->in_completion_queue = 1;
++    add_completion( packet->completion, packet->ckey, packet->cvalue, packet->status,
++                    packet->information, packet );
++}
++
+ /* try to wake up completion packets in the object when it's signaled */
+ void wake_up_completion_packets( struct object *obj )
+ {
+     struct completion_packet *packet, *next;
++    int watched_only = 1;
+ 
+-    if (list_empty( &obj->completion_packet_queue ))
+-        return;
++    LIST_FOR_EACH_ENTRY( packet, &obj->completion_packet_queue, struct completion_packet, entry )
++        if (!packet->watched) watched_only = 0;
++    /* a packet watch waits for this one, and it alone may acquire it */
++    if (watched_only) return;
+ 
+     if (!is_obj_signaled( obj ))
+         return;
+ 
+     LIST_FOR_EACH_ENTRY_SAFE( packet, next, &obj->completion_packet_queue, struct completion_packet, entry )
++        if (!packet->watched) signal_completion_packet( packet );
++}
++
++static void packet_watch_dump( struct object *obj, int verbose );
++static struct fd *packet_watch_get_fd( struct object *obj );
++static void packet_watch_destroy( struct object *obj );
++static void packet_watch_poll_event( struct fd *fd, int event );
++
++static const struct object_ops packet_watch_ops =
++{
++    .size    = sizeof(struct packet_watch),
++    .type    = &no_type,
++    .dump    = packet_watch_dump,
++    .get_fd  = packet_watch_get_fd,
++    .destroy = packet_watch_destroy,
++};
++
++static const struct fd_ops packet_watch_fd_ops =
++{
++    .poll_event = packet_watch_poll_event,
++};
++
++static void packet_watch_dump( struct object *obj, int verbose )
++{
++    struct packet_watch *watch = (struct packet_watch *)obj;
++    assert( obj->ops == &packet_watch_ops );
++    fprintf( stderr, "Packet watch id=%u process=%p\n", watch->id, watch->process );
++}
++
++static struct fd *packet_watch_get_fd( struct object *obj )
++{
++    struct packet_watch *watch = (struct packet_watch *)obj;
++    return (struct fd *)grab_object( watch->fd );
++}
++
++static void free_watched_target( struct watched_target *target )
++{
++    if (target->packet) target->packet->watched = NULL;
++    list_remove( &target->entry );
++    release_object( target->sync );
++    free( target );
++}
++
++static void packet_watch_destroy( struct object *obj )
++{
++    struct packet_watch *watch = (struct packet_watch *)obj;
++    struct watched_target *target, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( target, next, &watch->targets, struct watched_target, entry )
++        free_watched_target( target );
++    if (watch->fd) release_object( watch->fd );
++    if (watch->alert) release_object( watch->alert );
++    release_object( watch->process );
++}
++
++/* the thread acquired a target, or let go of one */
++static void watched_target_reported( struct packet_watch *watch, unsigned int report )
++{
++    struct watched_target *target;
++
++    LIST_FOR_EACH_ENTRY( target, &watch->targets, struct watched_target, entry )
+     {
+-        assert( packet->in_target_packet_queue );
+-        assert( packet->target );
+-        assert( !packet->in_completion_queue );
+-        assert( packet->completion );
++        if (target->id != (report & ~WATCH_RELEASED)) continue;
++        if (!(report & WATCH_RELEASED))
++        {
++            struct completion_packet *packet = target->packet;
+ 
+-        list_remove( &packet->entry );
+-        release_object( packet->target );
+-        packet->in_target_packet_queue = 0;
+-        packet->target = NULL;
+-        packet->in_completion_queue = 1;
+-        add_completion( packet->completion, packet->ckey, packet->cvalue, packet->status,
+-                        packet->information, packet );
++            if (packet)
++            {
++                packet->watched = NULL;
++                target->packet = NULL;
++                signal_completion_packet( packet );
++            }
++            else unacquire_inproc_sync( target->sync );  /* no packet waits for it any more */
++        }
++        free_watched_target( target );
++        return;
++    }
++}
++
++static void read_packet_watch_reports( struct packet_watch *watch )
++{
++    unsigned int report;
++
++    while (recv( get_unix_fd( watch->fd ), &report, sizeof(report), MSG_DONTWAIT ) == sizeof(report))
++        watched_target_reported( watch, report );
++}
++
++/* before a completion is looked at: what the watches reported so far has happened */
++static void read_packet_watches(void)
++{
++    struct packet_watch *watch;
++
++    LIST_FOR_EACH_ENTRY( watch, &packet_watches, struct packet_watch, entry )
++        if (!list_empty( &watch->targets )) read_packet_watch_reports( watch );
++}
++
++static void packet_watch_poll_event( struct fd *fd, int event )
++{
++    struct packet_watch *watch = get_fd_user( fd );
++
++    assert( watch->obj.ops == &packet_watch_ops );
++
++    if (event & POLLIN) read_packet_watch_reports( watch );
++    if (event & (POLLERR | POLLHUP))  /* the process is gone */
++    {
++        set_fd_events( fd, -1 );
++        list_remove( &watch->entry );
++        release_object( watch );
+     }
+ }
+ 
++static struct packet_watch *get_packet_watch( struct process *process, unsigned int id )
++{
++    struct packet_watch *watch;
++
++    LIST_FOR_EACH_ENTRY( watch, &packet_watches, struct packet_watch, entry )
++        if (watch->id == id && watch->process == process) return watch;
++    return NULL;
++}
++
++/* the packet stops waiting for its target: tell the thread to let go of it */
++static void unwatch_completion_packet( struct completion_packet *packet )
++{
++    struct watched_target *target = packet->watched;
++
++    packet->watched = NULL;
++    target->packet = NULL;
++    send( get_unix_fd( target->watch->fd ), &target->id, sizeof(target->id), MSG_DONTWAIT | MSG_NOSIGNAL );
++    signal_inproc_sync( target->watch->alert );
++}
++
+ static void cancel_completion_packet( struct completion_packet *packet )
+ {
+     struct comp_msg *comp_msg;
+ 
++    if (packet->watched) unwatch_completion_packet( packet );
++
+     if (packet->in_target_packet_queue)
+     {
+         assert( packet->target );
+@@ -499,6 +677,7 @@ DECL_HANDLER(remove_completion)
+     struct list *entry;
+     struct comp_msg *msg;
+ 
++    read_packet_watches();
+     if (!completion) return;
+ 
+     entry = list_head( &completion->queue );
+@@ -568,6 +747,7 @@ DECL_HANDLER(query_completion)
+ {
+     struct completion* completion = get_completion_obj( current->process, req->handle, IO_COMPLETION_QUERY_STATE );
+ 
++    read_packet_watches();
+     if (!completion) return;
+ 
+     reply->depth = completion->depth;
+@@ -591,6 +771,9 @@ DECL_HANDLER(associate_completion_packet)
+     struct completion_packet *packet;
+     struct completion *completion;
+     struct object *target, *sync;
++    struct packet_watch *watch = NULL;
++    struct watched_target *watched = NULL;
++    enum inproc_sync_type type;
+ 
+     packet = get_completion_packet_obj( current->process, req->packet, WAIT_COMPLETION_PACKET_QUERY_STATE );
+     if (!packet)
+@@ -629,6 +812,22 @@ DECL_HANDLER(associate_completion_packet)
+         return;
+     }
+ 
++    /* the clients signal an event or semaphore in-process: the caller's watch has to wait for it */
++    sync = get_obj_sync( target );
++    type = get_inproc_sync_type( sync );
++    if (type == INPROC_SYNC_EVENT || type == INPROC_SYNC_SEMAPHORE)
++    {
++        if (!(watch = get_packet_watch( current->process, req->watch ))) set_error( STATUS_INVALID_PARAMETER );
++        if (!watch || !(watched = mem_alloc( sizeof(*watched) )))
++        {
++            release_object( sync );
++            release_object( completion );
++            release_object( target );
++            release_object( packet );
++            return;
++        }
++    }
++
+     assert( !packet->completion );
+     assert( !packet->in_completion_queue );
+     assert( !packet->target );
+@@ -646,26 +845,83 @@ DECL_HANDLER(associate_completion_packet)
+         add_completion( packet->completion, packet->ckey, packet->cvalue, packet->status,
+                         packet->information, packet );
+         reply->already_signaled = 1;
++        if (watch) free( watched );
+     }
+     else
+     {
+         packet->target = grab_object( target );
+-        sync = get_obj_sync( target );
+         list_add_tail( &sync->completion_packet_queue, &packet->entry );
+         packet->in_target_packet_queue = 1;
+-        release_object( sync );
+         reply->already_signaled = 0;
++        if (watch)
++        {
++            if (!(++last_watched_target_id & ~WATCH_RELEASED)) last_watched_target_id = 1;
++            watched->watch = watch;
++            watched->id = last_watched_target_id & ~WATCH_RELEASED;
++            watched->packet = packet;
++            watched->sync = grab_object( sync );
++            list_add_tail( &watch->targets, &watched->entry );
++            packet->watched = watched;
++            reply->watch_id = watched->id;
++        }
+     }
++    release_object( sync );
+     release_object( completion );
+     release_object( target );
+     release_object( packet );
+ }
+ 
++/* create a packet watch */
++DECL_HANDLER(create_completion_packet_watch)
++{
++    struct packet_watch *watch;
++    int fds[2];
++
++    if (get_inproc_device_fd() < 0)
++    {
++        set_error( STATUS_NOT_SUPPORTED );
++        return;
++    }
++    if (socketpair( AF_UNIX, SOCK_DGRAM, 0, fds ))
++    {
++        file_set_error();
++        return;
++    }
++    fcntl( fds[0], F_SETFL, O_NONBLOCK );  /* the client's end blocks: its thread reports can wait for room */
++
++    if (!(watch = alloc_object( &packet_watch_ops )))
++    {
++        close( fds[0] );
++        close( fds[1] );
++        return;
++    }
++    watch->process = (struct process *)grab_object( current->process );
++    watch->alert = NULL;
++    list_init( &watch->targets );
++    if (!(++last_watch_id)) last_watch_id = 1;
++    watch->id = last_watch_id;
++    if (!(watch->fd = create_anonymous_fd( &packet_watch_fd_ops, fds[0], &watch->obj, 0 ))
++        || !(watch->alert = create_inproc_internal_sync( 0, 0 )))
++    {
++        close( fds[1] );
++        release_object( watch );
++        return;
++    }
++    set_fd_events( watch->fd, POLLIN );
++    list_add_tail( &packet_watches, &watch->entry );  /* until the process closes its end */
++
++    send_client_fd( current->process, fds[1], watch->id );
++    close( fds[1] );
++    send_client_fd( current->process, get_inproc_sync_fd( watch->alert ), watch->id );
++    reply->watch = watch->id;
++}
++
+ /* cancel a wait completion packet */
+ DECL_HANDLER(cancel_completion_packet)
+ {
+     struct completion_packet *packet;
+ 
++    read_packet_watches();  /* a target acquired before the cancel signals the packet */
+     packet = get_completion_packet_obj( current->process, req->packet, WAIT_COMPLETION_PACKET_QUERY_STATE );
+     if (!packet)
+         return;
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index 522d9a4e320..6c92570e76e 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -21,6 +21,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <errno.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ 
+@@ -185,11 +186,61 @@ static int inproc_sync_signal( struct object *obj, unsigned int access, int sign
+     assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT ); /* never called for mutex / semaphore */
+     assert( signal == 0 || signal == 1 ); /* never called from signal_object */
+ 
+-    if (signal) signal_inproc_sync( sync );
++    if (signal)
++    {
++        signal_inproc_sync( sync );
++        /* the server signals it, so it is the one to wake the wait completion packets */
++        wake_up_completion_packets( obj );
++    }
+     else reset_inproc_sync( sync );
+     return 1;
+ }
+ 
++enum inproc_sync_type get_inproc_sync_type( struct object *obj )
++{
++    if (obj->ops != &inproc_sync_ops) return INPROC_SYNC_UNKNOWN;
++    return ((struct inproc_sync *)obj)->type;
++}
++
++/* satisfy a wait for an in-process sync that does not block; returns whether it was signaled */
++int acquire_inproc_sync( struct object *obj )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    struct ntsync_wait_args args = {0};
++    int fd = sync->fd;
++
++    assert( obj->ops == &inproc_sync_ops );
++    args.objs = (uintptr_t)&fd;
++    args.count = 1;
++    args.owner = ~0u;  /* only mutexes care, and they are never waited for this way */
++    while (ioctl( get_inproc_device_fd(), NTSYNC_IOC_WAIT_ANY, &args ) < 0)
++        if (errno != EINTR) return 0;
++    return 1;
++}
++
++/* give back what a wait that acquired an in-process sync took from it */
++void unacquire_inproc_sync( struct object *obj )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    struct ntsync_event_args event;
++    __u32 count = 1;
++
++    assert( obj->ops == &inproc_sync_ops );
++    switch (sync->type)
++    {
++    case INPROC_SYNC_INTERNAL:
++    case INPROC_SYNC_EVENT:
++        if (!ioctl( sync->fd, NTSYNC_IOC_EVENT_READ, &event ) && !event.manual)
++            ioctl( sync->fd, NTSYNC_IOC_EVENT_SET, &count );
++        break;
++    case INPROC_SYNC_SEMAPHORE:
++        ioctl( sync->fd, NTSYNC_IOC_SEM_RELEASE, &count );
++        break;
++    default:
++        break;
++    }
++}
++
+ static void inproc_sync_destroy( struct object *obj )
+ {
+     struct inproc_sync *sync = (struct inproc_sync *)obj;
+@@ -272,6 +323,20 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
+     return -1;
+ }
+ 
++enum inproc_sync_type get_inproc_sync_type( struct object *obj )
++{
++    return INPROC_SYNC_UNKNOWN;
++}
++
++int acquire_inproc_sync( struct object *obj )
++{
++    return 0;
++}
++
++void unacquire_inproc_sync( struct object *obj )
++{
++}
++
+ #endif /* NTSYNC_IOC_EVENT_READ */
+ 
+ DECL_HANDLER(get_inproc_sync_fd)
+diff --git a/server/object.h b/server/object.h
+index 6cb2ea006a2..1958d8e288d 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -271,6 +271,9 @@ extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned
+ extern void abandon_inproc_mutexes( thread_id_t owner );
+ extern void signal_inproc_sync( struct inproc_sync *sync );
+ extern void reset_inproc_sync( struct inproc_sync *sync );
++extern enum inproc_sync_type get_inproc_sync_type( struct object *obj );
++extern int acquire_inproc_sync( struct object *obj );
++extern void unacquire_inproc_sync( struct object *obj );
+ 
+ /* serial functions */
+ 
+diff --git a/server/protocol.def b/server/protocol.def
+index 2bbf16d3888..64216766ecf 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4029,8 +4029,21 @@ struct handle_info
+     apc_param_t   cvalue;         /* completion value */
+     apc_param_t   information;    /* IO_STATUS_BLOCK information */
+     unsigned int  status;         /* completion status */
++    unsigned int  watch;          /* the caller's packet watch with room for the target, or 0 */
+ @REPLY
+     int           already_signaled; /* whether the object is already signaled */
++    unsigned int  watch_id;       /* the id the watch reports the target by, when it has to wait for it */
++@END
++
++
++/* Create a packet watch: a helper thread of the client that waits for the targets of wait completion
++ * packets which the clients signal in-process, where the server cannot see it.  It reports a target it
++ * acquired by writing its id on the socket sent to it (or the id | 0x80000000 for a target it let go of
++ * when told to), and the server tells it to let go of targets by writing their ids there and setting
++ * the alert event sent after the socket. */
++@REQ(create_completion_packet_watch)
++@REPLY
++    unsigned int  watch;          /* the watch's id */
+ @END
+ 
+ 
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 44d988717ef..0033c088511 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -282,6 +282,7 @@ DECL_HANDLER(query_completion);
+ DECL_HANDLER(set_completion_info);
+ DECL_HANDLER(create_completion_packet);
+ DECL_HANDLER(associate_completion_packet);
++DECL_HANDLER(create_completion_packet_watch);
+ DECL_HANDLER(cancel_completion_packet);
+ DECL_HANDLER(add_fd_completion);
+ DECL_HANDLER(set_fd_completion_mode);
+@@ -599,6 +600,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_set_completion_info,
+     (req_handler)req_create_completion_packet,
+     (req_handler)req_associate_completion_packet,
++    (req_handler)req_create_completion_packet_watch,
+     (req_handler)req_cancel_completion_packet,
+     (req_handler)req_add_fd_completion,
+     (req_handler)req_set_fd_completion_mode,
+@@ -2238,9 +2240,14 @@ C_ASSERT( offsetof(struct associate_completion_packet_request, ckey) == 24 );
+ C_ASSERT( offsetof(struct associate_completion_packet_request, cvalue) == 32 );
+ C_ASSERT( offsetof(struct associate_completion_packet_request, information) == 40 );
+ C_ASSERT( offsetof(struct associate_completion_packet_request, status) == 48 );
++C_ASSERT( offsetof(struct associate_completion_packet_request, watch) == 52 );
+ C_ASSERT( sizeof(struct associate_completion_packet_request) == 56 );
+ C_ASSERT( offsetof(struct associate_completion_packet_reply, already_signaled) == 8 );
++C_ASSERT( offsetof(struct associate_completion_packet_reply, watch_id) == 12 );
+ C_ASSERT( sizeof(struct associate_completion_packet_reply) == 16 );
++C_ASSERT( sizeof(struct create_completion_packet_watch_request) == 16 );
++C_ASSERT( offsetof(struct create_completion_packet_watch_reply, watch) == 8 );
++C_ASSERT( sizeof(struct create_completion_packet_watch_reply) == 16 );
+ C_ASSERT( offsetof(struct cancel_completion_packet_request, packet) == 12 );
+ C_ASSERT( offsetof(struct cancel_completion_packet_request, remove_signaled) == 16 );
+ C_ASSERT( sizeof(struct cancel_completion_packet_request) == 24 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index b00e7eda0ad..72fa8501d85 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3208,11 +3208,22 @@ static void dump_associate_completion_packet_request( const struct associate_com
+     dump_uint64( ", cvalue=", &req->cvalue );
+     dump_uint64( ", information=", &req->information );
+     fprintf( stderr, ", status=%08x", req->status );
++    fprintf( stderr, ", watch=%08x", req->watch );
+ }
+ 
+ static void dump_associate_completion_packet_reply( const struct associate_completion_packet_reply *req )
+ {
+     fprintf( stderr, " already_signaled=%d", req->already_signaled );
++    fprintf( stderr, ", watch_id=%08x", req->watch_id );
++}
++
++static void dump_create_completion_packet_watch_request( const struct create_completion_packet_watch_request *req )
++{
++}
++
++static void dump_create_completion_packet_watch_reply( const struct create_completion_packet_watch_reply *req )
++{
++    fprintf( stderr, " watch=%08x", req->watch );
+ }
+ 
+ static void dump_cancel_completion_packet_request( const struct cancel_completion_packet_request *req )
+@@ -3874,6 +3885,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_set_completion_info_request,
+     (dump_func)dump_create_completion_packet_request,
+     (dump_func)dump_associate_completion_packet_request,
++    (dump_func)dump_create_completion_packet_watch_request,
+     (dump_func)dump_cancel_completion_packet_request,
+     (dump_func)dump_add_fd_completion_request,
+     (dump_func)dump_set_fd_completion_mode_request,
+@@ -4191,6 +4203,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     NULL,
+     (dump_func)dump_create_completion_packet_reply,
+     (dump_func)dump_associate_completion_packet_reply,
++    (dump_func)dump_create_completion_packet_watch_reply,
+     NULL,
+     NULL,
+     NULL,
+@@ -4508,6 +4521,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "set_completion_info",
+     "create_completion_packet",
+     "associate_completion_packet",
++    "create_completion_packet_watch",
+     "cancel_completion_packet",
+     "add_fd_completion",
+     "set_fd_completion_mode",
+diff --git a/server/thread.c b/server/thread.c
+index 3f8fe513570..ded0234e3cf 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1346,13 +1346,18 @@ static int select_on( const union select_op *select_op, data_size_t op_size, cli
+     return 0;
+ }
+ 
+-/* check if an object is signaled for wait completion packets */
++/* check if an object is signaled for wait completion packets, satisfying the wait if it is */
+ int is_obj_signaled( struct object *obj )
+ {
+     struct object *sync = get_obj_sync( obj );
+-    int signaled = sync->ops->signaled && sync->ops->signaled( sync, NULL );
++    int signaled;
+ 
+-    if (signaled && sync->ops->satisfied) sync->ops->satisfied( sync, NULL );
++    if (get_inproc_sync_type( sync ) != INPROC_SYNC_UNKNOWN) signaled = acquire_inproc_sync( sync );
++    else
++    {
++        signaled = sync->ops->signaled && sync->ops->signaled( sync, NULL );
++        if (signaled && sync->ops->satisfied) sync->ops->satisfied( sync, NULL );
++    }
+     release_object( sync );
+     return signaled;
+ }

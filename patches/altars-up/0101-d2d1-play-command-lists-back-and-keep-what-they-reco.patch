@@ -1,0 +1,867 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 07:59:33 -0400
+Subject: [PATCH] d2d1: play command lists back, and keep what they recorded
+ where it can be found.
+
+Office's NetUI records its icons and text into command lists and draws
+those onto its surfaces, and none of it reached the screen: drawing a
+command list was an unhandled image, and EndDraw on one as a target
+failed with E_NOTIMPL.  DrawImage now plays a closed list back onto the
+context, under the context's transform moved to the target offset and
+clipped to the image rectangle, through a command sink of its own;
+what the list set -- transform, modes, tags, text parameters -- does not
+outlast it.  EndDraw on a list reports what drawing into it came to.
+
+Once that drew, NetUI's labels came out as the wrong characters.  The
+recorded glyph runs, bitmap and image rectangles and opacity masks kept
+pointers to data inside the list's buffer, and the buffer is
+reallocated as the list grows, leaving every such pointer of an earlier
+command dangling.  The commands now keep where their data is from
+themselves, and a command's data is turned back into pointers as it is
+played; commands also start aligned.
+
+As the tests have it on Windows: closing a list that was never drawn to
+succeeds, closing one that is a context's target makes the context
+target nothing, and a list made on one device cannot be the target of a
+context of another.  The todos for those now pass, and a new test of
+playing a list back, one grown after a bitmap was recorded, passes on
+Windows as here.
+
+IsDxgiFormatSupported answers for the formats Direct2D takes that the
+device can sample, rather than for none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 775f583c5d11ce51d7df25854ff69808a6814c5b)
+
+diff --git a/dlls/d2d1/bitmap.c b/dlls/d2d1/bitmap.c
+index c6ab60c1bc4..d9cc2eeb6a4 100644
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -392,6 +392,26 @@ static BOOL format_supported(const D2D1_PIXEL_FORMAT *format)
+     return FALSE;
+ }
+ 
++/* whether Direct2D takes the format, with any alpha mode */
++BOOL d2d_dxgi_format_supported(DXGI_FORMAT format)
++{
++    static const D2D1_ALPHA_MODE modes[] =
++    {
++        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_ALPHA_MODE_STRAIGHT, D2D1_ALPHA_MODE_IGNORE,
++    };
++    D2D1_PIXEL_FORMAT pixel_format;
++    unsigned int i;
++
++    pixel_format.format = format;
++    for (i = 0; i < ARRAY_SIZE(modes); ++i)
++    {
++        pixel_format.alphaMode = modes[i];
++        if (format_supported(&pixel_format))
++            return TRUE;
++    }
++    return FALSE;
++}
++
+ static void d2d_bitmap_init(struct d2d_bitmap *bitmap, struct d2d_device_context *context,
+         ID3D11Resource *resource, D2D1_SIZE_U size, const D2D1_BITMAP_PROPERTIES1 *desc)
+ {
+diff --git a/dlls/d2d1/command_list.c b/dlls/d2d1/command_list.c
+index 6c830d2660e..3f7603c1c03 100644
+--- a/dlls/d2d1/command_list.c
++++ b/dlls/d2d1/command_list.c
+@@ -219,6 +219,12 @@ struct d2d_command_draw_sprite_batch
+     D2D1_SPRITE_OPTIONS sprite_options;
+ };
+ 
++/* the variable data a command keeps is where it is from the command; see d2d_command_list_write_field() */
++static inline const void *d2d_command_field(const void *command, const void *field)
++{
++    return field ? (const BYTE *)command + (ULONG_PTR)field : NULL;
++}
++
+ static inline struct d2d_command_list *impl_from_ID2D1CommandList(ID2D1CommandList *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_command_list, ID2D1CommandList_iface);
+@@ -387,7 +393,21 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface
+             case D2D_COMMAND_DRAW_GLYPH_RUN:
+             {
+                 const struct d2d_command_draw_glyph_run *c = data;
+-                hr = ID2D1CommandSink_DrawGlyphRun(sink, c->origin, &c->run, c->run_desc, c->brush, c->measuring_mode);
++                const DWRITE_GLYPH_RUN_DESCRIPTION *d = d2d_command_field(c, c->run_desc);
++                DWRITE_GLYPH_RUN_DESCRIPTION desc;
++                DWRITE_GLYPH_RUN run = c->run;
++
++                run.glyphIndices = d2d_command_field(c, c->run.glyphIndices);
++                run.glyphAdvances = d2d_command_field(c, c->run.glyphAdvances);
++                run.glyphOffsets = d2d_command_field(c, c->run.glyphOffsets);
++                if (d)
++                {
++                    desc = *d;
++                    desc.localeName = d2d_command_field(c, d->localeName);
++                    desc.string = d2d_command_field(c, d->string);
++                    desc.clusterMap = d2d_command_field(c, d->clusterMap);
++                }
++                hr = ID2D1CommandSink_DrawGlyphRun(sink, c->origin, &run, d ? &desc : NULL, c->brush, c->measuring_mode);
+                 break;
+             }
+             case D2D_COMMAND_DRAW_LINE:
+@@ -414,15 +434,16 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface
+             case D2D_COMMAND_DRAW_BITMAP:
+             {
+                 const struct d2d_command_draw_bitmap *c = data;
+-                hr = ID2D1CommandSink_DrawBitmap(sink, c->bitmap, c->dst_rect, c->opacity,
+-                        c->interpolation_mode, c->src_rect, c->perspective_transform);
++                hr = ID2D1CommandSink_DrawBitmap(sink, c->bitmap, d2d_command_field(c, c->dst_rect), c->opacity,
++                        c->interpolation_mode, d2d_command_field(c, c->src_rect),
++                        d2d_command_field(c, c->perspective_transform));
+                 break;
+             }
+             case D2D_COMMAND_DRAW_IMAGE:
+             {
+                 const struct d2d_command_draw_image *c = data;
+-                hr = ID2D1CommandSink_DrawImage(sink, c->image, c->target_offset, c->image_rect,
+-                        c->interpolation_mode, c->composite_mode);
++                hr = ID2D1CommandSink_DrawImage(sink, c->image, d2d_command_field(c, c->target_offset),
++                        d2d_command_field(c, c->image_rect), c->interpolation_mode, c->composite_mode);
+                 break;
+             }
+             case D2D_COMMAND_DRAW_SPRITE_BATCH:
+@@ -452,7 +473,8 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface
+             case D2D_COMMAND_FILL_OPACITY_MASK:
+             {
+                 const struct d2d_command_fill_opacity_mask *c = data;
+-                hr = ID2D1CommandSink_FillOpacityMask(sink, c->bitmap, c->brush, c->dst_rect, c->src_rect);
++                hr = ID2D1CommandSink_FillOpacityMask(sink, c->bitmap, c->brush, d2d_command_field(c, c->dst_rect),
++                        d2d_command_field(c, c->src_rect));
+                 break;
+             }
+             case D2D_COMMAND_FILL_GEOMETRY:
+@@ -502,14 +524,17 @@ static HRESULT STDMETHODCALLTYPE d2d_command_list_Close(ID2D1CommandList *iface)
+ {
+     struct d2d_command_list *command_list = impl_from_ID2D1CommandList(iface);
+ 
+-    FIXME("iface %p stub.\n", iface);
++    TRACE("iface %p.\n", iface);
+ 
+-    if (command_list->state != D2D_COMMAND_LIST_STATE_OPEN)
++    /* A list never drawn to closes empty; one closed already, or broken, does not. */
++    if (command_list->state != D2D_COMMAND_LIST_STATE_OPEN && command_list->state != D2D_COMMAND_LIST_STATE_INITIAL)
+         return D2DERR_WRONG_STATE;
+ 
+     command_list->state = D2D_COMMAND_LIST_STATE_CLOSED;
+ 
+-    /* FIXME: reset as a target */
++    /* It stops being the target of the context it was set on. */
++    if (command_list->context)
++        d2d_device_context_detach_command_list(command_list->context);
+ 
+     return S_OK;
+ }
+@@ -550,6 +575,8 @@ static void * d2d_command_list_require_space(struct d2d_command_list *command_li
+ {
+     struct d2d_command *command;
+ 
++    /* the next command starts aligned */
++    size = (size + 7) & ~(size_t)7;
+     if (!d2d_array_reserve(&command_list->data, &command_list->capacity, command_list->size + size, 1))
+     {
+         command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
+@@ -949,7 +976,11 @@ void d2d_command_list_set_text_rendering_params(struct d2d_command_list *command
+     d2d_command_list_set_text_rendering_params_internal(command_list, FALSE, params);
+ }
+ 
+-static inline void d2d_command_list_write_field(BYTE **data, void *dst, const void *src, size_t size)
++/* The list's buffer moves as it grows, so what a command keeps of its variable
++ * data is where that is from the command, turned back into a pointer when the
++ * command is played. */
++static inline void d2d_command_list_write_field(const void *command, BYTE **data, void *dst, const void *src,
++        size_t size)
+ {
+     void **ptr = dst;
+ 
+@@ -959,11 +990,12 @@ static inline void d2d_command_list_write_field(BYTE **data, void *dst, const vo
+         return;
+     }
+ 
+-    *ptr = *data;
++    *ptr = (void *)(ULONG_PTR)(*data - (const BYTE *)command);
+     memcpy(*data, src, size);
+     *data = *data + size;
+ }
+ 
++
+ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
+         const struct d2d_device_context *context, D2D1_POINT_2F origin, const DWRITE_GLYPH_RUN *run,
+         const DWRITE_GLYPH_RUN_DESCRIPTION *run_desc, ID2D1Brush *orig_brush,
+@@ -1023,21 +1055,22 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &r->glyphIndices, run->glyphIndices, glyph_count * sizeof(*r->glyphIndices));
+-    d2d_command_list_write_field(&data, &r->glyphAdvances, run->glyphAdvances, glyph_count * sizeof(*r->glyphAdvances));
+-    d2d_command_list_write_field(&data, &r->glyphOffsets, run->glyphOffsets, glyph_count * sizeof(*r->glyphOffsets));
++    d2d_command_list_write_field(command, &data, &r->glyphIndices, run->glyphIndices, glyph_count * sizeof(*r->glyphIndices));
++    d2d_command_list_write_field(command, &data, &r->glyphAdvances, run->glyphAdvances, glyph_count * sizeof(*r->glyphAdvances));
++    d2d_command_list_write_field(command, &data, &r->glyphOffsets, run->glyphOffsets, glyph_count * sizeof(*r->glyphOffsets));
+ 
+     command->run_desc = NULL;
+     if (run_desc)
+     {
+-        d = command->run_desc = (DWRITE_GLYPH_RUN_DESCRIPTION *)data;
++        d = (DWRITE_GLYPH_RUN_DESCRIPTION *)data;
++        command->run_desc = (void *)(ULONG_PTR)(data - (BYTE *)command);
+         memset(d, 0, sizeof(*d));
+         data += sizeof(*d);
+ 
+-        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, locale_name_size);
+-        d2d_command_list_write_field(&data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
++        d2d_command_list_write_field(command, &data, &d->localeName, run_desc->localeName, locale_name_size);
++        d2d_command_list_write_field(command, &data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
+         d->stringLength = run_desc->stringLength;
+-        d2d_command_list_write_field(&data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
++        d2d_command_list_write_field(command, &data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
+         d->textPosition = run_desc->textPosition;
+     }
+ 
+@@ -1070,9 +1103,9 @@ void d2d_command_list_draw_bitmap(struct d2d_command_list *command_list, ID2D1Bi
+ 
+         data = (BYTE *)(command + 1);
+ 
+-        d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+-        d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
+-        d2d_command_list_write_field(&data, &command->perspective_transform, perspective_transform,
++        d2d_command_list_write_field(command, &data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
++        d2d_command_list_write_field(command, &data, &command->src_rect, src_rect, sizeof(*src_rect));
++        d2d_command_list_write_field(command, &data, &command->perspective_transform, perspective_transform,
+                 sizeof(*perspective_transform));
+     }
+ }
+@@ -1100,8 +1133,8 @@ void d2d_command_list_draw_image(struct d2d_command_list *command_list, ID2D1Ima
+ 
+         data = (BYTE *)(command + 1);
+ 
+-        d2d_command_list_write_field(&data, &command->target_offset, target_offset, sizeof(*target_offset));
+-        d2d_command_list_write_field(&data, &command->image_rect, image_rect, sizeof(*image_rect));
++        d2d_command_list_write_field(command, &data, &command->target_offset, target_offset, sizeof(*target_offset));
++        d2d_command_list_write_field(command, &data, &command->image_rect, image_rect, sizeof(*image_rect));
+     }
+ }
+ 
+@@ -1173,7 +1206,7 @@ void d2d_command_list_fill_opacity_mask(struct d2d_command_list *command_list, c
+ 
+         data = (BYTE *)(command + 1);
+ 
+-        d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+-        d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
++        d2d_command_list_write_field(command, &data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
++        d2d_command_list_write_field(command, &data, &command->src_rect, src_rect, sizeof(*src_rect));
+     }
+ }
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index f652d912304..f9654ee8c5a 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -936,6 +936,8 @@ struct d2d_command_list
+     LONG refcount;
+ 
+     ID2D1Factory *factory;
++    struct d2d_device *device;              /* what it was made by, the only one it records for */
++    struct d2d_device_context *context;     /* the context it is the target of */
+     enum d2d_command_list_state state;
+     unsigned int flags;
+ 
+@@ -950,6 +952,8 @@ struct d2d_command_list
+ 
+ HRESULT d2d_command_list_create(ID2D1Factory *factory, struct d2d_command_list **command_list);
+ struct d2d_command_list *unsafe_impl_from_ID2D1CommandList(ID2D1CommandList *iface);
++void d2d_device_context_detach_command_list(struct d2d_device_context *context);
++BOOL d2d_dxgi_format_supported(DXGI_FORMAT format);
+ void d2d_command_list_begin_draw(struct d2d_command_list *command_list, const struct d2d_device_context *context);
+ void d2d_command_list_set_antialias_mode(struct d2d_command_list *command_list, D2D1_ANTIALIAS_MODE mode);
+ void d2d_command_list_set_primitive_blend(struct d2d_command_list *command_list,
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index bb63aa0f14e..4a58fdadd79 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2109,12 +2109,7 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_EndDraw(ID2D1DeviceContext6
+ 
+     TRACE("iface %p, tag1 %p, tag2 %p.\n", iface, tag1, tag2);
+ 
+-    if (context->target.type == D2D_TARGET_COMMAND_LIST)
+-    {
+-        FIXME("Unimplemented for command list target.\n");
+-        return E_NOTIMPL;
+-    }
+-
++    /* what is drawn to a command list is recorded as it is drawn */
+     if (tag1)
+         *tag1 = context->error.tag1;
+     if (tag2)
+@@ -2417,16 +2412,27 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateCommandList(ID2D1Devic
+     TRACE("iface %p, command_list %p.\n", iface, command_list);
+ 
+     if (SUCCEEDED(hr = d2d_command_list_create(context->factory, &object)))
++    {
++        object->device = context->device;
+         *command_list = &object->ID2D1CommandList_iface;
++    }
+ 
+     return hr;
+ }
+ 
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsDxgiFormatSupported(ID2D1DeviceContext6 *iface, DXGI_FORMAT format)
+ {
+-    FIXME("iface %p, format %#x stub!\n", iface, format);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    UINT support = 0;
+ 
+-    return FALSE;
++    TRACE("iface %p, format %#x.\n", iface, format);
++
++    /* a format of Direct2D's own that the device can sample */
++    if (!d2d_dxgi_format_supported(format))
++        return FALSE;
++    if (FAILED(ID3D11Device1_CheckFormatSupport(context->d3d_device, format, &support)))
++        return FALSE;
++    return !!(support & D3D11_FORMAT_SUPPORT_TEXTURE2D);
+ }
+ 
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsBufferPrecisionSupported(ID2D1DeviceContext6 *iface,
+@@ -2583,6 +2589,8 @@ static void d2d_device_context_reset_target(struct d2d_device_context *context)
+     if (!context->target.object)
+         return;
+ 
++    if (context->target.type == D2D_TARGET_COMMAND_LIST && context->target.command_list->context == context)
++        context->target.command_list->context = NULL;
+     IUnknown_Release(context->target.object);
+     memset(&context->target, 0, sizeof(context->target));
+ 
+@@ -2595,6 +2603,12 @@ static void d2d_device_context_reset_target(struct d2d_device_context *context)
+     context->bs = NULL;
+ }
+ 
++/* a command list closed while it is the target stops being it */
++void d2d_device_context_detach_command_list(struct d2d_device_context *context)
++{
++    d2d_device_context_reset_target(context);
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_SetTarget(ID2D1DeviceContext6 *iface, ID2D1Image *target)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+@@ -2650,11 +2664,20 @@ static void STDMETHODCALLTYPE d2d_device_context_SetTarget(ID2D1DeviceContext6 *
+     {
+         command_list_impl = unsafe_impl_from_ID2D1CommandList(command_list);
+ 
++        /* a list records for the device that made it */
++        if (command_list_impl->device && command_list_impl->device != context->device)
++        {
++            WARN("Command list %p belongs to another device.\n", command_list);
++            ID2D1CommandList_Release(command_list);
++            return;
++        }
++
+         d2d_device_context_reset_target(context);
+ 
+         context->target.command_list = command_list_impl;
+         context->target.object = target;
+         context->target.type = D2D_TARGET_COMMAND_LIST;
++        command_list_impl->context = context;
+     }
+     else
+     {
+@@ -2752,11 +2775,336 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_DrawGlyphRun
+     d2d_device_context_draw_glyph_run(context, baseline_origin, glyph_run, glyph_run_desc, brush, measuring_mode);
+ }
+ 
++/* Plays a closed command list back onto a device context, under the
++ * transform DrawImage was called with. */
++struct d2d_command_player
++{
++    ID2D1CommandSink1 ID2D1CommandSink1_iface;
++    struct d2d_device_context *context;
++    D2D1_MATRIX_3X2_F base;
++};
++
++static inline struct d2d_command_player *impl_from_ID2D1CommandSink1(ID2D1CommandSink1 *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_command_player, ID2D1CommandSink1_iface);
++}
++
++static inline ID2D1DeviceContext6 *player_context(ID2D1CommandSink1 *iface)
++{
++    return &impl_from_ID2D1CommandSink1(iface)->context->ID2D1DeviceContext6_iface;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_QueryInterface(ID2D1CommandSink1 *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_ID2D1CommandSink)
++            || IsEqualGUID(iid, &IID_ID2D1CommandSink1))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++/* the player lives on the stack of the call playing the list */
++static ULONG STDMETHODCALLTYPE d2d_command_player_AddRef(ID2D1CommandSink1 *iface)
++{
++    return 2;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_command_player_Release(ID2D1CommandSink1 *iface)
++{
++    return 1;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_BeginDraw(ID2D1CommandSink1 *iface)
++{
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_EndDraw(ID2D1CommandSink1 *iface)
++{
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetAntialiasMode(ID2D1CommandSink1 *iface,
++        D2D1_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext6_SetAntialiasMode(player_context(iface), mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetTags(ID2D1CommandSink1 *iface, D2D1_TAG tag1, D2D1_TAG tag2)
++{
++    ID2D1DeviceContext6_SetTags(player_context(iface), tag1, tag2);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetTextAntialiasMode(ID2D1CommandSink1 *iface,
++        D2D1_TEXT_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext6_SetTextAntialiasMode(player_context(iface), mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetTextRenderingParams(ID2D1CommandSink1 *iface,
++        IDWriteRenderingParams *params)
++{
++    ID2D1DeviceContext6_SetTextRenderingParams(player_context(iface), params);
++    return S_OK;
++}
++
++/* what was recorded is placed where the list is drawn */
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetTransform(ID2D1CommandSink1 *iface,
++        const D2D1_MATRIX_3X2_F *transform)
++{
++    struct d2d_command_player *player = impl_from_ID2D1CommandSink1(iface);
++    D2D1_MATRIX_3X2_F m = *transform;
++
++    d2d_matrix_multiply(&m, &player->base);
++    ID2D1DeviceContext6_SetTransform(player_context(iface), &m);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetPrimitiveBlend(ID2D1CommandSink1 *iface,
++        D2D1_PRIMITIVE_BLEND blend)
++{
++    ID2D1DeviceContext6_SetPrimitiveBlend(player_context(iface), blend);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_SetUnitMode(ID2D1CommandSink1 *iface, D2D1_UNIT_MODE mode)
++{
++    ID2D1DeviceContext6_SetUnitMode(player_context(iface), mode);
++    return S_OK;
++}
++
++/* A clear in a list colors all of the list: drawn over the target, that is a fill of where it may draw. */
++static HRESULT STDMETHODCALLTYPE d2d_command_player_Clear(ID2D1CommandSink1 *iface, const D2D1_COLOR_F *color)
++{
++    static const D2D1_RECT_F everywhere = {-1.0e6f, -1.0e6f, 1.0e6f, 1.0e6f};
++    ID2D1DeviceContext6 *context = player_context(iface);
++    D2D1_COLOR_F c = {0.0f, 0.0f, 0.0f, 0.0f};
++    ID2D1SolidColorBrush *brush;
++
++    if (color)
++        c = *color;
++    if (!c.a)
++        return S_OK;
++    if (SUCCEEDED(ID2D1DeviceContext6_CreateSolidColorBrush(context, &c, NULL, &brush)))
++    {
++        ID2D1DeviceContext6_FillRectangle(context, &everywhere, (ID2D1Brush *)brush);
++        ID2D1SolidColorBrush_Release(brush);
++    }
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawGlyphRun(ID2D1CommandSink1 *iface, D2D1_POINT_2F origin,
++        const DWRITE_GLYPH_RUN *run, const DWRITE_GLYPH_RUN_DESCRIPTION *desc, ID2D1Brush *brush,
++        DWRITE_MEASURING_MODE mode)
++{
++    ID2D1DeviceContext6 *context = player_context(iface);
++    context->lpVtbl->ID2D1DeviceContext_DrawGlyphRun(context, origin, run, desc, brush, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawLine(ID2D1CommandSink1 *iface, D2D1_POINT_2F p0,
++        D2D1_POINT_2F p1, ID2D1Brush *brush, float width, ID2D1StrokeStyle *style)
++{
++    ID2D1DeviceContext6_DrawLine(player_context(iface), p0, p1, brush, width, style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawGeometry(ID2D1CommandSink1 *iface, ID2D1Geometry *geometry,
++        ID2D1Brush *brush, float width, ID2D1StrokeStyle *style)
++{
++    ID2D1DeviceContext6_DrawGeometry(player_context(iface), geometry, brush, width, style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawRectangle(ID2D1CommandSink1 *iface, const D2D1_RECT_F *rect,
++        ID2D1Brush *brush, float width, ID2D1StrokeStyle *style)
++{
++    ID2D1DeviceContext6_DrawRectangle(player_context(iface), rect, brush, width, style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawBitmap(ID2D1CommandSink1 *iface, ID2D1Bitmap *bitmap,
++        const D2D1_RECT_F *dst_rect, float opacity, D2D1_INTERPOLATION_MODE interpolation_mode,
++        const D2D1_RECT_F *src_rect, const D2D1_MATRIX_4X4_F *perspective_transform)
++{
++    ID2D1DeviceContext6 *context = player_context(iface);
++    context->lpVtbl->ID2D1DeviceContext_DrawBitmap(context, bitmap, dst_rect, opacity, interpolation_mode,
++            src_rect, perspective_transform);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawImage(ID2D1CommandSink1 *iface, ID2D1Image *image,
++        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
++        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
++{
++    ID2D1DeviceContext6_DrawImage(player_context(iface), image, target_offset, image_rect,
++            interpolation_mode, composite_mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_DrawGdiMetafile(ID2D1CommandSink1 *iface,
++        ID2D1GdiMetafile *metafile, const D2D1_POINT_2F *target_offset)
++{
++    FIXME("iface %p, metafile %p, target_offset %s, metafiles are not drawn.\n", iface, metafile,
++            debug_d2d_point_2f(target_offset));
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_FillMesh(ID2D1CommandSink1 *iface, ID2D1Mesh *mesh,
++        ID2D1Brush *brush)
++{
++    ID2D1DeviceContext6_FillMesh(player_context(iface), mesh, brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_FillOpacityMask(ID2D1CommandSink1 *iface, ID2D1Bitmap *bitmap,
++        ID2D1Brush *brush, const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect)
++{
++    ID2D1DeviceContext6 *context = player_context(iface);
++    context->lpVtbl->ID2D1DeviceContext_FillOpacityMask(context, bitmap, brush, dst_rect, src_rect);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_FillGeometry(ID2D1CommandSink1 *iface, ID2D1Geometry *geometry,
++        ID2D1Brush *brush, ID2D1Brush *opacity_brush)
++{
++    ID2D1DeviceContext6_FillGeometry(player_context(iface), geometry, brush, opacity_brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_FillRectangle(ID2D1CommandSink1 *iface, const D2D1_RECT_F *rect,
++        ID2D1Brush *brush)
++{
++    ID2D1DeviceContext6_FillRectangle(player_context(iface), rect, brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_PushAxisAlignedClip(ID2D1CommandSink1 *iface,
++        const D2D1_RECT_F *rect, D2D1_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext6_PushAxisAlignedClip(player_context(iface), rect, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_PushLayer(ID2D1CommandSink1 *iface,
++        const D2D1_LAYER_PARAMETERS1 *params, ID2D1Layer *layer)
++{
++    ID2D1DeviceContext6 *context = player_context(iface);
++    context->lpVtbl->ID2D1DeviceContext_PushLayer(context, params, layer);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_PopAxisAlignedClip(ID2D1CommandSink1 *iface)
++{
++    ID2D1DeviceContext6_PopAxisAlignedClip(player_context(iface));
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_command_player_PopLayer(ID2D1CommandSink1 *iface)
++{
++    ID2D1DeviceContext6_PopLayer(player_context(iface));
++    return S_OK;
++}
++
++static const ID2D1CommandSink1Vtbl d2d_command_player_vtbl =
++{
++    d2d_command_player_QueryInterface,
++    d2d_command_player_AddRef,
++    d2d_command_player_Release,
++    d2d_command_player_BeginDraw,
++    d2d_command_player_EndDraw,
++    d2d_command_player_SetAntialiasMode,
++    d2d_command_player_SetTags,
++    d2d_command_player_SetTextAntialiasMode,
++    d2d_command_player_SetTextRenderingParams,
++    d2d_command_player_SetTransform,
++    d2d_command_player_SetPrimitiveBlend,
++    d2d_command_player_SetUnitMode,
++    d2d_command_player_Clear,
++    d2d_command_player_DrawGlyphRun,
++    d2d_command_player_DrawLine,
++    d2d_command_player_DrawGeometry,
++    d2d_command_player_DrawRectangle,
++    d2d_command_player_DrawBitmap,
++    d2d_command_player_DrawImage,
++    d2d_command_player_DrawGdiMetafile,
++    d2d_command_player_FillMesh,
++    d2d_command_player_FillOpacityMask,
++    d2d_command_player_FillGeometry,
++    d2d_command_player_FillRectangle,
++    d2d_command_player_PushAxisAlignedClip,
++    d2d_command_player_PushLayer,
++    d2d_command_player_PopAxisAlignedClip,
++    d2d_command_player_PopLayer,
++    d2d_command_player_SetPrimitiveBlend,
++};
++
++/* Draws the part image_rect of a command list at target_offset, the way it
++ * would be drawn if its commands had been made here. */
++static void d2d_device_context_draw_command_list(struct d2d_device_context *context,
++        ID2D1CommandList *command_list, const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect)
++{
++    ID2D1DeviceContext6 *iface = &context->ID2D1DeviceContext6_iface;
++    struct d2d_command_player player = {{&d2d_command_player_vtbl}, context};
++    D2D1_DRAWING_STATE_DESCRIPTION1 state = context->drawing_state;
++    IDWriteRenderingParams *params = context->text_rendering_params;
++    D2D1_MATRIX_3X2_F offset = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    HRESULT hr;
++
++    if (unsafe_impl_from_ID2D1CommandList(command_list)->state != D2D_COMMAND_LIST_STATE_CLOSED)
++    {
++        WARN("Command list %p is not closed.\n", command_list);
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
++        return;
++    }
++
++    if (target_offset)
++    {
++        offset._31 = target_offset->x;
++        offset._32 = target_offset->y;
++    }
++    if (image_rect)
++    {
++        offset._31 -= image_rect->left;
++        offset._32 -= image_rect->top;
++    }
++    player.base = offset;
++    d2d_matrix_multiply(&player.base, &state.transform);
++
++    if (params)
++        IDWriteRenderingParams_AddRef(params);
++    if (image_rect)
++    {
++        ID2D1DeviceContext6_SetTransform(iface, &player.base);
++        ID2D1DeviceContext6_PushAxisAlignedClip(iface, image_rect, D2D1_ANTIALIAS_MODE_ALIASED);
++    }
++    if (FAILED(hr = ID2D1CommandList_Stream(command_list, (ID2D1CommandSink *)&player.ID2D1CommandSink1_iface)))
++        WARN("Failed to play command list %p, hr %#lx.\n", command_list, hr);
++    if (image_rect)
++    {
++        ID2D1DeviceContext6_SetTransform(iface, &player.base);
++        ID2D1DeviceContext6_PopAxisAlignedClip(iface);
++    }
++
++    /* what the list set does not outlast it */
++    context->drawing_state = state;
++    ID2D1DeviceContext6_SetTextRenderingParams(iface, params);
++    if (params)
++        IDWriteRenderingParams_Release(params);
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *iface, ID2D1Image *image,
+         const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect, D2D1_INTERPOLATION_MODE interpolation_mode,
+         D2D1_COMPOSITE_MODE composite_mode)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    ID2D1CommandList *command_list;
+     ID2D1Bitmap *bitmap;
+ 
+     TRACE("iface %p, image %p, target_offset %s, image_rect %s, interpolation_mode %#x, composite_mode %#x.\n",
+@@ -2790,6 +3138,13 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
+         return;
+     }
+ 
++    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1CommandList, (void **)&command_list)))
++    {
++        d2d_device_context_draw_command_list(context, command_list, target_offset, image_rect);
++        ID2D1CommandList_Release(command_list);
++        return;
++    }
++
+     FIXME("Unhandled image %p.\n", image);
+ }
+ 
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index 94aa4586184..c30bc3dc364 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -10672,6 +10672,107 @@ static ID2D1DeviceContext *create_device_context(ID2D1Factory1 *factory, IDXGIDe
+     return device_context;
+ }
+ 
++static void test_command_list_playback(BOOL d3d11)
++{
++    static const D2D1_COLOR_F red = {1.0f, 0.0f, 0.0f, 1.0f}, green = {0.0f, 1.0f, 0.0f, 1.0f};
++    static const D2D1_COLOR_F blue = {0.0f, 0.0f, 1.0f, 1.0f};
++    static const struct
++    {
++        unsigned int x, y;
++        DWORD colour;
++    }
++    points[] =
++    {
++        /* the whole list at (30, 40) */
++        {35, 45, 0xffff0000},
++        {45, 45, 0xff00ff00},
++        {55, 45, 0xff0000ff},
++        {35, 55, 0xff0000ff},
++        /* its part (10, 0)-(20, 10) at (100, 40) */
++        {95, 45, 0xff0000ff},
++        {105, 45, 0xff00ff00},
++        {115, 45, 0xff0000ff},
++        /* a bitmap's top right pixel stretched over (30, 60)-(50, 80), recorded before the list grew */
++        {40, 70, 0xff00ff00},
++    };
++    static const DWORD bitmap_data[] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff};
++    D2D1_BITMAP_PROPERTIES1 bitmap_props = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}, 96.0f, 96.0f};
++    D2D1_RECT_F dst = {0.0f, 20.0f, 20.0f, 40.0f}, src = {1.0f, 0.0f, 2.0f, 1.0f};
++    ID2D1Bitmap1 *bitmap;
++    D2D1_SIZE_U size;
++    D2D1_RECT_F rect, part = {10.0f, 0.0f, 20.0f, 10.0f};
++    D2D1_POINT_2F offset = {30.0f, 40.0f};
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    ID2D1CommandList *command_list;
++    ID2D1SolidColorBrush *brush;
++    ID2D1Image *target;
++    unsigned int i;
++    DWORD colour;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++    if (!ctx.factory1)
++    {
++        win_skip("ID2D1Factory1 is not supported.\n");
++        release_test_context(&ctx);
++        return;
++    }
++
++    hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1DeviceContext_GetTarget(ctx.context, &target);
++    ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)command_list);
++    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    set_size_u(&size, 2, 2);
++    hr = ID2D1DeviceContext_CreateBitmap(ctx.context, size, bitmap_data, 2 * sizeof(*bitmap_data), &bitmap_props, &bitmap);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1DeviceContext_BeginDraw(ctx.context);
++    ID2D1DeviceContext_DrawBitmap(ctx.context, (ID2D1Bitmap *)bitmap, &dst, 1.0f,
++            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src, NULL);
++    set_rect(&rect, 0.0f, 0.0f, 10.0f, 10.0f);
++    ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
++    ID2D1SolidColorBrush_SetColor(brush, &green);
++    set_rect(&rect, 10.0f, 0.0f, 20.0f, 10.0f);
++    ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
++    /* enough more for the list to have to grow */
++    set_rect(&rect, 300.0f, 200.0f, 301.0f, 201.0f);
++    for (i = 0; i < 200; ++i)
++        ID2D1DeviceContext_FillRectangle(ctx.context, &rect, (ID2D1Brush *)brush);
++    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1CommandList_Close(command_list);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    /* what the list recorded is drawn where it is drawn, and only the part asked for */
++    ID2D1DeviceContext_SetTarget(ctx.context, target);
++    ID2D1DeviceContext_BeginDraw(ctx.context);
++    ID2D1DeviceContext_Clear(ctx.context, &blue);
++    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, &offset, NULL,
++            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
++    offset.x = 100.0f;
++    ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, &offset, &part,
++            D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
++    hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    get_surface_readback(&ctx, &rb);
++    for (i = 0; i < ARRAY_SIZE(points); ++i)
++    {
++        colour = get_readback_colour(&rb, points[i].x, points[i].y);
++        ok(compare_colour(colour, points[i].colour, 1), "Point %u: got unexpected colour 0x%08lx.\n", i, colour);
++    }
++    release_resource_readback(&rb);
++
++    ID2D1SolidColorBrush_Release(brush);
++    ID2D1Bitmap1_Release(bitmap);
++    ID2D1Image_Release(target);
++    ID2D1CommandList_Release(command_list);
++    release_test_context(&ctx);
++}
++
+ static void test_command_list(BOOL d3d11)
+ {
+     static const DWORD bitmap_data[] =
+@@ -10885,7 +10986,6 @@ static void test_command_list(BOOL d3d11)
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
+     ID2D1DeviceContext_GetTarget(device_context, &target);
+-    todo_wine
+     ok(target == NULL, "Unexpected context target.\n");
+     if (target) ID2D1Image_Release(target);
+ 
+@@ -10899,7 +10999,6 @@ static void test_command_list(BOOL d3d11)
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
+     hr = ID2D1CommandList_Close(command_list);
+-    todo_wine
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+ 
+     ID2D1CommandList_Release(command_list);
+@@ -10913,7 +11012,6 @@ static void test_command_list(BOOL d3d11)
+ 
+     ID2D1DeviceContext_SetTarget(device_context2, (ID2D1Image *)command_list);
+     ID2D1DeviceContext_GetTarget(device_context2, &target);
+-    todo_wine
+     ok(target == NULL, "Unexpected target.\n");
+     if (target) ID2D1Image_Release(target);
+ 
+@@ -18365,6 +18463,7 @@ START_TEST(d2d1)
+     queue_d3d10_test(test_invert_matrix);
+     queue_d3d10_test(test_skew_matrix);
+     queue_test(test_command_list);
++    queue_test(test_command_list_playback);
+     queue_d3d10_test(test_max_bitmap_size);
+     queue_test(test_dpi);
+     queue_test(test_unit_mode);

@@ -1,0 +1,1530 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 11:02:33 -0400
+Subject: [PATCH] wbemdisp: Name the scripting objects' classes, and tell a
+ script why a call failed, as Windows does.
+
+Measured on Windows 11 build 29671 with tools/winmgmtsprobe (classinfo.c,
+errorinfo.c, errors.vbs):
+
+- Every object answers IProvideClassInfo with its class (SWbemLocator,
+  SWbemServicesEx, SWbemObjectEx, SWbemNamedValue, ...), which is what
+  VBScript's TypeName prints; the classes are in the type library.
+- A connection is an ISWbemServicesEx: Put (DISPID 20) puts an instance
+  and gives its path, PutAsync (21) is a stub.
+- A failed call tells the script the status's text, its line break a
+  space, and the class that failed it.
+- A query asked to return at once (the default) fails when its results
+  are asked for, with no text; an object set's Item finds an object by
+  its relative or full path, and its Security_ is its own.
+- WbemScripting.SWbemLastError can be created when there is a last
+  error; there never is one here, which is E_FAIL.
+
+The test checks the classes, the errors and the queries; on Windows it
+has no failures.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/wbemdisp/locator.c b/dlls/wbemdisp/locator.c
+index a200a91283c..b6469173767 100644
+--- a/dlls/wbemdisp/locator.c
++++ b/dlls/wbemdisp/locator.c
+@@ -64,6 +64,7 @@ struct services;
+ struct objectpath;
+ 
+ static HRESULT EnumVARIANT_create( enum enum_variant_type, struct services *, void *, IEnumVARIANT ** );
++static void enumvar_set_failure( IEnumVARIANT *, HRESULT );
+ static HRESULT dispatch_enum_create( IDispatch **, ULONG, IEnumVARIANT ** );
+ static HRESULT ISWbemSecurity_create( BOOL, ISWbemSecurity ** );
+ static HRESULT security_copy( ISWbemSecurity *, ISWbemSecurity ** );
+@@ -95,6 +96,23 @@ enum type_id
+     ISWbemQualifierSet_tid,
+     ISWbemPrivilege_tid,
+     ISWbemPrivilegeSet_tid,
++    ISWbemServicesEx_tid,
++    /* the classes, for IProvideClassInfo */
++    SWbemLocator_tid,
++    SWbemServicesEx_tid,
++    SWbemObjectEx_tid,
++    SWbemObjectSet_tid,
++    SWbemNamedValue_tid,
++    SWbemNamedValueSet_tid,
++    SWbemQualifierSet_tid,
++    SWbemProperty_tid,
++    SWbemPropertySet_tid,
++    SWbemMethod_tid,
++    SWbemMethodSet_tid,
++    SWbemSecurity_tid,
++    SWbemPrivilege_tid,
++    SWbemPrivilegeSet_tid,
++    SWbemObjectPath_tid,
+     last_tid
+ };
+ 
+@@ -119,6 +137,22 @@ static REFIID wbemdisp_tid_id[] =
+     &IID_ISWbemQualifierSet,
+     &IID_ISWbemPrivilege,
+     &IID_ISWbemPrivilegeSet,
++    &IID_ISWbemServicesEx,
++    &CLSID_SWbemLocator,
++    &CLSID_SWbemServicesEx,
++    &CLSID_SWbemObjectEx,
++    &CLSID_SWbemObjectSet,
++    &CLSID_SWbemNamedValue,
++    &CLSID_SWbemNamedValueSet,
++    &CLSID_SWbemQualifierSet,
++    &CLSID_SWbemProperty,
++    &CLSID_SWbemPropertySet,
++    &CLSID_SWbemMethod,
++    &CLSID_SWbemMethodSet,
++    &CLSID_SWbemSecurity,
++    &CLSID_SWbemPrivilege,
++    &CLSID_SWbemPrivilegeSet,
++    &CLSID_SWbemObjectPath,
+ };
+ 
+ static HRESULT get_typeinfo( enum type_id tid, ITypeInfo **ret )
+@@ -156,6 +190,107 @@ static HRESULT get_typeinfo( enum type_id tid, ITypeInfo **ret )
+     return S_OK;
+ }
+ 
++/* IProvideClassInfo, which VBScript's TypeName asks for: every object Windows hands out names its class
++ * (Windows 11, tools/winmgmtsprobe, classinfo.c) */
++struct classinfo
++{
++    IProvideClassInfo IProvideClassInfo_iface;
++    LONG refs;
++    IUnknown *outer;
++    enum type_id class_tid;
++};
++
++static struct classinfo *impl_from_IProvideClassInfo( IProvideClassInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct classinfo, IProvideClassInfo_iface );
++}
++
++static HRESULT WINAPI classinfo_QueryInterface( IProvideClassInfo *iface, REFIID riid, void **obj )
++{
++    struct classinfo *classinfo = impl_from_IProvideClassInfo( iface );
++
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++    {
++        *obj = iface;
++        IProvideClassInfo_AddRef( iface );
++        return S_OK;
++    }
++    return IUnknown_QueryInterface( classinfo->outer, riid, obj );
++}
++
++static ULONG WINAPI classinfo_AddRef( IProvideClassInfo *iface )
++{
++    struct classinfo *classinfo = impl_from_IProvideClassInfo( iface );
++    return InterlockedIncrement( &classinfo->refs );
++}
++
++static ULONG WINAPI classinfo_Release( IProvideClassInfo *iface )
++{
++    struct classinfo *classinfo = impl_from_IProvideClassInfo( iface );
++    LONG refs = InterlockedDecrement( &classinfo->refs );
++
++    if (!refs)
++    {
++        IUnknown_Release( classinfo->outer );
++        free( classinfo );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI classinfo_GetClassInfo( IProvideClassInfo *iface, ITypeInfo **info )
++{
++    struct classinfo *classinfo = impl_from_IProvideClassInfo( iface );
++
++    TRACE( "%p, %p\n", iface, info );
++
++    if (!info) return E_POINTER;
++    return get_typeinfo( classinfo->class_tid, info );
++}
++
++static const IProvideClassInfoVtbl classinfo_vtbl =
++{
++    classinfo_QueryInterface,
++    classinfo_AddRef,
++    classinfo_Release,
++    classinfo_GetClassInfo
++};
++
++static HRESULT classinfo_create( IUnknown *outer, enum type_id class_tid, void **obj )
++{
++    struct classinfo *classinfo;
++
++    if (!(classinfo = malloc( sizeof(*classinfo) ))) return E_OUTOFMEMORY;
++    classinfo->IProvideClassInfo_iface.lpVtbl = &classinfo_vtbl;
++    classinfo->refs = 1;
++    classinfo->outer = outer;
++    IUnknown_AddRef( outer );
++    classinfo->class_tid = class_tid;
++    *obj = &classinfo->IProvideClassInfo_iface;
++    return S_OK;
++}
++
++/* a failed call tells the script the status's text, with its line break a space, and the class that failed it
++ * (Windows 11, tools/winmgmtsprobe, errorinfo.c and errors.vbs) */
++static void fill_excepinfo( EXCEPINFO *info, enum type_id class_tid )
++{
++    IWbemStatusCodeText *text;
++    ITypeInfo *typeinfo;
++
++    if (!info || SUCCEEDED(info->scode) || info->bstrDescription || info->bstrSource) return;
++    if (SUCCEEDED(CoCreateInstance( &CLSID_WbemStatusCodeText, NULL, CLSCTX_INPROC_SERVER, &IID_IWbemStatusCodeText,
++                                    (void **)&text )))
++    {
++        IWbemStatusCodeText_GetErrorCodeText( text, info->scode, 0, WBEMSTATUS_FORMAT_NO_NEWLINE,
++                                              &info->bstrDescription );
++        IWbemStatusCodeText_Release( text );
++    }
++    if (SUCCEEDED(get_typeinfo( class_tid, &typeinfo )))
++    {
++        ITypeInfo_GetDocumentation( typeinfo, MEMBERID_NIL, &info->bstrSource, NULL, NULL, NULL );
++        ITypeInfo_Release( typeinfo );
++    }
++}
++
+ struct property
+ {
+     ISWbemProperty ISWbemProperty_iface;
+@@ -195,6 +330,9 @@ static HRESULT WINAPI property_QueryInterface( ISWbemProperty *iface, REFIID rii
+ 
+     TRACE( "%p %s %p\n", property, debugstr_guid(riid), obj );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemProperty_tid, obj );
++
+     if (IsEqualGUID( riid, &IID_ISWbemProperty ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -265,6 +403,7 @@ static HRESULT WINAPI property_Invoke( ISWbemProperty *iface, DISPID member, REF
+         hr = ITypeInfo_Invoke( typeinfo, &property->ISWbemProperty_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemProperty_tid );
+     }
+     return hr;
+ }
+@@ -460,6 +599,9 @@ static HRESULT WINAPI propertyset_QueryInterface( ISWbemPropertySet *iface,
+ 
+     TRACE( "%p %s %p\n", propertyset, debugstr_guid(riid), obj );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemPropertySet_tid, obj );
++
+     if (IsEqualGUID( riid, &IID_ISWbemPropertySet ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -530,6 +672,7 @@ static HRESULT WINAPI propertyset_Invoke( ISWbemPropertySet *iface, DISPID membe
+         hr = ITypeInfo_Invoke( typeinfo, &propertyset->ISWbemPropertySet_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemPropertySet_tid );
+     }
+     return hr;
+ }
+@@ -641,7 +784,7 @@ static HRESULT SWbemPropertySet_create( IWbemClassObject *wbem_object, ISWbemObj
+ 
+ struct services
+ {
+-    ISWbemServices ISWbemServices_iface;
++    ISWbemServicesEx ISWbemServicesEx_iface;
+     LONG refs;
+     IWbemServices *services;
+     ISWbemSecurity *security;
+@@ -697,6 +840,9 @@ static HRESULT WINAPI method_QueryInterface( ISWbemMethod *iface, REFIID riid, v
+ 
+     TRACE( "%p %s %p\n", method, debugstr_guid(riid), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemMethod_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemMethod ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -806,6 +952,7 @@ static HRESULT WINAPI method_Invoke(
+         hr = ITypeInfo_Invoke( typeinfo, &method->ISWbemMethod_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemMethod_tid );
+     }
+     return hr;
+ }
+@@ -921,6 +1068,9 @@ static HRESULT WINAPI methodset_QueryInterface( ISWbemMethodSet *iface, REFIID r
+ 
+     TRACE( "%p %s %p\n", set, debugstr_guid(riid), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemMethodSet_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemMethodSet ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -1028,6 +1178,7 @@ static HRESULT WINAPI methodset_Invoke(
+         hr = ITypeInfo_Invoke( typeinfo, &set->ISWbemMethodSet_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemMethodSet_tid );
+     }
+     return hr;
+ }
+@@ -1151,7 +1302,7 @@ static ULONG WINAPI object_Release(
+ 
+         TRACE( "destroying %p\n", object );
+         IWbemClassObject_Release( object->object );
+-        ISWbemServices_Release( &object->services->ISWbemServices_iface );
++        ISWbemServices_Release( (ISWbemServices *)&object->services->ISWbemServicesEx_iface );
+         if (object->security) ISWbemSecurity_Release( object->security );
+         for (i = 0; i < object->nb_members; i++) SysFreeString( object->members[i].name );
+         free( object->members );
+@@ -1169,6 +1320,9 @@ static HRESULT WINAPI object_QueryInterface(
+ 
+     TRACE( "%p %s %p\n", object, debugstr_guid(riid), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemObjectEx_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemObject ) ||
+         IsEqualGUID( riid, &IID_ISWbemObjectEx ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+@@ -1425,6 +1579,7 @@ static HRESULT WINAPI object_Invoke(
+             hr = ITypeInfo_Invoke( typeinfo, &object->ISWbemObjectEx_iface, member, flags,
+                                    params, result, excep_info, arg_err );
+             ITypeInfo_Release( typeinfo );
++            if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemObjectEx_tid );
+         }
+         return hr;
+     }
+@@ -1638,7 +1793,7 @@ static HRESULT WINAPI object_ExecMethod_(
+             return E_UNEXPECTED;
+         }
+ 
+-        hr = ISWbemServices_ExecMethod( &object->services->ISWbemServices_iface, V_BSTR( &path ), method,
++        hr = ISWbemServices_ExecMethod( (ISWbemServices *)&object->services->ISWbemServicesEx_iface, V_BSTR( &path ), method,
+                 in_params, flags, valueset, out_params );
+ 
+         VariantClear( &path );
+@@ -1875,7 +2030,7 @@ static HRESULT SWbemObject_create( struct services *services, IWbemClassObject *
+     object->last_dispid = DISPID_BASE;
+     object->last_dispid_method = DISPID_BASE_METHOD;
+     object->services = services;
+-    ISWbemServices_AddRef( &object->services->ISWbemServices_iface );
++    ISWbemServices_AddRef( (ISWbemServices *)&object->services->ISWbemServicesEx_iface );
+     object->security = NULL;
+ 
+     *obj = (ISWbemObject *)&object->ISWbemObjectEx_iface;
+@@ -1890,6 +2045,8 @@ struct objectset
+     IEnumWbemClassObject *objectenum;
+     LONG count;
+     struct services *services;
++    HRESULT failure;    /* a query's, which its results give when they are asked for */
++    ISWbemSecurity *security;
+ };
+ 
+ static inline struct objectset *impl_from_ISWbemObjectSet(
+@@ -1913,8 +2070,9 @@ static ULONG WINAPI objectset_Release(
+     if (!refs)
+     {
+         TRACE( "destroying %p\n", objectset );
+-        IEnumWbemClassObject_Release( objectset->objectenum );
+-        ISWbemServices_Release( &objectset->services->ISWbemServices_iface );
++        if (objectset->objectenum) IEnumWbemClassObject_Release( objectset->objectenum );
++        if (objectset->security) ISWbemSecurity_Release( objectset->security );
++        ISWbemServices_Release( (ISWbemServices *)&objectset->services->ISWbemServicesEx_iface );
+         free( objectset );
+     }
+     return refs;
+@@ -1929,6 +2087,9 @@ static HRESULT WINAPI objectset_QueryInterface(
+ 
+     TRACE( "%p %s %p\n", objectset, debugstr_guid(riid), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemObjectSet_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemObjectSet ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -2016,6 +2177,7 @@ static HRESULT WINAPI objectset_Invoke(
+         hr = ITypeInfo_Invoke( typeinfo, &objectset->ISWbemObjectSet_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemObjectSet_tid );
+     }
+     return hr;
+ }
+@@ -2030,6 +2192,12 @@ static HRESULT WINAPI objectset_get__NewEnum(
+ 
+     TRACE( "%p, %p\n", objectset, pUnk );
+ 
++    if (objectset->failure)
++    {
++        if (SUCCEEDED(hr = EnumVARIANT_create( ENUM_OBJECTS, objectset->services, NULL, (IEnumVARIANT **)pUnk )))
++            enumvar_set_failure( *(IEnumVARIANT **)pUnk, objectset->failure );
++        return hr;
++    }
+     hr = IEnumWbemClassObject_Clone( objectset->objectenum, &objectenum );
+     if (FAILED( hr )) return hr;
+ 
+@@ -2038,14 +2206,45 @@ static HRESULT WINAPI objectset_get__NewEnum(
+     return hr;
+ }
+ 
++/* the object of that relative or full path */
+ static HRESULT WINAPI objectset_Item(
+     ISWbemObjectSet *iface,
+     BSTR strObjectPath,
+     LONG iFlags,
+     ISWbemObject **objWbemObject )
+ {
+-    FIXME( "\n" );
+-    return E_NOTIMPL;
++    struct objectset *objectset = impl_from_ISWbemObjectSet( iface );
++    IEnumWbemClassObject *objectenum;
++    IWbemClassObject *obj;
++    HRESULT hr = WBEM_E_NOT_FOUND;
++    ULONG count;
++    VARIANT var;
++    BOOL found;
++
++    TRACE( "%p, %s, %#lx, %p\n", objectset, debugstr_w(strObjectPath), iFlags, objWbemObject );
++
++    if (!objWbemObject) return E_INVALIDARG;
++    *objWbemObject = NULL;
++    if (objectset->failure) return objectset->failure;
++    if (!strObjectPath) return WBEM_E_INVALID_PARAMETER;
++    if (FAILED(IEnumWbemClassObject_Clone( objectset->objectenum, &objectenum ))) return WBEM_E_FAILED;
++    while (IEnumWbemClassObject_Next( objectenum, WBEM_INFINITE, 1, &obj, &count ) == S_OK && count)
++    {
++        found = FALSE;
++        VariantInit( &var );
++        if (SUCCEEDED(IWbemClassObject_Get( obj, L"__RELPATH", 0, &var, NULL, NULL )) && V_VT( &var ) == VT_BSTR)
++            found = !wcsicmp( V_BSTR( &var ), strObjectPath );
++        VariantClear( &var );
++        if (!found && SUCCEEDED(IWbemClassObject_Get( obj, L"__PATH", 0, &var, NULL, NULL )) &&
++            V_VT( &var ) == VT_BSTR)
++            found = !wcsicmp( V_BSTR( &var ), strObjectPath );
++        VariantClear( &var );
++        if (found) hr = SWbemObject_create( objectset->services, obj, objWbemObject );
++        IWbemClassObject_Release( obj );
++        if (found) break;
++    }
++    IEnumWbemClassObject_Release( objectenum );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI objectset_get_Count(
+@@ -2056,6 +2255,7 @@ static HRESULT WINAPI objectset_get_Count(
+ 
+     TRACE( "%p, %p\n", objectset, iCount );
+ 
++    if (objectset->failure) return objectset->failure;
+     *iCount = objectset->count;
+     return S_OK;
+ }
+@@ -2064,8 +2264,17 @@ static HRESULT WINAPI objectset_get_Security_(
+     ISWbemObjectSet *iface,
+     ISWbemSecurity **objWbemSecurity )
+ {
+-    FIXME( "\n" );
+-    return E_NOTIMPL;
++    struct objectset *objectset = impl_from_ISWbemObjectSet( iface );
++    HRESULT hr;
++
++    TRACE( "%p, %p\n", objectset, objWbemSecurity );
++
++    if (!objWbemSecurity) return E_INVALIDARG;
++    if (!objectset->security && FAILED(hr = security_copy( objectset->services->security, &objectset->security )))
++        return hr;
++    *objWbemSecurity = objectset->security;
++    ISWbemSecurity_AddRef( *objWbemSecurity );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI objectset_ItemIndex(
+@@ -2139,20 +2348,33 @@ static HRESULT SWbemObjectSet_create( struct services *services, IEnumWbemClassO
+ 
+     TRACE( "%p, %p\n", obj, wbem_objectenum );
+ 
+-    if (!(objectset = malloc( sizeof(*objectset) ))) return E_OUTOFMEMORY;
++    if (!(objectset = calloc( 1, sizeof(*objectset) ))) return E_OUTOFMEMORY;
+     objectset->ISWbemObjectSet_iface.lpVtbl = &objectset_vtbl;
+     objectset->refs = 1;
+-    objectset->objectenum = wbem_objectenum;
+-    IEnumWbemClassObject_AddRef( objectset->objectenum );
+-    objectset->count = get_object_count( objectset->objectenum );
++    if ((objectset->objectenum = wbem_objectenum))
++    {
++        IEnumWbemClassObject_AddRef( objectset->objectenum );
++        objectset->count = get_object_count( objectset->objectenum );
++    }
+     objectset->services = services;
+-    ISWbemServices_AddRef( &services->ISWbemServices_iface );
++    ISWbemServicesEx_AddRef( &services->ISWbemServicesEx_iface );
+ 
+     *obj = &objectset->ISWbemObjectSet_iface;
+     TRACE( "returning iface %p\n", *obj );
+     return S_OK;
+ }
+ 
++/* a query asked to return at once fails when its results are asked for (Windows 11, tools/winmgmtsprobe,
++ * errors.vbs) */
++static HRESULT SWbemObjectSet_create_failed( struct services *services, HRESULT failure, ISWbemObjectSet **obj )
++{
++    HRESULT hr;
++
++    if (SUCCEEDED(hr = SWbemObjectSet_create( services, NULL, obj )))
++        impl_from_ISWbemObjectSet( *obj )->failure = failure;
++    return hr;
++}
++
+ struct enumvar
+ {
+     IEnumVARIANT IEnumVARIANT_iface;
+@@ -2168,6 +2390,7 @@ struct enumvar
+     } u;
+     struct services *services;
+     enum enum_variant_type enum_type;
++    HRESULT failure;    /* a failed query's, given for its results */
+ };
+ 
+ static inline struct enumvar *impl_from_IEnumVARIANT(
+@@ -2176,6 +2399,11 @@ static inline struct enumvar *impl_from_IEnumVARIANT(
+     return CONTAINING_RECORD( iface, struct enumvar, IEnumVARIANT_iface );
+ }
+ 
++static void enumvar_set_failure( IEnumVARIANT *iface, HRESULT failure )
++{
++    impl_from_IEnumVARIANT( iface )->failure = failure;
++}
++
+ static ULONG WINAPI enumvar_AddRef(
+     IEnumVARIANT *iface )
+ {
+@@ -2192,11 +2420,13 @@ static ULONG WINAPI enumvar_Release(
+     {
+         TRACE( "destroying %p\n", enumvar );
+         if (enumvar->enum_type == ENUM_OBJECTS)
+-            IEnumWbemClassObject_Release( enumvar->u.objectenum );
++        {
++            if (enumvar->u.objectenum) IEnumWbemClassObject_Release( enumvar->u.objectenum );
++        }
+         else if (enumvar->enum_type == ENUM_PROPERTIES || enumvar->enum_type == ENUM_SYSTEM_PROPERTIES ||
+                  enumvar->enum_type == ENUM_METHODS)
+             ISWbemObject_Release( enumvar->u.members.object );
+-        if (enumvar->services) ISWbemServices_Release( &enumvar->services->ISWbemServices_iface );
++        if (enumvar->services) ISWbemServices_Release( (ISWbemServices *)&enumvar->services->ISWbemServicesEx_iface );
+         free( enumvar );
+     }
+     return refs;
+@@ -2234,6 +2464,7 @@ static HRESULT WINAPI enumvar_Next( IEnumVARIANT *iface, ULONG celt, VARIANT *va
+ 
+     TRACE( "%p, %lu, %p, %p\n", iface, celt, var, fetched );
+ 
++    if (enumvar->failure) return enumvar->failure;
+     if (!var) return S_FALSE;
+ 
+     for (count = 0; count < celt; ++count) VariantInit( var + count );
+@@ -2322,6 +2553,7 @@ static HRESULT WINAPI enumvar_Skip( IEnumVARIANT *iface, ULONG celt )
+ 
+     TRACE( "%p, %lu\n", iface, celt );
+ 
++    if (enumvar->failure) return enumvar->failure;
+     if (enumvar->enum_type == ENUM_OBJECTS)
+         return IEnumWbemClassObject_Skip( enumvar->u.objectenum, WBEM_INFINITE, celt );
+     else if (enumvar->enum_type == ENUM_QUALIFIERS)
+@@ -2348,6 +2580,7 @@ static HRESULT WINAPI enumvar_Reset( IEnumVARIANT *iface )
+ 
+     TRACE( "%p\n", iface );
+ 
++    if (enumvar->failure) return enumvar->failure;
+     if (enumvar->enum_type == ENUM_OBJECTS)
+         hr = IEnumWbemClassObject_Reset( enumvar->u.objectenum );
+     else if (enumvar->enum_type == ENUM_PROPERTIES || enumvar->enum_type == ENUM_SYSTEM_PROPERTIES ||
+@@ -2385,8 +2618,7 @@ static HRESULT EnumVARIANT_create( enum enum_variant_type enum_type, struct serv
+     enumvar->enum_type = enum_type;
+     if (enum_type == ENUM_OBJECTS)
+     {
+-        enumvar->u.objectenum = object;
+-        IEnumWbemClassObject_AddRef( enumvar->u.objectenum );
++        if ((enumvar->u.objectenum = object)) IEnumWbemClassObject_AddRef( enumvar->u.objectenum );
+     }
+     else if (enumvar->enum_type == ENUM_PROPERTIES || enumvar->enum_type == ENUM_SYSTEM_PROPERTIES ||
+              enumvar->enum_type == ENUM_METHODS)
+@@ -2395,7 +2627,7 @@ static HRESULT EnumVARIANT_create( enum enum_variant_type enum_type, struct serv
+         ISWbemObject_AddRef( enumvar->u.members.object );
+     }
+     enumvar->services = services;
+-    if (services) ISWbemServices_AddRef( &services->ISWbemServices_iface );
++    if (services) ISWbemServicesEx_AddRef( &services->ISWbemServicesEx_iface );
+ 
+     *obj = &enumvar->IEnumVARIANT_iface;
+     TRACE( "returning iface %p\n", *obj );
+@@ -2403,20 +2635,20 @@ static HRESULT EnumVARIANT_create( enum enum_variant_type enum_type, struct serv
+ }
+ 
+ static inline struct services *impl_from_ISWbemServices(
+-    ISWbemServices *iface )
++    ISWbemServicesEx *iface )
+ {
+-    return CONTAINING_RECORD( iface, struct services, ISWbemServices_iface );
++    return CONTAINING_RECORD( iface, struct services, ISWbemServicesEx_iface );
+ }
+ 
+ static ULONG WINAPI services_AddRef(
+-    ISWbemServices *iface )
++    ISWbemServicesEx *iface )
+ {
+     struct services *services = impl_from_ISWbemServices( iface );
+     return InterlockedIncrement( &services->refs );
+ }
+ 
+ static ULONG WINAPI services_Release(
+-    ISWbemServices *iface )
++    ISWbemServicesEx *iface )
+ {
+     struct services *services = impl_from_ISWbemServices( iface );
+     LONG refs = InterlockedDecrement( &services->refs );
+@@ -2433,7 +2665,7 @@ static ULONG WINAPI services_Release(
+ }
+ 
+ static HRESULT WINAPI services_QueryInterface(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     REFIID riid,
+     void **ppvObject )
+ {
+@@ -2441,7 +2673,11 @@ static HRESULT WINAPI services_QueryInterface(
+ 
+     TRACE( "%p %s %p\n", services, debugstr_guid(riid), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemServicesEx_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemServices ) ||
++        IsEqualGUID( riid, &IID_ISWbemServicesEx ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+     {
+@@ -2453,12 +2689,12 @@ static HRESULT WINAPI services_QueryInterface(
+         *ppvObject = NULL;
+         return E_NOINTERFACE;
+     }
+-    ISWbemServices_AddRef( iface );
++    ISWbemServicesEx_AddRef( iface );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI services_GetTypeInfoCount(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     UINT *count )
+ {
+     struct services *services = impl_from_ISWbemServices( iface );
+@@ -2469,7 +2705,7 @@ static HRESULT WINAPI services_GetTypeInfoCount(
+ }
+ 
+ static HRESULT WINAPI services_GetTypeInfo(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     UINT index,
+     LCID lcid,
+     ITypeInfo **info )
+@@ -2477,11 +2713,11 @@ static HRESULT WINAPI services_GetTypeInfo(
+     struct services *services = impl_from_ISWbemServices( iface );
+     TRACE( "%p, %u, %#lx, %p\n", services, index, lcid, info );
+ 
+-    return get_typeinfo( ISWbemServices_tid, info );
++    return get_typeinfo( ISWbemServicesEx_tid, info );
+ }
+ 
+ static HRESULT WINAPI services_GetIDsOfNames(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     REFIID riid,
+     LPOLESTR *names,
+     UINT count,
+@@ -2496,7 +2732,7 @@ static HRESULT WINAPI services_GetIDsOfNames(
+ 
+     if (!names || !count || !dispid) return E_INVALIDARG;
+ 
+-    hr = get_typeinfo( ISWbemServices_tid, &typeinfo );
++    hr = get_typeinfo( ISWbemServicesEx_tid, &typeinfo );
+     if (SUCCEEDED(hr))
+     {
+         hr = ITypeInfo_GetIDsOfNames( typeinfo, names, count, dispid );
+@@ -2506,7 +2742,7 @@ static HRESULT WINAPI services_GetIDsOfNames(
+ }
+ 
+ static HRESULT WINAPI services_Invoke(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     DISPID member,
+     REFIID riid,
+     LCID lcid,
+@@ -2523,18 +2759,19 @@ static HRESULT WINAPI services_Invoke(
+     TRACE( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p\n", services, member, debugstr_guid(riid),
+            lcid, flags, params, result, excep_info, arg_err );
+ 
+-    hr = get_typeinfo( ISWbemServices_tid, &typeinfo );
++    hr = get_typeinfo( ISWbemServicesEx_tid, &typeinfo );
+     if (SUCCEEDED(hr))
+     {
+-        hr = ITypeInfo_Invoke( typeinfo, &services->ISWbemServices_iface, member, flags,
++        hr = ITypeInfo_Invoke( typeinfo, &services->ISWbemServicesEx_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemServicesEx_tid );
+     }
+     return hr;
+ }
+ 
+ static HRESULT WINAPI services_Get(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strObjectPath,
+     LONG iFlags,
+     IDispatch *objWbemNamedValueSet,
+@@ -2558,7 +2795,7 @@ static HRESULT WINAPI services_Get(
+ }
+ 
+ static HRESULT WINAPI services_GetAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strObjectPath,
+     LONG iFlags,
+@@ -2570,7 +2807,7 @@ static HRESULT WINAPI services_GetAsync(
+ }
+ 
+ static HRESULT WINAPI services_Delete(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strObjectPath,
+     LONG iFlags,
+     IDispatch *objWbemNamedValueSet )
+@@ -2580,7 +2817,7 @@ static HRESULT WINAPI services_Delete(
+ }
+ 
+ static HRESULT WINAPI services_DeleteAsync(
+-    ISWbemServices* This,
++    ISWbemServicesEx* This,
+     IDispatch *objWbemSink,
+     BSTR strObjectPath,
+     LONG iFlags,
+@@ -2603,7 +2840,7 @@ static BSTR build_query_string( const WCHAR *class )
+ }
+ 
+ static HRESULT WINAPI services_InstancesOf(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strClass,
+     LONG iFlags,
+     IDispatch *objWbemNamedValueSet,
+@@ -2620,14 +2857,14 @@ static HRESULT WINAPI services_InstancesOf(
+         SysFreeString( wql );
+         return E_OUTOFMEMORY;
+     }
+-    hr = ISWbemServices_ExecQuery( iface, query, wql, iFlags, objWbemNamedValueSet, objWbemObjectSet );
++    hr = ISWbemServicesEx_ExecQuery( iface, query, wql, iFlags, objWbemNamedValueSet, objWbemObjectSet );
+     SysFreeString( wql );
+     SysFreeString( query );
+     return hr;
+ }
+ 
+ static HRESULT WINAPI services_InstancesOfAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strClass,
+     LONG iFlags,
+@@ -2639,7 +2876,7 @@ static HRESULT WINAPI services_InstancesOfAsync(
+ }
+ 
+ static HRESULT WINAPI services_SubclassesOf(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strSuperclass,
+     LONG iFlags,
+     IDispatch *objWbemNamedValueSet,
+@@ -2650,7 +2887,7 @@ static HRESULT WINAPI services_SubclassesOf(
+ }
+ 
+ static HRESULT WINAPI services_SubclassesOfAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strSuperclass,
+     LONG iFlags,
+@@ -2662,7 +2899,7 @@ static HRESULT WINAPI services_SubclassesOfAsync(
+ }
+ 
+ static HRESULT WINAPI services_ExecQuery(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strQuery,
+     BSTR strQueryLanguage,
+     LONG iFlags,
+@@ -2681,7 +2918,11 @@ static HRESULT WINAPI services_ExecQuery(
+     /* results have their keys and paths, whatever the query selected (Windows 11, tools/winmgmtsprobe) */
+     hr = IWbemServices_ExecQuery( services->services, strQueryLanguage, strQuery,
+                                   iFlags | WBEM_FLAG_ENSURE_LOCATABLE, NULL, &iter );
+-    if (hr != S_OK) return hr;
++    if (hr != S_OK)
++    {
++        if (!(iFlags & wbemFlagReturnImmediately)) return hr;
++        return SWbemObjectSet_create_failed( services, hr, objWbemObjectSet );
++    }
+ 
+     hr = SWbemObjectSet_create( services, iter, objWbemObjectSet );
+     IEnumWbemClassObject_Release( iter );
+@@ -2689,7 +2930,7 @@ static HRESULT WINAPI services_ExecQuery(
+ }
+ 
+ static HRESULT WINAPI services_ExecQueryAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strQuery,
+     BSTR strQueryLanguage,
+@@ -2702,7 +2943,7 @@ static HRESULT WINAPI services_ExecQueryAsync(
+ }
+ 
+ static HRESULT WINAPI services_AssociatorsOf(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strObjectPath,
+     BSTR strAssocClass,
+     BSTR strResultClass,
+@@ -2721,7 +2962,7 @@ static HRESULT WINAPI services_AssociatorsOf(
+ }
+ 
+ static HRESULT WINAPI services_AssociatorsOfAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strObjectPath,
+     BSTR strAssocClass,
+@@ -2741,7 +2982,7 @@ static HRESULT WINAPI services_AssociatorsOfAsync(
+ }
+ 
+ static HRESULT WINAPI services_ReferencesTo(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strObjectPath,
+     BSTR strResultClass,
+     BSTR strRole,
+@@ -2757,7 +2998,7 @@ static HRESULT WINAPI services_ReferencesTo(
+ }
+ 
+ static HRESULT WINAPI services_ReferencesToAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strObjectPath,
+     BSTR strResultClass,
+@@ -2774,7 +3015,7 @@ static HRESULT WINAPI services_ReferencesToAsync(
+ }
+ 
+ static HRESULT WINAPI services_ExecNotificationQuery(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR strQuery,
+     BSTR strQueryLanguage,
+     LONG iFlags,
+@@ -2786,7 +3027,7 @@ static HRESULT WINAPI services_ExecNotificationQuery(
+ }
+ 
+ static HRESULT WINAPI services_ExecNotificationQueryAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strQuery,
+     BSTR strQueryLanguage,
+@@ -2799,7 +3040,7 @@ static HRESULT WINAPI services_ExecNotificationQueryAsync(
+ }
+ 
+ static HRESULT WINAPI services_ExecMethod(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     BSTR path,
+     BSTR method,
+     IDispatch *in_sparams,
+@@ -2834,7 +3075,7 @@ static HRESULT WINAPI services_ExecMethod(
+ }
+ 
+ static HRESULT WINAPI services_ExecMethodAsync(
+-    ISWbemServices *iface,
++    ISWbemServicesEx *iface,
+     IDispatch *objWbemSink,
+     BSTR strObjectPath,
+     BSTR strMethodName,
+@@ -2848,7 +3089,7 @@ static HRESULT WINAPI services_ExecMethodAsync(
+ }
+ 
+ static HRESULT WINAPI services_get_Security_(
+-        ISWbemServices *iface,
++        ISWbemServicesEx *iface,
+         ISWbemSecurity **objWbemSecurity )
+ {
+     struct services *services = impl_from_ISWbemServices( iface );
+@@ -2863,7 +3104,41 @@ static HRESULT WINAPI services_get_Security_(
+     return S_OK;
+ }
+ 
+-static const ISWbemServicesVtbl services_vtbl =
++static HRESULT WINAPI services_Put(
++    ISWbemServicesEx *iface,
++    ISWbemObjectEx *objWbemObject,
++    LONG iFlags,
++    IDispatch *objWbemNamedValueSet,
++    ISWbemObjectPath **objWbemObjectPath )
++{
++    struct services *services = impl_from_ISWbemServices( iface );
++    struct object *object;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %#lx, %p, %p\n", iface, objWbemObject, iFlags, objWbemNamedValueSet, objWbemObjectPath );
++
++    if (!objWbemObject || !(object = unsafe_object_impl_from_IDispatch( (IDispatch *)objWbemObject )))
++        return WBEM_E_INVALID_PARAMETER;
++    if (objWbemNamedValueSet) FIXME( "ignoring context\n" );
++    if (FAILED(hr = IWbemServices_PutInstance( services->services, object->object, iFlags, NULL, NULL ))) return hr;
++    if (!objWbemObjectPath) return S_OK;
++    return SWbemObjectPath_create( services, object->object, objWbemObjectPath );
++}
++
++static HRESULT WINAPI services_PutAsync(
++    ISWbemServicesEx *iface,
++    IDispatch *objWbemSink,
++    ISWbemObjectEx *objWbemObject,
++    LONG iFlags,
++    IDispatch *objWbemNamedValueSet,
++    IDispatch *objWbemAsyncContext )
++{
++    FIXME( "%p, %p, %p, %#lx, %p, %p\n", iface, objWbemSink, objWbemObject, iFlags, objWbemNamedValueSet,
++           objWbemAsyncContext );
++    return E_NOTIMPL;
++}
++
++static const ISWbemServicesExVtbl services_vtbl =
+ {
+     services_QueryInterface,
+     services_AddRef,
+@@ -2890,7 +3165,9 @@ static const ISWbemServicesVtbl services_vtbl =
+     services_ExecNotificationQueryAsync,
+     services_ExecMethod,
+     services_ExecMethodAsync,
+-    services_get_Security_
++    services_get_Security_,
++    services_Put,
++    services_PutAsync
+ };
+ 
+ /* a connection starts with the locator's settings, when it has any */
+@@ -2912,12 +3189,12 @@ static HRESULT SWbemServices_create( IWbemServices *wbem_services, ISWbemSecurit
+     }
+     services->locale = SysAllocString( locale && *locale ? locale : NULL );
+     services->authority = SysAllocString( authority && *authority ? authority : NULL );
+-    services->ISWbemServices_iface.lpVtbl = &services_vtbl;
++    services->ISWbemServicesEx_iface.lpVtbl = &services_vtbl;
+     services->refs = 1;
+     services->services = wbem_services;
+     IWbemServices_AddRef( services->services );
+ 
+-    *obj = &services->ISWbemServices_iface;
++    *obj = (ISWbemServices *)&services->ISWbemServicesEx_iface;
+     TRACE( "returning iface %p\n", *obj );
+     return S_OK;
+ }
+@@ -2967,6 +3244,9 @@ static HRESULT WINAPI locator_QueryInterface(
+ 
+     TRACE( "%p, %s, %p\n", locator, debugstr_guid( riid ), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemLocator_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemLocator ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -3055,6 +3335,7 @@ static HRESULT WINAPI locator_Invoke(
+         hr = ITypeInfo_Invoke( typeinfo, &locator->ISWbemLocator_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemLocator_tid );
+     }
+     return hr;
+ }
+@@ -3376,6 +3657,9 @@ static HRESULT WINAPI privilege_QueryInterface( ISWbemPrivilege *iface, REFIID r
+ {
+     TRACE( "%p, %s, %p\n", iface, debugstr_guid( riid ), obj );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemPrivilege_tid, obj );
++
+     if (IsEqualGUID( riid, &IID_ISWbemPrivilege ) || IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+     {
+@@ -3451,6 +3735,7 @@ static HRESULT WINAPI privilege_Invoke( ISWbemPrivilege *iface, DISPID member, R
+     {
+         hr = ITypeInfo_Invoke( typeinfo, iface, member, flags, params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemPrivilege_tid );
+     }
+     return hr;
+ }
+@@ -3548,6 +3833,9 @@ static HRESULT WINAPI privilegeset_QueryInterface( ISWbemPrivilegeSet *iface, RE
+ {
+     TRACE( "%p, %s, %p\n", iface, debugstr_guid( riid ), obj );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemPrivilegeSet_tid, obj );
++
+     if (IsEqualGUID( riid, &IID_ISWbemPrivilegeSet ) || IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+     {
+@@ -3637,6 +3925,7 @@ static HRESULT WINAPI privilegeset_Invoke( ISWbemPrivilegeSet *iface, DISPID mem
+     {
+         hr = ITypeInfo_Invoke( typeinfo, iface, member, flags, params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemPrivilegeSet_tid );
+     }
+     return hr;
+ }
+@@ -3817,6 +4106,9 @@ static HRESULT WINAPI security_QueryInterface(
+     struct security *security = impl_from_ISWbemSecurity( iface );
+     TRACE( "%p, %s, %p\n", security, debugstr_guid( riid ), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemSecurity_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemSecurity ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -3905,6 +4197,7 @@ static HRESULT WINAPI security_Invoke(
+         hr = ITypeInfo_Invoke( typeinfo, &security->ISWbemSecurity_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemSecurity_tid );
+     }
+     return hr;
+ }
+@@ -4071,6 +4364,9 @@ static HRESULT WINAPI namedvalue_QueryInterface(
+ 
+     TRACE( "%p, %s, %p\n", value, debugstr_guid( riid ), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemNamedValue_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemNamedValue ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -4180,6 +4476,7 @@ static HRESULT WINAPI namedvalue_Invoke(
+     {
+         hr = ITypeInfo_Invoke( typeinfo, iface, member, flags, params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemNamedValue_tid );
+     }
+     return hr;
+ }
+@@ -4274,6 +4571,9 @@ static HRESULT WINAPI namedvalueset_QueryInterface(
+ 
+     TRACE( "%p, %s, %p\n", set, debugstr_guid( riid ), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemNamedValueSet_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemNamedValueSet ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -4385,6 +4685,7 @@ static HRESULT WINAPI namedvalueset_Invoke(
+         hr = ITypeInfo_Invoke( typeinfo, &set->ISWbemNamedValueSet_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemNamedValueSet_tid );
+     }
+     return hr;
+ }
+@@ -4611,6 +4912,9 @@ static HRESULT WINAPI qualifierset_QueryInterface( ISWbemQualifierSet *iface, RE
+ 
+     TRACE( "%p %s %p\n", qualifierset, debugstr_guid( riid ), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemQualifierSet_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemQualifierSet ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -4703,6 +5007,7 @@ static HRESULT WINAPI qualifierset_Invoke( ISWbemQualifierSet *iface, DISPID mem
+         hr = ITypeInfo_Invoke( typeinfo, &qualifierset->ISWbemQualifierSet_iface, member, flags,
+                 params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemQualifierSet_tid );
+     }
+     return hr;
+ }
+@@ -4793,6 +5098,9 @@ static HRESULT WINAPI objectpath_QueryInterface( ISWbemObjectPath *iface, REFIID
+ 
+     TRACE( "%p %s %p\n", objectpath, debugstr_guid( riid ), ppvObject );
+ 
++    if (IsEqualGUID( riid, &IID_IProvideClassInfo ))
++        return classinfo_create( (IUnknown *)iface, SWbemObjectPath_tid, ppvObject );
++
+     if (IsEqualGUID( riid, &IID_ISWbemObjectPath ) ||
+         IsEqualGUID( riid, &IID_IDispatch ) ||
+         IsEqualGUID( riid, &IID_IUnknown ))
+@@ -4896,6 +5204,7 @@ static HRESULT WINAPI objectpath_Invoke( ISWbemObjectPath *iface, DISPID member,
+         hr = ITypeInfo_Invoke( typeinfo, &objectpath->ISWbemObjectPath_iface, member, flags,
+                                params, result, excep_info, arg_err );
+         ITypeInfo_Release( typeinfo );
++        if (hr == DISP_E_EXCEPTION) fill_excepinfo( excep_info, SWbemObjectPath_tid );
+     }
+     return hr;
+ }
+diff --git a/dlls/wbemdisp/main.c b/dlls/wbemdisp/main.c
+index f062d241b75..ff624c3ec53 100644
+--- a/dlls/wbemdisp/main.c
++++ b/dlls/wbemdisp/main.c
+@@ -285,6 +285,17 @@ static const struct IClassFactoryVtbl factory_vtbl =
+ static struct factory swbem_locator_cf = { { &factory_vtbl }, SWbemLocator_create };
+ static struct factory swbem_namedvalueset_cf = { { &factory_vtbl }, SWbemNamedValueSet_create };
+ static struct factory swbem_objectpath_cf = { { &factory_vtbl }, SWbemObjectPath_create_empty };
++
++/* the extended status of the last call WMI failed: there is never one here, which is what creating one with no last
++ * error says (Windows 11, tools/winmgmtsprobe, errors.vbs) */
++static HRESULT SWbemLastError_create( void **obj )
++{
++    TRACE( "%p\n", obj );
++    *obj = NULL;
++    return E_FAIL;
++}
++
++static struct factory swbem_lasterror_cf = { { &factory_vtbl }, SWbemLastError_create };
+ static struct factory winmgmts_cf = { { &factory_vtbl }, WinMGMTS_create };
+ 
+ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *obj )
+@@ -301,6 +312,8 @@ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *obj )
+         cf = &swbem_namedvalueset_cf.IClassFactory_iface;
+     else if (IsEqualGUID( rclsid, &CLSID_SWbemObjectPath ))
+         cf = &swbem_objectpath_cf.IClassFactory_iface;
++    else if (IsEqualGUID( rclsid, &CLSID_SWbemLastError ))
++        cf = &swbem_lasterror_cf.IClassFactory_iface;
+     else
+         return CLASS_E_CLASSNOTAVAILABLE;
+ 
+diff --git a/dlls/wbemdisp/tests/wbemdisp.c b/dlls/wbemdisp/tests/wbemdisp.c
+index 0bcc90e97c8..77829cd01aa 100644
+--- a/dlls/wbemdisp/tests/wbemdisp.c
++++ b/dlls/wbemdisp/tests/wbemdisp.c
+@@ -22,6 +22,7 @@
+ #include "windows.h"
+ #include "initguid.h"
+ #include "objidl.h"
++#include "ocidl.h"
+ #include "wbemdisp.h"
+ #include "wbemcli.h"
+ #include "wine/test.h"
+@@ -1120,6 +1121,160 @@ static void test_object_path(void)
+     ISWbemLocator_Release( locator );
+ }
+ 
++static void check_class_( unsigned int line, IUnknown *unk, const WCHAR *expected )
++{
++    IProvideClassInfo *provide;
++    ITypeInfo *info;
++    HRESULT hr;
++    BSTR name;
++
++    hr = IUnknown_QueryInterface( unk, &IID_IProvideClassInfo, (void **)&provide );
++    ok_(__FILE__, line)( hr == S_OK, "got %#lx\n", hr );
++    if (hr != S_OK) return;
++    hr = IProvideClassInfo_GetClassInfo( provide, &info );
++    ok_(__FILE__, line)( hr == S_OK, "got %#lx\n", hr );
++    if (hr == S_OK)
++    {
++        hr = ITypeInfo_GetDocumentation( info, MEMBERID_NIL, &name, NULL, NULL, NULL );
++        ok_(__FILE__, line)( hr == S_OK && !wcscmp( name, expected ), "got %#lx, %s\n", hr, wine_dbgstr_w(name) );
++        SysFreeString( name );
++        ITypeInfo_Release( info );
++    }
++    IProvideClassInfo_Release( provide );
++}
++#define check_class(a, b) check_class_( __LINE__, (IUnknown *)(a), b )
++
++/* every object names its class; a failed call tells the script the status's text and the class; a query asked to
++ * return at once fails when its results are asked for (Windows 11, tools/winmgmtsprobe: classinfo.c, errorinfo.c,
++ * errors.vbs) */
++static void test_classes_and_errors(void)
++{
++    static const WCHAR *names[] = { L"Put", L"PutAsync" };
++    ISWbemLocator *locator;
++    ISWbemServices *services;
++    ISWbemObjectSet *objects;
++    ISWbemObjectPath *path;
++    ISWbemNamedValueSet *values;
++    ISWbemObject *object;
++    IEnumVARIANT *items;
++    IUnknown *unk;
++    DISPPARAMS params;
++    DISPID put = DISPID_PROPERTYPUT;
++    EXCEPINFO excep;
++    VARIANT var, arg;
++    unsigned int i;
++    DISPID id;
++    HRESULT hr;
++    BSTR str, lang;
++
++    hr = CoCreateInstance( &CLSID_SWbemLocator, NULL, CLSCTX_INPROC_SERVER, &IID_ISWbemLocator, (void **)&locator );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_class( locator, L"SWbemLocator" );
++    str = SysAllocString( L"root\\cimv2" );
++    hr = ISWbemLocator_ConnectServer( locator, NULL, str, NULL, NULL, NULL, NULL, 0, NULL, &services );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    SysFreeString( str );
++    check_class( services, L"SWbemServicesEx" );
++
++    hr = ISWbemServices_QueryInterface( services, &IID_ISWbemServicesEx, (void **)&unk );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    if (hr == S_OK) IUnknown_Release( unk );
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++    {
++        LPOLESTR name = (LPOLESTR)names[i];
++        id = -1;
++        hr = ISWbemServices_GetIDsOfNames( services, &IID_NULL, &name, 1, english, &id );
++        ok( hr == S_OK && id == 20 + i, "%s: got %#lx, %ld\n", wine_dbgstr_w(names[i]), hr, id );
++    }
++
++    hr = CoCreateInstance( &CLSID_SWbemObjectPath, NULL, CLSCTX_INPROC_SERVER, &IID_ISWbemObjectPath, (void **)&path );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_class( path, L"SWbemObjectPath" );
++    hr = ISWbemObjectPath_get_Keys( path, &values );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_class( values, L"SWbemNamedValueSet" );
++    ISWbemNamedValueSet_Release( values );
++
++    /* Path = "Class.A = 5" through IDispatch */
++    V_VT( &arg ) = VT_BSTR;
++    V_BSTR( &arg ) = SysAllocString( L"Class.A = 5" );
++    params.rgvarg = &arg;
++    params.rgdispidNamedArgs = &put;
++    params.cArgs = 1;
++    params.cNamedArgs = 1;
++    memset( &excep, 0, sizeof(excep) );
++    hr = ISWbemObjectPath_Invoke( path, DISPID_VALUE, &IID_NULL, english, DISPATCH_PROPERTYPUT, &params, NULL, &excep,
++                                  NULL );
++    ok( hr == DISP_E_EXCEPTION, "got %#lx\n", hr );
++    ok( excep.scode == WBEM_E_FAILED, "got %#lx\n", excep.scode );
++    ok( excep.bstrSource && !wcscmp( excep.bstrSource, L"SWbemObjectPath" ), "got %s\n",
++        wine_dbgstr_w(excep.bstrSource) );
++    ok( excep.bstrDescription && SysStringLen( excep.bstrDescription ) > 1 &&
++        excep.bstrDescription[SysStringLen( excep.bstrDescription ) - 1] == ' ', "got %s\n",
++        wine_dbgstr_w(excep.bstrDescription) );
++    if (PRIMARYLANGID( GetUserDefaultUILanguage() ) == LANG_ENGLISH)
++        ok( !wcscmp( excep.bstrDescription, L"Generic failure " ), "got %s\n", wine_dbgstr_w(excep.bstrDescription) );
++    SysFreeString( excep.bstrSource );
++    SysFreeString( excep.bstrDescription );
++    SysFreeString( excep.bstrHelpFile );
++    VariantClear( &arg );
++    ISWbemObjectPath_Release( path );
++
++    /* a query that is no query, asked to return at once and not */
++    str = SysAllocString( L"SELEC * FROM Win32_LogicalDisk" );
++    lang = SysAllocString( L"WQL" );
++    hr = ISWbemServices_ExecQuery( services, str, lang, wbemFlagReturnImmediately, NULL, &objects );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    if (hr == S_OK)
++    {
++        check_class( objects, L"SWbemObjectSet" );
++        hr = ISWbemObjectSet_get__NewEnum( objects, &unk );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        hr = IUnknown_QueryInterface( unk, &IID_IEnumVARIANT, (void **)&items );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        IUnknown_Release( unk );
++        VariantInit( &var );
++        hr = IEnumVARIANT_Next( items, 1, &var, NULL );
++        ok( hr == WBEM_E_INVALID_QUERY, "got %#lx\n", hr );
++        IEnumVARIANT_Release( items );
++        ISWbemObjectSet_Release( objects );
++    }
++    hr = ISWbemServices_ExecQuery( services, str, lang, 0, NULL, &objects );
++    ok( hr == WBEM_E_INVALID_QUERY, "got %#lx\n", hr );
++    SysFreeString( str );
++
++    /* an object of the results by its path */
++    str = SysAllocString( L"SELECT * FROM Win32_LogicalDisk" );
++    hr = ISWbemServices_ExecQuery( services, str, lang, 0, NULL, &objects );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    SysFreeString( str );
++    if (hr == S_OK)
++    {
++        str = SysAllocString( L"Win32_LogicalDisk.DeviceID=\"C:\"" );
++        hr = ISWbemObjectSet_Item( objects, str, 0, &object );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        if (hr == S_OK)
++        {
++            check_class( object, L"SWbemObjectEx" );
++            ISWbemObject_Release( object );
++        }
++        SysFreeString( str );
++        str = SysAllocString( L"Win32_LogicalDisk.DeviceID=\"nonesuch\"" );
++        hr = ISWbemObjectSet_Item( objects, str, 0, &object );
++        ok( hr == WBEM_E_NOT_FOUND, "got %#lx\n", hr );
++        SysFreeString( str );
++        ISWbemObjectSet_Release( objects );
++    }
++    SysFreeString( lang );
++
++    /* there is no last error to be had */
++    hr = CoCreateInstance( &CLSID_SWbemLastError, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&unk );
++    ok( hr == E_FAIL, "got %#lx\n", hr );
++
++    ISWbemServices_Release( services );
++    ISWbemLocator_Release( locator );
++}
++
+ START_TEST(wbemdisp)
+ {
+     CoInitialize( NULL );
+@@ -1131,6 +1286,7 @@ START_TEST(wbemdisp)
+     test_namedvalueset();
+     test_objectpath();
+     test_object_path();
++    test_classes_and_errors();
+ 
+     CoUninitialize();
+ }
+diff --git a/include/wbemdisp.idl b/include/wbemdisp.idl
+index ae6bd745d7e..2929505075d 100644
+--- a/include/wbemdisp.idl
++++ b/include/wbemdisp.idl
+@@ -53,6 +53,8 @@ interface ISWbemQualifier;
+ interface ISWbemQualifierSet;
+ interface ISWbemSecurity;
+ interface ISWbemServices;
++interface ISWbemServicesEx;
++interface ISWbemLastError;
+ 
+ typedef
+ [
+@@ -1368,6 +1370,34 @@ interface ISWbemServices : IDispatch
+         [out, retval] ISWbemSecurity **objWbemSecurity);
+ }
+ 
++[
++    object,
++    local,
++    uuid(d2f68443-85dc-427e-91d8-366554cc754c),
++    dual,
++    hidden,
++    oleautomation,
++    nonextensible,
++    pointer_default(unique)
++]
++interface ISWbemServicesEx : ISWbemServices
++{
++    [ id(20) ]
++    HRESULT Put(
++        [in] ISWbemObjectEx *objWbemObject,
++        [in, defaultvalue(wbemChangeFlagCreateOrUpdate)] long iFlags,
++        [in, defaultvalue(0)] IDispatch *objWbemNamedValueSet,
++        [out, retval] ISWbemObjectPath **objWbemObjectPath);
++
++    [ id(21) ]
++    HRESULT PutAsync(
++        [in] IDispatch *objWbemSink,
++        [in] ISWbemObjectEx *objWbemObject,
++        [in, defaultvalue(wbemChangeFlagCreateOrUpdate)] long iFlags,
++        [in, defaultvalue(0)] IDispatch *objWbemNamedValueSet,
++        [in, defaultvalue(0)] IDispatch *objWbemAsyncContext);
++}
++
+ [
+     threading(apartment),
+     uuid(76a64158-cb41-11d1-8b02-00600806d9b6),
+@@ -1390,6 +1420,31 @@ coclass SWbemNamedValueSet
+     interface ISWbemNamedValueSet;
+ }
+ 
++[
++    object,
++    local,
++    uuid(d962db84-d4bb-11d1-8b09-00600806d9b6),
++    dual,
++    hidden,
++    oleautomation,
++    nonextensible,
++    pointer_default(unique)
++]
++interface ISWbemLastError : ISWbemObject
++{
++}
++
++[
++    threading(apartment),
++    uuid(c2feeeac-cfcd-11d1-8b05-00600806d9b6),
++    progid("WbemScripting.SWbemLastError.1"),
++    vi_progid("WbemScripting.SWbemLastError")
++]
++coclass SWbemLastError
++{
++    interface ISWbemLastError;
++}
++
+ [
+     threading(apartment),
+     uuid(5791bc26-ce9c-11d1-97bf-0000f81e849c),
+@@ -1401,4 +1456,150 @@ coclass SWbemObjectPath
+     interface ISWbemObjectPath;
+ }
+ 
++/* the classes of the objects scripting hands out, which IProvideClassInfo names */
++
++[
++    uuid(04b83d63-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemServices
++{
++    interface ISWbemServices;
++}
++
++[
++    uuid(62e522dc-8cf3-40a8-8b2e-37d595651e40),
++    noncreatable
++]
++coclass SWbemServicesEx
++{
++    interface ISWbemServicesEx;
++}
++
++[
++    uuid(04b83d62-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemObject
++{
++    interface ISWbemObject;
++}
++
++[
++    uuid(d6bdafb2-9435-491f-bb87-6aa0f0bc31a2),
++    noncreatable
++]
++coclass SWbemObjectEx
++{
++    interface ISWbemObjectEx;
++}
++
++[
++    uuid(04b83d61-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemObjectSet
++{
++    interface ISWbemObjectSet;
++}
++
++[
++    uuid(04b83d60-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemNamedValue
++{
++    interface ISWbemNamedValue;
++}
++
++[
++    uuid(04b83d5f-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemQualifier
++{
++    interface ISWbemQualifier;
++}
++
++[
++    uuid(04b83d5e-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemQualifierSet
++{
++    interface ISWbemQualifierSet;
++}
++
++[
++    uuid(04b83d5d-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemProperty
++{
++    interface ISWbemProperty;
++}
++
++[
++    uuid(04b83d5c-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemPropertySet
++{
++    interface ISWbemPropertySet;
++}
++
++[
++    uuid(04b83d5b-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemMethod
++{
++    interface ISWbemMethod;
++}
++
++[
++    uuid(04b83d5a-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemMethodSet
++{
++    interface ISWbemMethodSet;
++}
++
++[
++    uuid(04b83d58-21ae-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemEventSource
++{
++    interface ISWbemEventSource;
++}
++
++[
++    uuid(b54d66e9-2287-11d2-8b33-00600806d9b6),
++    noncreatable
++]
++coclass SWbemSecurity
++{
++    interface ISWbemSecurity;
++}
++
++[
++    uuid(26ee67bc-5804-11d2-8b4a-00600806d9b6),
++    noncreatable
++]
++coclass SWbemPrivilege
++{
++    interface ISWbemPrivilege;
++}
++
++[
++    uuid(26ee67be-5804-11d2-8b4a-00600806d9b6),
++    noncreatable
++]
++coclass SWbemPrivilegeSet
++{
++    interface ISWbemPrivilegeSet;
++}
++
+ } /* WbemScripting */

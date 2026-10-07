@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 04:37:55 -0400
+Subject: [PATCH] wbemprox: Implement Win32_Process.Terminate.
+
+The reason is the exit code the process is given; the method answers 0,
+or 2 when access is denied and 8 for any other failure, as the class
+documents.  The test also checks another process's command line.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/wbemprox/builtin.c b/dlls/wbemprox/builtin.c
+index 688f0b5f0c8..24c8a67ff92 100644
+--- a/dlls/wbemprox/builtin.c
++++ b/dlls/wbemprox/builtin.c
+@@ -411,6 +411,7 @@ static const struct column col_process[] =
+     /* methods */
+     { L"Create",          CIM_FLAG_ARRAY|COL_FLAG_METHOD },
+     { L"GetOwner",        CIM_FLAG_ARRAY|COL_FLAG_METHOD },
++    { L"Terminate",       CIM_FLAG_ARRAY|COL_FLAG_METHOD },
+ };
+ static const struct column col_processor[] =
+ {
+@@ -993,6 +994,7 @@ struct record_process
+     /* methods */
+     class_method *create;
+     class_method *get_owner;
++    class_method *terminate;
+ };
+ struct record_processor
+ {
+@@ -1272,6 +1274,8 @@ static const struct record_param data_param[] =
+     { L"Win32_Process", L"GetOwner", -1, L"ReturnValue", CIM_UINT32 },
+     { L"Win32_Process", L"GetOwner", -1, L"User", CIM_STRING },
+     { L"Win32_Process", L"GetOwner", -1, L"Domain", CIM_STRING },
++    { L"Win32_Process", L"Terminate", 1, L"Reason", CIM_UINT32 },
++    { L"Win32_Process", L"Terminate", -1, L"ReturnValue", CIM_UINT32 },
+     { L"Win32_Service", L"PauseService", -1, L"ReturnValue", CIM_UINT32 },
+     { L"Win32_Service", L"ResumeService", -1, L"ReturnValue", CIM_UINT32 },
+     { L"Win32_Service", L"StartService", -1, L"ReturnValue", CIM_UINT32 },
+@@ -3833,6 +3837,7 @@ static enum fill_status fill_process( struct table *table, const struct expr *co
+         /* methods */
+         rec->create         = process_create;
+         rec->get_owner      = process_get_owner;
++        rec->terminate      = process_terminate;
+         if (!match_row( table, row, cond, &status ))
+         {
+             free_row_values( table, row );
+diff --git a/dlls/wbemprox/process.c b/dlls/wbemprox/process.c
+index d03d78bfbc3..cf4c268ec2f 100644
+--- a/dlls/wbemprox/process.c
++++ b/dlls/wbemprox/process.c
+@@ -220,3 +220,56 @@ done:
+     TRACE( "ret %#lx\n", ret );
+     return ret;
+ }
++
++HRESULT process_terminate( IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out )
++{
++    IWbemClassObject *sig, *out_params = NULL;
++    VARIANT id, reason, retval;
++    UINT32 error = 0, code = 0;
++    HANDLE process;
++    HRESULT hr;
++
++    TRACE("%p, %p, %p, %p\n", obj, context, in, out);
++
++    if ((hr = create_signature( WBEMPROX_NAMESPACE_CIMV2, L"Win32_Process", L"Terminate", PARAM_OUT, &sig ))) return hr;
++    if (out && (hr = IWbemClassObject_SpawnInstance( sig, 0, &out_params )))
++    {
++        IWbemClassObject_Release( sig );
++        return hr;
++    }
++
++    VariantInit( &id );
++    VariantInit( &reason );
++    if ((hr = IWbemClassObject_Get( obj, L"ProcessID", 0, &id, NULL, NULL ))) goto done;
++    /* the reason is the exit code the process is given */
++    if (in && SUCCEEDED(IWbemClassObject_Get( in, L"Reason", 0, &reason, NULL, NULL )) &&
++        (V_VT( &reason ) == VT_I4 || V_VT( &reason ) == VT_UI4))
++        code = V_UI4( &reason );
++
++    if (!(process = OpenProcess( PROCESS_TERMINATE, FALSE, V_UI4( &id ) )))
++        error = GetLastError() == ERROR_ACCESS_DENIED ? 2 : 8;
++    else
++    {
++        if (!TerminateProcess( process, code )) error = GetLastError() == ERROR_ACCESS_DENIED ? 2 : 8;
++        CloseHandle( process );
++    }
++    TRACE( "process %lu, exit code %u: %u\n", V_UI4( &id ), code, error );
++
++    if (out_params)
++    {
++        set_variant( VT_UI4, error, NULL, &retval );
++        hr = IWbemClassObject_Put( out_params, L"ReturnValue", 0, &retval, CIM_UINT32 );
++    }
++
++done:
++    VariantClear( &id );
++    VariantClear( &reason );
++    IWbemClassObject_Release( sig );
++    if (hr == S_OK && out)
++    {
++        *out = out_params;
++        IWbemClassObject_AddRef( out_params );
++    }
++    if (out_params) IWbemClassObject_Release( out_params );
++    return hr;
++}
+diff --git a/dlls/wbemprox/tests/query.c b/dlls/wbemprox/tests/query.c
+index 63723e55dc1..e06c8063fea 100644
+--- a/dlls/wbemprox/tests/query.c
++++ b/dlls/wbemprox/tests/query.c
+@@ -887,6 +887,79 @@ static void test_Win32_Process( IWbemServices *services, BOOL use_full_path )
+     SysFreeString( class );
+ }
+ 
++/* another process's command line, and terminating it with an exit code */
++static void test_Win32_Process_other( IWbemServices *services )
++{
++    STARTUPINFOW si = { sizeof(si) };
++    WCHAR cmdline[MAX_PATH + 64];
++    IWbemClassObject *process, *sig_in, *params, *out;
++    PROCESS_INFORMATION pi;
++    BSTR path, method;
++    VARIANT val;
++    CIMTYPE type;
++    DWORD code;
++    HRESULT hr;
++
++    GetModuleFileNameW( NULL, cmdline, MAX_PATH + 1 );
++    lstrcatW( cmdline, L" query  created_process   with spaces" );
++    if (!CreateProcessW( NULL, cmdline, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi ))
++    {
++        ok( 0, "CreateProcess failed, error %lu.\n", GetLastError() );
++        return;
++    }
++
++    path = SysAllocStringLen( NULL, ARRAY_SIZE( L"Win32_Process.Handle=\"%u\"" ) + 10 );
++    wsprintfW( path, L"Win32_Process.Handle=\"%u\"", pi.dwProcessId );
++    hr = IWbemServices_GetObject( services, path, 0, NULL, &process, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    if (hr == S_OK)
++    {
++        VariantInit( &val );
++        hr = IWbemClassObject_Get( process, L"CommandLine", 0, &val, &type, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        ok( V_VT( &val ) == VT_BSTR, "got type %#x\n", V_VT( &val ) );
++        ok( type == CIM_STRING, "got %#lx\n", type );
++        if (V_VT( &val ) == VT_BSTR)
++            ok( !lstrcmpW( V_BSTR( &val ), cmdline ), "got %s\n", wine_dbgstr_w( V_BSTR( &val ) ) );
++        VariantClear( &val );
++
++        hr = IWbemClassObject_GetMethod( process, L"Terminate", 0, &sig_in, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        hr = IWbemClassObject_SpawnInstance( sig_in, 0, &params );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        V_VT( &val ) = VT_I4;
++        V_I4( &val ) = 7;
++        hr = IWbemClassObject_Put( params, L"Reason", 0, &val, 0 );
++        ok( hr == S_OK, "got %#lx\n", hr );
++
++        out = NULL;
++        method = SysAllocString( L"Terminate" );
++        hr = IWbemServices_ExecMethod( services, path, method, 0, NULL, params, &out, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        SysFreeString( method );
++        if (out)
++        {
++            VariantInit( &val );
++            hr = IWbemClassObject_Get( out, L"ReturnValue", 0, &val, &type, NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( V_VT( &val ) == VT_I4, "got type %#x\n", V_VT( &val ) );
++            ok( !V_I4( &val ), "got %ld\n", V_I4( &val ) );
++            IWbemClassObject_Release( out );
++        }
++        ok( !WaitForSingleObject( pi.hProcess, 5000 ), "process still running\n" );
++        ok( GetExitCodeProcess( pi.hProcess, &code ) && code == 7, "got exit code %lu\n", code );
++
++        IWbemClassObject_Release( params );
++        IWbemClassObject_Release( sig_in );
++        IWbemClassObject_Release( process );
++    }
++    SysFreeString( path );
++
++    TerminateProcess( pi.hProcess, 0 );
++    CloseHandle( pi.hProcess );
++    CloseHandle( pi.hThread );
++}
++
+ static void test_Win32_ComputerSystem( IWbemServices *services )
+ {
+     BSTR wql = SysAllocString( L"wql" ), query = SysAllocString( L"SELECT * FROM Win32_ComputerSystem" );
+@@ -2690,6 +2763,7 @@ START_TEST(query)
+     test_Win32_Printer( services );
+     test_Win32_Process( services, FALSE );
+     test_Win32_Process( services, TRUE );
++    test_Win32_Process_other( services );
+     test_Win32_Processor( services );
+     test_Win32_QuickFixEngineering( services );
+     test_Win32_Service( services );
+diff --git a/dlls/wbemprox/wbemprox_private.h b/dlls/wbemprox/wbemprox_private.h
+index 1da85a1182d..aa251d70f35 100644
+--- a/dlls/wbemprox/wbemprox_private.h
++++ b/dlls/wbemprox/wbemprox_private.h
+@@ -257,6 +257,7 @@ HRESULT WbemQualifierSet_create(enum wbm_namespace, const WCHAR *, const WCHAR *
+ 
+ HRESULT process_get_owner(IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out);
+ HRESULT process_create(IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out);
++HRESULT process_terminate(IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out);
+ HRESULT reg_create_key(IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out);
+ HRESULT reg_enum_key(IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out);
+ HRESULT reg_enum_values(IWbemClassObject *obj, IWbemContext *context, IWbemClassObject *in, IWbemClassObject **out);

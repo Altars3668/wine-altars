@@ -1,0 +1,792 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 09:17:48 -0400
+Subject: [PATCH] dcomp: Coast, overshoot and clamp an InteractionTracker as
+ Windows does.
+
+Measured frame by frame on Windows 11 build 29671 with tools/trackerprobe
+(inertia.c, clamp.c, requestid.c):
+
+- Inertia decays at the decay rate until it goes slower than 30 pixels a
+  second, and so rests (v - 30) / k from where it started; scale stops
+  below 0.05 a second and goes no faster than 5.  A bound in the way is
+  overshot and a damped spring brings it back onto it.  The modified
+  resting position is always reported: a modifier's, or the natural one
+  within the bounds.  Velocity a request adds is no impulse.
+- A custom animation goes past the bounds, to where it goes; then the
+  tracker settles back, as inertia for the same request with no
+  velocity, its natural resting position where it is and a modified one
+  of zero.
+- An idle tracker is clamped to its bounds as they are, whatever the
+  clamping option, and keeps no memory of a position asked for beyond
+  them; bounds that push it tell the owner, with the latest request's
+  id.  The memory, added for Word's in-place activation, is gone: with
+  the rest of this, Excel's in-place window stays shown through Word's
+  scroll animation (tools/officeautomationprobe, embedevents).
+- The scale decay rate, inertia modifiers and position adjustments take
+  a request id, as the position decay rate and scale bounds do.
+
+The test checks the overshoot of a custom animation, the settling and
+the natural and modified resting positions; on Windows it has no
+failures.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/dcomp/interaction.c b/dlls/dcomp/interaction.c
+index 15904892e9c..5fd8f62273e 100644
+--- a/dlls/dcomp/interaction.c
++++ b/dlls/dcomp/interaction.c
+@@ -141,13 +141,21 @@ enum tracker_state
+     TRACKER_CUSTOM_ANIMATION,
+ };
+ 
+-/* one axis of inertia -- x, y, or the logarithm of scale -- slowing as its decay rate says */
++/*
++ * One axis of inertia -- x, y or scale -- coasting until it is too slow to go
++ * on, and springing back to a bound it coasted past, or was past when it
++ * started.
++ */
+ struct inertia_axis
+ {
+-    float from;                     /* where it was when inertia started */
++    float from;                     /* where it was when it started coasting */
+     float velocity;                 /* how fast it went then, per second */
+-    float rate;                     /* the fraction of its velocity it loses each second */
+-    float rest;                     /* where it comes to rest: naturally, or where a modifier says, within bounds */
++    float k;                        /* how fast that decays: -ln(1 - the decay rate) */
++    float stop;                     /* the speed it stops at */
++    float rest;                     /* where it stops */
++    float low, high;                /* its bounds */
++    BOOL spring;                    /* springing back to a bound */
++    float target, x0, v0, t0;       /* the bound, how far past it and how fast it was, and when */
+     float at, speed;                /* where the latest frame put it, and how fast it went there */
+     BOOL moving;
+ };
+@@ -167,8 +175,6 @@ struct tracker
+     INT32 request_id;
+ 
+     Vector3 position, min_position, max_position, natural_resting_position, position_velocity;
+-    Vector3 unclamped_position;     /* where a request without clamping put it, while the bounds keep it elsewhere */
+-    BOOL position_unclamped;
+     FLOAT scale, min_scale, max_scale, natural_resting_scale, scale_velocity;
+     boolean position_rounding;
+     IReference_Vector3 *position_decay;
+@@ -1747,32 +1753,52 @@ static void tracker_bounds( struct tracker *tracker, Vector3 *min_position, Vect
+ }
+ 
+ /* keeps position and scale within their bounds; the upper bound gives way to the lower one */
+-static void tracker_clamp( struct tracker *tracker, BOOL position_unclamped )
++static void tracker_clamp( struct tracker *tracker )
+ {
+     Vector3 low, high;
+     float low_scale, high_scale;
+ 
+     tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
+     tracker->scale = clampf( tracker->scale, low_scale, max( low_scale, high_scale ) );
+-    if (position_unclamped) return;
+     tracker->position.X = clampf( tracker->position.X, low.X, max( low.X, high.X ) );
+     tracker->position.Y = clampf( tracker->position.Y, low.Y, max( low.Y, high.Y ) );
+     tracker->position.Z = clampf( tracker->position.Z, low.Z, max( low.Z, high.Z ) );
+ }
+ 
++/* keeps scale within its bounds */
++static void tracker_clamp_scale( struct tracker *tracker )
++{
++    Vector3 low, high;
++    float low_scale, high_scale;
++
++    tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
++    tracker->scale = clampf( tracker->scale, low_scale, max( low_scale, high_scale ) );
++}
++
+ /*
+- * Keeps an idle tracker within its bounds as they change.  A position a request
+- * asked for without clamping is kept: the bounds clamp where the tracker is,
+- * and it goes there once they allow it.  Office scrolls so, to where the bounds
+- * its content's size animates will reach, and waits for the tracker to get there.
++ * Keeps an idle tracker within its bounds as they change, telling the owner
++ * when they move it -- with the latest request's id.  It keeps no memory of
++ * where a request asked it to be: on Windows a position asked for past the
++ * bounds, clamping disabled or not, is clamped there and then, and stays where
++ * that put it when the bounds move away (tools/trackerprobe, clamp.c).
+  */
+-static void tracker_clamp_idle( struct tracker *tracker )
++static void tracker_clamp_idle( struct tracker *tracker, BOOL in_frame )
+ {
+-    if (tracker->position_unclamped) tracker->position = tracker->unclamped_position;
+-    tracker_clamp( tracker, FALSE );
+-    if (tracker->position_unclamped &&
+-        !memcmp( &tracker->position, &tracker->unclamped_position, sizeof(tracker->position) ))
+-        tracker->position_unclamped = FALSE;
++    Vector3 position = tracker->position;
++    float scale = tracker->scale;
++
++    if (tracker->state != TRACKER_IDLE) return;
++    tracker_clamp( tracker );
++    if (!memcmp( &position, &tracker->position, sizeof(position) ) && scale == tracker->scale) return;
++    tracker->natural_resting_position = tracker->position;
++    tracker->natural_resting_scale = tracker->scale;
++    /* in a frame there is a frame already: another would make them run back to back */
++    if (!in_frame) tracker_values_changed( tracker, tracker->request_id );
++    else
++    {
++        tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, tracker->request_id );
++        tracker_follow_binding( tracker );
++    }
+ }
+ 
+ /* Copy the axes one partner shares, without recursively notifying the source. */
+@@ -1843,11 +1869,7 @@ static void tracker_scale_about( struct tracker *tracker, float old, float new,
+ static BOOL tracker_request( struct tracker *tracker, INT32 *id )
+ {
+     *id = ++tracker->request_id;
+-    if (tracker->state != TRACKER_INTERACTING)
+-    {
+-        tracker->position_unclamped = FALSE;
+-        return TRUE;
+-    }
++    if (tracker->state != TRACKER_INTERACTING) return TRUE;
+     TRACE( "tracker %p ignores request %d.\n", tracker, *id );
+     tracker_tell_owner( tracker, CALLBACK_REQUEST_IGNORED, *id );
+     return FALSE;
+@@ -1887,7 +1909,6 @@ static void tracker_enter( struct tracker *tracker, enum tracker_state state, IN
+ 
+     TRACE( "tracker %p enters state %u for request %d.\n", tracker, state, request_id );
+     tracker->state = state;
+-    if (state != TRACKER_IDLE) tracker->position_unclamped = FALSE;
+     tracker->motion_request = request_id;
+     tracker_tell_owner_args( tracker, callbacks[state], request_id, inertia );
+     compositor_changed( tracker->base.compositor );
+@@ -1896,39 +1917,73 @@ static void tracker_enter( struct tracker *tracker, enum tracker_state state, IN
+ /*** inertia ***/
+ 
+ /*
+- * An axis in inertia loses the same fraction of its velocity every second, the
+- * decay rate: after t seconds it goes at v * (1 - rate)^t, and it has covered
+- * v * (1 - (1 - rate)^t) / k of the v / k it covers in all, k being
+- * -ln(1 - rate).  Where it comes to rest can be moved -- by an inertia modifier,
+- * or by a bound in the way -- and then the same curve is stretched to end there.
+- * Scale coasts the same way in its logarithm: its velocity is a fraction of
+- * itself per second.
++ * What Windows 11 does, frame by frame (tools/trackerprobe, inertia.c): an
++ * axis in inertia loses the same fraction of its velocity every second, the
++ * decay rate -- after t seconds it goes at v * exp(-k * t), k being
++ * -ln(1 - rate), and it has gone v / k * (1 - exp(-k * t)) -- until it goes
++ * slower than 30 pixels a second, and so comes to rest (v - 30) / k from where
++ * it started.  Scale coasts the same way, stopping below 0.05 a second, and
++ * goes no faster than 5.  A bound in its way it overshoots, and a spring,
++ * damped not quite critically, brings it back onto the bound; so it does when
++ * it starts past one.  Where a modifier says it rests, the same curve starts
++ * as fast as it takes to stop there.
+  */
+ #define DEFAULT_DECAY_RATE 0.95f
++#define POSITION_STOP_SPEED 30.0f
++#define SCALE_STOP_SPEED 0.05f
++#define SCALE_MAX_SPEED 5.0f
++#define SPRING_DAMPING 0.9f
++#define SPRING_FREQUENCY 15.0f          /* radians per second */
++#define SPRING_SETTLED 0.05f            /* the swing left when it is done */
+ 
+-static void inertia_axis_at( struct inertia_axis *axis, float t, float epsilon )
++/* switches an axis to the spring that brings it back to a bound */
++static void inertia_axis_spring( struct inertia_axis *axis, float target, float t )
+ {
+-    float k, f;
++    axis->spring = TRUE;
++    axis->target = target;
++    axis->x0 = axis->at - target;
++    axis->v0 = axis->speed;
++    axis->t0 = t;
++}
++
++/* where an axis is t seconds after inertia started */
++static void inertia_axis_at( struct inertia_axis *axis, float t )
++{
++    float f, zw, wd, tau, b, c, s;
+ 
+     if (!axis->moving) return;
+-    if (axis->rate <= 0.0f)
++    if (!axis->spring)
+     {
+-        /* nothing slows it: it goes on at its speed until it gets where it rests, which is a bound */
+-        axis->at = axis->from + axis->velocity * t;
+-        axis->speed = axis->velocity;
+-        if (axis->velocity > 0.0f ? axis->at >= axis->rest : axis->at <= axis->rest) axis->moving = FALSE;
++        f = axis->k > 0.0f ? expf( -axis->k * t ) : 1.0f;
++        axis->speed = axis->velocity * f;
++        if (axis->k > 0.0f) axis->at = axis->from + axis->velocity / axis->k * (1.0f - f);
++        else axis->at = axis->from + axis->velocity * t;
++        if (axis->at > axis->high) inertia_axis_spring( axis, axis->high, t );
++        else if (axis->at < axis->low) inertia_axis_spring( axis, axis->low, t );
++        else if (fabsf( axis->speed ) < axis->stop)
++        {
++            axis->at = axis->rest;
++            axis->speed = 0.0f;
++            axis->moving = FALSE;
++        }
++        return;
+     }
+-    else
++
++    zw = SPRING_DAMPING * SPRING_FREQUENCY;
++    wd = SPRING_FREQUENCY * sqrtf( 1.0f - SPRING_DAMPING * SPRING_DAMPING );
++    tau = t - axis->t0;
++    f = expf( -zw * tau );
++    c = cosf( wd * tau );
++    s = sinf( wd * tau );
++    b = (axis->v0 + zw * axis->x0) / wd;
++    axis->at = axis->target + f * (axis->x0 * c + b * s);
++    axis->speed = f * ((b * wd - zw * axis->x0) * c - (axis->x0 * wd + zw * b) * s);
++    if (sqrtf( axis->x0 * axis->x0 + b * b ) * f < SPRING_SETTLED)
+     {
+-        k = -logf( 1.0f - min( axis->rate, 0.999999f ) );
+-        f = expf( -k * t );
+-        axis->at = axis->from + (axis->rest - axis->from) * (1.0f - f);
+-        axis->speed = (axis->rest - axis->from) * k * f;
+-        if (fabsf( axis->rest - axis->at ) < epsilon) axis->moving = FALSE;
++        axis->at = axis->target;
++        axis->speed = 0.0f;
++        axis->moving = FALSE;
+     }
+-    if (axis->moving) return;
+-    axis->at = axis->rest;
+-    axis->speed = 0.0f;
+ }
+ 
+ /* the decay rates set, and the default for those that are not */
+@@ -1980,14 +2035,20 @@ static BOOL tracker_modified( struct tracker *tracker, const struct modifiers *m
+     return found;
+ }
+ 
+-/* sets it coasting from where it is, as fast as it is told */
++/*
++ * Sets it coasting from where it is, as fast as it is told.  What it reports
++ * as the modified resting place is where it will rest: a modifier's, or the
++ * natural one within the bounds.  Settling is what follows a custom animation
++ * that ended past the bounds, which Windows reports with no velocity, the
++ * natural resting place where it is and a modified one of zero.
++ */
+ static void tracker_start_inertia( struct tracker *tracker, Vector3 velocity, float scale_velocity, Vector3 center,
+-                                   INT32 request_id, boolean from_impulse )
++                                   INT32 request_id, boolean from_impulse, BOOL settling )
+ {
+     struct inertia_args args = {0};
+-    float rates[3], lows[3], highs[3], natural[3], value, low_scale, high_scale;
+-    const float velocities[3] = {velocity.X, velocity.Y, scale_velocity};
+-    BOOL modified[3];
++    float rates[3], lows[3], highs[3], value, low_scale, high_scale, rest;
++    const float starts[3] = {tracker->position.X, tracker->position.Y, tracker->scale};
++    float velocities[3] = {velocity.X, velocity.Y, scale_velocity};
+     Vector3 low, high;
+     unsigned int i;
+ 
+@@ -1996,59 +2057,75 @@ static void tracker_start_inertia( struct tracker *tracker, Vector3 velocity, fl
+     highs[0] = max( low.X, high.X );
+     lows[1] = low.Y;
+     highs[1] = max( low.Y, high.Y );
+-    lows[2] = logf( max( low_scale, 1e-6f ) );
+-    highs[2] = logf( max( max( low_scale, high_scale ), 1e-6f ) );
++    lows[2] = low_scale;
++    highs[2] = max( low_scale, high_scale );
+     tracker_decay_rates( tracker, rates );
++    velocities[2] = clampf( velocities[2], -SCALE_MAX_SPEED, SCALE_MAX_SPEED );
+ 
+-    tracker->inertia[0].from = tracker->position.X;
+-    tracker->inertia[1].from = tracker->position.Y;
+-    tracker->inertia[2].from = logf( max( tracker->scale, 1e-6f ) );
+     for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++)
+     {
+         struct inertia_axis *axis = &tracker->inertia[i];
+-
+-        axis->velocity = velocities[i];
+-        axis->rate = clampf( rates[i], 0.0f, 1.0f );
+-        if (!axis->velocity || axis->rate >= 1.0f) natural[i] = axis->from;
+-        else if (axis->rate <= 0.0f) natural[i] = axis->velocity > 0.0f ? INFINITY : -INFINITY;
+-        else natural[i] = axis->from - axis->velocity / logf( 1.0f - axis->rate );
++        float rate = clampf( rates[i], 0.0f, 1.0f );
++
++        memset( axis, 0, sizeof(*axis) );
++        axis->from = axis->at = starts[i];
++        axis->velocity = axis->speed = rate >= 1.0f ? 0.0f : velocities[i];
++        axis->k = rate > 0.0f ? -logf( 1.0f - min( rate, 0.999999f ) ) : 0.0f;
++        axis->stop = i == 2 ? SCALE_STOP_SPEED : POSITION_STOP_SPEED;
++        axis->low = lows[i];
++        axis->high = highs[i];
++        if (fabsf( axis->velocity ) <= axis->stop) axis->rest = axis->from;
++        else if (axis->k > 0.0f)
++            axis->rest = axis->from + (axis->velocity - copysignf( axis->stop, axis->velocity )) / axis->k;
++        else axis->rest = axis->velocity > 0.0f ? INFINITY : -INFINITY;
+     }
+ 
+     /* what the modifiers read of it */
+-    tracker->natural_resting_position.X = natural[0];
+-    tracker->natural_resting_position.Y = natural[1];
++    tracker->natural_resting_position.X = tracker->inertia[0].rest;
++    tracker->natural_resting_position.Y = tracker->inertia[1].rest;
+     tracker->natural_resting_position.Z = tracker->position.Z;
+-    tracker->natural_resting_scale = expf( natural[2] );
+-    tracker->position_velocity.X = velocity.X;
+-    tracker->position_velocity.Y = velocity.Y;
++    tracker->natural_resting_scale = tracker->inertia[2].rest;
++    tracker->position_velocity.X = tracker->inertia[0].velocity;
++    tracker->position_velocity.Y = tracker->inertia[1].velocity;
+     tracker->position_velocity.Z = 0.0f;
+-    tracker->scale_velocity = scale_velocity;
++    tracker->scale_velocity = tracker->inertia[2].velocity;
+ 
+     args.natural_position = tracker->natural_resting_position;
+     args.natural_scale = tracker->natural_resting_scale;
+     args.velocity = tracker->position_velocity;
+-    args.scale_velocity = scale_velocity;
+-    args.modified_position = tracker->natural_resting_position;
+-    args.modified_scale = tracker->natural_resting_scale;
++    args.scale_velocity = tracker->scale_velocity;
++    args.position_modified = args.scale_modified = TRUE;
++    args.modified_position.X = clampf( tracker->inertia[0].rest, lows[0], highs[0] );
++    args.modified_position.Y = clampf( tracker->inertia[1].rest, lows[1], highs[1] );
++    args.modified_position.Z = tracker->position.Z;
++    args.modified_scale = clampf( tracker->inertia[2].rest, lows[2], highs[2] );
+     for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++)
+     {
+         struct inertia_axis *axis = &tracker->inertia[i];
+-        float rest = natural[i];
+ 
+-        if ((modified[i] = tracker_modified( tracker, &tracker->inertia_modifiers[i], &value )))
++        if (!settling && tracker_modified( tracker, &tracker->inertia_modifiers[i], &value ))
++        {
++            rest = clampf( value, lows[i], highs[i] );
++            if (i == 0) args.modified_position.X = rest;
++            else if (i == 1) args.modified_position.Y = rest;
++            else args.modified_scale = rest;
++            axis->rest = rest;
++            if (rest == axis->from || axis->k <= 0.0f) axis->velocity = 0.0f;
++            else axis->velocity = (rest - axis->from) * axis->k + copysignf( axis->stop, rest - axis->from );
++            axis->speed = axis->velocity;
++        }
++        if (axis->from > axis->high || axis->from < axis->low)
+         {
+-            if (i == 0) args.modified_position.X = value;
+-            else if (i == 1) args.modified_position.Y = value;
+-            else args.modified_scale = value;
+-            rest = i == 2 ? logf( max( value, 1e-6f ) ) : value;
++            axis->moving = TRUE;
++            inertia_axis_spring( axis, axis->from > axis->high ? axis->high : axis->low, 0.0f );
+         }
+-        axis->rest = clampf( rest, lows[i], highs[i] );
+-        axis->at = axis->from;
+-        axis->speed = axis->velocity;
+-        axis->moving = axis->rest != axis->from;
++        else axis->moving = axis->rest != axis->from;
++    }
++    if (settling)
++    {
++        args.modified_position.X = args.modified_position.Y = args.modified_position.Z = 0.0f;
++        args.modified_scale = tracker->scale;
+     }
+-    args.position_modified = modified[0] || modified[1];
+-    args.scale_modified = modified[2];
+     args.from_impulse = from_impulse;
+ 
+     tracker->scale_center = center;
+@@ -2062,7 +2139,8 @@ static void tracker_start_inertia( struct tracker *tracker, Vector3 velocity, fl
+ /* moves it along its inertia; FALSE once every axis has come to rest */
+ static BOOL tracker_inertia_frame( struct tracker *tracker, LONGLONG now )
+ {
+-    float before[3], scale, t;
++    float before[3], scale, t, low_scale, high_scale;
++    Vector3 low, high;
+     BOOL moving = FALSE;
+     unsigned int i;
+ 
+@@ -2072,20 +2150,37 @@ static BOOL tracker_inertia_frame( struct tracker *tracker, LONGLONG now )
+         tracker->inertia_start = now;
+         return TRUE;
+     }
++    /* bounds that move move what it springs back to */
++    tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
++    tracker->inertia[0].low = low.X;
++    tracker->inertia[0].high = max( low.X, high.X );
++    tracker->inertia[1].low = low.Y;
++    tracker->inertia[1].high = max( low.Y, high.Y );
++    tracker->inertia[2].low = low_scale;
++    tracker->inertia[2].high = max( low_scale, high_scale );
++
+     t = (now - tracker->inertia_start) / 10000000.0f;
+     for (i = 0; i < ARRAY_SIZE(tracker->inertia); i++)
+     {
+         before[i] = tracker->inertia[i].at;
+-        inertia_axis_at( &tracker->inertia[i], t, i == 2 ? 1e-4f : 0.05f );
++        inertia_axis_at( &tracker->inertia[i], t );
+         moving |= tracker->inertia[i].moving;
+     }
+     /* scale moves what is under the center point with it, and position goes on from there as it would have */
+-    scale = expf( tracker->inertia[2].at );
++    scale = tracker->inertia[2].at;
+     tracker_scale_about( tracker, tracker->scale, scale, tracker->scale_center );
+     tracker->scale = scale;
+-    tracker->position.X += tracker->inertia[0].at - before[0];
+-    tracker->position.Y += tracker->inertia[1].at - before[1];
+-    tracker_clamp( tracker, FALSE );
++    if (!tracker->inertia[2].velocity && !tracker->inertia[2].spring)
++    {
++        /* with scale still, where the axes are is where it is: it ends exactly where it rests */
++        tracker->position.X = tracker->inertia[0].at;
++        tracker->position.Y = tracker->inertia[1].at;
++    }
++    else
++    {
++        tracker->position.X += tracker->inertia[0].at - before[0];
++        tracker->position.Y += tracker->inertia[1].at - before[1];
++    }
+     tracker->position_velocity.X = tracker->inertia[0].speed;
+     tracker->position_velocity.Y = tracker->inertia[1].speed;
+     tracker->scale_velocity = tracker->inertia[2].speed;
+@@ -2094,23 +2189,23 @@ static BOOL tracker_inertia_frame( struct tracker *tracker, LONGLONG now )
+ 
+ /*** custom animations ***/
+ 
+-/* moves it as its custom animations say, within bounds; FALSE once they have all run their course */
++/*
++ * Moves it as its custom animations say; FALSE once they have all run their
++ * course.  On Windows they take it past the bounds, to where they go, and it
++ * settles back inside them after.
++ */
+ static BOOL tracker_animation_frame( struct tracker *tracker )
+ {
+-    Vector3 low, high;
+-    float low_scale, high_scale;
+     struct value value;
+     BOOL done;
+ 
+-    tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
+     if (tracker->scale_motion)
+     {
+         done = motion_done( tracker->scale_motion );
+         if (motion_value( tracker->scale_motion, &value ))
+         {
+-            float scale = clampf( value.f[0], low_scale, max( low_scale, high_scale ) );
+-            tracker_scale_about( tracker, tracker->scale, scale, tracker->scale_center );
+-            tracker->scale = scale;
++            tracker_scale_about( tracker, tracker->scale, value.f[0], tracker->scale_center );
++            tracker->scale = value.f[0];
+         }
+         if (done)
+         {
+@@ -2128,14 +2223,24 @@ static BOOL tracker_animation_frame( struct tracker *tracker )
+             tracker->position_motion = NULL;
+         }
+     }
+-    /* custom animations are always kept within bounds */
+-    tracker_clamp( tracker, FALSE );
+     if (tracker->position_motion || tracker->scale_motion) return TRUE;
+     tracker->natural_resting_position = tracker->position;
+     tracker->natural_resting_scale = tracker->scale;
+     return FALSE;
+ }
+ 
++/* whether a custom animation has left it past its bounds */
++static BOOL tracker_past_bounds( struct tracker *tracker )
++{
++    Vector3 low, high;
++    float low_scale, high_scale;
++
++    tracker_bounds( tracker, &low, &high, &low_scale, &high_scale );
++    return tracker->position.X < low.X || tracker->position.X > max( low.X, high.X ) ||
++           tracker->position.Y < low.Y || tracker->position.Y > max( low.Y, high.Y ) ||
++           tracker->scale < low_scale || tracker->scale > max( low_scale, high_scale );
++}
++
+ /*
+  * Called with the compositor locked, each frame: moves what custom animations
+  * and inertia move, and what bounds that animations moved carry with them, and
+@@ -2163,13 +2268,8 @@ void trackers_frame( struct compositor *compositor )
+         case TRACKER_INTERACTING:
+             continue;
+         case TRACKER_IDLE:
+-            if (list_empty( &tracker->base.animations )) continue;
+-            tracker_clamp_idle( tracker );
+-            if (!memcmp( &position, &tracker->position, sizeof(position) ) && scale == tracker->scale) continue;
+-            tracker->natural_resting_position = tracker->position;
+-            tracker->natural_resting_scale = tracker->scale;
+-            tracker_tell_owner( tracker, CALLBACK_VALUES_CHANGED, 0 );
+-            tracker_follow_binding( tracker );
++            /* bounds that animations move push it */
++            if (!list_empty( &tracker->base.animations )) tracker_clamp_idle( tracker, TRUE );
+             continue;
+         }
+         if (memcmp( &position, &tracker->position, sizeof(position) ) || scale != tracker->scale)
+@@ -2178,6 +2278,13 @@ void trackers_frame( struct compositor *compositor )
+             tracker_follow_binding( tracker );
+         }
+         if (moving) continue;
++        if (tracker->state == TRACKER_CUSTOM_ANIMATION && tracker_past_bounds( tracker ))
++        {
++            /* it settles back, as inertia for the same request */
++            tracker_start_inertia( tracker, (Vector3){0}, 0.0f, tracker->scale_center, tracker->motion_request,
++                                   FALSE, TRUE );
++            continue;
++        }
+         if (tracker->state == TRACKER_INERTIA)
+         {
+             tracker_stop_inertia( tracker );
+@@ -2221,10 +2328,9 @@ static HRESULT tracker_update_position( struct tracker *tracker, Vector3 value,
+             value.Y += tracker->position.Y;
+             value.Z += tracker->position.Z;
+         }
++        /* Windows clamps it either way (tools/trackerprobe, clamp.c) */
+         tracker->position = value;
+-        tracker_clamp( tracker, !clamp );
+-        tracker->unclamped_position = value;
+-        tracker->position_unclamped = !clamp;
++        tracker_clamp( tracker );
+         tracker->natural_resting_position = tracker->position;
+         if (!tracker->scale_motion) tracker->natural_resting_scale = tracker->scale;
+         tracker_values_changed( tracker, id );
+@@ -2271,9 +2377,9 @@ static HRESULT tracker_update_scale( struct tracker *tracker, FLOAT value, Vecto
+         tracker_stop_animations( tracker, FALSE );
+         old = tracker->scale;
+         tracker->scale = value;
+-        tracker_clamp( tracker, TRUE );
++        tracker_clamp_scale( tracker );
+         tracker_scale_about( tracker, old, tracker->scale, center );
+-        tracker_clamp( tracker, FALSE );
++        tracker_clamp( tracker );
+         tracker->natural_resting_scale = tracker->scale;
+         tracker->natural_resting_position = tracker->position;
+         tracker_values_changed( tracker, id );
+@@ -2361,7 +2467,8 @@ static HRESULT tracker_add_velocity( struct tracker *tracker, const Vector3 *vel
+             center = tracker->scale_center;
+         }
+         if (scale_velocity) scale_speed += *scale_velocity;
+-        tracker_start_inertia( tracker, position_velocity, scale_speed, center, id, TRUE );
++        /* not an impulse, which is input's: Windows reports FALSE for these */
++        tracker_start_inertia( tracker, position_velocity, scale_speed, center, id, FALSE, FALSE );
+     }
+     *result = id;
+     compositor_unlock( tracker->base.compositor );
+@@ -2837,7 +2944,7 @@ static HRESULT WINAPI tracker_put_MaxPosition( IInteractionTracker *iface, Vecto
+ 
+     compositor_lock( tracker->base.compositor );
+     tracker->max_position = value;
+-    tracker_clamp_idle( tracker );
++    tracker_clamp_idle( tracker, FALSE );
+     compositor_changed( tracker->base.compositor );
+     compositor_unlock( tracker->base.compositor );
+     return S_OK;
+@@ -2865,7 +2972,7 @@ static HRESULT WINAPI tracker_put_MaxScale( IInteractionTracker *iface, FLOAT va
+     compositor_lock( tracker->base.compositor );
+     tracker->max_scale = value;
+     ++tracker->request_id;
+-    tracker_clamp_idle( tracker );
++    tracker_clamp_idle( tracker, FALSE );
+     compositor_changed( tracker->base.compositor );
+     compositor_unlock( tracker->base.compositor );
+     return S_OK;
+@@ -2892,7 +2999,7 @@ static HRESULT WINAPI tracker_put_MinPosition( IInteractionTracker *iface, Vecto
+ 
+     compositor_lock( tracker->base.compositor );
+     tracker->min_position = value;
+-    tracker_clamp_idle( tracker );
++    tracker_clamp_idle( tracker, FALSE );
+     compositor_changed( tracker->base.compositor );
+     compositor_unlock( tracker->base.compositor );
+     return S_OK;
+@@ -2920,7 +3027,7 @@ static HRESULT WINAPI tracker_put_MinScale( IInteractionTracker *iface, FLOAT va
+     compositor_lock( tracker->base.compositor );
+     tracker->min_scale = value;
+     ++tracker->request_id;
+-    tracker_clamp_idle( tracker );
++    tracker_clamp_idle( tracker, FALSE );
+     compositor_changed( tracker->base.compositor );
+     compositor_unlock( tracker->base.compositor );
+     return S_OK;
+@@ -3000,6 +3107,8 @@ static HRESULT WINAPI tracker_put_PositionInertiaDecayRate( IInteractionTracker
+     compositor_lock( tracker->base.compositor );
+     old = tracker->position_decay;
+     tracker->position_decay = value;
++    /* it takes a request id on Windows, as the scale bounds do (tools/trackerprobe, requestid.c) */
++    ++tracker->request_id;
+     compositor_unlock( tracker->base.compositor );
+     if (old) IReference_Vector3_Release( old );
+     return S_OK;
+@@ -3055,6 +3164,7 @@ static HRESULT WINAPI tracker_put_ScaleInertiaDecayRate( IInteractionTracker *if
+     compositor_lock( tracker->base.compositor );
+     old = tracker->scale_decay;
+     tracker->scale_decay = value;
++    ++tracker->request_id;
+     compositor_unlock( tracker->base.compositor );
+     if (old) IReference_FLOAT_Release( old );
+     return S_OK;
+@@ -3073,6 +3183,17 @@ static HRESULT WINAPI tracker_get_ScaleVelocityInPercentPerSecond( IInteractionT
+     return S_OK;
+ }
+ 
++/* inertia modifiers take a request id on Windows, center point ones do not (tools/trackerprobe, requestid.c) */
++static HRESULT tracker_set_modifiers( struct tracker *tracker, struct modifiers *modifiers, IIterable_IInspectable *iterable )
++{
++    HRESULT hr = modifiers_set( tracker->base.compositor, modifiers, iterable );
++
++    compositor_lock( tracker->base.compositor );
++    ++tracker->request_id;
++    compositor_unlock( tracker->base.compositor );
++    return hr;
++}
++
+ static HRESULT WINAPI tracker_AdjustPositionXIfGreaterThanThreshold( IInteractionTracker *iface, FLOAT adjustment, FLOAT positionThreshold )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+@@ -3080,12 +3201,12 @@ static HRESULT WINAPI tracker_AdjustPositionXIfGreaterThanThreshold( IInteractio
+     TRACE( "iface %p, adjustment %f, positionThreshold %f.\n", iface, adjustment, positionThreshold );
+ 
+     compositor_lock( tracker->base.compositor );
++    /* an adjustment is a request on Windows (tools/trackerprobe, requestid.c) */
++    ++tracker->request_id;
+     if (tracker->position.X > positionThreshold)
+     {
+-        /* what it moves is where the tracker is */
+-        tracker->position_unclamped = FALSE;
+         tracker->position.X += adjustment;
+-        tracker_clamp( tracker, 0 );
++        tracker_clamp( tracker );
+         tracker_values_changed( tracker, tracker->request_id );
+     }
+     compositor_unlock( tracker->base.compositor );
+@@ -3099,12 +3220,12 @@ static HRESULT WINAPI tracker_AdjustPositionYIfGreaterThanThreshold( IInteractio
+     TRACE( "iface %p, adjustment %f, positionThreshold %f.\n", iface, adjustment, positionThreshold );
+ 
+     compositor_lock( tracker->base.compositor );
++    /* an adjustment is a request on Windows (tools/trackerprobe, requestid.c) */
++    ++tracker->request_id;
+     if (tracker->position.Y > positionThreshold)
+     {
+-        /* what it moves is where the tracker is */
+-        tracker->position_unclamped = FALSE;
+         tracker->position.Y += adjustment;
+-        tracker_clamp( tracker, 0 );
++        tracker_clamp( tracker );
+         tracker_values_changed( tracker, tracker->request_id );
+     }
+     compositor_unlock( tracker->base.compositor );
+@@ -3115,21 +3236,21 @@ static HRESULT WINAPI tracker_ConfigurePositionXInertiaModifiers( IInteractionTr
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     TRACE( "iface %p, modifiers %p.\n", iface, modifiers );
+-    return modifiers_set( tracker->base.compositor, &tracker->inertia_modifiers[0], (IIterable_IInspectable *)modifiers );
++    return tracker_set_modifiers( tracker, &tracker->inertia_modifiers[0], (IIterable_IInspectable *)modifiers );
+ }
+ 
+ static HRESULT WINAPI tracker_ConfigurePositionYInertiaModifiers( IInteractionTracker *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CInteractionTrackerInertiaModifier *modifiers )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     TRACE( "iface %p, modifiers %p.\n", iface, modifiers );
+-    return modifiers_set( tracker->base.compositor, &tracker->inertia_modifiers[1], (IIterable_IInspectable *)modifiers );
++    return tracker_set_modifiers( tracker, &tracker->inertia_modifiers[1], (IIterable_IInspectable *)modifiers );
+ }
+ 
+ static HRESULT WINAPI tracker_ConfigureScaleInertiaModifiers( IInteractionTracker *iface, __FIIterable_1_Windows__CUI__CComposition__CInteractions__CInteractionTrackerInertiaModifier *modifiers )
+ {
+     struct tracker *tracker = impl_from_IInteractionTracker( iface );
+     TRACE( "iface %p, modifiers %p.\n", iface, modifiers );
+-    return modifiers_set( tracker->base.compositor, &tracker->inertia_modifiers[2], (IIterable_IInspectable *)modifiers );
++    return tracker_set_modifiers( tracker, &tracker->inertia_modifiers[2], (IIterable_IInspectable *)modifiers );
+ }
+ 
+ static HRESULT WINAPI tracker_TryUpdatePosition( IInteractionTracker *iface, Vector3 value, INT32 *result )
+diff --git a/dlls/dcomp/tests/composition.c b/dlls/dcomp/tests/composition.c
+index fc8dee4f417..371e2b71a96 100644
+--- a/dlls/dcomp/tests/composition.c
++++ b/dlls/dcomp/tests/composition.c
+@@ -1377,32 +1377,6 @@ static struct tracker_event *add_event( enum tracker_event_kind kind, INT32 id )
+     return event;
+ }
+ 
+-/* the states it went through, with the values between summed up */
+-static void trace_events( const char *what )
+-{
+-    static const char *names[] = {"values", "idle", "custom animation", "inertia", "interacting", "ignored"};
+-    float first = 0.0f, last = 0.0f, highest = 0.0f;
+-    unsigned int i, values = 0;
+-
+-    for (i = 0; i <= event_count; i++)
+-    {
+-        if (i < event_count && events[i].kind == EVENT_VALUES)
+-        {
+-            last = events[i].position.Y;
+-            if (!values++) first = highest = last;
+-            highest = max( highest, last );
+-            continue;
+-        }
+-        if (values) trace( "%s: %u values %f to %f, highest %f.\n", what, values, first, last, highest );
+-        values = 0;
+-        if (i == event_count) break;
+-        if (events[i].kind == EVENT_INERTIA)
+-            trace( "%s: inertia for request %d, velocity %f, natural %f, modified %d %f.\n", what, events[i].id,
+-                   events[i].velocity.Y, events[i].natural.Y, events[i].has_modified, events[i].modified.Y );
+-        else trace( "%s: %s for request %d.\n", what, names[events[i].kind], events[i].id );
+-    }
+-}
+-
+ static HRESULT WINAPI owner_QueryInterface( IInteractionTrackerOwner *iface, REFIID iid, void **out )
+ {
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+@@ -1727,7 +1701,7 @@ static void test_tracker_motion(void)
+     IInspectable *inspectable;
+     Vector3 v3, center = {0};
+     int i, idle, custom;
+-    BOOL between;
++    BOOL between, beyond;
+     HSTRING str;
+     INT32 id;
+     HRESULT hr;
+@@ -1851,7 +1825,9 @@ static void test_tracker_motion(void)
+     IInteractionTracker_get_Position( tracker, &v3 );
+     ok( v3.Y == 300.0f, "got position %f,%f,%f.\n", v3.X, v3.Y, v3.Z );
+ 
+-    /* custom animations are kept within bounds */
++    /* a custom animation goes past the bounds, to where it goes; then the
++     * tracker settles back, as inertia for the same request with no velocity,
++     * the natural resting position where it is and a modified one of zero */
+     event_count = 0;
+     animation = create_vector3_animation( compositor, (Vector3){0, 5000, 0}, 2000000 );
+     hr = IInteractionTracker_TryUpdatePositionWithAnimation( tracker, animation, &id );
+@@ -1859,8 +1835,18 @@ static void test_tracker_motion(void)
+     ICompositionAnimation_Release( animation );
+     idle = wait_for_event( EVENT_IDLE, id, 3000 );
+     ok( idle >= 0, "the animation did not end.\n" );
+-    pump_messages( 300 );
+-    trace_events( "custom animation to 5000 with 1000 the most" );
++    beyond = FALSE;
++    for (i = 0; i < idle; i++) if (events[i].kind == EVENT_VALUES && events[i].position.Y == 5000.0f) beyond = TRUE;
++    ok( beyond, "it did not get to 5000.\n" );
++    i = wait_for_event( EVENT_INERTIA, id, 0 );
++    ok( i >= 0 && i < idle, "it did not settle back as inertia.\n" );
++    if (i >= 0)
++    {
++        ok( !events[i].velocity.Y, "got velocity %f.\n", events[i].velocity.Y );
++        ok( events[i].natural.Y == 5000.0f, "got natural resting position %f.\n", events[i].natural.Y );
++        ok( events[i].has_modified && !events[i].modified.X && !events[i].modified.Y && !events[i].modified.Z,
++            "got modified resting position %d %f.\n", events[i].has_modified, events[i].modified.Y );
++    }
+     IInteractionTracker_get_Position( tracker, &v3 );
+     ok( v3.Y == 1000.0f, "got position %f,%f,%f.\n", v3.X, v3.Y, v3.Z );
+ 
+@@ -1891,14 +1877,16 @@ static void test_tracker_motion(void)
+     ok( i >= 0, "no inertia.\n" );
+     if (i >= 0)
+     {
++        /* it decays at 0.95 a second until it goes slower than 30 pixels a second */
+         ok( events[i].velocity.Y == 200.0f, "got velocity %f.\n", events[i].velocity.Y );
+-        ok( events[i].natural.Y > 500.0f && events[i].natural.Y < 1000.0f, "got natural resting position %f.\n",
+-            events[i].natural.Y );
++        ok( fabsf( events[i].natural.Y - (500.0f + 170.0f / -logf( 0.05f )) ) < 0.01f,
++            "got natural resting position %f.\n", events[i].natural.Y );
++        ok( events[i].has_modified && events[i].modified.Y == events[i].natural.Y,
++            "got modified resting position %d %f.\n", events[i].has_modified, events[i].modified.Y );
+         v3 = events[i].natural;
+     }
+     idle = wait_for_event( EVENT_IDLE, id, 5000 );
+     ok( idle >= 0, "inertia did not end.\n" );
+-    trace_events( "velocity 200 from 500" );
+     if (i >= 0)
+     {
+         Vector3 at;

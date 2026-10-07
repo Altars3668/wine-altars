@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 01:40:04 -0400
+Subject: [PATCH] sppc: register the product definitions an install hands to
+ SLInstallLicense.
+
+Click-to-Run installs Office's SKU definitions the way Windows expects: during
+setup it reads root\Licenses16\*.xrm-ms and passes each one to
+SLInstallLicense.  A +slc trace of one install shows 54 such calls, and every
+one of the 30 distinct blob sizes matches a file in that directory exactly.
+
+    SLGetSLIDList (...) stub, returning an empty list
+    SLInstallLicense (0000000000000001,11181,...) stub, accepting
+    SLInstallLicense (0000000000000001,11185,...) stub, accepting
+    ... 54 times
+
+"accepting" meant discarding, so HKLM\Software\Wine\SPPC\Applications stayed
+empty and the catalogue had nothing to answer with.  Word then asks for the
+Office application and gets SL_E_PRODUCT_SKU_NOT_INSTALLED -- "that product is
+not installed" -- where a machine with the same install answers S_OK with a
+row per SKU, all of them unlicensed.  Office reads that as a broken
+installation rather than an unlicensed one, and puts up "Word ran into an
+error ... repair?" instead of its sign-in surface, which is why signing in
+could not be reached at all.
+
+So install them.  A licence of this kind is a product definition: the PPD
+title names the SKU, sl:appId names the application, tm:editionId names the
+edition, and other files carry the ApplicationBitmap saying which apps a SKU
+covers.  None of it is a key, an entitlement, an account or a device binding,
+and registering it changes no status: the catalogue still reports every SKU
+UNLICENSED with SL_E_PKEY_NOT_INSTALLED, which is the truth.
+
+license.c decodes the blob (UTF-8 or either UTF-16 byte order), refuses DTDs
+and entity declarations, and scans for those fields by local name so the
+namespace prefixes do not have to be guessed.  Bitmaps and PPDs arrive in
+separate files in an order nothing guarantees, so bitmaps are parked under
+Software\Wine\SPPC\Bitmaps and merged when the SKU itself registers -- keeping
+them out of the catalogue means sppc_catalog_status never sees a SKU key
+without a Name.  SLInstallLicense now validates its context and returns the
+licence file id the blob declares.
+
+slinstallprobe installs a licence by hand and then evaluates the application
+the way Word does, so the before/after can be read in ten seconds instead of a
+ten-minute install.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit f4d5cfcf198f5c41d949a3942c221538b23d7cfc)
+
+diff --git a/dlls/sppc/Makefile.in b/dlls/sppc/Makefile.in
+index a0952f633e3..5bbeaa1fb4e 100644
+--- a/dlls/sppc/Makefile.in
++++ b/dlls/sppc/Makefile.in
+@@ -7,4 +7,5 @@ EXTRADLLFLAGS = -Wb,--prefer-native
+ SOURCES = \
+ 	catalog.c \
+ 	context.c \
++	license.c \
+ 	sppc.c
+diff --git a/dlls/sppc/license.c b/dlls/sppc/license.c
+new file mode 100644
+index 00000000000..6155eb7d7c2
+--- /dev/null
++++ b/dlls/sppc/license.c
+@@ -0,0 +1,322 @@
++/* 安装期交来的产品定义登记。
++ *
++ * Click-to-Run 在安装时把 root\Licenses16 下的 XrML 文件逐个交给
++ * SLInstallLicense，一次安装 54 份。这类许可声明的是"某个 SKU 装上了"，
++ * 它不授予任何权利，也不含密钥、账户或设备绑定；装好之后产品仍然未授权。
++ * 之前这里只是收下就扔，于是目录始终为空，SLConsumeRight 只能回答
++ * SL_E_PRODUCT_SKU_NOT_INSTALLED——即"这个产品根本没装"，而不是"装了但没授权"。
++ */
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wchar.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winreg.h"
++#include "winternl.h"
++#include "slerror.h"
++#include "sppc_private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(slc);
++
++static const WCHAR catalog_root[] = L"Software\\Wine\\SPPC\\Applications";
++/* 位图和 PPD 分散在不同文件里，到达顺序不定；先各自收着，再在 SKU 注册时合并。
++ * 放在目录之外，免得 sppc_catalog_status 看见没有 Name 的半成品 SKU 键。 */
++static const WCHAR bitmap_root[] = L"Software\\Wine\\SPPC\\Bitmaps";
++
++#define MAX_LICENSE_BYTES (4 * 1024 * 1024)
++
++/* 把许可 blob 解成以 NUL 结尾的 UTF-16。BOM 缺失时按 UTF-8 处理，与安装目录里
++ * 实际出现的两种编码一致。 */
++static WCHAR *decode_license( const BYTE *data, UINT size )
++{
++    WCHAR *text;
++    ULONG len;
++
++    if (size >= 2 && data[0] == 0xff && data[1] == 0xfe)
++    {
++        size -= 2; data += 2;
++        if (size % sizeof(WCHAR)) return NULL;
++        if (!(text = malloc( size + sizeof(WCHAR) ))) return NULL;
++        memcpy( text, data, size );
++        text[size / sizeof(WCHAR)] = 0;
++        return text;
++    }
++    if (size >= 2 && data[0] == 0xfe && data[1] == 0xff)
++    {
++        UINT i;
++
++        size -= 2; data += 2;
++        if (size % sizeof(WCHAR)) return NULL;
++        if (!(text = malloc( size + sizeof(WCHAR) ))) return NULL;
++        for (i = 0; i < size / sizeof(WCHAR); i++) text[i] = (data[2 * i] << 8) | data[2 * i + 1];
++        text[size / sizeof(WCHAR)] = 0;
++        return text;
++    }
++    if (size >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) { size -= 3; data += 3; }
++    if (RtlUTF8ToUnicodeN( NULL, 0, &len, (const char *)data, size )) return NULL;
++    if (!(text = malloc( len + sizeof(WCHAR) ))) return NULL;
++    if (RtlUTF8ToUnicodeN( text, len, &len, (const char *)data, size )) { free( text ); return NULL; }
++    text[len / sizeof(WCHAR)] = 0;
++    return text;
++}
++
++static BOOL name_char( WCHAR c )
++{
++    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++           c == '_' || c == '-' || c == '.';
++}
++
++/* 找到下一个本地名为 local 的元素开标签，返回标签起始处。命名空间前缀不固定，
++ * 所以只比本地名，前缀部分整体跳过。 */
++static const WCHAR *next_element( const WCHAR *pos, const WCHAR *local )
++{
++    SIZE_T len = wcslen( local );
++
++    while ((pos = wcschr( pos, '<' )))
++    {
++        const WCHAR *name = pos + 1, *colon;
++
++        pos++;
++        if (*name == '/' || *name == '!' || *name == '?') continue;
++        for (colon = name; name_char( *colon ); colon++) {}
++        if (*colon == ':') name = colon + 1;
++        if (wcsncmp( name, local, len )) continue;
++        if (name_char( name[len] )) continue;
++        return name + len;
++    }
++    return NULL;
++}
++
++/* 取开标签内某个属性的值；只在本标签范围内查找，不越过 '>'。 */
++static BOOL element_attr( const WCHAR *after_name, const WCHAR *attr, WCHAR *out, SIZE_T max )
++{
++    const WCHAR *end = wcschr( after_name, '>' ), *pos = after_name;
++    SIZE_T len = wcslen( attr ), value;
++
++    if (!end) return FALSE;
++    while (pos < end)
++    {
++        while (pos < end && *pos != ' ' && *pos != '\t' && *pos != '\r' && *pos != '\n') pos++;
++        while (pos < end && (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n')) pos++;
++        if (pos >= end) break;
++        if (!wcsncmp( pos, attr, len ) && pos[len] == '=' && pos[len + 1] == '"')
++        {
++            const WCHAR *start = pos + len + 2, *stop = wcschr( start, '"' );
++
++            if (!stop || stop > end) return FALSE;
++            value = stop - start;
++            if (!value || value >= max) return FALSE;
++            memcpy( out, start, value * sizeof(WCHAR) );
++            out[value] = 0;
++            return TRUE;
++        }
++        pos++;
++    }
++    return FALSE;
++}
++
++/* 取开标签之后、下一个标签之前的文本；本格式里这些字段都没有子元素或实体。 */
++static BOOL element_text( const WCHAR *after_name, WCHAR *out, SIZE_T max )
++{
++    const WCHAR *start = wcschr( after_name, '>' ), *stop;
++    SIZE_T len;
++
++    if (!start || start[-1] == '/') return FALSE;
++    start++;
++    if (!(stop = wcschr( start, '<' ))) return FALSE;
++    while (start < stop && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) start++;
++    while (stop > start && (stop[-1] == ' ' || stop[-1] == '\t' || stop[-1] == '\r' || stop[-1] == '\n')) stop--;
++    len = stop - start;
++    if (!len || len >= max) return FALSE;
++    memcpy( out, start, len * sizeof(WCHAR) );
++    out[len] = 0;
++    return TRUE;
++}
++
++static BOOL parse_guid( const WCHAR *text, GUID *out )
++{
++    WCHAR braced[40];
++    UNICODE_STRING string;
++
++    if (text[0] == '{')
++    {
++        RtlInitUnicodeString( &string, text );
++        return !RtlGUIDFromString( &string, out );
++    }
++    if (wcslen( text ) != 36) return FALSE;
++    braced[0] = '{';
++    memcpy( braced + 1, text, 36 * sizeof(WCHAR) );
++    braced[37] = '}';
++    braced[38] = 0;
++    RtlInitUnicodeString( &string, braced );
++    return !RtlGUIDFromString( &string, out );
++}
++
++static void format_guid( const GUID *id, WCHAR *out )
++{
++    swprintf( out, 40, L"{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", id->Data1, id->Data2,
++              id->Data3, id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3], id->Data4[4],
++              id->Data4[5], id->Data4[6], id->Data4[7] );
++}
++
++static LSTATUS open_sku_key( const GUID *app, const GUID *sku, DWORD access, HKEY *key, BOOL create )
++{
++    WCHAR path[ARRAY_SIZE(catalog_root) + 96];
++    WCHAR app_name[40], sku_name[40];
++
++    format_guid( app, app_name );
++    format_guid( sku, sku_name );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s\\Skus\\%s", catalog_root, app_name, sku_name );
++    if (create)
++        return RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, access | KEY_WOW64_64KEY,
++                                NULL, key, NULL );
++    return RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, access | KEY_WOW64_64KEY, key );
++}
++
++static LSTATUS set_string( HKEY key, const WCHAR *name, const WCHAR *value )
++{
++    return RegSetValueExW( key, name, 0, REG_SZ, (const BYTE *)value,
++                           (wcslen( value ) + 1) * sizeof(WCHAR) );
++}
++
++/* 位图说明一个 SKU 覆盖哪些应用，属于产品定义。写进暂存处，并补到已注册的 SKU 上。 */
++static void record_bitmap( const GUID *sku, const WCHAR *bitmap )
++{
++    WCHAR sku_name[40];
++    HKEY key;
++
++    format_guid( sku, sku_name );
++    if (!RegCreateKeyExW( HKEY_LOCAL_MACHINE, bitmap_root, 0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY,
++                         NULL, &key, NULL ))
++    {
++        set_string( key, sku_name, bitmap );
++        RegCloseKey( key );
++    }
++}
++
++static BOOL lookup_bitmap( const GUID *sku, WCHAR *out, DWORD max )
++{
++    WCHAR sku_name[40];
++    DWORD size = max * sizeof(WCHAR), type;
++    HKEY key;
++    LSTATUS result;
++
++    format_guid( sku, sku_name );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, bitmap_root, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key ))
++        return FALSE;
++    result = RegQueryValueExW( key, sku_name, NULL, &type, (BYTE *)out, &size );
++    RegCloseKey( key );
++    return !result && type == REG_SZ;
++}
++
++/* 把 SKU 登记进目录。Name 的形状与原生注册一致，catalog.c 靠它判断条目完整。 */
++static HRESULT register_sku( const GUID *app, const GUID *sku, const WCHAR *edition )
++{
++    WCHAR app_path[ARRAY_SIZE(catalog_root) + 48], app_name[40], name[160], bitmap[40];
++    DWORD version = 1;
++    HKEY key;
++
++    if (wcsncmp( edition, L"Office16", 8 )) return SL_E_VALUE_NOT_FOUND;
++    swprintf( name, ARRAY_SIZE(name), L"Office 16, %s edition", edition );
++
++    format_guid( app, app_name );
++    swprintf( app_path, ARRAY_SIZE(app_path), L"%s\\%s", catalog_root, app_name );
++    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, app_path, 0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY,
++                         NULL, &key, NULL ))
++        return E_ACCESSDENIED;
++    RegSetValueExW( key, L"CatalogVersion", 0, REG_DWORD, (const BYTE *)&version, sizeof(version) );
++    RegCloseKey( key );
++
++    if (open_sku_key( app, sku, KEY_SET_VALUE, &key, TRUE )) return E_ACCESSDENIED;
++    set_string( key, L"Name", name );
++    set_string( key, L"Edition", edition );
++    set_string( key, L"RegistrationSource", L"wine-sl-install-license" );
++    if (lookup_bitmap( sku, bitmap, ARRAY_SIZE(bitmap) )) set_string( key, L"ApplicationBitmap", bitmap );
++    RegCloseKey( key );
++
++    TRACE( "registered SKU %s edition %s.\n", wine_dbgstr_guid( sku ), debugstr_w(edition) );
++    return S_OK;
++}
++
++/* 扫描整份文档里的 productSkuId / ApplicationBitmap 对。两者成对出现在同一个
++ * license 块内，所以每个位图配它前面最近的一个 SKU；跨块不配对。 */
++static void collect_bitmaps( const WCHAR *text )
++{
++    const WCHAR *pos = text, *block = NULL;
++    GUID sku;
++    BOOL have_sku = FALSE;
++
++    while ((pos = next_element( pos, L"infoStr" )))
++    {
++        const WCHAR *scan;
++        WCHAR attr[64], value[64];
++
++        for (scan = block ? block : text; ; )
++        {
++            const WCHAR *next = next_element( scan, L"license" );
++            if (!next || next > pos) break;
++            block = scan = next;
++            have_sku = FALSE;
++        }
++        if (!element_attr( pos, L"name", attr, ARRAY_SIZE(attr) )) continue;
++        if (!wcscmp( attr, L"productSkuId" ))
++        {
++            if (element_text( pos, value, ARRAY_SIZE(value) ) && parse_guid( value, &sku )) have_sku = TRUE;
++        }
++        else if (!wcscmp( attr, L"ApplicationBitmap" ) && have_sku)
++        {
++            if (element_text( pos, value, ARRAY_SIZE(value) )) record_bitmap( &sku, value );
++        }
++    }
++}
++
++HRESULT sppc_license_install( const BYTE *data, UINT size, SLID *file_id )
++{
++    WCHAR title[128], edition[128], text[64];
++    const WCHAR *pos, *app_pos;
++    GUID app, sku, license_id;
++    HRESULT hr = S_OK;
++    WCHAR *xml;
++
++    if (!data || !size || size > MAX_LICENSE_BYTES) return E_INVALIDARG;
++    if (!(xml = decode_license( data, size ))) return SL_E_INVALID_LICENSE;
++    /* 这里只读安装目录交来的固定格式，不接受外部实体展开。 */
++    if (wcsstr( xml, L"<!DOCTYPE" ) || wcsstr( xml, L"<!ENTITY" ))
++    {
++        free( xml );
++        return SL_E_INVALID_LICENSE;
++    }
++
++    if (file_id && (pos = next_element( xml, L"license" )) &&
++        element_attr( pos, L"licenseId", text, ARRAY_SIZE(text) ) && parse_guid( text, &license_id ))
++        *file_id = license_id;
++
++    collect_bitmaps( xml );
++
++    /* PPD 许可用标题声明它描述的 SKU；其他种类的许可没有这个标题，跳过即可。 */
++    if ((pos = next_element( xml, L"title" )) && element_text( pos, title, ARRAY_SIZE(title) ) &&
++        !wcsncmp( title, L"Office", 6 ) && wcslen( title ) == 6 + 36 + 12 &&
++        !wcscmp( title + 6 + 36, L" PPD License" ))
++    {
++        title[6 + 36] = 0;
++        if (!parse_guid( title + 6, &sku )) hr = SL_E_INVALID_LICENSE;
++        else if (!(app_pos = next_element( xml, L"appId" )) ||
++                 !(app_pos = next_element( app_pos, L"guid" )) ||
++                 !element_text( app_pos, text, ARRAY_SIZE(text) ) || !parse_guid( text, &app ))
++            hr = SL_E_INVALID_LICENSE;
++        else if (!(pos = next_element( xml, L"editionId" )) ||
++                 !element_attr( pos, L"value", edition, ARRAY_SIZE(edition) ))
++            hr = SL_E_INVALID_LICENSE;
++        else
++            hr = register_sku( &app, &sku, edition );
++    }
++
++    free( xml );
++    return hr;
++}
+diff --git a/dlls/sppc/sppc.c b/dlls/sppc/sppc.c
+index 7bfaa50f0fb..9e5ba0aa1ca 100644
+--- a/dlls/sppc/sppc.c
++++ b/dlls/sppc/sppc.c
+@@ -177,8 +177,13 @@ HRESULT WINAPI SLGetSLIDList(HSLC handle, int query_id_type, const SLID *query_i
+ 
+ HRESULT WINAPI SLInstallLicense(HSLC handle, UINT cb_license, const BYTE *license, SLID *file_id)
+ {
+-    FIXME("(%p,%u,%p,%p) stub, accepting\n", handle, cb_license, license, file_id);
+-    return S_OK;
++    HRESULT hr;
++
++    TRACE("(%p,%u,%p,%p)\n", handle, cb_license, license, file_id);
++
++    if ((hr = sppc_context_validate(handle))) return hr;
++    if (!license || !cb_license) return E_INVALIDARG;
++    return sppc_license_install(license, cb_license, file_id);
+ }
+ 
+ HRESULT WINAPI SLFireEvent(HSLC handle, LPCWSTR event_id, const SLID *app)
+diff --git a/dlls/sppc/sppc_private.h b/dlls/sppc/sppc_private.h
+index 366bd1227f3..65c1f25c115 100644
+--- a/dlls/sppc/sppc_private.h
++++ b/dlls/sppc/sppc_private.h
+@@ -15,4 +15,7 @@ HRESULT sppc_context_validate(HSLC handle);
+ /* 读取已注册 SKU 的字符串属性；成功时输出 LocalAlloc 的缓冲区，由调用方 LocalFree。 */
+ HRESULT sppc_catalog_sku_string(const SLID *sku, const WCHAR *name, UINT *size, BYTE **value);
+ 
++/* 登记安装期交来的产品定义；只写目录元数据，不授予任何权利。 */
++HRESULT sppc_license_install(const BYTE *data, UINT size, SLID *file_id);
++
+ #endif
+diff --git a/include/slerror.h b/include/slerror.h
+index 1fb76cbd1a9..ac12814a75d 100644
+--- a/include/slerror.h
++++ b/include/slerror.h
+@@ -26,6 +26,7 @@
+ #define SL_E_PKEY_NOT_INSTALLED       0xC004F014
+ #define SL_E_PRODUCT_SKU_NOT_INSTALLED 0xC004F015
+ #define SL_E_NOT_SUPPORT              0xC004F016
++#define SL_E_INVALID_LICENSE          0xC004F017
+ #define SL_E_DATATYPE_MISMATCHED      0xC004F01E
+ #define SL_E_APPLICATION_POLICIES_MISSING 0xC004F072
+ 

@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 00:16:16 -0400
+Subject: [PATCH] mfmediaengine: Transfer frames with a context state of its
+ own.
+
+Transferring a frame to a texture binds shaders, buffers, a sampler and
+a target and draws on the immediate context of the application's
+device, and left them bound there; with a state emulating ID3D10Device
+active the calls are dropped.  The engine now keeps a state of its own
+for them and puts the application's back afterwards.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 4b5c9df6452..9bb46ca38f4 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -29,7 +29,7 @@
+ #include "mferror.h"
+ #include "dxgi.h"
+ #include "initguid.h"
+-#include "d3d11.h"
++#include "d3d11_1.h"
+ #include "wincodec.h"
+ #include "mmdeviceapi.h"
+ #include "audiosessiontypes.h"
+@@ -196,6 +196,7 @@ struct media_engine
+             ID3D11InputLayout *input_layout;
+             ID3D11VertexShader *vs;
+             ID3D11PixelShader *ps;
++            ID3DDeviceContextState *state;  /* what the calls of our own are made with */
+             struct vec3 quad[4];
+             struct
+             {
+@@ -226,11 +227,71 @@ static void media_engine_release_video_frame_resources(struct media_engine *engi
+         ID3D11VertexShader_Release(engine->video_frame.d3d11.vs);
+     if (engine->video_frame.d3d11.ps)
+         ID3D11PixelShader_Release(engine->video_frame.d3d11.ps);
++    if (engine->video_frame.d3d11.state)
++        ID3DDeviceContextState_Release(engine->video_frame.d3d11.state);
+ 
+     memset(&engine->video_frame.d3d11, 0, sizeof(engine->video_frame.d3d11));
+     memcpy(engine->video_frame.d3d11.quad, fullquad, sizeof(fullquad));
+ }
+ 
++/* The calls of our own on the application's device are made with a state of our own: they leave the
++ * application's state as it was, and one emulating ID3D10Device would drop them. */
++static ID3D11DeviceContext *media_engine_begin_d3d_calls(struct media_engine *engine, ID3D11Device *device,
++        ID3DDeviceContextState **prev)
++{
++    ID3DDeviceContextState **state = &engine->video_frame.d3d11.state;
++    ID3D11DeviceContext1 *context;
++    ID3D11Device1 *device1;
++    ID3D11Device *owner;
++
++    *prev = NULL;
++    if (FAILED(ID3D11Device_QueryInterface(device, &IID_ID3D11Device1, (void **)&device1)))
++    {
++        ID3D11DeviceContext *context0;
++        ID3D11Device_GetImmediateContext(device, &context0);
++        return context0;
++    }
++    if (*state)
++    {
++        ID3DDeviceContextState_GetDevice(*state, &owner);
++        ID3D11Device_Release(owner);
++        if (owner != device)
++        {
++            ID3DDeviceContextState_Release(*state);
++            *state = NULL;
++        }
++    }
++    if (!*state)
++    {
++        D3D_FEATURE_LEVEL level = ID3D11Device1_GetFeatureLevel(device1);
++
++        if (FAILED(ID3D11Device1_CreateDeviceContextState(device1, 0, &level, 1, D3D11_SDK_VERSION,
++                &IID_ID3D11Device1, NULL, state)))
++            *state = NULL;
++    }
++    ID3D11Device1_GetImmediateContext1(device1, &context);
++    ID3D11Device1_Release(device1);
++    if (*state)
++        ID3D11DeviceContext1_SwapDeviceContextState(context, *state, prev);
++    return (ID3D11DeviceContext *)context;
++}
++
++static void media_engine_end_d3d_calls(ID3D11DeviceContext *context, ID3DDeviceContextState *prev)
++{
++    if (prev)
++    {
++        ID3D11DeviceContext1 *context1;
++
++        if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(context, &IID_ID3D11DeviceContext1, (void **)&context1)))
++        {
++            ID3D11DeviceContext1_SwapDeviceContextState(context1, prev, NULL);
++            ID3D11DeviceContext1_Release(context1);
++        }
++        ID3DDeviceContextState_Release(prev);
++    }
++    ID3D11DeviceContext_Release(context);
++}
++
+ static HRESULT media_engine_lock_d3d_device(struct media_engine *engine, ID3D11Device **device)
+ {
+     HRESULT hr;
+@@ -2598,6 +2659,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     MFVideoNormalizedRect src_rect_default = {0.0, 0.0, 1.0, 1.0};
+     MFARGB color_default = {0, 0, 0, 0};
+     D3D11_TEXTURE2D_DESC src_desc, dst_desc;
++    ID3DDeviceContextState *prev;
+     ID3D11DeviceContext *context;
+     ID3D11Texture2D *src_texture;
+     RECT dst_rect_default = {0};
+@@ -2644,10 +2706,10 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+         return hr;
+     }
+ 
+-    ID3D11Device_GetImmediateContext(device, &context);
++    context = media_engine_begin_d3d_calls(engine, device, &prev);
+     ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)dst_texture, 0,
+             dst_rect->left, dst_rect->top, 0, (ID3D11Resource *)src_texture, subresource, &src_box);
+-    ID3D11DeviceContext_Release(context);
++    media_engine_end_d3d_calls(context, prev);
+ 
+     media_engine_unlock_d3d_device(engine, device);
+     ID3D11Texture2D_Release(src_texture);
+@@ -2659,6 +2721,7 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+ {
+     static const float black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+     ID3D11Device *device, *dst_device;
++    ID3DDeviceContextState *prev;
+     ID3D11DeviceContext *context;
+     ID3D11RenderTargetView *rtv;
+     unsigned int stride, offset;
+@@ -2699,7 +2762,7 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+         goto done;
+     }
+ 
+-    ID3D11Device_GetImmediateContext(device, &context);
++    context = media_engine_begin_d3d_calls(engine, device, &prev);
+ 
+     /* Whole destination is cleared, regardless of specified rectangle. */
+     ID3D11DeviceContext_ClearRenderTargetView(context, rtv, black);
+@@ -2796,7 +2859,7 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+     ID3D11DeviceContext_Draw(context, 4, 0);
+ 
+     ID3D11RenderTargetView_Release(rtv);
+-    ID3D11DeviceContext_Release(context);
++    media_engine_end_d3d_calls(context, prev);
+ 
+ done:
+     media_engine_unlock_d3d_device(engine, device);

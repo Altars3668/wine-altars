@@ -1,0 +1,1139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 00:44:24 -0400
+Subject: [PATCH] winhttp: close a web socket, and fail one, the way Windows
+ does.
+
+Measured against WinHTTP on Windows with a server in the probe that
+sends exactly the bytes asked of it:
+
+- The peer's close frame closes only its side: this one can go on
+  sending until it shuts down.
+- Status 1005 means no status at all, so it goes out as an empty close
+  frame, and an empty close frame reads back as 1005.  Only the
+  statuses a close frame may carry are sent: 1000-1003, 1007-1011 and
+  3000 up, 1005 without a reason.  Anything else is
+  ERROR_INVALID_PARAMETER; a refused shutdown still shuts this side,
+  sending nothing, while a refused close leaves the socket as it was.
+- Every call looks at the handle before its arguments.
+- A server that breaks the protocol -- a close status no frame may
+  carry, a close reason or a text message that is not UTF-8 (overlong
+  forms and surrogates included, a sequence split between fragments
+  allowed), a fragmented or oversized control frame, a continuation
+  with nothing to continue or a message inside another, besides the
+  reserved bits, opcodes and masking already refused -- fails the
+  receive with ERROR_WINHTTP_INVALID_SERVER_RESPONSE and drops the
+  connection.  A connection that ends is ERROR_WINHTTP_CONNECTION_ERROR
+  rather than an invalid response, and a receive waiting on it reads
+  nothing of no type.  Either way every later call on the socket fails
+  the same way, and QueryCloseStatus has nothing to report.
+- A ping's data comes back in the pong; it was neither read nor
+  returned, which left its bytes in the stream to be taken for the
+  next frame.
+- Closing the handle cancels a synchronous receive blocked in another
+  thread, with ERROR_WINHTTP_OPERATION_CANCELLED, and resets the
+  connection; a WebSocketClose from another thread makes the blocked
+  receive give way and reads the close frame itself.
+
+The tests cover each of these and pass on Windows and here alike.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 01cd3ead457596d8f299b42ed946569349f2f7e1)
+
+diff --git a/dlls/winhttp/net.c b/dlls/winhttp/net.c
+index 05922acca00..808c0da709f 100644
+--- a/dlls/winhttp/net.c
++++ b/dlls/winhttp/net.c
+@@ -668,10 +668,13 @@ DWORD netconn_recv( struct netconn *conn, void *buf, size_t len, int flags, int
+     return ERROR_SUCCESS;
+ }
+ 
++/* Whatever was under way is abandoned: the connection is reset rather than closed. */
+ void netconn_cancel_io( struct netconn *conn )
+ {
+     SOCKET socket = InterlockedExchange( (LONG *)&conn->socket, -1 );
++    struct linger linger = { 1, 0 };
+ 
++    setsockopt( socket, SOL_SOCKET, SO_LINGER, (const char *)&linger, sizeof(linger) );
+     closesocket( socket );
+ }
+ 
+diff --git a/dlls/winhttp/socket.c b/dlls/winhttp/socket.c
+index 03be9cdb7f7..21e9b1f2ba1 100644
+--- a/dlls/winhttp/socket.c
++++ b/dlls/winhttp/socket.c
+@@ -42,6 +42,13 @@ static void socket_handle_closing( struct object_header *hdr )
+     pending_tasks = cancel_queue( &socket->send_q );
+     pending_tasks = cancel_queue( &socket->recv_q ) || pending_tasks;
+ 
++    /* a synchronous receive blocked in another thread is cancelled as well */
++    socket->handle_closed = TRUE;
++    if (!pending_tasks && !(socket->hdr.flags & WINHTTP_FLAG_ASYNC))
++    {
++        if (TryAcquireSRWLockExclusive( &socket->recv_lock )) ReleaseSRWLockExclusive( &socket->recv_lock );
++        else pending_tasks = TRUE;
++    }
+     if (pending_tasks) netconn_cancel_io( socket->netconn );
+ }
+ 
+@@ -161,6 +168,7 @@ HINTERNET WINAPI WinHttpWebSocketCompleteUpgrade( HINTERNET hrequest, DWORD_PTR
+         request->read.pos = request->read.size = 0;
+     }
+     InitializeSRWLock( &socket->send_lock );
++    InitializeSRWLock( &socket->recv_lock );
+     init_queue( &socket->send_q );
+     init_queue( &socket->recv_q );
+     netconn_addref( request->netconn );
+@@ -199,13 +207,16 @@ static DWORD send_frame( struct socket *socket, enum socket_opcode opcode, USHOR
+                          DWORD buflen, BOOL final, WSAOVERLAPPED *ovr )
+ {
+     DWORD i, offset = 2, len = buflen, buffer_size, ret = 0;
++    BOOL with_status;
+     int sent_size;
+     char hdr[14];
+     char *ptr;
+ 
+     TRACE( "sending %02x frame, len %lu\n", opcode, len );
+ 
+-    if (opcode == SOCKET_OPCODE_CLOSE) len += sizeof(status);
++    /* 1005 stands for no status at all: the close frame is then empty (RFC 6455 7.4.1) */
++    with_status = opcode == SOCKET_OPCODE_CLOSE && status != WINHTTP_WEB_SOCKET_EMPTY_CLOSE_STATUS;
++    if (with_status) len += sizeof(status);
+ 
+     hdr[0] = final ? (char)FIN_BIT : 0;
+     hdr[0] |= opcode;
+@@ -255,7 +266,7 @@ static DWORD send_frame( struct socket *socket, enum socket_opcode opcode, USHOR
+     ptr += 4;
+     socket->mask_index = 0;
+ 
+-    if (opcode == SOCKET_OPCODE_CLOSE) /* prepend status code */
++    if (with_status) /* prepend status code */
+     {
+         *ptr++ = (status >> 8) ^ socket->mask[socket->mask_index++ % 4];
+         *ptr++ = (status & 0xff) ^ socket->mask[socket->mask_index++ % 4];
+@@ -334,9 +345,10 @@ static void receive_io_complete( struct socket *socket )
+     assert( count >= 0 );
+ }
+ 
++/* The peer's close frame closes only its side: this one can go on sending until it shuts down. */
+ static BOOL socket_can_send( struct socket *socket )
+ {
+-    return socket->state == SOCKET_STATE_OPEN && !socket->close_frame_received;
++    return socket->state == SOCKET_STATE_OPEN;
+ }
+ 
+ static BOOL socket_can_receive( struct socket *socket )
+@@ -344,6 +356,60 @@ static BOOL socket_can_receive( struct socket *socket )
+     return socket->state <= SOCKET_STATE_SHUTDOWN && !socket->close_frame_received;
+ }
+ 
++/* A connection the peer broke the protocol on, or that went away, is done with: every later call on
++ * the socket fails with what ended it, and one still up is dropped at once. */
++static DWORD socket_fail( struct socket *socket, DWORD ret )
++{
++    if (!ret || ret == WSAETIMEDOUT || socket->failed) return ret;
++    socket->failed = ret;
++    if (ret == ERROR_WINHTTP_INVALID_SERVER_RESPONSE) netconn_cancel_io( socket->netconn );
++    return ret;
++}
++
++/* The statuses a close frame may carry (RFC 6455 7.4); 1005 only ever stands for an empty one. */
++static BOOL is_valid_close_status( USHORT status )
++{
++    return (status >= 1000 && status <= 1003) || (status >= 1007 && status <= 1011) || status >= 3000;
++}
++
++/* UTF-8 as RFC 3629 has it: no overlong forms, surrogates or code points past U+10FFFF. */
++static BOOL check_utf8( struct utf8_check *check, const BYTE *bytes, DWORD len )
++{
++    DWORD i;
++
++    for (i = 0; i < len; i++)
++    {
++        BYTE c = bytes[i];
++
++        if (check->pending)
++        {
++            if (c < check->lower || c > check->upper) return FALSE;
++            check->pending--;
++            check->lower = 0x80;
++            check->upper = 0xbf;
++            continue;
++        }
++        if (c < 0x80) continue;
++        check->lower = 0x80;
++        check->upper = 0xbf;
++        if (c >= 0xc2 && c <= 0xdf) check->pending = 1;
++        else if (c >= 0xe0 && c <= 0xef)
++        {
++            check->pending = 2;
++            if (c == 0xe0) check->lower = 0xa0;
++            else if (c == 0xed) check->upper = 0x9f;
++        }
++        else if (c >= 0xf0 && c <= 0xf4)
++        {
++            check->pending = 3;
++            if (c == 0xf0) check->lower = 0x90;
++            else if (c == 0xf4) check->upper = 0x8f;
++        }
++        else return FALSE;
++    }
++    return TRUE;
++}
++
+ static BOOL validate_buffer_type( WINHTTP_WEB_SOCKET_BUFFER_TYPE type, enum fragment_type current_fragment )
+ {
+     switch (current_fragment)
+@@ -465,14 +531,23 @@ DWORD WINAPI WinHttpWebSocketSend( HINTERNET hsocket, WINHTTP_WEB_SOCKET_BUFFER_
+ 
+     TRACE( "%p, %u, %p, %lu\n", hsocket, type, buf, len );
+ 
+-    if (len && !buf) return ERROR_INVALID_PARAMETER;
+-
++    /* the handle is looked at before anything else */
+     if (!(socket = (struct socket *)grab_object( hsocket ))) return ERROR_INVALID_HANDLE;
+     if (socket->hdr.type != WINHTTP_HANDLE_TYPE_WEBSOCKET)
+     {
+         release_object( &socket->hdr );
+         return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+     }
++    if (len && !buf)
++    {
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
++    if ((ret = socket->failed))
++    {
++        release_object( &socket->hdr );
++        return ret;
++    }
+     if (!socket_can_send( socket ))
+     {
+         release_object( &socket->hdr );
+@@ -559,6 +634,8 @@ DWORD WINAPI WinHttpWebSocketSend( HINTERNET hsocket, WINHTTP_WEB_SOCKET_BUFFER_
+     return ret;
+ }
+ 
++/* The connection ending, gracefully or not, is a connection error; a timeout is only a pause, the
++ * keepalive's cue. */
+ static DWORD receive_bytes( struct socket *socket, char *buf, DWORD len, DWORD *ret_len, BOOL read_full_buffer )
+ {
+     DWORD err, size = 0, needed = len;
+@@ -576,7 +653,8 @@ static DWORD receive_bytes( struct socket *socket, char *buf, DWORD len, DWORD *
+     }
+     while (size != len)
+     {
+-        if ((err = netconn_recv( socket->netconn, ptr, needed, 0, &received ))) return err;
++        if ((err = netconn_recv( socket->netconn, ptr, needed, 0, &received )))
++            return err == WSAETIMEDOUT ? err : ERROR_WINHTTP_CONNECTION_ERROR;
+         if (!received) break;
+         size += received;
+         if (!read_full_buffer) break;
+@@ -584,7 +662,7 @@ static DWORD receive_bytes( struct socket *socket, char *buf, DWORD len, DWORD *
+         ptr += received;
+     }
+     *ret_len = size;
+-    if (size != len && (read_full_buffer || !size)) return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
++    if (size != len && (read_full_buffer || !size)) return ERROR_WINHTTP_CONNECTION_ERROR;
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -605,6 +683,7 @@ static BOOL is_supported_opcode( enum socket_opcode opcode )
+     }
+ }
+ 
++/* A frame out of order or out of shape is the peer breaking the protocol (RFC 6455 5.2, 5.4, 5.5). */
+ static DWORD receive_frame( struct socket *socket, DWORD *ret_len, enum socket_opcode *opcode, BOOL *final )
+ {
+     DWORD ret, len, count;
+@@ -619,6 +698,24 @@ static DWORD receive_frame( struct socket *socket, DWORD *ret_len, enum socket_o
+     *final = hdr[0] & FIN_BIT;
+     TRACE("received %02x frame, final %#x\n", *opcode, *final);
+ 
++    if (*opcode & CONTROL_BIT)
++    {
++        /* control frames come whole and small, possibly between the fragments of a message */
++        if (!*final || (hdr[1] & ~MASK_BIT) > 125) return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
++    }
++    else
++    {
++        /* a continuation only continues a message, and a message starts only after the last one ended */
++        if ((*opcode == SOCKET_OPCODE_CONTINUE) != socket->receiving_message)
++            return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
++        if (*opcode != SOCKET_OPCODE_CONTINUE)
++        {
++            socket->receiving_text = *opcode == SOCKET_OPCODE_TEXT;
++            memset( &socket->utf8, 0, sizeof(socket->utf8) );
++        }
++        socket->receiving_message = !*final;
++    }
++
+     len = hdr[1] & ~MASK_BIT;
+     if (len == 126)
+     {
+@@ -647,29 +744,34 @@ static void task_socket_send_pong( void *ctx, BOOL abort )
+ 
+     TRACE("running %p\n", ctx);
+ 
+-    if (s->complete_async) complete_send_frame( socket, &s->ovr, NULL );
+-    else send_frame( socket, SOCKET_OPCODE_PONG, 0, NULL, 0, TRUE, NULL );
++    if (s->complete_async) complete_send_frame( socket, &s->ovr, s->buf );
++    else send_frame( socket, SOCKET_OPCODE_PONG, 0, s->buf, s->len, TRUE, NULL );
+ 
+     send_io_complete( socket );
+ }
+ 
+-static DWORD socket_send_pong( struct socket *socket )
++/* A pong answers a ping with the ping's data (RFC 6455 5.5.3); unsolicited, it keeps the connection alive. */
++static DWORD socket_send_pong( struct socket *socket, const char *data, DWORD len )
+ {
+     BOOL async_send, complete_async = FALSE;
+     struct socket_send *s;
+     DWORD ret = 0;
+ 
+     if (!(socket->hdr.flags & WINHTTP_FLAG_ASYNC))
+-        return send_frame( socket, SOCKET_OPCODE_PONG, 0, NULL, 0, TRUE, NULL );
++        return send_frame( socket, SOCKET_OPCODE_PONG, 0, data, len, TRUE, NULL );
+ 
+-    if (!(s = malloc( sizeof(*s) ))) return ERROR_OUTOFMEMORY;
++    /* the data travels with the task, which may run after the ping's buffer is gone */
++    if (!(s = malloc( sizeof(*s) + len ))) return ERROR_OUTOFMEMORY;
++    if (len) memcpy( s + 1, data, len );
++    s->buf = s + 1;
++    s->len = len;
+ 
+     AcquireSRWLockExclusive( &socket->send_lock );
+     async_send = InterlockedIncrement( &socket->pending_sends ) > 1;
+     if (!async_send)
+     {
+         memset( &s->ovr, 0, sizeof(s->ovr) );
+-        if ((ret = send_frame( socket, SOCKET_OPCODE_PONG, 0, NULL, 0, TRUE, &s->ovr )) == WSA_IO_PENDING)
++        if ((ret = send_frame( socket, SOCKET_OPCODE_PONG, 0, s->buf, len, TRUE, &s->ovr )) == WSA_IO_PENDING)
+         {
+             async_send = TRUE;
+             complete_async = TRUE;
+@@ -709,21 +811,38 @@ static DWORD socket_drain( struct socket *socket )
+ 
+ static DWORD receive_close_status( struct socket *socket, DWORD len )
+ {
++    struct utf8_check check = {0};
+     DWORD reason_len, ret;
+ 
+     socket->close_frame_received = TRUE;
+     if ((len && (len < sizeof(socket->status) || len > sizeof(socket->status) + sizeof(socket->reason))))
+         return (socket->close_frame_receive_err = ERROR_WINHTTP_INVALID_SERVER_RESPONSE);
+ 
+-    if (!len) return (socket->close_frame_receive_err = ERROR_SUCCESS);
++    if (!len)
++    {
++        /* a close frame without a status */
++        socket->status = WINHTTP_WEB_SOCKET_EMPTY_CLOSE_STATUS;
++        socket->reason_len = 0;
++        return (socket->close_frame_receive_err = ERROR_SUCCESS);
++    }
+ 
+     reason_len = len - sizeof(socket->status);
+     if ((ret = receive_bytes( socket, (char *)&socket->status, sizeof(socket->status), &len, TRUE )))
+         return (socket->close_frame_receive_err = ret);
+ 
+     socket->status = RtlUshortByteSwap( socket->status );
+-    return (socket->close_frame_receive_err
+-            = receive_bytes( socket, socket->reason, reason_len, &socket->reason_len, TRUE ));
++    if ((ret = receive_bytes( socket, socket->reason, reason_len, &socket->reason_len, TRUE )))
++        return (socket->close_frame_receive_err = ret);
++
++    /* a status only from those a close frame may carry, a reason only in UTF-8 */
++    if (!is_valid_close_status( socket->status ) || !check_utf8( &check, (BYTE *)socket->reason, socket->reason_len )
++        || check.pending)
++    {
++        WARN( "invalid close frame, status %u reason %s.\n", socket->status,
++              debugstr_an( socket->reason, socket->reason_len ) );
++        return (socket->close_frame_receive_err = ERROR_WINHTTP_INVALID_SERVER_RESPONSE);
++    }
++    return (socket->close_frame_receive_err = ERROR_SUCCESS);
+ }
+ 
+ static DWORD handle_control_frame( struct socket *socket )
+@@ -735,7 +854,14 @@ static DWORD handle_control_frame( struct socket *socket )
+     switch (socket->opcode)
+     {
+     case SOCKET_OPCODE_PING:
+-        return socket_send_pong( socket );
++    {
++        char data[125];
++        DWORD len = socket->read_size, count;
++
++        if ((ret = receive_bytes( socket, data, len, &count, TRUE ))) return ret;
++        socket->read_size = 0;
++        return socket_send_pong( socket, data, len );
++    }
+ 
+     case SOCKET_OPCODE_PONG:
+         return socket_drain( socket );
+@@ -828,9 +954,13 @@ static DWORD socket_receive( struct socket *socket, void *buf, DWORD len, DWORD
+                 if (!(socket->opcode & CONTROL_BIT) || (ret = handle_control_frame( socket ))
+                     || socket->opcode == SOCKET_OPCODE_CLOSE) break;
+             }
+-            else if (ret == WSAETIMEDOUT) ret = socket_send_pong( socket );
++            else if (ret == WSAETIMEDOUT) ret = socket_send_pong( socket, NULL, 0 );
+             if (ret) break;
++            if (socket->state == SOCKET_STATE_CLOSED) break;
+         }
++        /* a close from another thread cancels this receive and takes over what is left of the frame */
++        if (!ret && socket->state == SOCKET_STATE_CLOSED && !(socket->hdr.flags & WINHTTP_FLAG_ASYNC))
++            return ERROR_WINHTTP_OPERATION_CANCELLED;
+     }
+     if (!ret)
+     {
+@@ -842,6 +972,15 @@ static DWORD socket_receive( struct socket *socket, void *buf, DWORD len, DWORD
+         if (count < socket->read_size) WARN( "short read\n" );
+ 
+         socket->read_size -= count;
++
++        /* text is UTF-8 throughout, a sequence possibly split between frames but not left unfinished */
++        if (!(socket->opcode & CONTROL_BIT) && socket->receiving_text
++            && (!check_utf8( &socket->utf8, buf, count ) || (final && !socket->read_size && socket->utf8.pending)))
++        {
++            WARN( "invalid UTF-8 in a text message.\n" );
++            return socket_fail( socket, ERROR_WINHTTP_INVALID_SERVER_RESPONSE );
++        }
++
+         *ret_len = count;
+         *ret_type = map_opcode( socket, socket->opcode, !final || socket->read_size != 0 );
+         TRACE( "len %lu, *ret_len %lu, *ret_type %u\n", len, *ret_len, *ret_type );
+@@ -849,10 +988,16 @@ static DWORD socket_receive( struct socket *socket, void *buf, DWORD len, DWORD
+         {
+             FIXME( "unexpected opcode %u\n", socket->opcode );
+             socket->read_size = 0;
+-            return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
++            return socket_fail( socket, ERROR_WINHTTP_INVALID_SERVER_RESPONSE );
+         }
+     }
+-    return ret;
++    else if (ret == ERROR_WINHTTP_CONNECTION_ERROR && !socket->handle_closed)
++    {
++        /* the connection's end reads as nothing of no type */
++        *ret_len = 0;
++        *ret_type = ~0u;
++    }
++    return socket_fail( socket, ret );
+ }
+ 
+ static void socket_receive_complete( struct socket *socket, DWORD ret, WINHTTP_WEB_SOCKET_BUFFER_TYPE type, DWORD len )
+@@ -901,14 +1046,22 @@ DWORD WINAPI WinHttpWebSocketReceive( HINTERNET hsocket, void *buf, DWORD len, D
+ 
+     TRACE( "%p, %p, %lu, %p, %p\n", hsocket, buf, len, ret_len, ret_type );
+ 
+-    if (!buf || !len) return ERROR_INVALID_PARAMETER;
+-
+     if (!(socket = (struct socket *)grab_object( hsocket ))) return ERROR_INVALID_HANDLE;
+     if (socket->hdr.type != WINHTTP_HANDLE_TYPE_WEBSOCKET)
+     {
+         release_object( &socket->hdr );
+         return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+     }
++    if (!buf || !len)
++    {
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
++    if ((ret = socket->failed))
++    {
++        release_object( &socket->hdr );
++        return ret;
++    }
+     if (!socket_can_receive( socket ))
+     {
+         release_object( &socket->hdr );
+@@ -942,7 +1095,13 @@ DWORD WINAPI WinHttpWebSocketReceive( HINTERNET hsocket, void *buf, DWORD len, D
+             free( r );
+         }
+     }
+-    else ret = socket_receive( socket, buf, len, ret_len, ret_type );
++    else
++    {
++        AcquireSRWLockExclusive( &socket->recv_lock );
++        ret = socket_receive( socket, buf, len, ret_len, ret_type );
++        ReleaseSRWLockExclusive( &socket->recv_lock );
++        if (ret && socket->handle_closed) ret = ERROR_WINHTTP_OPERATION_CANCELLED;
++    }
+ 
+     release_object( &socket->hdr );
+     return ret;
+@@ -1033,6 +1192,12 @@ static DWORD send_socket_shutdown( struct socket *socket, USHORT status, const v
+     return ret;
+ }
+ 
++/* What may be sent: a status a close frame may carry, or 1005 for an empty frame. */
++static BOOL can_send_close_status( USHORT status, DWORD len )
++{
++    return is_valid_close_status( status ) || (status == WINHTTP_WEB_SOCKET_EMPTY_CLOSE_STATUS && !len);
++}
++
+ DWORD WINAPI WinHttpWebSocketShutdown( HINTERNET hsocket, USHORT status, void *reason, DWORD len )
+ {
+     struct socket *socket;
+@@ -1040,19 +1205,35 @@ DWORD WINAPI WinHttpWebSocketShutdown( HINTERNET hsocket, USHORT status, void *r
+ 
+     TRACE( "%p, %u, %p, %lu\n", hsocket, status, reason, len );
+ 
+-    if ((len && !reason) || len > sizeof(socket->reason)) return ERROR_INVALID_PARAMETER;
+-
+     if (!(socket = (struct socket *)grab_object( hsocket ))) return ERROR_INVALID_HANDLE;
+     if (socket->hdr.type != WINHTTP_HANDLE_TYPE_WEBSOCKET)
+     {
+         release_object( &socket->hdr );
+         return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+     }
++    if ((len && !reason) || len > sizeof(socket->reason))
++    {
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
++    if ((ret = socket->failed))
++    {
++        release_object( &socket->hdr );
++        return ret;
++    }
+     if (socket->state >= SOCKET_STATE_SHUTDOWN)
+     {
+         release_object( &socket->hdr );
+         return ERROR_INVALID_OPERATION;
+     }
++    if (!can_send_close_status( status, len ))
++    {
++        /* as on Windows, this side is shut all the same, with nothing sent */
++        WARN( "invalid status %u.\n", status );
++        socket->state = SOCKET_STATE_SHUTDOWN;
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
+ 
+     ret = send_socket_shutdown( socket, status, reason, len, TRUE );
+     release_object( &socket->hdr );
+@@ -1066,19 +1247,18 @@ static DWORD socket_close( struct socket *socket )
+ 
+     if (socket->close_frame_received) return socket->close_frame_receive_err;
+ 
+-    if ((ret = socket_drain( socket ))) return ret;
++    if ((ret = socket_drain( socket ))) return socket_fail( socket, ret );
+ 
+     while (1)
+     {
+-        if ((ret = receive_frame( socket, &count, &socket->opcode, &final ))) return ret;
++        if ((ret = receive_frame( socket, &count, &socket->opcode, &final ))) return socket_fail( socket, ret );
+         if (socket->opcode == SOCKET_OPCODE_CLOSE) break;
+ 
+         socket->read_size = count;
+-        if ((ret = socket_drain( socket ))) return ret;
++        if ((ret = socket_drain( socket ))) return socket_fail( socket, ret );
+     }
+-    if (!final) FIXME( "received close opcode without FIN bit\n" );
+ 
+-    return receive_close_status( socket, count );
++    return socket_fail( socket, receive_close_status( socket, count ) );
+ }
+ 
+ static void socket_close_complete( struct socket *socket, DWORD ret )
+@@ -1122,19 +1302,34 @@ DWORD WINAPI WinHttpWebSocketClose( HINTERNET hsocket, USHORT status, void *reas
+ 
+     TRACE( "%p, %u, %p, %lu\n", hsocket, status, reason, len );
+ 
+-    if ((len && !reason) || len > sizeof(socket->reason)) return ERROR_INVALID_PARAMETER;
+-
+     if (!(socket = (struct socket *)grab_object( hsocket ))) return ERROR_INVALID_HANDLE;
+     if (socket->hdr.type != WINHTTP_HANDLE_TYPE_WEBSOCKET)
+     {
+         release_object( &socket->hdr );
+         return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+     }
++    if ((len && !reason) || len > sizeof(socket->reason))
++    {
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
++    if ((ret = socket->failed))
++    {
++        release_object( &socket->hdr );
++        return ret;
++    }
+     if (socket->state >= SOCKET_STATE_CLOSED)
+     {
+         release_object( &socket->hdr );
+         return ERROR_INVALID_OPERATION;
+     }
++    if (!can_send_close_status( status, len ))
++    {
++        /* unlike a shutdown, a close refused leaves the socket as it was */
++        WARN( "invalid status %u.\n", status );
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
+ 
+     prev_state = socket->state;
+     socket->state = SOCKET_STATE_CLOSED;
+@@ -1169,7 +1364,13 @@ DWORD WINAPI WinHttpWebSocketClose( HINTERNET hsocket, USHORT status, void *reas
+             free( s );
+         }
+     }
+-    else ret = socket_close( socket );
++    else
++    {
++        /* a receive in another thread sees the close and gives way, the close frame read by either */
++        AcquireSRWLockExclusive( &socket->recv_lock );
++        ret = socket_close( socket );
++        ReleaseSRWLockExclusive( &socket->recv_lock );
++    }
+ 
+ done:
+     release_object( &socket->hdr );
+@@ -1184,20 +1385,23 @@ DWORD WINAPI WinHttpWebSocketQueryCloseStatus( HINTERNET hsocket, USHORT *status
+ 
+     TRACE( "%p, %p, %p, %lu, %p\n", hsocket, status, reason, len, ret_len );
+ 
+-    if (!status || (len && !reason) || !ret_len) return ERROR_INVALID_PARAMETER;
+-
+     if (!(socket = (struct socket *)grab_object( hsocket ))) return ERROR_INVALID_HANDLE;
+     if (socket->hdr.type != WINHTTP_HANDLE_TYPE_WEBSOCKET)
+     {
+         release_object( &socket->hdr );
+         return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+     }
++    if (!status || (len && !reason) || !ret_len)
++    {
++        release_object( &socket->hdr );
++        return ERROR_INVALID_PARAMETER;
++    }
+ 
++    /* a close frame that could not be taken for one ended the connection instead */
+     if (!socket->close_frame_received || socket->close_frame_receive_err)
+     {
+-        ret = socket->close_frame_received ? socket->close_frame_receive_err : ERROR_INVALID_OPERATION;
+         release_object( &socket->hdr );
+-        return ret;
++        return ERROR_INVALID_OPERATION;
+     }
+ 
+     *status = socket->status;
+diff --git a/dlls/winhttp/tests/winhttp.c b/dlls/winhttp/tests/winhttp.c
+index 35128a788fb..7123101ba42 100644
+--- a/dlls/winhttp/tests/winhttp.c
++++ b/dlls/winhttp/tests/winhttp.c
+@@ -2475,6 +2475,64 @@ static int server_receive_request(int c, char *buffer, size_t buffer_size)
+     return r;
+ }
+ 
++static char websocket_frames[64];
++static HANDLE websocket_event;
++
++/* what a server may send that the client must take for a broken protocol, or answer */
++static const struct
++{
++    int len;
++    unsigned char data[12];
++    BOOL drop;
++}
++websocket_raw_frames[] =
++{
++    {4, {0x88, 0x02, 0x03, 0xe7}},                          /* close status 999 */
++    {5, {0x88, 0x03, 0x03, 0xe8, 0xff}},                    /* close reason not UTF-8 */
++    {3, {0x81, 0x01, 0xff}},                                /* text not UTF-8 */
++    {8, {0x89, 0x03, 'a', 'b', 'c', 0x81, 0x01, 'z'}},      /* ping, then text */
++    {3, {0x01, 0x01, 'a'}, TRUE},                           /* a fragment, then the connection ends */
++    {7, {0x01, 0x02, 0xe4, 0xb8, 0x80, 0x01, 0xad}},        /* UTF-8 split between fragments */
++    {3, {0x09, 0x01, 'p'}},                                 /* fragmented ping */
++    {6, {0x01, 0x01, 'a', 0x81, 0x01, 'b'}},                /* a message inside a message */
++};
++
++static BOOL server_recv_all(int c, unsigned char *buf, int len)
++{
++    int r;
++
++    while (len)
++    {
++        if ((r = recv(c, (char *)buf, len, 0)) <= 0) return FALSE;
++        buf += r;
++        len -= r;
++    }
++    return TRUE;
++}
++
++/* the frames a client sends, up to its close frame, as "opcode:payload" */
++static void server_read_websocket_frames(int c)
++{
++    unsigned char head[2], mask[4], payload[125];
++    int len, i;
++
++    websocket_frames[0] = 0;
++    for (;;)
++    {
++        if (!server_recv_all(c, head, 2)) break;
++        len = head[1] & 0x7f;
++        if (len > 125 || !server_recv_all(c, mask, 4) || !server_recv_all(c, payload, len)) break;
++        for (i = 0; i < len; i++) payload[i] ^= mask[i % 4];
++        if ((head[0] & 0x0f) == 8 && len >= 2)
++            sprintf(websocket_frames + strlen(websocket_frames), "%02x:%u:%.*s ", head[0],
++                    (payload[0] << 8) | payload[1], len - 2, payload + 2);
++        else
++            sprintf(websocket_frames + strlen(websocket_frames), "%02x:%.*s ", head[0], len, payload);
++        if ((head[0] & 0x0f) == 8) break;
++    }
++    SetEvent(websocket_event);
++}
++
+ static DWORD CALLBACK server_thread(LPVOID param)
+ {
+     struct server_info *si = param;
+@@ -2648,13 +2706,57 @@ static DWORD CALLBACK server_thread(LPVOID param)
+                 key[24] = 0;
+ 
+                 create_websocket_accept(key, accept, sizeof(accept));
++                /* nothing may follow the headers where frames are read at once */
++                if (strstr(buffer, "GET /websocket_")) accept[strcspn(accept, "\r\n")] = 0;
+ 
+                 strcat(headers, "Sec-WebSocket-Accept: ");
+                 strcat(headers, accept);
+                 strcat(headers, "\r\n\r\n");
+ 
+                 send(c, headers, strlen(headers), 0);
+-                send(c, "data", 4, 0);
++                if (strstr(buffer, "GET /websocket_close"))
++                {
++                    /* close this side at once, then see what the client still sends */
++                    static const char close_frame[] = {0x88, 0x05, 0x03, 0xe8, 'b', 'y', 'e'};
++                    send(c, close_frame, sizeof(close_frame), 0);
++                    server_read_websocket_frames(c);
++                    closesocket(c);
++                    c = -1;
++                }
++                else if (strstr(buffer, "GET /websocket_silent"))
++                {
++                    /* say nothing until the client goes away */
++                    char byte;
++                    while (recv(c, &byte, 1, 0) > 0);
++                    closesocket(c);
++                    c = -1;
++                    SetEvent(websocket_event);
++                }
++                else if (strstr(buffer, "GET /websocket_empty"))
++                {
++                    /* whatever close frame comes is answered with an empty one */
++                    server_read_websocket_frames(c);
++                    send(c, "\x88\x00", 2, 0);
++                    closesocket(c);
++                    c = -1;
++                }
++                else if (strstr(buffer, "GET /websocket_raw"))
++                {
++                    int i = atoi(strstr(buffer, "GET /websocket_raw") + 18);
++
++                    send(c, (const char *)websocket_raw_frames[i].data, websocket_raw_frames[i].len, 0);
++                    if (websocket_raw_frames[i].drop)
++                    {
++                        /* while the client waits for more */
++                        Sleep(500);
++                        websocket_frames[0] = 0;
++                        SetEvent(websocket_event);
++                    }
++                    else server_read_websocket_frames(c);
++                    closesocket(c);
++                    c = -1;
++                }
++                else send(c, "data", 4, 0);
+                 continue;
+             }
+             else send(c, notokmsg, sizeof(notokmsg) - 1, 0);
+@@ -3989,6 +4091,344 @@ static void test_websocket(int port)
+     WinHttpCloseHandle(session);
+ }
+ 
++static HINTERNET upgrade_to_websocket(HINTERNET connection, const WCHAR *path)
++{
++    HINTERNET request, socket;
++    BOOL ret;
++
++    request = WinHttpOpenRequest(connection, L"GET", path, NULL, NULL, NULL, 0);
++    ok(request != NULL, "got %lu\n", GetLastError());
++    ret = WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
++    ok(ret, "got %lu\n", GetLastError());
++    ret = WinHttpSendRequest(request, NULL, 0, NULL, 0, 0, 0);
++    ok(ret, "got %lu\n", GetLastError());
++    ret = WinHttpReceiveResponse(request, NULL);
++    ok(ret, "got %lu\n", GetLastError());
++    socket = pWinHttpWebSocketCompleteUpgrade(request, 0);
++    ok(socket != NULL, "got %lu\n", GetLastError());
++    WinHttpCloseHandle(request);
++    return socket;
++}
++
++struct blocked_receive
++{
++    HINTERNET socket;
++    DWORD error;
++};
++
++static DWORD CALLBACK blocked_receive_thread(void *arg)
++{
++    struct blocked_receive *receive = arg;
++    WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
++    DWORD count;
++    char buf[16];
++
++    receive->error = pWinHttpWebSocketReceive(receive->socket, buf, sizeof(buf), &count, &type);
++    return 0;
++}
++
++static void test_websocket_closing(int port)
++{
++    HINTERNET session, connection, socket;
++    WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
++    struct blocked_receive receive;
++    DWORD count, error, len;
++    USHORT close_status;
++    HANDLE thread;
++    char buf[128];
++
++    if (!pWinHttpWebSocketCompleteUpgrade)
++    {
++        win_skip("WinHttpWebSocketCompleteUpgrade not supported\n");
++        return;
++    }
++
++    websocket_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    session = WinHttpOpen(L"winetest", 0, NULL, NULL, 0);
++    ok(session != NULL, "got %lu\n", GetLastError());
++    connection = WinHttpConnect(session, L"localhost", port, 0);
++    ok(connection != NULL, "got %lu\n", GetLastError());
++
++    /* the server closes its side */
++    socket = upgrade_to_websocket(connection, L"/websocket_close");
++
++    count = 0xdeadbeef;
++    type = 0xdeadbeef;
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE, "got %u\n", type);
++    ok(!count, "got %lu\n", count);
++
++    close_status = 0;
++    len = 0;
++    error = pWinHttpWebSocketQueryCloseStatus(socket, &close_status, buf, sizeof(buf), &len);
++    ok(!error, "got %lu\n", error);
++    ok(close_status == 1000, "got %u\n", close_status);
++    ok(len == 3 && !memcmp(buf, "bye", 3), "got %lu\n", len);
++
++    /* which leaves this side open to send */
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"late", 4);
++    ok(!error, "got %lu\n", error);
++
++    /* but with nothing more to receive */
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(error == ERROR_INVALID_OPERATION, "got %lu\n", error);
++
++    error = pWinHttpWebSocketShutdown(socket, 1000, (void *)"done", 4);
++    ok(!error, "got %lu\n", error);
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"after", 5);
++    ok(error == ERROR_INVALID_OPERATION, "got %lu\n", error);
++
++    ok(!WaitForSingleObject(websocket_event, 5000), "the server saw no close frame\n");
++    ok(!strcmp(websocket_frames, "81:late 88:1000:done "), "got %s\n", debugstr_a(websocket_frames));
++
++    error = pWinHttpWebSocketClose(socket, 1000, NULL, 0);
++    ok(!error, "got %lu\n", error);
++    WinHttpCloseHandle(socket);
++
++    /* closing the handle cancels a receive blocked in another thread, and drops the connection */
++    socket = upgrade_to_websocket(connection, L"/websocket_silent");
++    receive.socket = socket;
++    receive.error = 0xdeadbeef;
++    thread = CreateThread(NULL, 0, blocked_receive_thread, &receive, 0, NULL);
++    ok(WaitForSingleObject(thread, 200) == WAIT_TIMEOUT, "the receive did not block\n");
++    WinHttpCloseHandle(socket);
++    ok(!WaitForSingleObject(thread, 5000), "the receive was not cancelled\n");
++    ok(receive.error == ERROR_WINHTTP_OPERATION_CANCELLED, "got %lu\n", receive.error);
++    CloseHandle(thread);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the connection was not dropped\n");
++
++    WinHttpCloseHandle(connection);
++    WinHttpCloseHandle(session);
++    CloseHandle(websocket_event);
++}
++
++/* Every call on a socket looks at the handle first. */
++static void test_websocket_arguments(void)
++{
++    WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
++    USHORT close_status;
++    DWORD error, count;
++    char buf[200];
++
++    if (!pWinHttpWebSocketCompleteUpgrade)
++    {
++        win_skip("WinHttpWebSocketCompleteUpgrade not supported\n");
++        return;
++    }
++
++    error = pWinHttpWebSocketSend(NULL, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, NULL, 1);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++    error = pWinHttpWebSocketReceive(NULL, NULL, 0, &count, &type);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++    error = pWinHttpWebSocketShutdown(NULL, 999, NULL, 1);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++    error = pWinHttpWebSocketShutdown(NULL, 1000, buf, 124);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++    error = pWinHttpWebSocketClose(NULL, 999, NULL, 1);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++    error = pWinHttpWebSocketQueryCloseStatus(NULL, NULL, NULL, 0, NULL);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++    error = pWinHttpWebSocketQueryCloseStatus(NULL, &close_status, NULL, 1, &count);
++    ok(error == ERROR_INVALID_HANDLE, "got %lu\n", error);
++}
++
++/* Which close statuses go out, and how a refused one leaves the socket. */
++static void test_websocket_close_status(int port)
++{
++    HINTERNET session, connection, socket;
++    WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
++    USHORT close_status;
++    DWORD error, count, len;
++    char buf[128];
++
++    if (!pWinHttpWebSocketCompleteUpgrade)
++    {
++        win_skip("WinHttpWebSocketCompleteUpgrade not supported\n");
++        return;
++    }
++
++    websocket_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    session = WinHttpOpen(L"winetest", 0, NULL, NULL, 0);
++    ok(session != NULL, "got %lu\n", GetLastError());
++    connection = WinHttpConnect(session, L"localhost", port, 0);
++    ok(connection != NULL, "got %lu\n", GetLastError());
++
++    /* a shutdown refused for its status shuts this side all the same, with nothing sent */
++    socket = upgrade_to_websocket(connection, L"/websocket_empty");
++    error = pWinHttpWebSocketShutdown(socket, 999, (void *)"r", 1);
++    ok(error == ERROR_INVALID_PARAMETER, "got %lu\n", error);
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"s", 1);
++    ok(error == ERROR_INVALID_OPERATION, "got %lu\n", error);
++    error = pWinHttpWebSocketShutdown(socket, 1000, NULL, 0);
++    ok(error == ERROR_INVALID_OPERATION, "got %lu\n", error);
++    WinHttpCloseHandle(socket);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the connection was not dropped\n");
++    ok(!websocket_frames[0], "got %s\n", debugstr_a(websocket_frames));
++
++    /* 1005 stands for no status at all, and so goes with no reason */
++    socket = upgrade_to_websocket(connection, L"/websocket_empty");
++    error = pWinHttpWebSocketShutdown(socket, WINHTTP_WEB_SOCKET_EMPTY_CLOSE_STATUS, (void *)"r", 1);
++    ok(error == ERROR_INVALID_PARAMETER, "got %lu\n", error);
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"s", 1);
++    ok(error == ERROR_INVALID_OPERATION, "got %lu\n", error);
++    WinHttpCloseHandle(socket);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the connection was not dropped\n");
++
++    /* a close refused leaves the socket as it was; an empty close frame stands for 1005, both ways */
++    socket = upgrade_to_websocket(connection, L"/websocket_empty");
++    error = pWinHttpWebSocketClose(socket, 1006, (void *)"r", 1);
++    ok(error == ERROR_INVALID_PARAMETER, "got %lu\n", error);
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"s", 1);
++    ok(!error, "got %lu\n", error);
++    error = pWinHttpWebSocketShutdown(socket, WINHTTP_WEB_SOCKET_EMPTY_CLOSE_STATUS, NULL, 0);
++    ok(!error, "got %lu\n", error);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the server saw no close frame\n");
++    ok(!strcmp(websocket_frames, "81:s 88: "), "got %s\n", debugstr_a(websocket_frames));
++    count = 0xdeadbeef;
++    type = 0xdeadbeef;
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE, "got %u\n", type);
++    close_status = 0;
++    len = 0xdeadbeef;
++    error = pWinHttpWebSocketQueryCloseStatus(socket, &close_status, buf, sizeof(buf), &len);
++    ok(!error, "got %lu\n", error);
++    ok(close_status == WINHTTP_WEB_SOCKET_EMPTY_CLOSE_STATUS, "got %u\n", close_status);
++    ok(!len, "got %lu\n", len);
++    WinHttpCloseHandle(socket);
++
++    /* any status from 3000 up is the application's */
++    socket = upgrade_to_websocket(connection, L"/websocket_empty");
++    error = pWinHttpWebSocketShutdown(socket, 5000, (void *)"r", 1);
++    ok(!error, "got %lu\n", error);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the server saw no close frame\n");
++    ok(!strcmp(websocket_frames, "88:5000:r "), "got %s\n", debugstr_a(websocket_frames));
++    WinHttpCloseHandle(socket);
++
++    WinHttpCloseHandle(connection);
++    WinHttpCloseHandle(session);
++    CloseHandle(websocket_event);
++}
++
++static HINTERNET upgrade_to_raw_websocket(HINTERNET connection, int index)
++{
++    WCHAR path[32];
++
++    swprintf(path, ARRAY_SIZE(path), L"/websocket_raw%d", index);
++    return upgrade_to_websocket(connection, path);
++}
++
++/* A server breaking the protocol, or going away, ends the connection: every later call fails alike. */
++static void test_websocket_protocol(int port)
++{
++    HINTERNET session, connection, socket;
++    WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
++    USHORT close_status;
++    DWORD error, count, len;
++    char buf[128];
++    int i;
++
++    if (!pWinHttpWebSocketCompleteUpgrade)
++    {
++        win_skip("WinHttpWebSocketCompleteUpgrade not supported\n");
++        return;
++    }
++
++    websocket_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    session = WinHttpOpen(L"winetest", 0, NULL, NULL, 0);
++    ok(session != NULL, "got %lu\n", GetLastError());
++    connection = WinHttpConnect(session, L"localhost", port, 0);
++    ok(connection != NULL, "got %lu\n", GetLastError());
++
++    /* a close status no close frame may carry, a reason or a text that is not UTF-8, a fragmented ping */
++    for (i = 0; i < 7; i++)
++    {
++        if (i == 3 || i == 4 || i == 5) continue;
++        winetest_push_context("%d", i);
++        socket = upgrade_to_raw_websocket(connection, i);
++        count = 0xdeadbeef;
++        error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++        ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++        ok(count == 0xdeadbeef, "got %lu\n", count);
++        error = pWinHttpWebSocketQueryCloseStatus(socket, &close_status, buf, sizeof(buf), &len);
++        ok(error == ERROR_INVALID_OPERATION, "got %lu\n", error);
++        error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++        ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++        error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"s", 1);
++        ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++        error = pWinHttpWebSocketShutdown(socket, 1000, NULL, 0);
++        ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++        error = pWinHttpWebSocketClose(socket, 1000, NULL, 0);
++        ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++        WinHttpCloseHandle(socket);
++        ok(!WaitForSingleObject(websocket_event, 5000), "the connection was not dropped\n");
++        ok(!websocket_frames[0], "got %s\n", debugstr_a(websocket_frames));
++        winetest_pop_context();
++    }
++
++    /* a message where another had not ended */
++    socket = upgrade_to_raw_websocket(connection, 7);
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE, "got %u\n", type);
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"s", 1);
++    ok(error == ERROR_WINHTTP_INVALID_SERVER_RESPONSE, "got %lu\n", error);
++    WinHttpCloseHandle(socket);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the connection was not dropped\n");
++
++    /* a ping is answered with its data, in the course of a receive */
++    socket = upgrade_to_raw_websocket(connection, 3);
++    count = 0xdeadbeef;
++    type = 0xdeadbeef;
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, "got %u\n", type);
++    ok(count == 1 && buf[0] == 'z', "got %lu\n", count);
++    error = pWinHttpWebSocketShutdown(socket, 1000, NULL, 0);
++    ok(!error, "got %lu\n", error);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the server saw no close frame\n");
++    ok(!strcmp(websocket_frames, "8a:abc 88:1000: "), "got %s\n", debugstr_a(websocket_frames));
++    WinHttpCloseHandle(socket);
++
++    /* UTF-8 may be split between the fragments of a message */
++    socket = upgrade_to_raw_websocket(connection, 5);
++    count = 0xdeadbeef;
++    type = 0xdeadbeef;
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE, "got %u\n", type);
++    ok(count == 2, "got %lu\n", count);
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, "got %u\n", type);
++    ok(count == 1, "got %lu\n", count);
++    WinHttpCloseHandle(socket);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the connection was not dropped\n");
++
++    /* the connection's end, while a receive waits, reads as nothing of no type */
++    socket = upgrade_to_raw_websocket(connection, 4);
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(!error, "got %lu\n", error);
++    ok(type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE, "got %u\n", type);
++    error = pWinHttpWebSocketReceive(socket, buf, sizeof(buf), &count, &type);
++    ok(error == ERROR_WINHTTP_CONNECTION_ERROR, "got %lu\n", error);
++    ok(!count, "got %lu\n", count);
++    ok(type == ~0u, "got %u\n", type);
++    ok(!WaitForSingleObject(websocket_event, 5000), "the server did not go away\n");
++    error = pWinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void *)"s", 1);
++    ok(error == ERROR_WINHTTP_CONNECTION_ERROR, "got %lu\n", error);
++    error = pWinHttpWebSocketClose(socket, 1000, NULL, 0);
++    ok(error == ERROR_WINHTTP_CONNECTION_ERROR, "got %lu\n", error);
++    WinHttpCloseHandle(socket);
++
++    WinHttpCloseHandle(connection);
++    WinHttpCloseHandle(session);
++    CloseHandle(websocket_event);
++}
++
+ static void test_not_modified(int port)
+ {
+     BOOL ret;
+@@ -6591,6 +7031,10 @@ START_TEST (winhttp)
+     test_request_path_escapes(si.port);
+     test_passport_auth(si.port);
+     test_websocket(si.port);
++    test_websocket_closing(si.port);
++    test_websocket_arguments();
++    test_websocket_close_status(si.port);
++    test_websocket_protocol(si.port);
+     test_redirect(si.port, L"/redirect-temp", L"temporary");
+     test_redirect(si.port, L"/redirect-perm", L"permanent");
+     test_WinHttpGetProxyForUrl(si.port);
+diff --git a/dlls/winhttp/winhttp_private.h b/dlls/winhttp/winhttp_private.h
+index bf94c650744..05f993a70d8 100644
+--- a/dlls/winhttp/winhttp_private.h
++++ b/dlls/winhttp/winhttp_private.h
+@@ -293,6 +293,13 @@ enum fragment_type
+     SOCKET_FRAGMENT_UTF8,
+ };
+ 
++/* UTF-8 checked as it arrives, a sequence possibly split between frames */
++struct utf8_check
++{
++    unsigned char pending;      /* continuation bytes still to come */
++    unsigned char lower, upper; /* the range the next one must be in */
++};
++
+ struct socket
+ {
+     struct object_header hdr;
+@@ -308,6 +315,11 @@ struct socket
+     unsigned int mask_index;
+     BOOL close_frame_received;
+     DWORD close_frame_receive_err;
++    volatile BOOL handle_closed;
++    volatile DWORD failed;      /* what ended the connection: every later call fails with it */
++    BOOL receiving_message;     /* a fragmented message has more to come */
++    BOOL receiving_text;
++    struct utf8_check utf8;
+     USHORT status;
+     char reason[123];
+     DWORD reason_len;
+@@ -319,6 +331,7 @@ struct socket
+     char *read_buffer;
+     unsigned int bytes_in_read_buffer;
+     SRWLOCK send_lock;
++    SRWLOCK recv_lock;          /* a synchronous receive, or a close waiting for the close frame */
+     volatile LONG pending_noncontrol_send;
+     volatile LONG pending_sends;
+     volatile LONG pending_receives;

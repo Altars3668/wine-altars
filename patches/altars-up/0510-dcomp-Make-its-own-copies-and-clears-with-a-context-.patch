@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 00:16:16 -0400
+Subject: [PATCH] dcomp: Make its own copies and clears with a context state of
+ its own.
+
+A drawing surface's tiles are copied and cleared, and a texture is
+mirrored to the device a target draws with, through the immediate
+context of the application's device.  With a state of the application's
+active that emulates ID3D10Device, as Office's D3D10.1 device has, those
+calls are dropped; they now go through a state of our own, kept with
+the graphics device or the mirror and made again for another device.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/dcomp/private.h b/dlls/dcomp/private.h
+index df8b6b76f14..383059b8be0 100644
+--- a/dlls/dcomp/private.h
++++ b/dlls/dcomp/private.h
+@@ -32,7 +32,7 @@
+ #include "activation.h"
+ #include "roapi.h"
+ 
+-#include "d3d11.h"
++#include "d3d11_1.h"
+ #include "dxgi1_2.h"
+ #include "d2d1_3.h"
+ 
+@@ -472,6 +472,7 @@ struct graphics_device
+     ICompositionGraphicsDeviceInterop ICompositionGraphicsDeviceInterop_iface;
+     IUnknown *rendering_device;     /* as the application gave it */
+     ID3D11Device *d3d_device;
++    ID3DDeviceContextState *d3d_state;  /* what the calls of our own on it are made with */
+     ID2D1Device *d2d_device;
+     ID2D1Multithread *multithread;  /* the lock of the device's Direct2D factory */
+     ID2D1DeviceContext *context;    /* what BeginDraw hands out, one surface at a time */
+@@ -492,8 +493,13 @@ struct mirror
+     ID3D11Texture2D *texture;
+     ID3D11Device *device;
+     UINT version;
++    ID3DDeviceContextState *own_state, *state;  /* for the calls on the source's device and on this one */
+ };
+ 
++extern ID3D11DeviceContext1 *begin_d3d_calls( ID3D11Device *device, ID3DDeviceContextState **state,
++                                              ID3DDeviceContextState **prev );
++extern void end_d3d_calls( ID3D11DeviceContext1 *context, ID3DDeviceContextState *prev );
++
+ extern HRESULT mirror_texture( struct mirror *mirror, ID3D11Texture2D *source, UINT version, ID3D11Device *device,
+                                ID3D11Texture2D **out );
+ extern void mirror_release( struct mirror *mirror );
+diff --git a/dlls/dcomp/surface.c b/dlls/dcomp/surface.c
+index 61f26b45c00..28d8d223333 100644
+--- a/dlls/dcomp/surface.c
++++ b/dlls/dcomp/surface.c
+@@ -87,16 +87,65 @@ static HRESULT texture_create( ID3D11Device *device, UINT width, UINT height, Di
+     return hr;
+ }
+ 
+-static void texture_clear( ID3D11Device *device, ID3D11Texture2D *texture )
++/*
++ * The D3D11 calls of our own go through a state of our own: an application's device may have a state emulating
++ * ID3D10Device active, which drops them.  The state is made the first time, and again for another device.
++ */
++ID3D11DeviceContext1 *begin_d3d_calls( ID3D11Device *device, ID3DDeviceContextState **state,
++                                       ID3DDeviceContextState **prev )
++{
++    ID3D11DeviceContext1 *context;
++    ID3D11Device1 *device1;
++    ID3D11Device *owner;
++
++    *prev = NULL;
++    if (FAILED(ID3D11Device_QueryInterface( device, &IID_ID3D11Device1, (void **)&device1 ))) return NULL;
++    if (*state)
++    {
++        ID3DDeviceContextState_GetDevice( *state, &owner );
++        ID3D11Device_Release( owner );
++        if (owner != device)
++        {
++            ID3DDeviceContextState_Release( *state );
++            *state = NULL;
++        }
++    }
++    if (!*state)
++    {
++        D3D_FEATURE_LEVEL level = ID3D11Device1_GetFeatureLevel( device1 );
++
++        if (FAILED(ID3D11Device1_CreateDeviceContextState( device1, 0, &level, 1, D3D11_SDK_VERSION,
++                                                            &IID_ID3D11Device1, NULL, state )))
++            *state = NULL;
++    }
++    ID3D11Device1_GetImmediateContext1( device1, &context );
++    ID3D11Device1_Release( device1 );
++    if (*state) ID3D11DeviceContext1_SwapDeviceContextState( context, *state, prev );
++    return context;
++}
++
++void end_d3d_calls( ID3D11DeviceContext1 *context, ID3DDeviceContextState *prev )
++{
++    if (!context) return;
++    if (prev)
++    {
++        ID3D11DeviceContext1_SwapDeviceContextState( context, prev, NULL );
++        ID3DDeviceContextState_Release( prev );
++    }
++    ID3D11DeviceContext1_Release( context );
++}
++
++static void texture_clear( struct graphics_device *device, ID3D11Texture2D *texture )
+ {
+     static const float zero[4];
++    ID3DDeviceContextState *prev;
+     ID3D11RenderTargetView *view;
+-    ID3D11DeviceContext *context;
++    ID3D11DeviceContext1 *context;
+ 
+-    if (FAILED(ID3D11Device_CreateRenderTargetView( device, (ID3D11Resource *)texture, NULL, &view ))) return;
+-    ID3D11Device_GetImmediateContext( device, &context );
+-    ID3D11DeviceContext_ClearRenderTargetView( context, view, zero );
+-    ID3D11DeviceContext_Release( context );
++    if (FAILED(ID3D11Device_CreateRenderTargetView( device->d3d_device, (ID3D11Resource *)texture, NULL, &view ))) return;
++    if ((context = begin_d3d_calls( device->d3d_device, &device->d3d_state, &prev )))
++        ID3D11DeviceContext1_ClearRenderTargetView( context, view, zero );
++    end_d3d_calls( context, prev );
+     ID3D11RenderTargetView_Release( view );
+ }
+ 
+@@ -106,8 +155,11 @@ void mirror_release( struct mirror *mirror )
+ {
+     if (mirror->texture) ID3D11Texture2D_Release( mirror->texture );
+     if (mirror->device) ID3D11Device_Release( mirror->device );
++    if (mirror->own_state) ID3DDeviceContextState_Release( mirror->own_state );
++    if (mirror->state) ID3DDeviceContextState_Release( mirror->state );
+     mirror->texture = NULL;
+     mirror->device = NULL;
++    mirror->own_state = mirror->state = NULL;
+ }
+ 
+ /*
+@@ -119,7 +171,8 @@ void mirror_release( struct mirror *mirror )
+ HRESULT mirror_texture( struct mirror *mirror, ID3D11Texture2D *source, UINT version, ID3D11Device *device,
+                         ID3D11Texture2D **out )
+ {
+-    ID3D11DeviceContext *own_context, *context;
++    ID3D11DeviceContext1 *own_context, *context;
++    ID3DDeviceContextState *own_prev, *prev;
+     D3D11_MAPPED_SUBRESOURCE map;
+     D3D11_TEXTURE2D_DESC desc, mirror_desc;
+     ID3D11Texture2D *staging;
+@@ -156,18 +209,22 @@ HRESULT mirror_texture( struct mirror *mirror, ID3D11Texture2D *source, UINT ver
+         hr = ID3D11Device_CreateTexture2D( own, &desc, NULL, &staging );
+         if (SUCCEEDED(hr))
+         {
+-            ID3D11Device_GetImmediateContext( own, &own_context );
+-            ID3D11DeviceContext_CopyResource( own_context, (ID3D11Resource *)staging, (ID3D11Resource *)source );
+-            if (SUCCEEDED(hr = ID3D11DeviceContext_Map( own_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map )))
++            if (!(own_context = begin_d3d_calls( own, &mirror->own_state, &own_prev ))) hr = E_FAIL;
++            else
+             {
+-                ID3D11Device_GetImmediateContext( device, &context );
+-                ID3D11DeviceContext_UpdateSubresource( context, (ID3D11Resource *)mirror->texture, 0, NULL, map.pData,
+-                                                       map.RowPitch, 0 );
+-                ID3D11DeviceContext_Release( context );
+-                ID3D11DeviceContext_Unmap( own_context, (ID3D11Resource *)staging, 0 );
+-                mirror->version = version;
++                ID3D11DeviceContext1_CopyResource( own_context, (ID3D11Resource *)staging, (ID3D11Resource *)source );
++                if (SUCCEEDED(hr = ID3D11DeviceContext1_Map( own_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ,
++                                                             0, &map )))
++                {
++                    if ((context = begin_d3d_calls( device, &mirror->state, &prev )))
++                        ID3D11DeviceContext1_UpdateSubresource( context, (ID3D11Resource *)mirror->texture, 0, NULL,
++                                                                map.pData, map.RowPitch, 0 );
++                    end_d3d_calls( context, prev );
++                    ID3D11DeviceContext1_Unmap( own_context, (ID3D11Resource *)staging, 0 );
++                    mirror->version = version;
++                }
+             }
+-            ID3D11DeviceContext_Release( own_context );
++            end_d3d_calls( own_context, own_prev );
+             ID3D11Texture2D_Release( staging );
+         }
+         ID3D11Device_Release( own );
+@@ -252,10 +309,11 @@ static HRESULT surface_get_tile( struct drawing_surface *surface, int x, int y,
+ /* copies the part of the surface in rect to (x, y) of texture; where no tile is, texture is left as it was */
+ static void surface_read( struct drawing_surface *surface, const RECT *rect, ID3D11Resource *texture, int x, int y )
+ {
+-    ID3D11DeviceContext *context;
++    ID3DDeviceContextState *prev;
++    ID3D11DeviceContext1 *context;
+     struct tile *tile;
+ 
+-    ID3D11Device_GetImmediateContext( surface->device->d3d_device, &context );
++    if (!(context = begin_d3d_calls( surface->device->d3d_device, &surface->device->d3d_state, &prev ))) return;
+     LIST_FOR_EACH_ENTRY( tile, &surface->tiles, struct tile, entry )
+     {
+         D3D11_BOX box;
+@@ -268,21 +326,23 @@ static void surface_read( struct drawing_surface *surface, const RECT *rect, ID3
+         box.bottom = part.bottom - tile->rect.top;
+         box.front = 0;
+         box.back = 1;
+-        ID3D11DeviceContext_CopySubresourceRegion( context, texture, 0, x + part.left - rect->left,
+-                                                   y + part.top - rect->top, 0, (ID3D11Resource *)tile->texture,
+-                                                   0, &box );
++        ID3D11DeviceContext1_CopySubresourceRegion( context, texture, 0, x + part.left - rect->left,
++                                                    y + part.top - rect->top, 0, (ID3D11Resource *)tile->texture,
++                                                    0, &box );
+     }
+-    ID3D11DeviceContext_Release( context );
++    end_d3d_calls( context, prev );
+ }
+ 
+ /* copies what is at (x, y) of texture into the part of the surface in rect, making the tiles it needs */
+ static HRESULT surface_write( struct drawing_surface *surface, const RECT *rect, ID3D11Resource *texture, int x, int y )
+ {
+-    ID3D11DeviceContext *context;
++    ID3DDeviceContextState *prev;
++    ID3D11DeviceContext1 *context;
+     HRESULT hr = S_OK;
+     int tx, ty;
+ 
+-    ID3D11Device_GetImmediateContext( surface->device->d3d_device, &context );
++    if (!(context = begin_d3d_calls( surface->device->d3d_device, &surface->device->d3d_state, &prev )))
++        return E_FAIL;
+     for (ty = rect->top; ty < rect->bottom && SUCCEEDED(hr); ty = (ty - ty % TILE_SIZE) + TILE_SIZE)
+     {
+         for (tx = rect->left; tx < rect->right; tx = (tx - tx % TILE_SIZE) + TILE_SIZE)
+@@ -299,15 +359,15 @@ static HRESULT surface_write( struct drawing_surface *surface, const RECT *rect,
+             box.bottom = box.top + part.bottom - part.top;
+             box.front = 0;
+             box.back = 1;
+-            ID3D11DeviceContext_CopySubresourceRegion( context, (ID3D11Resource *)tile->texture, 0,
+-                                                       part.left - tile->rect.left, part.top - tile->rect.top, 0,
+-                                                       texture, 0, &box );
++            ID3D11DeviceContext1_CopySubresourceRegion( context, (ID3D11Resource *)tile->texture, 0,
++                                                        part.left - tile->rect.left, part.top - tile->rect.top, 0,
++                                                        texture, 0, &box );
+             tile->version++;
+             if (!surface->is_virtual) break;
+         }
+         if (!surface->is_virtual) break;
+     }
+-    ID3D11DeviceContext_Release( context );
++    end_d3d_calls( context, prev );
+     return hr;
+ }
+ 
+@@ -320,7 +380,7 @@ static HRESULT surface_scratch( struct drawing_surface *surface, UINT width, UIN
+         ID3D11Texture2D_GetDesc( surface->scratch, &desc );
+         if (desc.Width >= width && desc.Height >= height)
+         {
+-            texture_clear( surface->device->d3d_device, surface->scratch );
++            texture_clear( surface->device, surface->scratch );
+             return S_OK;
+         }
+         ID3D11Texture2D_Release( surface->scratch );
+@@ -1180,8 +1240,10 @@ static void device_release_devices( struct graphics_device *device )
+     if (device->context) ID2D1DeviceContext_Release( device->context );
+     if (device->multithread) ID2D1Multithread_Release( device->multithread );
+     if (device->d2d_device) ID2D1Device_Release( device->d2d_device );
++    if (device->d3d_state) ID3DDeviceContextState_Release( device->d3d_state );
+     if (device->d3d_device) ID3D11Device_Release( device->d3d_device );
+     if (device->rendering_device) IUnknown_Release( device->rendering_device );
++    device->d3d_state = NULL;
+     device->context = NULL;
+     device->multithread = NULL;
+     device->d2d_device = NULL;

@@ -1,0 +1,468 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:07:49 -0400
+Subject: [PATCH] mountmgr: Query backing storage attributes and match
+ descriptor buffers.
+
+Read Linux block-device attributes, including directory-backed DOS
+volumes, rather than labeling every device as a fake SCSI disk. Devices
+with no physical mapping identify themselves as Wine virtual disks.
+Report hardware seek/trim capabilities where available.
+
+Match native input-size errors, property existence, invalid query types
+and partial device descriptor copies. Seek/trim descriptors require a
+header-sized output and return only the header when the rest does not fit.
+Native isolated tests and the Wine volume suite pass.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/volume.c b/dlls/kernel32/tests/volume.c
+index 05a6ef123bc..c82fb4bf25e 100644
+--- a/dlls/kernel32/tests/volume.c
++++ b/dlls/kernel32/tests/volume.c
+@@ -668,7 +668,7 @@ static void test_disk_query_property(void)
+     DWORD size;
+     BOOL ret;
+ 
+-    handle = CreateFileA("\\\\.\\PhysicalDrive0", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
++    handle = CreateFileA("\\\\.\\PhysicalDrive0", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                          0, 0);
+     if (handle == INVALID_HANDLE_VALUE)
+     {
+@@ -761,6 +761,35 @@ static void test_disk_query_property(void)
+         ok(trim_descriptor.Size == sizeof(trim_descriptor), "got descriptor.Size %ld\n", trim_descriptor.Size);
+     }
+ 
++    {
++        static const DWORD lengths[] = {0, 1, 7, 8, 9, 16, 39, 40, 64, 1024};
++        BYTE buffer[1024];
++        unsigned int i;
++
++        query.PropertyId = StorageDeviceProperty;
++        query.QueryType = PropertyStandardQuery;
++        for (i = 0; i < ARRAY_SIZE(lengths); ++i)
++        {
++            size = 0xdeadbeef;
++            SetLastError(0xdeadbeef);
++            ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), buffer, lengths[i], &size, NULL);
++            ok(ret, "length %lu: error %lu.\n", lengths[i], GetLastError());
++            ok(size == min(lengths[i], descriptor.Size), "length %lu: got %lu.\n", lengths[i], size);
++        }
++        ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query) - 1, buffer, sizeof(buffer), &size, NULL);
++        ok(!ret && GetLastError() == ERROR_BAD_LENGTH, "Got %u, error %lu.\n", ret, GetLastError());
++        query.QueryType = PropertyExistsQuery;
++        size = 0xdeadbeef;
++        ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), buffer, 0, &size, NULL);
++        ok(ret && !size, "Got %u, size %lu, error %lu.\n", ret, size, GetLastError());
++        query.QueryType = 0x7fffffff;
++        ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), buffer, sizeof(buffer), &size, NULL);
++        ok(!ret && GetLastError() == ERROR_NOT_SUPPORTED, "Got %u, error %lu.\n", ret, GetLastError());
++        query.QueryType = PropertyStandardQuery;
++        query.PropertyId = 0x7fffffff;
++        ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), buffer, sizeof(buffer), &size, NULL);
++        ok(!ret && GetLastError() == ERROR_INVALID_FUNCTION, "Got %u, error %lu.\n", ret, GetLastError());
++    }
+     CloseHandle(handle);
+ }
+ 
+@@ -2226,6 +2255,15 @@ static void test_GetDiskSpaceInformationA(void)
+ 
+ START_TEST(volume)
+ {
++    int argc;
++    char **argv;
++
++    argc = winetest_get_mainargs(&argv);
++    if (argc >= 3 && !strcmp(argv[2], "storage_property"))
++    {
++        test_disk_query_property();
++        return;
++    }
+     hdll = GetModuleHandleA("kernel32.dll");
+     pFindFirstVolumeA = (void *) GetProcAddress(hdll, "FindFirstVolumeA");
+     pFindNextVolumeA = (void *) GetProcAddress(hdll, "FindNextVolumeA");
+diff --git a/dlls/mountmgr.sys/device.c b/dlls/mountmgr.sys/device.c
+index d5d8fb9f5b0..e6557d6e04f 100644
+--- a/dlls/mountmgr.sys/device.c
++++ b/dlls/mountmgr.sys/device.c
+@@ -1555,130 +1555,121 @@ NTSTATUS query_unix_drive( void *buff, SIZE_T insize, SIZE_T outsize, IO_STATUS_
+     return status;
+ }
+ 
++static void append_device_string( char *buffer, DWORD *length, const char *string, DWORD *offset )
++{
++    if (!*string) return;
++    *offset = *length;
++    strcpy( buffer + *length, string );
++    *length += strlen(string) + 1;
++}
++
+ static NTSTATUS query_property( struct disk_device *device, IRP *irp )
+ {
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation( irp );
+     STORAGE_PROPERTY_QUERY *query = irp->AssociatedIrp.SystemBuffer;
++    DWORD outsize = irpsp->Parameters.DeviceIoControl.OutputBufferLength;
++    struct storage_device_info info;
++    struct get_storage_device_info_params params;
++    STORAGE_PROPERTY_ID property;
++    struct dos_drive *drive;
+     NTSTATUS status;
+ 
+-    if (!irp->AssociatedIrp.SystemBuffer
+-        || irpsp->Parameters.DeviceIoControl.InputBufferLength < sizeof(STORAGE_PROPERTY_QUERY))
++    if (!query || irpsp->Parameters.DeviceIoControl.InputBufferLength < sizeof(*query))
++        return STATUS_INFO_LENGTH_MISMATCH;
++    property = query->PropertyId;
++    if (query->QueryType != PropertyStandardQuery && query->QueryType != PropertyExistsQuery)
++        return STATUS_NOT_SUPPORTED;
++    if (property != StorageDeviceProperty && property != StorageDeviceSeekPenaltyProperty &&
++        property != StorageDeviceTrimProperty)
++        return STATUS_INVALID_DEVICE_REQUEST;
++    if (query->QueryType == PropertyExistsQuery)
+     {
+-        return STATUS_INVALID_PARAMETER;
++        irp->IoStatus.Information = 0;
++        return STATUS_SUCCESS;
+     }
++    if (property != StorageDeviceProperty && outsize < sizeof(STORAGE_DESCRIPTOR_HEADER))
++        return STATUS_BUFFER_TOO_SMALL;
+ 
+-    /* Try to persuade application not to check property */
+-    if (query->QueryType == PropertyExistsQuery)
++    EnterCriticalSection( &device_section );
++    params.device = device->unix_device;
++    params.mount_point = device->volume ? device->volume->unix_mount : NULL;
++    params.info = &info;
++    params.letter = 0;
++    LIST_FOR_EACH_ENTRY( drive, &drives_list, struct dos_drive, entry )
++        if (drive->volume->device == device) { params.letter = 'a' + drive->drive; break; }
++    status = MOUNTMGR_CALL( get_storage_device_info, &params );
++    if (status)
+     {
+-        return STATUS_NOT_SUPPORTED;
++        memset( &info, 0, sizeof(info) );
++        info.bus_type = BusTypeVirtual;
++        strcpy( info.product, "Wine virtual disk" );
+     }
++    if (device->type == DEVICE_CDROM || device->type == DEVICE_DVD)
++    {
++        info.device_type = 5;
++        info.removable = TRUE;
++    }
++    else if (device->type == DEVICE_FLOPPY) info.removable = TRUE;
++    if (!*info.serial && device->disk_serial) lstrcpynA( info.serial, device->disk_serial, sizeof(info.serial) );
++    LeaveCriticalSection( &device_section );
+ 
+-    switch (query->PropertyId)
++    switch (property)
+     {
+     case StorageDeviceProperty:
+     {
+-        STORAGE_DEVICE_DESCRIPTOR *descriptor;
+-        DWORD len = sizeof(*descriptor);
+-
+-        if (device->disk_serial) len += strlen( device->disk_serial ) + 1;
+-
+-        if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(STORAGE_DESCRIPTOR_HEADER))
+-            status = STATUS_INVALID_PARAMETER;
+-        else if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < len)
++        union
+         {
+-            descriptor = irp->AssociatedIrp.SystemBuffer;
+-            descriptor->Version = sizeof(STORAGE_DEVICE_DESCRIPTOR);
+-            descriptor->Size = len;
+-            irp->IoStatus.Information = sizeof(STORAGE_DESCRIPTOR_HEADER);
+-            status = STATUS_SUCCESS;
+-        }
+-        else
+-        {
+-            FIXME( "Faking StorageDeviceProperty data\n" );
+-
+-            memset( irp->AssociatedIrp.SystemBuffer, 0, irpsp->Parameters.DeviceIoControl.OutputBufferLength );
+-            descriptor = irp->AssociatedIrp.SystemBuffer;
+-            descriptor->Version = sizeof(STORAGE_DEVICE_DESCRIPTOR);
+-            descriptor->Size = len;
+-            descriptor->DeviceType = FILE_DEVICE_DISK;
+-            descriptor->DeviceTypeModifier = 0;
+-            descriptor->RemovableMedia = FALSE;
+-            descriptor->CommandQueueing = FALSE;
+-            descriptor->VendorIdOffset = 0;
+-            descriptor->ProductIdOffset = 0;
+-            descriptor->ProductRevisionOffset = 0;
+-            descriptor->BusType = BusTypeScsi;
+-            descriptor->RawPropertiesLength = 0;
+-            if (!device->disk_serial) descriptor->SerialNumberOffset = 0;
+-            else
+-            {
+-                descriptor->SerialNumberOffset = sizeof(*descriptor);
+-                strcpy( (char *)descriptor + descriptor->SerialNumberOffset, device->disk_serial );
+-            }
+-            irp->IoStatus.Information = len;
+-            status = STATUS_SUCCESS;
+-        }
+-
++            STORAGE_DEVICE_DESCRIPTOR descriptor;
++            char buffer[sizeof(STORAGE_DEVICE_DESCRIPTOR) + sizeof(info.vendor) + sizeof(info.product) +
++                        sizeof(info.revision) + sizeof(info.serial)];
++        } storage;
++        STORAGE_DEVICE_DESCRIPTOR *descriptor = &storage.descriptor;
++        DWORD length = sizeof(*descriptor);
++
++        memset( &storage, 0, sizeof(storage) );
++        descriptor->Version = sizeof(*descriptor);
++        descriptor->DeviceType = info.device_type;
++        descriptor->RemovableMedia = info.removable;
++        descriptor->CommandQueueing = info.command_queueing;
++        descriptor->BusType = info.bus_type;
++        append_device_string( storage.buffer, &length, info.vendor, &descriptor->VendorIdOffset );
++        append_device_string( storage.buffer, &length, info.product, &descriptor->ProductIdOffset );
++        append_device_string( storage.buffer, &length, info.revision, &descriptor->ProductRevisionOffset );
++        append_device_string( storage.buffer, &length, info.serial, &descriptor->SerialNumberOffset );
++        descriptor->Size = length;
++        length = min( outsize, length );
++        if (length) memcpy( query, &storage, length );
++        irp->IoStatus.Information = length;
+         break;
+     }
+     case StorageDeviceSeekPenaltyProperty:
+     {
+-        DEVICE_SEEK_PENALTY_DESCRIPTOR *d = irp->AssociatedIrp.SystemBuffer;
++        DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor;
++        DWORD length = outsize < sizeof(descriptor) ? sizeof(STORAGE_DESCRIPTOR_HEADER) : sizeof(descriptor);
+ 
+-        if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(STORAGE_DESCRIPTOR_HEADER))
+-        {
+-            status = STATUS_INVALID_PARAMETER;
+-        }
+-        else
+-        {
+-            if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*d))
+-            {
+-                d->Version = d->Size = sizeof(*d);
+-                irp->IoStatus.Information = sizeof(STORAGE_DESCRIPTOR_HEADER);
+-            }
+-            else
+-            {
+-                FIXME( "Faking StorageDeviceSeekPenaltyProperty data.\n" );
+-
+-                memset( d, 0, sizeof(*d) );
+-                d->Version = d->Size = sizeof(*d);
+-                irp->IoStatus.Information = sizeof(*d);
+-            }
+-            status = STATUS_SUCCESS;
+-        }
++        memset( &descriptor, 0, sizeof(descriptor) );
++        descriptor.Version = descriptor.Size = sizeof(descriptor);
++        descriptor.IncursSeekPenalty = info.seek_penalty;
++        memcpy( query, &descriptor, length );
++        irp->IoStatus.Information = length;
+         break;
+     }
+     case StorageDeviceTrimProperty:
+     {
+-        DEVICE_TRIM_DESCRIPTOR *d = irp->AssociatedIrp.SystemBuffer;
++        DEVICE_TRIM_DESCRIPTOR descriptor;
++        DWORD length = outsize < sizeof(descriptor) ? sizeof(STORAGE_DESCRIPTOR_HEADER) : sizeof(descriptor);
+ 
+-        if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(STORAGE_DESCRIPTOR_HEADER))
+-            status = STATUS_INVALID_PARAMETER;
+-        else
+-        {
+-            if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*d))
+-            {
+-                d->Version = d->Size = sizeof(*d);
+-                irp->IoStatus.Information = sizeof(STORAGE_DESCRIPTOR_HEADER);
+-            }
+-            else
+-            {
+-                FIXME( "Returning TRUE for StorageDeviceTrimProperty.\n" );
+-                d->Version = d->Size = sizeof(*d);
+-                d->TrimEnabled = TRUE;
+-                irp->IoStatus.Information = sizeof(*d);
+-            }
+-            status = STATUS_SUCCESS;
+-        }
++        memset( &descriptor, 0, sizeof(descriptor) );
++        descriptor.Version = descriptor.Size = sizeof(descriptor);
++        descriptor.TrimEnabled = info.trim_enabled;
++        memcpy( query, &descriptor, length );
++        irp->IoStatus.Information = length;
+         break;
+     }
+-
+     default:
+-        FIXME( "Unsupported property %#x\n", query->PropertyId );
+-        status = STATUS_NOT_SUPPORTED;
+         break;
+     }
+-    return status;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS WINAPI disk_query_volume( DEVICE_OBJECT *device, IRP *irp )
+diff --git a/dlls/mountmgr.sys/unixlib.c b/dlls/mountmgr.sys/unixlib.c
+index 235e3ae16c7..84600af7b74 100644
+--- a/dlls/mountmgr.sys/unixlib.c
++++ b/dlls/mountmgr.sys/unixlib.c
+@@ -30,6 +30,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
++#ifdef __linux__
++#include <sys/sysmacros.h>
++#endif
+ #ifdef HAVE_SYS_STATFS_H
+ #include <sys/statfs.h>
+ #endif
+@@ -43,6 +46,7 @@
+ #include <unistd.h>
+ 
+ #include "unixlib.h"
++#include "winioctl.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mountmgr);
+@@ -610,6 +614,94 @@ static NTSTATUS get_shell_folder( void *args )
+     return status;
+ }
+ 
++#ifdef __linux__
++static BOOL read_storage_attribute( const char *directory, const char *attribute, char *buffer, size_t size )
++{
++    char path[4096];
++    ssize_t len;
++    int fd;
++
++    if (snprintf( path, sizeof(path), "%s/%s", directory, attribute ) >= sizeof(path)) return FALSE;
++    if ((fd = open( path, O_RDONLY | O_CLOEXEC )) == -1) return FALSE;
++    len = read( fd, buffer, size - 1 );
++    close( fd );
++    if (len <= 0) return FALSE;
++    while (len && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r' || buffer[len - 1] == ' ')) len--;
++    buffer[len] = 0;
++    return TRUE;
++}
++#endif
++
++static NTSTATUS get_storage_device_info( void *args )
++{
++#ifdef __linux__
++    const struct get_storage_device_info_params *params = args;
++    struct storage_device_info *info = params->info;
++    char link[128], directory[4096], value[128];
++    const char *name;
++    struct stat st;
++    dev_t dev;
++
++    memset( info, 0, sizeof(*info) );
++    if (params->device && !stat( params->device, &st ))
++    {
++        if (S_ISBLK( st.st_mode )) dev = st.st_rdev;
++        else if (S_ISDIR( st.st_mode )) dev = st.st_dev;
++        else return STATUS_NOT_SUPPORTED;
++    }
++    else if (params->mount_point && !stat( params->mount_point, &st )) dev = st.st_dev;
++    else if (params->letter)
++    {
++        char drive[3] = { params->letter, ':', 0 };
++        char *path = get_dosdevices_path( drive );
++        int ret;
++
++        if (!path) return STATUS_NO_MEMORY;
++        ret = stat( path, &st );
++        free( path );
++        if (ret) return STATUS_NOT_SUPPORTED;
++        dev = st.st_dev;
++    }
++    else return STATUS_NOT_SUPPORTED;
++    snprintf( link, sizeof(link), "/sys/dev/block/%u:%u", major(dev), minor(dev) );
++    if (!realpath( link, directory )) return STATUS_NOT_SUPPORTED;
++    if (read_storage_attribute( directory, "partition", value, sizeof(value) ))
++    {
++        char *slash = strrchr( directory, '/' );
++        if (slash) *slash = 0;
++    }
++    name = strrchr( directory, '/' );
++    if (!name) return STATUS_NOT_SUPPORTED;
++    name++;
++    if (strstr( directory, "/nvme/" ) || !strncmp( name, "nvme", 4 )) info->bus_type = BusTypeNvme;
++    else if (strstr( directory, "/usb" )) info->bus_type = BusTypeUsb;
++    else if (strstr( directory, "/ata" )) info->bus_type = BusTypeSata;
++    else if (strstr( directory, "/virtio" ) || !strncmp( name, "dm-", 3 )) info->bus_type = BusTypeVirtual;
++    else if (!strncmp( name, "loop", 4 )) info->bus_type = BusTypeFileBackedVirtual;
++    else if (strstr( directory, "/scsi" ) || !strncmp( name, "sd", 2 ) || !strncmp( name, "sr", 2 ))
++        info->bus_type = BusTypeScsi;
++
++    read_storage_attribute( directory, "device/vendor", info->vendor, sizeof(info->vendor) );
++    read_storage_attribute( directory, "device/model", info->product, sizeof(info->product) );
++    if (!read_storage_attribute( directory, "device/rev", info->revision, sizeof(info->revision) ))
++        read_storage_attribute( directory, "device/firmware_rev", info->revision, sizeof(info->revision) );
++    read_storage_attribute( directory, "device/serial", info->serial, sizeof(info->serial) );
++    if (read_storage_attribute( directory, "device/type", value, sizeof(value) )) info->device_type = strtoul( value, NULL, 0 );
++    if (read_storage_attribute( directory, "removable", value, sizeof(value) )) info->removable = !!strtoul( value, NULL, 0 );
++    if (read_storage_attribute( directory, "queue/rotational", value, sizeof(value) )) info->seek_penalty = !!strtoul( value, NULL, 0 );
++    if (read_storage_attribute( directory, "queue/discard_max_bytes", value, sizeof(value) )) info->trim_enabled = !!strtoull( value, NULL, 0 );
++    if (read_storage_attribute( directory, "device/queue_depth", value, sizeof(value) ))
++        info->command_queueing = strtoul( value, NULL, 0 ) > 1;
++    else if (read_storage_attribute( directory, "queue/nr_requests", value, sizeof(value) ))
++        info->command_queueing = strtoul( value, NULL, 0 ) > 1;
++    /* SATA devices often identify themselves as ATA rather than naming their transport. */
++    if (info->bus_type == BusTypeScsi && !strcmp( info->vendor, "ATA" )) info->bus_type = BusTypeSata;
++    return STATUS_SUCCESS;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     run_loop,
+@@ -635,6 +727,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     write_credential,
+     delete_credential,
+     enumerate_credentials,
++    get_storage_device_info,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+diff --git a/dlls/mountmgr.sys/unixlib.h b/dlls/mountmgr.sys/unixlib.h
+index 4fe31d23db3..c4b7115a64a 100644
+--- a/dlls/mountmgr.sys/unixlib.h
++++ b/dlls/mountmgr.sys/unixlib.h
+@@ -169,6 +169,28 @@ struct ioctl_params
+     ULONG *info;
+ };
+ 
++struct storage_device_info
++{
++    ULONG device_type;
++    ULONG bus_type;
++    BOOL removable;
++    BOOL command_queueing;
++    BOOL seek_penalty;
++    BOOL trim_enabled;
++    char vendor[64];
++    char product[128];
++    char revision[64];
++    char serial[128];
++};
++
++struct get_storage_device_info_params
++{
++    const char *device;
++    const char *mount_point;
++    struct storage_device_info *info;
++    ULONG letter;
++};
++
+ enum mountmgr_funcs
+ {
+     unix_run_loop,
+@@ -194,6 +216,7 @@ enum mountmgr_funcs
+     unix_write_credential,
+     unix_delete_credential,
+     unix_enumerate_credentials,
++    unix_get_storage_device_info,
+     unix_funcs_count
+ };
+ 

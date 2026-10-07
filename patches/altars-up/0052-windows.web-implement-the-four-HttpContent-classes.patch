@@ -1,0 +1,1003 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 14:09:32 -0400
+Subject: [PATCH] windows.web: implement the four HttpContent classes.
+
+One body, four ways of giving it: a string, a buffer, a stream, or a list of
+other contents.  They are the same object with a different source, so what they
+share -- the headers, the length, the identity -- is written once.
+
+A string content knows its own length in the bytes that will travel, which is
+UTF-8 and not the UTF-16 the HSTRING holds, so a caller that sets
+Content-Length from it sets one it can keep.  A buffer content refuses a window
+that runs past the end of its buffer rather than describing a body nobody can
+send.  A stream content and a multipart one both decline to state a length:
+a stream is as long as it turns out to be, and a multipart body's length
+depends on a boundary chosen when it is written.
+
+The factories set Content-Type the way a caller would, through the same header
+map, and the encodings this does not write say so rather than quietly producing
+UTF-8 under another name.
+
+Reading a body back needs asynchronous operations and stream types this tree
+does not have; each of those four says which one.
+
+classes.idl gains all six of the new classes, including the two messages the
+last commit added and left out of it: the registration resource is what
+regsvr32 writes, and a class missing from it works only where someone wrote the
+registry by hand.
+
+tools/winrtprobe checks the length is counted in UTF-8 bytes, that the default
+and the explicit media type both land in the header map, that ToString gives a
+string content's own text back, that an unimplemented encoding says so, and
+that a multipart content refuses a null part.  58 of 58 checks pass against the
+prefix Office runs in.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+(cherry picked from commit cd6a6fed2cdb2963f9eb7923578344baede00810)
+
+diff --git a/dlls/windows.web/Makefile.in b/dlls/windows.web/Makefile.in
+index dda885b6580..e261844b420 100644
+--- a/dlls/windows.web/Makefile.in
++++ b/dlls/windows.web/Makefile.in
+@@ -3,6 +3,7 @@ IMPORTS = combase
+ 
+ SOURCES = \
+ 	classes.idl \
++	content.c \
+ 	filters.c \
+ 	http.c \
+ 	json_array.c \
+diff --git a/dlls/windows.web/classes.idl b/dlls/windows.web/classes.idl
+index bd80779f184..644997f5793 100644
+--- a/dlls/windows.web/classes.idl
++++ b/dlls/windows.web/classes.idl
+@@ -32,8 +32,14 @@ namespace Windows.Data.Json {
+ }
+ 
+ namespace Windows.Web.Http {
++    runtimeclass HttpBufferContent;
+     runtimeclass HttpClient;
+     runtimeclass HttpMethod;
++    runtimeclass HttpMultipartFormDataContent;
++    runtimeclass HttpRequestMessage;
++    runtimeclass HttpResponseMessage;
++    runtimeclass HttpStreamContent;
++    runtimeclass HttpStringContent;
+ }
+ 
+ namespace Windows.Web.Http.Filters {
+diff --git a/dlls/windows.web/content.c b/dlls/windows.web/content.c
+new file mode 100644
+index 00000000000..ed8c3fe2236
+--- /dev/null
++++ b/dlls/windows.web/content.c
+@@ -0,0 +1,885 @@
++/* WinRT Windows.Web.Http content classes
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(web);
++
++/*
++ * One body, four ways of giving it.
++ *
++ * All four are the same object with a different source: a string, a buffer, a
++ * stream, or a list of other contents.  What they share -- the headers, the
++ * length, the identity -- is here once.  The asynchronous readers need the
++ * operations and the stream types this tree does not have, and say so; what a
++ * caller can do today is build a content, set its type, ask its length and
++ * hand it to a request.
++ */
++
++enum content_kind
++{
++    CONTENT_STRING,
++    CONTENT_BUFFER,
++    CONTENT_STREAM,
++    CONTENT_MULTIPART,
++};
++
++struct part
++{
++    struct list link;
++    IHttpContent *content;
++    HSTRING name;
++    HSTRING file_name;
++};
++
++struct http_content
++{
++    IHttpContent IHttpContent_iface;
++    IHttpMultipartFormDataContent IHttpMultipartFormDataContent_iface;
++    IClosable IClosable_iface;
++    IStringable IStringable_iface;
++    LONG ref;
++
++    enum content_kind kind;
++    IMap_HSTRING_HSTRING *headers;
++
++    /* CONTENT_STRING */
++    HSTRING text;
++    UINT64 text_bytes;
++    /* CONTENT_BUFFER */
++    IBuffer *buffer;
++    UINT32 offset;
++    UINT32 count;
++    /* CONTENT_STREAM */
++    IInputStream *stream;
++    /* CONTENT_MULTIPART */
++    struct list parts;
++};
++
++static inline struct http_content *impl_from_IHttpContent( IHttpContent *iface )
++{
++    return CONTAINING_RECORD( iface, struct http_content, IHttpContent_iface );
++}
++
++static const WCHAR *content_class_name( enum content_kind kind )
++{
++    switch (kind)
++    {
++    case CONTENT_STRING: return RuntimeClass_Windows_Web_Http_HttpStringContent;
++    case CONTENT_BUFFER: return RuntimeClass_Windows_Web_Http_HttpBufferContent;
++    case CONTENT_STREAM: return RuntimeClass_Windows_Web_Http_HttpStreamContent;
++    default: return RuntimeClass_Windows_Web_Http_HttpMultipartFormDataContent;
++    }
++}
++
++static HRESULT WINAPI content_QueryInterface( IHttpContent *iface, REFIID iid, void **out )
++{
++    struct http_content *impl = impl_from_IHttpContent( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IHttpContent ))
++    {
++        *out = &impl->IHttpContent_iface;
++        IInspectable_AddRef( (*out) );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IHttpMultipartFormDataContent ) && impl->kind == CONTENT_MULTIPART)
++    {
++        *out = &impl->IHttpMultipartFormDataContent_iface;
++        IInspectable_AddRef( (*out) );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IClosable ))
++    {
++        *out = &impl->IClosable_iface;
++        IInspectable_AddRef( (*out) );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IStringable ))
++    {
++        *out = &impl->IStringable_iface;
++        IInspectable_AddRef( (*out) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI content_AddRef( IHttpContent *iface )
++{
++    struct http_content *impl = impl_from_IHttpContent( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI content_Release( IHttpContent *iface )
++{
++    struct http_content *impl = impl_from_IHttpContent( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        struct part *part, *next;
++
++        if (impl->headers) IMap_HSTRING_HSTRING_Release( impl->headers );
++        WindowsDeleteString( impl->text );
++        if (impl->buffer) IBuffer_Release( impl->buffer );
++        if (impl->stream) IInputStream_Release( impl->stream );
++        LIST_FOR_EACH_ENTRY_SAFE( part, next, &impl->parts, struct part, link )
++        {
++            list_remove( &part->link );
++            IHttpContent_Release( part->content );
++            WindowsDeleteString( part->name );
++            WindowsDeleteString( part->file_name );
++            free( part );
++        }
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI content_GetIids( IHttpContent *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_GetRuntimeClassName( IHttpContent *iface, HSTRING *class_name )
++{
++    struct http_content *impl = impl_from_IHttpContent( iface );
++    const WCHAR *name = content_class_name( impl->kind );
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI content_GetTrustLevel( IHttpContent *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI content_get_Headers( IHttpContent *iface, IMap_HSTRING_HSTRING **value )
++{
++    struct http_content *impl = impl_from_IHttpContent( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    IMap_HSTRING_HSTRING_AddRef( impl->headers );
++    *value = impl->headers;
++    return S_OK;
++}
++
++/* Reading a body back needs the asynchronous operations and the stream types
++ * this tree does not have; each says which one rather than handing back an
++ * operation that never completes. */
++#define CONTENT_READER_NOT_IMPLEMENTED( name, needs )                                              \
++    static HRESULT WINAPI content_##name( IHttpContent *iface, IInspectable **operation )          \
++    {                                                                                              \
++        FIXME( "iface %p, operation %p: " #name " needs " needs ".\n", iface, operation );          \
++        if (operation) *operation = NULL;                                                          \
++        return E_NOTIMPL;                                                                          \
++    }
++
++CONTENT_READER_NOT_IMPLEMENTED( BufferAllAsync, "IAsyncOperationWithProgress<IHttpContent *, UINT64>" )
++CONTENT_READER_NOT_IMPLEMENTED( ReadAsBufferAsync, "Windows.Storage.Streams.IBuffer and its async operation" )
++CONTENT_READER_NOT_IMPLEMENTED( ReadAsInputStreamAsync, "Windows.Storage.Streams.IInputStream" )
++CONTENT_READER_NOT_IMPLEMENTED( ReadAsStringAsync, "IAsyncOperationWithProgress<HSTRING, UINT64>" )
++
++static HRESULT WINAPI content_TryComputeLength( IHttpContent *iface, UINT64 *length, boolean *success )
++{
++    struct http_content *impl = impl_from_IHttpContent( iface );
++
++    TRACE( "iface %p, length %p, success %p.\n", iface, length, success );
++
++    if (!length || !success) return E_POINTER;
++    *length = 0;
++    *success = FALSE;
++
++    switch (impl->kind)
++    {
++    case CONTENT_STRING:
++        *length = impl->text_bytes;
++        *success = TRUE;
++        return S_OK;
++
++    case CONTENT_BUFFER:
++        *length = impl->count;
++        *success = TRUE;
++        return S_OK;
++
++    case CONTENT_STREAM:
++        /* A stream is as long as it turns out to be; saying otherwise would
++         * have the caller send a Content-Length it cannot keep. */
++        return S_OK;
++
++    case CONTENT_MULTIPART:
++        /* The length depends on a boundary that is only chosen when the body
++         * is written, which this does not do yet. */
++        return S_OK;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI content_WriteToStreamAsync( IHttpContent *iface, IInspectable *stream,
++                                                  IInspectable **operation )
++{
++    FIXME( "iface %p, stream %p, operation %p: needs Windows.Storage.Streams.IOutputStream.\n",
++           iface, stream, operation );
++    if (operation) *operation = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IHttpContentVtbl content_vtbl =
++{
++    content_QueryInterface,
++    content_AddRef,
++    content_Release,
++    /* IInspectable methods */
++    content_GetIids,
++    content_GetRuntimeClassName,
++    content_GetTrustLevel,
++    /* IHttpContent methods */
++    content_get_Headers,
++    content_BufferAllAsync,
++    content_ReadAsBufferAsync,
++    content_ReadAsInputStreamAsync,
++    content_ReadAsStringAsync,
++    content_TryComputeLength,
++    content_WriteToStreamAsync,
++};
++
++DEFINE_IINSPECTABLE_( content_multipart, IHttpMultipartFormDataContent, struct http_content,
++                      impl_from_IHttpMultipartFormDataContent,
++                      IHttpMultipartFormDataContent_iface, &impl->IHttpContent_iface )
++
++static HRESULT add_part( struct http_content *impl, IHttpContent *content, HSTRING name, HSTRING file_name )
++{
++    struct part *part;
++    HRESULT hr;
++
++    if (!content) return E_INVALIDARG;
++    if (!(part = calloc( 1, sizeof(*part) ))) return E_OUTOFMEMORY;
++
++    if (FAILED(hr = WindowsDuplicateString( name, &part->name )) ||
++        FAILED(hr = WindowsDuplicateString( file_name, &part->file_name )))
++    {
++        WindowsDeleteString( part->name );
++        free( part );
++        return hr;
++    }
++    IHttpContent_AddRef( content );
++    part->content = content;
++    list_add_tail( &impl->parts, &part->link );
++    return S_OK;
++}
++
++static HRESULT WINAPI content_multipart_Add( IHttpMultipartFormDataContent *iface, IHttpContent *content )
++{
++    struct http_content *impl = impl_from_IHttpMultipartFormDataContent( iface );
++
++    TRACE( "iface %p, content %p.\n", iface, content );
++
++    return add_part( impl, content, NULL, NULL );
++}
++
++static HRESULT WINAPI content_multipart_AddWithName( IHttpMultipartFormDataContent *iface,
++                                                     IHttpContent *content, HSTRING name )
++{
++    struct http_content *impl = impl_from_IHttpMultipartFormDataContent( iface );
++
++    TRACE( "iface %p, content %p, name %s.\n", iface, content, debugstr_hstring( name ) );
++
++    return add_part( impl, content, name, NULL );
++}
++
++static HRESULT WINAPI content_multipart_AddWithNameAndFileName( IHttpMultipartFormDataContent *iface,
++        IHttpContent *content, HSTRING name, HSTRING file_name )
++{
++    struct http_content *impl = impl_from_IHttpMultipartFormDataContent( iface );
++
++    TRACE( "iface %p, content %p, name %s, file_name %s.\n", iface, content,
++           debugstr_hstring( name ), debugstr_hstring( file_name ) );
++
++    return add_part( impl, content, name, file_name );
++}
++
++static const struct IHttpMultipartFormDataContentVtbl content_multipart_vtbl =
++{
++    content_multipart_QueryInterface,
++    content_multipart_AddRef,
++    content_multipart_Release,
++    /* IInspectable methods */
++    content_multipart_GetIids,
++    content_multipart_GetRuntimeClassName,
++    content_multipart_GetTrustLevel,
++    /* IHttpMultipartFormDataContent methods */
++    content_multipart_Add,
++    content_multipart_AddWithName,
++    content_multipart_AddWithNameAndFileName,
++};
++
++DEFINE_IINSPECTABLE_( content_closable, IClosable, struct http_content, impl_from_content_IClosable,
++                      IClosable_iface, &impl->IHttpContent_iface )
++
++static HRESULT WINAPI content_closable_Close( IClosable *iface )
++{
++    struct http_content *impl = impl_from_content_IClosable( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    if (impl->stream)
++    {
++        IInputStream_Release( impl->stream );
++        impl->stream = NULL;
++    }
++    return S_OK;
++}
++
++static const struct IClosableVtbl content_closable_vtbl =
++{
++    content_closable_QueryInterface,
++    content_closable_AddRef,
++    content_closable_Release,
++    /* IInspectable methods */
++    content_closable_GetIids,
++    content_closable_GetRuntimeClassName,
++    content_closable_GetTrustLevel,
++    /* IClosable methods */
++    content_closable_Close,
++};
++
++DEFINE_IINSPECTABLE_( content_stringable, IStringable, struct http_content, impl_from_content_IStringable,
++                      IStringable_iface, &impl->IHttpContent_iface )
++
++static HRESULT WINAPI content_stringable_ToString( IStringable *iface, HSTRING *value )
++{
++    struct http_content *impl = impl_from_content_IStringable( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    /* A string content is its string; the others are named by their class,
++     * since their body is not text to begin with. */
++    if (impl->kind == CONTENT_STRING) return WindowsDuplicateString( impl->text, value );
++    return WindowsCreateString( content_class_name( impl->kind ),
++                                wcslen( content_class_name( impl->kind ) ), value );
++}
++
++static const struct IStringableVtbl content_stringable_vtbl =
++{
++    content_stringable_QueryInterface,
++    content_stringable_AddRef,
++    content_stringable_Release,
++    /* IInspectable methods */
++    content_stringable_GetIids,
++    content_stringable_GetRuntimeClassName,
++    content_stringable_GetTrustLevel,
++    /* IStringable methods */
++    content_stringable_ToString,
++};
++
++static HRESULT create_content( enum content_kind kind, struct http_content **out )
++{
++    struct http_content *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++
++    impl->IHttpContent_iface.lpVtbl = &content_vtbl;
++    impl->IHttpMultipartFormDataContent_iface.lpVtbl = &content_multipart_vtbl;
++    impl->IClosable_iface.lpVtbl = &content_closable_vtbl;
++    impl->IStringable_iface.lpVtbl = &content_stringable_vtbl;
++    impl->ref = 1;
++    impl->kind = kind;
++    list_init( &impl->parts );
++    if (FAILED(hr = create_string_map( &impl->headers )))
++    {
++        free( impl );
++        return hr;
++    }
++
++    *out = impl;
++    return S_OK;
++}
++
++/* Content-Type is a header like any other, and the factories that take a media
++ * type set it the way a caller would. */
++static HRESULT set_media_type( struct http_content *impl, const WCHAR *media_type )
++{
++    HSTRING name = NULL, value = NULL;
++    HRESULT hr;
++
++    if (FAILED(hr = WindowsCreateString( L"Content-Type", 12, &name ))) return hr;
++    if (SUCCEEDED(hr = WindowsCreateString( media_type, wcslen( media_type ), &value )))
++    {
++        hr = IMap_HSTRING_HSTRING_Insert( impl->headers, name, value, NULL );
++        WindowsDeleteString( value );
++    }
++    WindowsDeleteString( name );
++    return hr;
++}
++
++/*** the three factories ***/
++
++#define CONTENT_FACTORY( pfx, iface_type, iid_name )                                               \
++    struct pfx##_statics                                                                           \
++    {                                                                                              \
++        IActivationFactory IActivationFactory_iface;                                               \
++        iface_type iface_type##_iface;                                                             \
++        LONG ref;                                                                                  \
++    };                                                                                             \
++    static inline struct pfx##_statics *pfx##_from_IActivationFactory( IActivationFactory *iface ) \
++    {                                                                                              \
++        return CONTAINING_RECORD( iface, struct pfx##_statics, IActivationFactory_iface );         \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_factory_QueryInterface( IActivationFactory *iface, REFIID iid,     \
++                                                        void **out )                               \
++    {                                                                                              \
++        struct pfx##_statics *impl = pfx##_from_IActivationFactory( iface );                       \
++        TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );                  \
++        if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||          \
++            IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))  \
++        {                                                                                          \
++            *out = &impl->IActivationFactory_iface;                                                \
++            IInspectable_AddRef( (*out) );                                                         \
++            return S_OK;                                                                           \
++        }                                                                                          \
++        if (IsEqualGUID( iid, &iid_name ))                                                         \
++        {                                                                                          \
++            *out = &impl->iface_type##_iface;                                                      \
++            IInspectable_AddRef( (*out) );                                                         \
++            return S_OK;                                                                           \
++        }                                                                                          \
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );           \
++        *out = NULL;                                                                               \
++        return E_NOINTERFACE;                                                                      \
++    }                                                                                              \
++    static ULONG WINAPI pfx##_factory_AddRef( IActivationFactory *iface )                          \
++    {                                                                                              \
++        return InterlockedIncrement( &pfx##_from_IActivationFactory( iface )->ref );               \
++    }                                                                                              \
++    static ULONG WINAPI pfx##_factory_Release( IActivationFactory *iface )                         \
++    {                                                                                              \
++        return InterlockedDecrement( &pfx##_from_IActivationFactory( iface )->ref );               \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_factory_GetIids( IActivationFactory *iface, ULONG *c, IID **i )    \
++    {                                                                                              \
++        FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, c, i );                            \
++        return E_NOTIMPL;                                                                          \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *n )\
++    {                                                                                              \
++        FIXME( "iface %p, class_name %p stub!\n", iface, n );                                       \
++        return E_NOTIMPL;                                                                          \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *t )  \
++    {                                                                                              \
++        FIXME( "iface %p, trust_level %p stub!\n", iface, t );                                      \
++        return E_NOTIMPL;                                                                          \
++    }
++
++CONTENT_FACTORY( string_content, IHttpStringContentFactory, IID_IHttpStringContentFactory )
++
++static HRESULT WINAPI string_content_factory_ActivateInstance( IActivationFactory *iface,
++                                                               IInspectable **instance )
++{
++    /* HttpStringContent is always made from a string. */
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    if (instance) *instance = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl string_content_factory_vtbl =
++{
++    string_content_factory_QueryInterface,
++    string_content_factory_AddRef,
++    string_content_factory_Release,
++    string_content_factory_GetIids,
++    string_content_factory_GetRuntimeClassName,
++    string_content_factory_GetTrustLevel,
++    string_content_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE_( string_create, IHttpStringContentFactory, struct string_content_statics,
++                      string_content_statics_from_IHttpStringContentFactory,
++                      IHttpStringContentFactory_iface, &impl->IActivationFactory_iface )
++
++static HRESULT create_string_content( HSTRING text, const WCHAR *media_type, IHttpContent **out )
++{
++    struct http_content *impl;
++    const WCHAR *raw;
++    UINT32 len = 0;
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (FAILED(hr = create_content( CONTENT_STRING, &impl ))) return hr;
++
++    if (FAILED(hr = WindowsDuplicateString( text, &impl->text )))
++    {
++        IHttpContent_Release( &impl->IHttpContent_iface );
++        return hr;
++    }
++
++    /* The body travels as UTF-8, so that is the length a caller is told. */
++    raw = WindowsGetStringRawBuffer( impl->text, &len );
++    if (raw && len)
++        impl->text_bytes = WideCharToMultiByte( CP_UTF8, 0, raw, len, NULL, 0, NULL, NULL );
++
++    if (media_type && FAILED(hr = set_media_type( impl, media_type )))
++    {
++        IHttpContent_Release( &impl->IHttpContent_iface );
++        return hr;
++    }
++
++    *out = &impl->IHttpContent_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI string_create_CreateFromString( IHttpStringContentFactory *iface, HSTRING content,
++                                                      IHttpContent **value )
++{
++    TRACE( "iface %p, content %s, value %p.\n", iface, debugstr_hstring( content ), value );
++    return create_string_content( content, L"text/plain; charset=utf-8", value );
++}
++
++static HRESULT WINAPI string_create_CreateFromStringWithEncoding( IHttpStringContentFactory *iface,
++        HSTRING content, UnicodeEncoding encoding, IHttpContent **value )
++{
++    TRACE( "iface %p, content %s, encoding %d, value %p.\n", iface, debugstr_hstring( content ),
++           encoding, value );
++
++    if (encoding != UnicodeEncoding_Utf8)
++    {
++        FIXME( "only UTF-8 bodies are written; encoding %d is not implemented.\n", encoding );
++        if (value) *value = NULL;
++        return E_NOTIMPL;
++    }
++    return create_string_content( content, L"text/plain; charset=utf-8", value );
++}
++
++static HRESULT WINAPI string_create_CreateFromStringWithEncodingAndMediaType(
++        IHttpStringContentFactory *iface, HSTRING content, UnicodeEncoding encoding, HSTRING media_type,
++        IHttpContent **value )
++{
++    TRACE( "iface %p, content %s, encoding %d, media_type %s, value %p.\n", iface,
++           debugstr_hstring( content ), encoding, debugstr_hstring( media_type ), value );
++
++    if (encoding != UnicodeEncoding_Utf8)
++    {
++        FIXME( "only UTF-8 bodies are written; encoding %d is not implemented.\n", encoding );
++        if (value) *value = NULL;
++        return E_NOTIMPL;
++    }
++    if (!media_type || !WindowsGetStringLen( media_type )) return E_INVALIDARG;
++    return create_string_content( content, WindowsGetStringRawBuffer( media_type, NULL ), value );
++}
++
++static const struct IHttpStringContentFactoryVtbl string_create_vtbl =
++{
++    string_create_QueryInterface,
++    string_create_AddRef,
++    string_create_Release,
++    string_create_GetIids,
++    string_create_GetRuntimeClassName,
++    string_create_GetTrustLevel,
++    string_create_CreateFromString,
++    string_create_CreateFromStringWithEncoding,
++    string_create_CreateFromStringWithEncodingAndMediaType,
++};
++
++static struct string_content_statics string_content_statics =
++{
++    {&string_content_factory_vtbl},
++    {&string_create_vtbl},
++    1,
++};
++
++IActivationFactory *http_string_content_factory = &string_content_statics.IActivationFactory_iface;
++
++CONTENT_FACTORY( buffer_content, IHttpBufferContentFactory, IID_IHttpBufferContentFactory )
++
++static HRESULT WINAPI buffer_content_factory_ActivateInstance( IActivationFactory *iface,
++                                                               IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    if (instance) *instance = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl buffer_content_factory_vtbl =
++{
++    buffer_content_factory_QueryInterface,
++    buffer_content_factory_AddRef,
++    buffer_content_factory_Release,
++    buffer_content_factory_GetIids,
++    buffer_content_factory_GetRuntimeClassName,
++    buffer_content_factory_GetTrustLevel,
++    buffer_content_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE_( buffer_create, IHttpBufferContentFactory, struct buffer_content_statics,
++                      buffer_content_statics_from_IHttpBufferContentFactory,
++                      IHttpBufferContentFactory_iface, &impl->IActivationFactory_iface )
++
++static HRESULT create_buffer_content( IBuffer *buffer, UINT32 offset, UINT32 count, IHttpContent **out )
++{
++    struct http_content *impl;
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!buffer) return E_INVALIDARG;
++    if (FAILED(hr = create_content( CONTENT_BUFFER, &impl ))) return hr;
++
++    IBuffer_AddRef( buffer );
++    impl->buffer = buffer;
++    impl->offset = offset;
++    impl->count = count;
++
++    *out = &impl->IHttpContent_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI buffer_create_CreateFromBuffer( IHttpBufferContentFactory *iface, IBuffer *content,
++                                                      IHttpContent **value )
++{
++    UINT32 length = 0;
++
++    TRACE( "iface %p, content %p, value %p.\n", iface, content, value );
++
++    if (!content) return E_INVALIDARG;
++    IBuffer_get_Length( content, &length );
++    return create_buffer_content( content, 0, length, value );
++}
++
++static HRESULT WINAPI buffer_create_CreateFromBufferWithOffset( IHttpBufferContentFactory *iface,
++        IBuffer *content, UINT32 offset, UINT32 count, IHttpContent **value )
++{
++    UINT32 length = 0;
++
++    TRACE( "iface %p, content %p, offset %u, count %u, value %p.\n", iface, content, offset, count, value );
++
++    if (!content) return E_INVALIDARG;
++    IBuffer_get_Length( content, &length );
++    /* A window past the end of the buffer is not a body anyone can send. */
++    if (offset > length || count > length - offset) return E_BOUNDS;
++    return create_buffer_content( content, offset, count, value );
++}
++
++static const struct IHttpBufferContentFactoryVtbl buffer_create_vtbl =
++{
++    buffer_create_QueryInterface,
++    buffer_create_AddRef,
++    buffer_create_Release,
++    buffer_create_GetIids,
++    buffer_create_GetRuntimeClassName,
++    buffer_create_GetTrustLevel,
++    buffer_create_CreateFromBuffer,
++    buffer_create_CreateFromBufferWithOffset,
++};
++
++static struct buffer_content_statics buffer_content_statics =
++{
++    {&buffer_content_factory_vtbl},
++    {&buffer_create_vtbl},
++    1,
++};
++
++IActivationFactory *http_buffer_content_factory = &buffer_content_statics.IActivationFactory_iface;
++
++CONTENT_FACTORY( stream_content, IHttpStreamContentFactory, IID_IHttpStreamContentFactory )
++
++static HRESULT WINAPI stream_content_factory_ActivateInstance( IActivationFactory *iface,
++                                                               IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    if (instance) *instance = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl stream_content_factory_vtbl =
++{
++    stream_content_factory_QueryInterface,
++    stream_content_factory_AddRef,
++    stream_content_factory_Release,
++    stream_content_factory_GetIids,
++    stream_content_factory_GetRuntimeClassName,
++    stream_content_factory_GetTrustLevel,
++    stream_content_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE_( stream_create, IHttpStreamContentFactory, struct stream_content_statics,
++                      stream_content_statics_from_IHttpStreamContentFactory,
++                      IHttpStreamContentFactory_iface, &impl->IActivationFactory_iface )
++
++static HRESULT WINAPI stream_create_CreateFromInputStream( IHttpStreamContentFactory *iface,
++                                                           IInputStream *content, IHttpContent **value )
++{
++    struct http_content *impl;
++    HRESULT hr;
++
++    TRACE( "iface %p, content %p, value %p.\n", iface, content, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!content) return E_INVALIDARG;
++    if (FAILED(hr = create_content( CONTENT_STREAM, &impl ))) return hr;
++
++    IInputStream_AddRef( content );
++    impl->stream = content;
++
++    *value = &impl->IHttpContent_iface;
++    return S_OK;
++}
++
++static const struct IHttpStreamContentFactoryVtbl stream_create_vtbl =
++{
++    stream_create_QueryInterface,
++    stream_create_AddRef,
++    stream_create_Release,
++    stream_create_GetIids,
++    stream_create_GetRuntimeClassName,
++    stream_create_GetTrustLevel,
++    stream_create_CreateFromInputStream,
++};
++
++static struct stream_content_statics stream_content_statics =
++{
++    {&stream_content_factory_vtbl},
++    {&stream_create_vtbl},
++    1,
++};
++
++IActivationFactory *http_stream_content_factory = &stream_content_statics.IActivationFactory_iface;
++
++/*** HttpMultipartFormDataContent: a plain activation, then parts get added ***/
++
++struct multipart_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    LONG ref;
++};
++
++static inline struct multipart_statics *multipart_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct multipart_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI multipart_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct multipart_statics *impl = multipart_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        IInspectable_AddRef( (*out) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI multipart_factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &multipart_from_IActivationFactory( iface )->ref );
++}
++
++static ULONG WINAPI multipart_factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &multipart_from_IActivationFactory( iface )->ref );
++}
++
++static HRESULT WINAPI multipart_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI multipart_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI multipart_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI multipart_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct http_content *impl;
++    HRESULT hr;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    if (!instance) return E_POINTER;
++    *instance = NULL;
++    if (FAILED(hr = create_content( CONTENT_MULTIPART, &impl ))) return hr;
++
++    if (FAILED(hr = set_media_type( impl, L"multipart/form-data" )))
++    {
++        IHttpContent_Release( &impl->IHttpContent_iface );
++        return hr;
++    }
++
++    *instance = (IInspectable *)&impl->IHttpContent_iface;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl multipart_factory_vtbl =
++{
++    multipart_factory_QueryInterface,
++    multipart_factory_AddRef,
++    multipart_factory_Release,
++    multipart_factory_GetIids,
++    multipart_factory_GetRuntimeClassName,
++    multipart_factory_GetTrustLevel,
++    multipart_factory_ActivateInstance,
++};
++
++static struct multipart_statics multipart_statics =
++{
++    {&multipart_factory_vtbl},
++    1,
++};
++
++IActivationFactory *http_multipart_content_factory = &multipart_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.web/main.c b/dlls/windows.web/main.c
+index 2d83aa7880a..d8162973d79 100644
+--- a/dlls/windows.web/main.c
++++ b/dlls/windows.web/main.c
+@@ -54,6 +54,14 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( http_request_message_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_Web_Http_HttpResponseMessage ))
+         IActivationFactory_QueryInterface( http_response_message_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Web_Http_HttpStringContent ))
++        IActivationFactory_QueryInterface( http_string_content_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Web_Http_HttpBufferContent ))
++        IActivationFactory_QueryInterface( http_buffer_content_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Web_Http_HttpStreamContent ))
++        IActivationFactory_QueryInterface( http_stream_content_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Web_Http_HttpMultipartFormDataContent ))
++        IActivationFactory_QueryInterface( http_multipart_content_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.web/private.h b/dlls/windows.web/private.h
+index 2b0ec047b3f..0e168c646c2 100644
+--- a/dlls/windows.web/private.h
++++ b/dlls/windows.web/private.h
+@@ -34,6 +34,8 @@
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
++#define WIDL_using_Windows_Storage_Streams
++#include "windows.storage.streams.h"
+ #define WIDL_using_Windows_Data_Json
+ #include "windows.data.json.h"
+ #define WIDL_using_Windows_Web_Http
+@@ -49,6 +51,10 @@ extern IActivationFactory *http_client_factory;
+ extern IActivationFactory *http_method_factory;
+ extern IActivationFactory *http_request_message_factory;
+ extern IActivationFactory *http_response_message_factory;
++extern IActivationFactory *http_string_content_factory;
++extern IActivationFactory *http_buffer_content_factory;
++extern IActivationFactory *http_stream_content_factory;
++extern IActivationFactory *http_multipart_content_factory;
+ 
+ extern HRESULT create_string_map( IMap_HSTRING_HSTRING **out );
+ extern HRESULT create_response_message( IHttpResponseMessage **out );

@@ -1,0 +1,2516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 18:29:53 -0400
+Subject: [PATCH] opcservices: Read packages, and implement the remaining
+ stubs.
+
+ReadPackageFromStream() reads ZIP32 and ZIP64 archives, stored and
+deflated entries (checking sizes and CRCs), gives every part the content
+type [Content_Types].xml declares (an Override before a Default, both
+case-insensitive) and the compression option its entry records, and
+loads every relationships part into its source's set, TargetMode
+included; the relationships parts and the content types are not parts.
+
+The relationship set deletes relationships, enumerates by type and gives
+its relationships part as a read-only stream, written by the same code
+as the package's; the part set deletes parts and finds them without
+regard to case; part URIs compare without regard to case, give the
+relative reference to another part (empty to themselves) and are
+normalized when created or combined; content and file streams implement
+the rest of IStream, with Clone sharing the data and keeping its own
+position.  The existing tests' todo_wines all pass now.
+
+Not yet run on Windows: the error codes for invalid packages (they only
+test that reading fails), CopyTo's S_FALSE at the end of the data,
+LockRegion's STG_E_INVALIDFUNCTION, the content stream's grfMode and
+STG_E_ACCESSDENIED for a write to the relationships stream;
+tools/opcprobe prints what Windows answers.  CreateDigitalSignatureManager
+stays a stub.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/opcservices/compress.c b/dlls/opcservices/compress.c
+index a03d7b18387..5c442a90936 100644
+--- a/dlls/opcservices/compress.c
++++ b/dlls/opcservices/compress.c
+@@ -583,3 +583,388 @@ HRESULT compress_add_file(struct zip_archive *archive, const WCHAR *path,
+ 
+     return S_OK;
+ }
++
++struct zip_read_archive
++{
++    IStream *input;
++    uint64_t size, directory_offset;
++    struct zip_read_file *files;
++    size_t count;
++};
++
++static HRESULT zip_read_at(struct zip_read_archive *archive, uint64_t offset, void *data, ULONG size)
++{
++    LARGE_INTEGER pos;
++    ULONG got;
++    HRESULT hr;
++
++    if (offset > archive->size || size > archive->size - offset || offset > INT64_MAX)
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    pos.QuadPart = offset;
++    if (FAILED(hr = IStream_Seek(archive->input, pos, STREAM_SEEK_SET, NULL)))
++        return hr;
++    while (size)
++    {
++        got = 0;
++        hr = IStream_Read(archive->input, data, size, &got);
++        if (FAILED(hr))
++            return hr;
++        if (!got)
++            return OPC_E_ZIP_COMPRESSION_FAILED;
++        data = (BYTE *)data + got;
++        size -= got;
++    }
++    return S_OK;
++}
++
++size_t compress_read_count(const struct zip_read_archive *archive)
++{
++    return archive->count;
++}
++
++const struct zip_read_file *compress_read_entry(const struct zip_read_archive *archive, size_t index)
++{
++    return &archive->files[index];
++}
++
++void compress_release_read_archive(struct zip_read_archive *archive)
++{
++    size_t i;
++
++    if (!archive)
++        return;
++    for (i = 0; i < archive->count; ++i)
++        free(archive->files[i].name);
++    free(archive->files);
++    IStream_Release(archive->input);
++    free(archive);
++}
++
++static HRESULT zip_read_central_entry(struct zip_read_archive *archive, size_t index, uint64_t *position,
++        uint64_t directory_end)
++{
++    struct zip32_central_directory_header header;
++    struct zip_read_file *file = &archive->files[index];
++    BYTE *extra = NULL;
++    char *name = NULL;
++    uint64_t end, offset;
++    size_t cursor;
++    int length, codepage;
++    HRESULT hr;
++
++    if (*position > directory_end || directory_end - *position < sizeof(header) ||
++            FAILED(hr = zip_read_at(archive, *position, &header, sizeof(header))))
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    if (header.signature != ZIP32_CDFH || header.diskid || (header.flags & 1) ||
++            (header.method != 0 && header.method != Z_DEFLATED))
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    end = *position + sizeof(header) + header.name_length + header.extra_length + header.comment_length;
++    if (end > directory_end || !header.name_length)
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    if (!(name = malloc(header.name_length + 1)) ||
++            (header.extra_length && !(extra = malloc(header.extra_length))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    if (FAILED(hr = zip_read_at(archive, *position + sizeof(header), name, header.name_length)))
++        goto done;
++    name[header.name_length] = 0;
++    if (memchr(name, 0, header.name_length))
++    {
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++    if (header.extra_length && FAILED(hr = zip_read_at(archive, *position + sizeof(header) +
++            header.name_length, extra, header.extra_length)))
++        goto done;
++
++    file->uncompressed_size = header.uncompressed_size;
++    file->compressed_size = header.compressed_size;
++    file->offset = header.local_file_offset;
++    file->crc32 = header.crc32;
++    file->flags = header.flags;
++    file->method = header.method;
++    for (cursor = 0; cursor + 4 <= header.extra_length; )
++    {
++        uint16_t id, size;
++
++        memcpy(&id, extra + cursor, sizeof(id));
++        memcpy(&size, extra + cursor + 2, sizeof(size));
++        cursor += 4;
++        if (size > header.extra_length - cursor)
++        {
++            /* Older archives generated here counted the four-byte extra header. */
++            if (id == 1 && size == header.extra_length)
++                size = header.extra_length - cursor;
++            else
++            {
++                hr = OPC_E_ZIP_COMPRESSION_FAILED;
++                goto done;
++            }
++        }
++        if (id == 1)
++        {
++            offset = cursor;
++            if (header.uncompressed_size == ~0u)
++            {
++                if (size < offset - cursor + 8)
++                    break;
++                memcpy(&file->uncompressed_size, extra + offset, 8);
++                offset += 8;
++            }
++            if (header.compressed_size == ~0u)
++            {
++                if (size < offset - cursor + 8)
++                    break;
++                memcpy(&file->compressed_size, extra + offset, 8);
++                offset += 8;
++            }
++            if (header.local_file_offset == ~0u)
++            {
++                if (size < offset - cursor + 8)
++                    break;
++                memcpy(&file->offset, extra + offset, 8);
++                offset += 8;
++            }
++            break;
++        }
++        cursor += size;
++    }
++    if ((header.uncompressed_size == ~0u && file->uncompressed_size == ~0u) ||
++            (header.compressed_size == ~0u && file->compressed_size == ~0u) ||
++            (header.local_file_offset == ~0u && file->offset == ~0u))
++    {
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++
++    codepage = (header.flags & 0x800) ? CP_UTF8 : CP_ACP;
++    length = MultiByteToWideChar(codepage, codepage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0,
++            name, header.name_length, NULL, 0);
++    if (!length || !(file->name = malloc((length + 1) * sizeof(WCHAR))))
++    {
++        hr = length ? E_OUTOFMEMORY : OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++    MultiByteToWideChar(codepage, codepage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0,
++            name, header.name_length, file->name, length);
++    file->name[length] = 0;
++    file->options = header.method == 0 ? OPC_COMPRESSION_NONE :
++            (header.flags & 6) == DEFLATE_MAX ? OPC_COMPRESSION_MAXIMUM :
++            (header.flags & 6) == DEFLATE_FAST ? OPC_COMPRESSION_FAST :
++            (header.flags & 6) == DEFLATE_SUPERFAST ? OPC_COMPRESSION_SUPERFAST : OPC_COMPRESSION_NORMAL;
++    *position = end;
++    hr = S_OK;
++done:
++    free(name);
++    free(extra);
++    return hr;
++}
++
++HRESULT compress_read_archive(IStream *input, struct zip_read_archive **out)
++{
++    struct zip_read_archive *archive;
++    struct zip32_end_of_central_directory end32;
++    struct zip64_end_of_central_directory end64;
++    struct zip64_end_of_central_directory_locator locator;
++    LARGE_INTEGER zero = {0};
++    ULARGE_INTEGER length;
++    BYTE *tail = NULL;
++    uint64_t directory_size, records, position, end_offset;
++    ULONG tail_size;
++    size_t i;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(archive = calloc(1, sizeof(*archive))))
++        return E_OUTOFMEMORY;
++    archive->input = input;
++    IStream_AddRef(input);
++    if (FAILED(hr = IStream_Seek(input, zero, STREAM_SEEK_END, &length)))
++        goto done;
++    archive->size = length.QuadPart;
++    tail_size = min(archive->size, (uint64_t)(0xffff + sizeof(end32)));
++    if (tail_size < sizeof(end32))
++    {
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++    if (!(tail = malloc(tail_size)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    if (FAILED(hr = zip_read_at(archive, archive->size - tail_size, tail, tail_size)))
++        goto done;
++    for (i = tail_size - sizeof(end32); ; --i)
++    {
++        memcpy(&end32, tail + i, sizeof(end32));
++        if (end32.signature == ZIP32_EOCD && i + sizeof(end32) + end32.comment_length == tail_size)
++            break;
++        if (!i)
++        {
++            hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            goto done;
++        }
++    }
++    end_offset = archive->size - tail_size + i;
++    if ((end32.diskid && (end32.diskid != 0xffff || end32.records_total != 0xffff)) ||
++            (end32.firstdisk && (end32.firstdisk != 0xffff || end32.records_total != 0xffff)) ||
++            end32.records_num != end32.records_total)
++    {
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++    records = end32.records_total;
++    directory_size = end32.directory_size;
++    archive->directory_offset = end32.directory_offset;
++    if (records == 0xffff || directory_size == ~0u || archive->directory_offset == ~0u)
++    {
++        if (end_offset < sizeof(locator) || FAILED(hr = zip_read_at(archive, end_offset - sizeof(locator),
++                &locator, sizeof(locator))) || locator.signature != ZIP64_EOCD64_LOCATOR ||
++                locator.eocd64_disk || locator.disk_num > 1)
++        {
++            hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            goto done;
++        }
++        hr = zip_read_at(archive, locator.eocd64_offset, &end64, sizeof(end64));
++        if (FAILED(hr) || end64.signature != ZIP64_EOCD64)
++            hr = zip_read_at(archive, end_offset - sizeof(locator) - sizeof(end64), &end64, sizeof(end64));
++        if (FAILED(hr) || end64.signature != ZIP64_EOCD64 || end64.diskid || end64.directory_diskid ||
++                end64.records_num != end64.records_total || end64.size < sizeof(end64) - 12)
++        {
++            hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            goto done;
++        }
++        records = end64.records_total;
++        directory_size = end64.directory_size;
++        archive->directory_offset = end64.directory_offset;
++    }
++    if (archive->directory_offset > end_offset || directory_size > end_offset - archive->directory_offset ||
++            records > SIZE_MAX / sizeof(*archive->files) || records > directory_size / sizeof(struct zip32_central_directory_header))
++    {
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++    archive->count = records;
++    if (!(archive->files = calloc(max(archive->count, 1), sizeof(*archive->files))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    position = archive->directory_offset;
++    for (i = 0; i < archive->count; ++i)
++    {
++        if (FAILED(hr = zip_read_central_entry(archive, i, &position, archive->directory_offset + directory_size)))
++            goto done;
++    }
++    if (position != archive->directory_offset + directory_size)
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++    if (SUCCEEDED(hr))
++        *out = archive;
++done:
++    free(tail);
++    if (FAILED(hr))
++        compress_release_read_archive(archive);
++    return hr;
++}
++
++HRESULT compress_read_file(struct zip_read_archive *archive, size_t index, IStream **out)
++{
++    struct zip_read_file *file = &archive->files[index];
++    struct local_file_header header;
++    uint64_t offset, left, produced = 0;
++    BYTE input[0x8000], output[0x8000];
++    DWORD crc = 0;
++    z_stream zstr = {0};
++    LARGE_INTEGER zero = {0};
++    ULONG got, written;
++    IStream *content;
++    HRESULT hr;
++    int ret = Z_OK;
++
++    *out = NULL;
++    if (file->offset > archive->directory_offset ||
++            archive->directory_offset - file->offset < sizeof(header))
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    hr = zip_read_at(archive, file->offset, &header, sizeof(header));
++    if (FAILED(hr) || header.signature != LOCAL_HEADER_SIGNATURE || header.method != file->method ||
++            (header.flags & 1))
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    offset = file->offset + sizeof(header) + header.name_length + header.extra_length;
++    if (offset > archive->directory_offset || file->compressed_size > archive->directory_offset - offset)
++        return OPC_E_ZIP_COMPRESSION_FAILED;
++    if (FAILED(hr = CreateStreamOnHGlobal(NULL, TRUE, &content)))
++        return hr;
++    zstr.zalloc = zalloc;
++    zstr.zfree = zfree;
++    if (file->method == Z_DEFLATED && (ret = inflateInit2(&zstr, -MAX_WBITS)) != Z_OK)
++    {
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        goto done;
++    }
++    left = file->compressed_size;
++    while (left)
++    {
++        got = min(left, (uint64_t)sizeof(input));
++        if (FAILED(hr = zip_read_at(archive, offset, input, got)))
++            break;
++        offset += got;
++        left -= got;
++        if (file->method == 0)
++        {
++            if (produced + got > file->uncompressed_size)
++            {
++                hr = OPC_E_ZIP_COMPRESSION_FAILED;
++                break;
++            }
++            crc = RtlComputeCrc32(crc, input, got);
++            hr = IStream_Write(content, input, got, &written);
++            if (SUCCEEDED(hr) && written != got)
++                hr = STG_E_WRITEFAULT;
++            produced += got;
++        }
++        else
++        {
++            zstr.next_in = input;
++            zstr.avail_in = got;
++            do
++            {
++                zstr.next_out = output;
++                zstr.avail_out = sizeof(output);
++                ret = inflate(&zstr, Z_NO_FLUSH);
++                written = sizeof(output) - zstr.avail_out;
++                if ((ret != Z_OK && ret != Z_STREAM_END) || written > file->uncompressed_size - produced)
++                {
++                    hr = OPC_E_ZIP_COMPRESSION_FAILED;
++                    break;
++                }
++                crc = RtlComputeCrc32(crc, output, written);
++                produced += written;
++                hr = IStream_Write(content, output, written, &got);
++                if (SUCCEEDED(hr) && got != written)
++                    hr = STG_E_WRITEFAULT;
++            } while (SUCCEEDED(hr) && (zstr.avail_in || !zstr.avail_out) && ret != Z_STREAM_END);
++            if (ret == Z_STREAM_END && (left || zstr.avail_in))
++                hr = OPC_E_ZIP_COMPRESSION_FAILED;
++        }
++        if (FAILED(hr) || ret == Z_STREAM_END)
++            break;
++    }
++    if (file->method == Z_DEFLATED)
++        inflateEnd(&zstr);
++    if (SUCCEEDED(hr) && (produced != file->uncompressed_size || crc != file->crc32 ||
++            (file->method == Z_DEFLATED && ret != Z_STREAM_END)))
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++    if (SUCCEEDED(hr))
++        hr = IStream_Seek(content, zero, STREAM_SEEK_SET, NULL);
++    if (SUCCEEDED(hr))
++    {
++        *out = content;
++        return S_OK;
++    }
++done:
++    IStream_Release(content);
++    return hr;
++}
+diff --git a/dlls/opcservices/factory.c b/dlls/opcservices/factory.c
+index fcebb977c1d..1083c88ddf9 100644
+--- a/dlls/opcservices/factory.c
++++ b/dlls/opcservices/factory.c
+@@ -19,6 +19,7 @@
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
++#include <limits.h>
+ #include "windef.h"
+ #include "winbase.h"
+ 
+@@ -40,6 +41,7 @@ struct opc_filestream
+     LONG refcount;
+ 
+     HANDLE hfile;
++    ULONGLONG pos;
+ };
+ 
+ static inline struct opc_filestream *impl_from_IStream(IStream *iface)
+@@ -102,12 +104,20 @@ static HRESULT WINAPI opc_filestream_Read(IStream *iface, void *buff, ULONG size
+         num_read = &read;
+ 
+     *num_read = 0;
++    {
++        LARGE_INTEGER pos;
++
++        pos.QuadPart = stream->pos;
++        if (!SetFilePointerEx(stream->hfile, pos, NULL, FILE_BEGIN))
++            return HRESULT_FROM_WIN32(GetLastError());
++    }
+     if (!ReadFile(stream->hfile, buff, size, num_read, NULL))
+     {
+         WARN("Failed to read file, error %ld.\n", GetLastError());
+         return HRESULT_FROM_WIN32(GetLastError());
+     }
+ 
++    stream->pos += *num_read;
+     return *num_read == size ? S_OK : S_FALSE;
+ }
+ 
+@@ -122,73 +132,138 @@ static HRESULT WINAPI opc_filestream_Write(IStream *iface, const void *data, ULO
+         num_written = &written;
+ 
+     *num_written = 0;
++    {
++        LARGE_INTEGER pos;
++
++        pos.QuadPart = stream->pos;
++        if (!SetFilePointerEx(stream->hfile, pos, NULL, FILE_BEGIN))
++            return HRESULT_FROM_WIN32(GetLastError());
++    }
+     if (!WriteFile(stream->hfile, data, size, num_written, NULL))
+     {
+         WARN("Failed to write to file, error %ld.\n", GetLastError());
+         return HRESULT_FROM_WIN32(GetLastError());
+     }
+ 
++    stream->pos += *num_written;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_Seek(IStream *iface, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newpos)
+ {
+     struct opc_filestream *stream = impl_from_IStream(iface);
++    LARGE_INTEGER base;
+ 
+     TRACE("%p, %s, %ld, %p.\n", iface, wine_dbgstr_longlong(move.QuadPart), origin, newpos);
+ 
+-    if (!SetFilePointerEx(stream->hfile, move, (LARGE_INTEGER *)newpos, origin))
+-        return HRESULT_FROM_WIN32(GetLastError());
+-
++    switch (origin)
++    {
++    case STREAM_SEEK_SET:
++        base.QuadPart = 0;
++        break;
++    case STREAM_SEEK_CUR:
++        base.QuadPart = stream->pos;
++        break;
++    case STREAM_SEEK_END:
++        if (!GetFileSizeEx(stream->hfile, &base))
++            return HRESULT_FROM_WIN32(GetLastError());
++        break;
++    default:
++        return STG_E_INVALIDFUNCTION;
++    }
++    if (move.QuadPart < 0 && (ULONGLONG)(-(move.QuadPart + 1)) + 1 > base.QuadPart)
++        return STG_E_INVALIDFUNCTION;
++    if (move.QuadPart > 0 && (ULONGLONG)move.QuadPart > LLONG_MAX - base.QuadPart)
++        return STG_E_INVALIDFUNCTION;
++    stream->pos = base.QuadPart + move.QuadPart;
++    if (newpos)
++        newpos->QuadPart = stream->pos;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_SetSize(IStream *iface, ULARGE_INTEGER size)
+ {
+-    FIXME("iface %p, size %s stub!\n", iface, wine_dbgstr_longlong(size.QuadPart));
++    struct opc_filestream *stream = impl_from_IStream(iface);
++    LARGE_INTEGER pos;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, size %s.\n", iface, wine_dbgstr_longlong(size.QuadPart));
++    if (size.QuadPart > LLONG_MAX)
++        return STG_E_INVALIDFUNCTION;
++    pos.QuadPart = size.QuadPart;
++    if (!SetFilePointerEx(stream->hfile, pos, NULL, FILE_BEGIN) || !SetEndOfFile(stream->hfile))
++        return HRESULT_FROM_WIN32(GetLastError());
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_CopyTo(IStream *iface, IStream *dest, ULARGE_INTEGER size,
+         ULARGE_INTEGER *num_read, ULARGE_INTEGER *written)
+ {
+-    FIXME("iface %p, dest %p, size %s, num_read %p, written %p stub!\n", iface, dest,
+-            wine_dbgstr_longlong(size.QuadPart), num_read, written);
++    BYTE buffer[0x8000];
++    ULONGLONG total_read = 0, total_written = 0;
++    ULONG got, done;
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, dest %p, size %s, num_read %p, written %p.\n", iface, dest,
++            wine_dbgstr_longlong(size.QuadPart), num_read, written);
++    if (num_read)
++        num_read->QuadPart = 0;
++    if (written)
++        written->QuadPart = 0;
++    if (!dest)
++        return STG_E_INVALIDPOINTER;
++
++    while (total_read < size.QuadPart)
++    {
++        got = 0;
++        hr = IStream_Read(iface, buffer, min(size.QuadPart - total_read, (ULONGLONG)sizeof(buffer)), &got);
++        if (FAILED(hr))
++            break;
++        total_read += got;
++        if (!got)
++            break;
++        done = 0;
++        hr = IStream_Write(dest, buffer, got, &done);
++        total_written += done;
++        if (FAILED(hr) || done != got)
++        {
++            if (SUCCEEDED(hr))
++                hr = STG_E_MEDIUMFULL;
++            break;
++        }
++    }
++    if (num_read)
++        num_read->QuadPart = total_read;
++    if (written)
++        written->QuadPart = total_written;
++    return SUCCEEDED(hr) && total_read != size.QuadPart ? S_FALSE : hr;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_Commit(IStream *iface, DWORD flags)
+ {
+-    FIXME("%p, %#lx stub!\n", iface, flags);
+-
+-    return E_NOTIMPL;
++    TRACE("iface %p, flags %#lx.\n", iface, flags);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_Revert(IStream *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-
+-    return E_NOTIMPL;
++    TRACE("iface %p.\n", iface);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_LockRegion(IStream *iface, ULARGE_INTEGER offset,
+         ULARGE_INTEGER size, DWORD lock_type)
+ {
+-    FIXME("%p, %s, %s, %ld stub!\n", iface, wine_dbgstr_longlong(offset.QuadPart),
++    TRACE("iface %p, offset %s, size %s, lock_type %ld.\n", iface, wine_dbgstr_longlong(offset.QuadPart),
+             wine_dbgstr_longlong(size.QuadPart), lock_type);
+-
+-    return E_NOTIMPL;
++    return STG_E_INVALIDFUNCTION;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_UnlockRegion(IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER size,
+         DWORD lock_type)
+ {
+-    FIXME("%p, %s, %s, %ld stub!\n", iface, wine_dbgstr_longlong(offset.QuadPart),
++    TRACE("iface %p, offset %s, size %s, lock_type %ld.\n", iface, wine_dbgstr_longlong(offset.QuadPart),
+             wine_dbgstr_longlong(size.QuadPart), lock_type);
+-
+-    return E_NOTIMPL;
++    return STG_E_INVALIDFUNCTION;
+ }
+ 
+ static HRESULT WINAPI opc_filestream_Stat(IStream *iface, STATSTG *statstg, DWORD flag)
+@@ -201,8 +276,8 @@ static HRESULT WINAPI opc_filestream_Stat(IStream *iface, STATSTG *statstg, DWOR
+     if (!statstg)
+         return E_POINTER;
+ 
+-    memset(&fi, 0, sizeof(fi));
+-    GetFileInformationByHandle(stream->hfile, &fi);
++    if (!GetFileInformationByHandle(stream->hfile, &fi))
++        return HRESULT_FROM_WIN32(GetLastError());
+ 
+     memset(statstg, 0, sizeof(*statstg));
+     statstg->type = STGTY_STREAM;
+@@ -217,9 +292,25 @@ static HRESULT WINAPI opc_filestream_Stat(IStream *iface, STATSTG *statstg, DWOR
+ 
+ static HRESULT WINAPI opc_filestream_Clone(IStream *iface, IStream **result)
+ {
+-    FIXME("iface %p, result %p stub!\n", iface, result);
++    struct opc_filestream *stream = impl_from_IStream(iface), *clone;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, result %p.\n", iface, result);
++    if (!result)
++        return E_POINTER;
++    *result = NULL;
++    if (!(clone = calloc(1, sizeof(*clone))))
++        return E_OUTOFMEMORY;
++    if (!DuplicateHandle(GetCurrentProcess(), stream->hfile, GetCurrentProcess(), &clone->hfile, 0, FALSE,
++            DUPLICATE_SAME_ACCESS))
++    {
++        free(clone);
++        return HRESULT_FROM_WIN32(GetLastError());
++    }
++    clone->IStream_iface.lpVtbl = stream->IStream_iface.lpVtbl;
++    clone->refcount = 1;
++    clone->pos = stream->pos;
++    *result = &clone->IStream_iface;
++    return S_OK;
+ }
+ 
+ static const IStreamVtbl opc_filestream_vtbl =
+@@ -352,8 +443,16 @@ static HRESULT WINAPI opc_factory_CreatePartUri(IOpcFactory *iface, LPCWSTR uri,
+         return hr;
+     }
+ 
+-    hr = opc_part_uri_create(combined, NULL, out);
+-    IUri_Release(combined);
++    {
++        IUri *normalized;
++
++        hr = opc_normalize_part_uri(combined, &normalized);
++        IUri_Release(combined);
++        if (FAILED(hr))
++            return hr;
++        hr = opc_part_uri_create(normalized, NULL, out);
++        IUri_Release(normalized);
++    }
+     return hr;
+ }
+ 
+@@ -372,12 +471,419 @@ static HRESULT WINAPI opc_factory_CreatePackage(IOpcFactory *iface, IOpcPackage
+     return opc_package_create(iface, package);
+ }
+ 
++struct opc_read_type
++{
++    WCHAR *key, *value;
++    BOOL is_override;
++};
++
++struct opc_read_types
++{
++    struct opc_read_type *items;
++    size_t count, capacity;
++};
++
++static WCHAR *opc_read_strdup(const WCHAR *value)
++{
++    WCHAR *copy;
++    size_t size = (wcslen(value) + 1) * sizeof(WCHAR);
++
++    if ((copy = malloc(size)))
++        memcpy(copy, value, size);
++    return copy;
++}
++
++static void opc_read_free_types(struct opc_read_types *types)
++{
++    size_t i;
++
++    for (i = 0; i < types->count; ++i)
++    {
++        free(types->items[i].key);
++        free(types->items[i].value);
++    }
++    free(types->items);
++}
++
++static HRESULT opc_read_add_type(struct opc_read_types *types, const WCHAR *key, const WCHAR *value,
++        BOOL is_override)
++{
++    struct opc_read_type *item;
++
++    if (!opc_array_reserve((void **)&types->items, &types->capacity, types->count + 1,
++            sizeof(*types->items)))
++        return E_OUTOFMEMORY;
++    item = &types->items[types->count];
++    item->key = opc_read_strdup(key);
++    item->value = opc_read_strdup(value);
++    if (!item->key || !item->value)
++    {
++        free(item->key);
++        free(item->value);
++        return E_OUTOFMEMORY;
++    }
++    item->is_override = is_override;
++    types->count++;
++    return S_OK;
++}
++
++static const WCHAR *opc_read_find_type(const struct opc_read_types *types, const WCHAR *name)
++{
++    const WCHAR *extension = wcsrchr(name, '.');
++    const WCHAR *slash = wcsrchr(name, '/');
++    const WCHAR *def = NULL;
++    size_t i;
++
++    if (slash && extension && extension < slash)
++        extension = NULL;
++    for (i = 0; i < types->count; ++i)
++    {
++        const struct opc_read_type *type = &types->items[i];
++
++        if (type->is_override && type->key[0] == '/' && !wcsicmp(type->key + 1, name))
++            return type->value;
++        if (!type->is_override && extension && !wcsicmp(type->key, extension + 1))
++            def = type->value;
++    }
++    return def;
++}
++
++static HRESULT opc_read_xml(IStream *stream, struct opc_read_types *types, IOpcRelationshipSet *rels)
++{
++    IXmlReader *reader;
++    XmlNodeType node;
++    const WCHAR *name, *value, *ns;
++    WCHAR *key = NULL, *content_type = NULL, *id = NULL, *target = NULL, *mode = NULL;
++    BOOL root = FALSE;
++    HRESULT hr;
++
++    if (FAILED(hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL)))
++        return hr;
++    hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++    while (hr == S_OK && (hr = IXmlReader_Read(reader, &node)) == S_OK)
++    {
++        BOOL entry = FALSE, is_override = FALSE;
++
++        if (node != XmlNodeType_Element)
++            continue;
++        if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++            break;
++        if (!root)
++        {
++            hr = IXmlReader_GetNamespaceUri(reader, &ns, NULL);
++            if (SUCCEEDED(hr) && (wcscmp(name, types ? L"Types" : L"Relationships") ||
++                    wcscmp(ns, types ? L"http://schemas.openxmlformats.org/package/2006/content-types" :
++                            L"http://schemas.openxmlformats.org/package/2006/relationships")))
++                hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            if (SUCCEEDED(hr))
++                root = TRUE;
++            continue;
++        }
++        if (types)
++        {
++            is_override = !wcscmp(name, L"Override");
++            entry = is_override || !wcscmp(name, L"Default");
++        }
++        else
++            entry = !wcscmp(name, L"Relationship");
++        if (!entry)
++            continue;
++
++        if (IXmlReader_MoveToFirstAttribute(reader) == S_OK)
++        {
++            do
++            {
++                if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)) ||
++                        FAILED(hr = IXmlReader_GetValue(reader, &value, NULL)))
++                    break;
++                if (types)
++                {
++                    if (!wcscmp(name, is_override ? L"PartName" : L"Extension"))
++                    {
++                        free(key);
++                        key = opc_read_strdup(value);
++                    }
++                    else if (!wcscmp(name, L"ContentType"))
++                    {
++                        free(content_type);
++                        content_type = opc_read_strdup(value);
++                    }
++                }
++                else
++                {
++                    WCHAR **field = NULL;
++
++                    if (!wcscmp(name, L"Id"))
++                        field = &id;
++                    else if (!wcscmp(name, L"Type"))
++                        field = &content_type;
++                    else if (!wcscmp(name, L"Target"))
++                        field = &target;
++                    else if (!wcscmp(name, L"TargetMode"))
++                        field = &mode;
++                    if (field)
++                    {
++                        free(*field);
++                        *field = opc_read_strdup(value);
++                    }
++                }
++            } while (SUCCEEDED(hr) && IXmlReader_MoveToNextAttribute(reader) == S_OK);
++            if (SUCCEEDED(hr))
++                hr = IXmlReader_MoveToElement(reader);
++        }
++        if (FAILED(hr))
++            break;
++        if (types)
++        {
++            if (!key || !content_type || !*key || !*content_type || (is_override && key[0] != '/'))
++                hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            else
++                hr = opc_read_add_type(types, key, content_type, is_override);
++        }
++        else
++        {
++            IUri *uri;
++            IOpcRelationship *rel;
++            OPC_URI_TARGET_MODE target_mode = OPC_URI_TARGET_MODE_INTERNAL;
++
++            if (!id || !content_type || !target || !*id || !*content_type ||
++                    (mode && wcscmp(mode, L"Internal") && wcscmp(mode, L"External")))
++                hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            else
++            {
++                if (mode && !wcscmp(mode, L"External"))
++                    target_mode = OPC_URI_TARGET_MODE_EXTERNAL;
++                hr = CreateUri(target, Uri_CREATE_ALLOW_RELATIVE, 0, &uri);
++                if (SUCCEEDED(hr))
++                {
++                    hr = IOpcRelationshipSet_CreateRelationship(rels, id, content_type, uri, target_mode, &rel);
++                    if (SUCCEEDED(hr))
++                        IOpcRelationship_Release(rel);
++                    IUri_Release(uri);
++                }
++            }
++        }
++        free(key); key = NULL;
++        free(id); id = NULL;
++        free(content_type); content_type = NULL;
++        free(target); target = NULL;
++        free(mode); mode = NULL;
++    }
++    if (hr == S_FALSE)
++        hr = root ? S_OK : OPC_E_ZIP_COMPRESSION_FAILED;
++    free(key);
++    free(id);
++    free(content_type);
++    free(target);
++    free(mode);
++    IXmlReader_Release(reader);
++    return hr;
++}
++
++static BOOL opc_read_is_rels(const WCHAR *name, WCHAR **source)
++{
++    const WCHAR *folder = wcsstr(name, L"_rels/");
++    const WCHAR *end = name + wcslen(name);
++    const WCHAR *last = folder ? folder + 6 : NULL;
++    size_t prefix;
++
++    *source = NULL;
++    if (!folder || (folder != name && folder[-1] != '/') || end - last < 5 ||
++            wcscmp(end - 5, L".rels") || wcschr(last, '/'))
++        return FALSE;
++    if (folder == name && !wcscmp(last, L".rels"))
++        return TRUE;
++    if (last == end - 5)
++        return FALSE;
++    prefix = folder - name;
++    if (!(*source = malloc((prefix + (end - 5 - last) + 2) * sizeof(WCHAR))))
++        return TRUE;
++    (*source)[0] = '/';
++    memcpy(*source + 1, name, prefix * sizeof(WCHAR));
++    memcpy(*source + 1 + prefix, last, (end - 5 - last) * sizeof(WCHAR));
++    (*source)[1 + prefix + (end - 5 - last)] = 0;
++    return TRUE;
++}
++
++static HRESULT opc_read_load_parts(IOpcFactory *factory, struct zip_read_archive *archive,
++        struct opc_read_types *types, IOpcPackage *package)
++{
++    IOpcPartSet *set;
++    HRESULT hr;
++    size_t i;
++
++    if (FAILED(hr = IOpcPackage_GetPartSet(package, &set)))
++        return hr;
++    for (i = 0; i < compress_read_count(archive); ++i)
++    {
++        const struct zip_read_file *entry = compress_read_entry(archive, i);
++        const WCHAR *type;
++        IOpcPartUri *uri = NULL;
++        IOpcPart *part = NULL;
++        IStream *input = NULL, *output = NULL;
++        ULARGE_INTEGER size;
++        WCHAR *source = NULL;
++        WCHAR *path;
++
++        if (!wcscmp(entry->name, L"[Content_Types].xml") ||
++                opc_read_is_rels(entry->name, &source))
++        {
++            free(source);
++            continue;
++        }
++        if (!*entry->name)
++        {
++            hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            break;
++        }
++        if (entry->name[wcslen(entry->name) - 1] == '/')
++        {
++            hr = compress_read_file(archive, i, &input);
++            if (SUCCEEDED(hr))
++                IStream_Release(input);
++            if (FAILED(hr))
++                break;
++            continue;
++        }
++        if (!(type = opc_read_find_type(types, entry->name)))
++        {
++            hr = OPC_E_ZIP_COMPRESSION_FAILED;
++            break;
++        }
++        if (!(path = malloc((wcslen(entry->name) + 2) * sizeof(WCHAR))))
++        {
++            hr = E_OUTOFMEMORY;
++            break;
++        }
++        path[0] = '/';
++        wcscpy(path + 1, entry->name);
++        hr = IOpcFactory_CreatePartUri(factory, path, &uri);
++        free(path);
++        if (SUCCEEDED(hr))
++            hr = IOpcPartSet_CreatePart(set, uri, type, entry->options, &part);
++        if (SUCCEEDED(hr))
++            hr = compress_read_file(archive, i, &input);
++        if (SUCCEEDED(hr))
++            hr = IOpcPart_GetContentStream(part, &output);
++        if (SUCCEEDED(hr))
++        {
++            size.QuadPart = entry->uncompressed_size;
++            hr = IStream_CopyTo(input, output, size, NULL, NULL);
++        }
++        if (output)
++            IStream_Release(output);
++        if (input)
++            IStream_Release(input);
++        if (part)
++            IOpcPart_Release(part);
++        if (uri)
++            IOpcPartUri_Release(uri);
++        if (FAILED(hr))
++            break;
++    }
++    IOpcPartSet_Release(set);
++    return hr;
++}
++
++static HRESULT opc_read_load_rels(IOpcFactory *factory, struct zip_read_archive *archive, IOpcPackage *package)
++{
++    HRESULT hr = S_OK;
++    size_t i;
++
++    for (i = 0; i < compress_read_count(archive); ++i)
++    {
++        const struct zip_read_file *entry = compress_read_entry(archive, i);
++        IOpcRelationshipSet *set = NULL;
++        IOpcPartSet *parts = NULL;
++        IOpcPartUri *uri = NULL;
++        IOpcPart *part = NULL;
++        IStream *xml = NULL;
++        WCHAR *source;
++
++        if (!opc_read_is_rels(entry->name, &source))
++            continue;
++        if (!source && wcscmp(entry->name, L"_rels/.rels"))
++            return E_OUTOFMEMORY;
++        if (source)
++        {
++            hr = IOpcFactory_CreatePartUri(factory, source, &uri);
++            if (SUCCEEDED(hr))
++                hr = IOpcPackage_GetPartSet(package, &parts);
++            if (SUCCEEDED(hr))
++                hr = IOpcPartSet_GetPart(parts, uri, &part);
++            if (SUCCEEDED(hr))
++                hr = IOpcPart_GetRelationshipSet(part, &set);
++        }
++        else
++            hr = IOpcPackage_GetRelationshipSet(package, &set);
++        if (SUCCEEDED(hr))
++            hr = compress_read_file(archive, i, &xml);
++        if (SUCCEEDED(hr))
++            hr = opc_read_xml(xml, NULL, set);
++        free(source);
++        if (xml)
++            IStream_Release(xml);
++        if (set)
++            IOpcRelationshipSet_Release(set);
++        if (part)
++            IOpcPart_Release(part);
++        if (parts)
++            IOpcPartSet_Release(parts);
++        if (uri)
++            IOpcPartUri_Release(uri);
++        if (FAILED(hr))
++            break;
++    }
++    return hr;
++}
++
+ static HRESULT WINAPI opc_factory_ReadPackageFromStream(IOpcFactory *iface, IStream *stream,
+         OPC_READ_FLAGS flags, IOpcPackage **package)
+ {
+-    FIXME("iface %p, stream %p, flags %#x, package %p stub!\n", iface, stream, flags, package);
++    struct zip_read_archive *archive;
++    struct opc_read_types types = {0};
++    IOpcPackage *result = NULL;
++    IStream *xml = NULL;
++    HRESULT hr;
++    size_t i;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, stream %p, flags %#x, package %p.\n", iface, stream, flags, package);
++    if (!package)
++        return E_POINTER;
++    *package = NULL;
++    if (!stream)
++        return E_POINTER;
++    if (FAILED(hr = compress_read_archive(stream, &archive)))
++        return hr;
++    hr = OPC_E_ZIP_COMPRESSION_FAILED;
++    for (i = 0; i < compress_read_count(archive); ++i)
++    {
++        if (!wcscmp(compress_read_entry(archive, i)->name, L"[Content_Types].xml"))
++        {
++            hr = compress_read_file(archive, i, &xml);
++            if (SUCCEEDED(hr))
++                hr = opc_read_xml(xml, &types, NULL);
++            if (xml)
++                IStream_Release(xml);
++            break;
++        }
++    }
++    if (SUCCEEDED(hr))
++        hr = IOpcFactory_CreatePackage(iface, &result);
++    if (SUCCEEDED(hr))
++        hr = opc_read_load_parts(iface, archive, &types, result);
++    if (SUCCEEDED(hr))
++        hr = opc_read_load_rels(iface, archive, result);
++    if (SUCCEEDED(hr))
++        *package = result;
++    else if (result)
++        IOpcPackage_Release(result);
++    opc_read_free_types(&types);
++    compress_release_read_archive(archive);
++    if (FAILED(hr) && hr != E_OUTOFMEMORY &&
++            (hr & 0xffff0000) != (OPC_E_DUPLICATE_PART & 0xffff0000))
++        hr = OPC_E_ZIP_COMPRESSION_FAILED;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI opc_factory_WritePackageToStream(IOpcFactory *iface, IOpcPackage *package, OPC_WRITE_FLAGS flags,
+diff --git a/dlls/opcservices/opc_private.h b/dlls/opcservices/opc_private.h
+index 8365916eebb..87431ccc746 100644
+--- a/dlls/opcservices/opc_private.h
++++ b/dlls/opcservices/opc_private.h
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ #include "msopc.h"
+ 
+@@ -60,6 +61,7 @@ struct opc_uri
+ extern HRESULT opc_package_create(IOpcFactory *factory, IOpcPackage **package);
+ extern HRESULT opc_part_uri_create(IUri *uri, struct opc_uri *source_uri, IOpcPartUri **part_uri);
+ extern HRESULT opc_root_uri_create(IOpcUri **opc_uri);
++extern HRESULT opc_normalize_part_uri(IUri *uri, IUri **normalized);
+ 
+ extern HRESULT opc_package_write(IOpcPackage *package, OPC_WRITE_FLAGS flags, IStream *stream);
+ 
+@@ -69,3 +71,19 @@ extern HRESULT compress_add_file(struct zip_archive *archive, const WCHAR *path,
+         OPC_COMPRESSION_OPTIONS options);
+ extern HRESULT compress_finalize_archive(struct zip_archive *archive);
+ extern void compress_release_archive(struct zip_archive *archive);
++
++struct zip_read_file
++{
++    WCHAR *name;
++    uint64_t compressed_size, uncompressed_size, offset;
++    uint32_t crc32;
++    uint16_t method, flags;
++    OPC_COMPRESSION_OPTIONS options;
++};
++
++struct zip_read_archive;
++extern HRESULT compress_read_archive(IStream *input, struct zip_read_archive **out);
++extern size_t compress_read_count(const struct zip_read_archive *archive);
++extern const struct zip_read_file *compress_read_entry(const struct zip_read_archive *archive, size_t index);
++extern HRESULT compress_read_file(struct zip_read_archive *archive, size_t index, IStream **out);
++extern void compress_release_read_archive(struct zip_read_archive *archive);
+diff --git a/dlls/opcservices/package.c b/dlls/opcservices/package.c
+index c01b794ef25..23599c87617 100644
+--- a/dlls/opcservices/package.c
++++ b/dlls/opcservices/package.c
+@@ -19,6 +19,7 @@
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
++#include <limits.h>
+ #include "windef.h"
+ #include "winbase.h"
+ #include "ntsecapi.h"
+@@ -45,6 +46,7 @@ struct opc_content_stream
+ 
+     struct opc_content *content;
+     ULARGE_INTEGER pos;
++    BOOL read_only;
+ };
+ 
+ struct opc_package
+@@ -97,6 +99,7 @@ struct opc_rel_enum
+ 
+     struct opc_relationship_set *rel_set;
+     size_t pos;
++    WCHAR *type;
+     GUID id;
+ };
+ 
+@@ -339,7 +342,8 @@ static HRESULT opc_part_enum_create(struct opc_part_set *part_set, IOpcPartEnume
+     return S_OK;
+ }
+ 
+-static HRESULT opc_rel_enum_create(struct opc_relationship_set *rel_set, IOpcRelationshipEnumerator **out);
++static HRESULT opc_rel_enum_create(struct opc_relationship_set *rel_set, const WCHAR *type,
++        IOpcRelationshipEnumerator **out);
+ 
+ static HRESULT WINAPI opc_rel_enum_QueryInterface(IOpcRelationshipEnumerator *iface, REFIID iid, void **out)
+ {
+@@ -378,6 +382,7 @@ static ULONG WINAPI opc_rel_enum_Release(IOpcRelationshipEnumerator *iface)
+     if (!refcount)
+     {
+         IOpcRelationshipSet_Release(&rel_enum->rel_set->IOpcRelationshipSet_iface);
++        free(rel_enum->type);
+         free(rel_enum);
+     }
+ 
+@@ -401,7 +406,12 @@ static HRESULT WINAPI opc_rel_enum_MoveNext(IOpcRelationshipEnumerator *iface, B
+     if (has_rel_collection_changed(rel_enum))
+         return OPC_E_ENUM_COLLECTION_CHANGED;
+ 
+-    if (rel_enum->rel_set->count && (rel_enum->pos == ~(size_t)0 || rel_enum->pos < rel_enum->rel_set->count))
++    if (rel_enum->pos == rel_enum->rel_set->count)
++        return OPC_E_ENUM_CANNOT_MOVE_NEXT;
++
++    rel_enum->pos++;
++    while (rel_enum->pos < rel_enum->rel_set->count && rel_enum->type &&
++            wcscmp(rel_enum->type, rel_enum->rel_set->relationships[rel_enum->pos]->type))
+         rel_enum->pos++;
+ 
+     *has_next = rel_enum->pos < rel_enum->rel_set->count;
+@@ -421,8 +431,14 @@ static HRESULT WINAPI opc_rel_enum_MovePrevious(IOpcRelationshipEnumerator *ifac
+     if (has_rel_collection_changed(rel_enum))
+         return OPC_E_ENUM_COLLECTION_CHANGED;
+ 
+-    if (rel_enum->pos != ~(size_t)0)
++    if (rel_enum->pos == ~(size_t)0)
++        return OPC_E_ENUM_CANNOT_MOVE_PREVIOUS;
++
++    do
++    {
+         rel_enum->pos--;
++    } while (rel_enum->pos != ~(size_t)0 && rel_enum->type &&
++            wcscmp(rel_enum->type, rel_enum->rel_set->relationships[rel_enum->pos]->type));
+ 
+     *has_previous = rel_enum->pos != ~(size_t)0;
+ 
+@@ -467,7 +483,7 @@ static HRESULT WINAPI opc_rel_enum_Clone(IOpcRelationshipEnumerator *iface, IOpc
+         return OPC_E_ENUM_COLLECTION_CHANGED;
+     }
+ 
+-    return opc_rel_enum_create(rel_enum->rel_set, out);
++    return opc_rel_enum_create(rel_enum->rel_set, rel_enum->type, out);
+ }
+ 
+ static const IOpcRelationshipEnumeratorVtbl opc_rel_enum_vtbl =
+@@ -481,12 +497,22 @@ static const IOpcRelationshipEnumeratorVtbl opc_rel_enum_vtbl =
+     opc_rel_enum_Clone,
+ };
+ 
+-static HRESULT opc_rel_enum_create(struct opc_relationship_set *rel_set, IOpcRelationshipEnumerator **out)
++static HRESULT opc_rel_enum_create(struct opc_relationship_set *rel_set, const WCHAR *type,
++        IOpcRelationshipEnumerator **out)
+ {
+     struct opc_rel_enum *rel_enum;
+ 
+     if (!(rel_enum = calloc(1, sizeof(*rel_enum))))
+         return E_OUTOFMEMORY;
++    if (type)
++    {
++        if (!(rel_enum->type = malloc((wcslen(type) + 1) * sizeof(WCHAR))))
++        {
++            free(rel_enum);
++            return E_OUTOFMEMORY;
++        }
++        wcscpy(rel_enum->type, type);
++    }
+ 
+     rel_enum->IOpcRelationshipEnumerator_iface.lpVtbl = &opc_rel_enum_vtbl;
+     rel_enum->refcount = 1;
+@@ -554,11 +580,10 @@ static HRESULT WINAPI opc_content_stream_Read(IStream *iface, void *buff, ULONG
+     if (!num_read)
+         num_read = &read;
+ 
+-    if (stream->content->size.QuadPart - stream->pos.QuadPart < size)
+-        *num_read = stream->content->size.QuadPart - stream->pos.QuadPart;
+-    else
+-        *num_read = size;
+-
++    *num_read = stream->pos.QuadPart >= stream->content->size.QuadPart ? 0 :
++            min((ULONGLONG)size, stream->content->size.QuadPart - stream->pos.QuadPart);
++    if (*num_read && !buff)
++        return STG_E_INVALIDPOINTER;
+     if (*num_read)
+         memcpy(buff, stream->content->data + stream->pos.QuadPart, *num_read);
+ 
+@@ -578,18 +603,30 @@ static HRESULT WINAPI opc_content_stream_Write(IStream *iface, const void *data,
+         num_written = &written;
+ 
+     *num_written = 0;
++    if (stream->read_only)
++        return STG_E_ACCESSDENIED;
++    if (size && !data)
++        return STG_E_INVALIDPOINTER;
++    if (!size)
++        return S_OK;
++    if (stream->pos.QuadPart > SIZE_MAX - size)
++        return E_OUTOFMEMORY;
+ 
+-    if (size > stream->content->size.QuadPart - stream->pos.QuadPart)
++    if (stream->pos.QuadPart + size > stream->content->size.QuadPart)
+     {
+         void *ptr = realloc(stream->content->data, stream->pos.QuadPart + size);
+-        if (!ptr)
++        if (!ptr && size)
+             return E_OUTOFMEMORY;
+         stream->content->data = ptr;
++        if (stream->pos.QuadPart > stream->content->size.QuadPart)
++            memset(stream->content->data + stream->content->size.QuadPart, 0,
++                    stream->pos.QuadPart - stream->content->size.QuadPart);
++        stream->content->size.QuadPart = stream->pos.QuadPart + size;
+     }
+ 
+-    memcpy(stream->content->data + stream->pos.QuadPart, data, size);
++    if (size)
++        memcpy(stream->content->data + stream->pos.QuadPart, data, size);
+     stream->pos.QuadPart += size;
+-    stream->content->size.QuadPart += size;
+     *num_written = size;
+ 
+     return S_OK;
+@@ -605,18 +642,31 @@ static HRESULT WINAPI opc_content_stream_Seek(IStream *iface, LARGE_INTEGER move
+     switch (origin)
+     {
+     case STREAM_SEEK_SET:
+-        pos.QuadPart = move.QuadPart;
++        pos.QuadPart = 0;
+         break;
+     case STREAM_SEEK_CUR:
+-        pos.QuadPart = stream->pos.QuadPart + move.QuadPart;
++        pos = stream->pos;
+         break;
+     case STREAM_SEEK_END:
+-        pos.QuadPart = stream->content->size.QuadPart + move.QuadPart;
++        pos = stream->content->size;
+         break;
+     default:
+         WARN("Unknown origin mode %ld.\n", origin);
+         return E_INVALIDARG;
+     }
++    if (move.QuadPart < 0)
++    {
++        ULONGLONG backward = (ULONGLONG)(-(move.QuadPart + 1)) + 1;
++        if (backward > pos.QuadPart)
++            return STG_E_INVALIDFUNCTION;
++        pos.QuadPart -= backward;
++    }
++    else
++    {
++        if (pos.QuadPart > LLONG_MAX - (ULONGLONG)move.QuadPart)
++            return STG_E_INVALIDFUNCTION;
++        pos.QuadPart += move.QuadPart;
++    }
+ 
+     stream->pos = pos;
+ 
+@@ -628,64 +678,136 @@ static HRESULT WINAPI opc_content_stream_Seek(IStream *iface, LARGE_INTEGER move
+ 
+ static HRESULT WINAPI opc_content_stream_SetSize(IStream *iface, ULARGE_INTEGER size)
+ {
+-    FIXME("iface %p, size %s stub!\n", iface, wine_dbgstr_longlong(size.QuadPart));
++    struct opc_content_stream *stream = impl_from_IStream(iface);
++    void *data;
++
++    TRACE("iface %p, size %s.\n", iface, wine_dbgstr_longlong(size.QuadPart));
+ 
+-    return E_NOTIMPL;
++    if (stream->read_only)
++        return STG_E_ACCESSDENIED;
++    if (size.QuadPart > SIZE_MAX)
++        return E_OUTOFMEMORY;
++    if (size.QuadPart == stream->content->size.QuadPart)
++        return S_OK;
++    if (size.QuadPart)
++    {
++        if (!(data = realloc(stream->content->data, size.QuadPart)))
++            return E_OUTOFMEMORY;
++        if (size.QuadPart > stream->content->size.QuadPart)
++            memset((BYTE *)data + stream->content->size.QuadPart, 0,
++                    size.QuadPart - stream->content->size.QuadPart);
++    }
++    else
++    {
++        free(stream->content->data);
++        data = NULL;
++    }
++    stream->content->data = data;
++    stream->content->size = size;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_CopyTo(IStream *iface, IStream *dest, ULARGE_INTEGER size,
+         ULARGE_INTEGER *num_read, ULARGE_INTEGER *written)
+ {
+-    FIXME("iface %p, dest %p, size %s, num_read %p, written %p stub!\n", iface, dest,
++    struct opc_content_stream *stream = impl_from_IStream(iface);
++    ULONGLONG count, copied = 0, read = 0;
++    BYTE buffer[0x8000];
++    ULONG chunk, done;
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, dest %p, size %s, num_read %p, written %p.\n", iface, dest,
+             wine_dbgstr_longlong(size.QuadPart), num_read, written);
+ 
+-    return E_NOTIMPL;
++    if (num_read)
++        num_read->QuadPart = 0;
++    if (written)
++        written->QuadPart = 0;
++    if (!dest)
++        return STG_E_INVALIDPOINTER;
++    count = stream->pos.QuadPart >= stream->content->size.QuadPart ? 0 :
++            min(size.QuadPart, stream->content->size.QuadPart - stream->pos.QuadPart);
++    while (read < count)
++    {
++        chunk = min(count - read, (ULONGLONG)sizeof(buffer));
++        memcpy(buffer, stream->content->data + stream->pos.QuadPart, chunk);
++        stream->pos.QuadPart += chunk;
++        read += chunk;
++        done = 0;
++        hr = IStream_Write(dest, buffer, chunk, &done);
++        copied += done;
++        if (FAILED(hr) || done != chunk)
++        {
++            if (SUCCEEDED(hr))
++                hr = STG_E_MEDIUMFULL;
++            break;
++        }
++    }
++    if (num_read)
++        num_read->QuadPart = read;
++    if (written)
++        written->QuadPart = copied;
++    return SUCCEEDED(hr) && read != size.QuadPart ? S_FALSE : hr;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_Commit(IStream *iface, DWORD flags)
+ {
+-    FIXME("iface %p, flags %#lx stub!\n", iface, flags);
+-
+-    return E_NOTIMPL;
++    TRACE("iface %p, flags %#lx.\n", iface, flags);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_Revert(IStream *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-
+-    return E_NOTIMPL;
++    TRACE("iface %p.\n", iface);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_LockRegion(IStream *iface, ULARGE_INTEGER offset,
+         ULARGE_INTEGER size, DWORD lock_type)
+ {
+-    FIXME("iface %p, offset %s, size %s, lock_type %ld stub!\n", iface, wine_dbgstr_longlong(offset.QuadPart),
++    TRACE("iface %p, offset %s, size %s, lock_type %ld.\n", iface, wine_dbgstr_longlong(offset.QuadPart),
+             wine_dbgstr_longlong(size.QuadPart), lock_type);
+-
+-    return E_NOTIMPL;
++    return STG_E_INVALIDFUNCTION;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_UnlockRegion(IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER size,
+         DWORD lock_type)
+ {
+-    FIXME("iface %p, offset %s, size %s, lock_type %ld stub!\n", iface, wine_dbgstr_longlong(offset.QuadPart),
++    TRACE("iface %p, offset %s, size %s, lock_type %ld.\n", iface, wine_dbgstr_longlong(offset.QuadPart),
+             wine_dbgstr_longlong(size.QuadPart), lock_type);
+-
+-    return E_NOTIMPL;
++    return STG_E_INVALIDFUNCTION;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_Stat(IStream *iface, STATSTG *statstg, DWORD flag)
+ {
+-    FIXME("iface %p, statstg %p, flag %ld stub!\n", iface, statstg, flag);
++    struct opc_content_stream *stream = impl_from_IStream(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, statstg %p, flag %ld.\n", iface, statstg, flag);
++    if (!statstg)
++        return E_POINTER;
++    memset(statstg, 0, sizeof(*statstg));
++    statstg->type = STGTY_STREAM;
++    statstg->cbSize = stream->content->size;
++    statstg->grfMode = stream->read_only ? STGM_READ : STGM_READWRITE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_content_stream_Clone(IStream *iface, IStream **result)
+ {
+-    FIXME("iface %p, result %p stub!\n", iface, result);
++    struct opc_content_stream *stream = impl_from_IStream(iface);
++    struct opc_content_stream *clone;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, result %p.\n", iface, result);
++    if (!result)
++        return E_POINTER;
++    *result = NULL;
++    if (!(clone = malloc(sizeof(*clone))))
++        return E_OUTOFMEMORY;
++    *clone = *stream;
++    clone->refcount = 1;
++    InterlockedIncrement(&clone->content->refcount);
++    *result = &clone->IStream_iface;
++    return S_OK;
+ }
+ 
+ static const IStreamVtbl opc_content_stream_vtbl =
+@@ -724,7 +846,43 @@ static HRESULT opc_content_stream_create(struct opc_content *content, IStream **
+     return S_OK;
+ }
+ 
++static HRESULT opc_content_stream_create_readonly(IStream *source, IStream **out)
++{
++    struct opc_content *content;
++    STATSTG stat;
++    HRESULT hr;
++    ULONG read;
++
++    *out = NULL;
++    if (FAILED(hr = IStream_Stat(source, &stat, STATFLAG_NONAME)))
++        return hr;
++    if (stat.cbSize.QuadPart > ~(ULONG)0 || !(content = calloc(1, sizeof(*content))))
++        return E_OUTOFMEMORY;
++    content->refcount = 1;
++    content->size = stat.cbSize;
++    if (content->size.QuadPart && !(content->data = malloc(content->size.QuadPart)))
++    {
++        opc_content_release(content);
++        return E_OUTOFMEMORY;
++    }
++    if (content->size.QuadPart)
++        hr = IStream_Read(source, content->data, content->size.QuadPart, &read);
++    else
++        hr = S_OK;
++    if (SUCCEEDED(hr) && content->size.QuadPart && read != content->size.QuadPart)
++        hr = STG_E_READFAULT;
++    if (SUCCEEDED(hr))
++    {
++        hr = opc_content_stream_create(content, out);
++        if (SUCCEEDED(hr))
++            impl_from_IStream(*out)->read_only = TRUE;
++    }
++    opc_content_release(content);
++    return hr;
++}
++
+ static HRESULT opc_relationship_set_create(IOpcUri *source_uri, IOpcRelationshipSet **relationship_set);
++static HRESULT opc_relationships_to_stream(IOpcRelationshipSet *rels, IXmlWriter *writer, IStream **stream);
+ 
+ static WCHAR *opc_strdupW(const WCHAR *str)
+ {
+@@ -782,7 +940,8 @@ static ULONG WINAPI opc_part_Release(IOpcPart *iface)
+             IOpcRelationshipSet_Release(part->relationship_set);
+         IOpcPartUri_Release(part->name);
+         CoTaskMemFree(part->content_type);
+-        opc_content_release(part->content);
++        if (part->content)
++            opc_content_release(part->content);
+         free(part);
+     }
+ 
+@@ -902,13 +1061,12 @@ static HRESULT opc_part_create(struct opc_part_set *set, IOpcPartUri *name, cons
+ 
+ static struct opc_part *opc_part_set_get_part(const struct opc_part_set *part_set, IOpcPartUri *name)
+ {
+-    BOOL is_equal;
++    INT32 result;
+     size_t i;
+ 
+     for (i = 0; i < part_set->count; ++i)
+     {
+-        is_equal = FALSE;
+-        if (IOpcPartUri_IsEqual(part_set->parts[i]->name, (IUri *)name, &is_equal) == S_OK && is_equal)
++        if (IOpcPartUri_ComparePartUri(part_set->parts[i]->name, name, &result) == S_OK && !result)
+             return part_set->parts[i];
+     }
+ 
+@@ -1009,9 +1167,23 @@ static HRESULT WINAPI opc_part_set_CreatePart(IOpcPartSet *iface, IOpcPartUri *n
+ 
+ static HRESULT WINAPI opc_part_set_DeletePart(IOpcPartSet *iface, IOpcPartUri *name)
+ {
+-    FIXME("iface %p, name %p stub!\n", iface, name);
++    struct opc_part_set *set = impl_from_IOpcPartSet(iface);
++    struct opc_part *part;
++    size_t i;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, name %p.\n", iface, name);
++    if (!name)
++        return E_POINTER;
++    if (!(part = opc_part_set_get_part(set, name)))
++        return OPC_E_NO_SUCH_PART;
++
++    for (i = 0; i < set->count; ++i)
++        if (set->parts[i] == part)
++            break;
++    memmove(set->parts + i, set->parts + i + 1, (--set->count - i) * sizeof(*set->parts));
++    CoCreateGuid(&set->id);
++    IOpcPart_Release(&part->IOpcPart_iface);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_part_set_PartExists(IOpcPartSet *iface, IOpcPartUri *name, BOOL *exists)
+@@ -1337,9 +1509,23 @@ static HRESULT WINAPI opc_relationship_set_CreateRelationship(IOpcRelationshipSe
+ 
+ static HRESULT WINAPI opc_relationship_set_DeleteRelationship(IOpcRelationshipSet *iface, const WCHAR *id)
+ {
+-    FIXME("iface %p, id %s stub!\n", iface, debugstr_w(id));
++    struct opc_relationship_set *set = impl_from_IOpcRelationshipSet(iface);
++    struct opc_relationship *rel;
++    size_t i;
++
++    TRACE("iface %p, id %s.\n", iface, debugstr_w(id));
++    if (!id)
++        return E_POINTER;
++    if (!(rel = opc_relationshipset_get_rel(set, id)))
++        return OPC_E_NO_SUCH_RELATIONSHIP;
+ 
+-    return E_NOTIMPL;
++    for (i = 0; i < set->count; ++i)
++        if (set->relationships[i] == rel)
++            break;
++    memmove(set->relationships + i, set->relationships + i + 1, (--set->count - i) * sizeof(*set->relationships));
++    CoCreateGuid(&set->id);
++    IOpcRelationship_Release(&rel->IOpcRelationship_iface);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_relationship_set_RelationshipExists(IOpcRelationshipSet *iface, const WCHAR *id, BOOL *exists)
+@@ -1366,22 +1552,43 @@ static HRESULT WINAPI opc_relationship_set_GetEnumerator(IOpcRelationshipSet *if
+     if (!enumerator)
+         return E_POINTER;
+ 
+-    return opc_rel_enum_create(relationship_set, enumerator);
++    return opc_rel_enum_create(relationship_set, NULL, enumerator);
+ }
+ 
+ static HRESULT WINAPI opc_relationship_set_GetEnumeratorForType(IOpcRelationshipSet *iface, const WCHAR *type,
+         IOpcRelationshipEnumerator **enumerator)
+ {
+-    FIXME("iface %p, type %s, enumerator %p stub!\n", iface, debugstr_w(type), enumerator);
++    struct opc_relationship_set *set = impl_from_IOpcRelationshipSet(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, type %s, enumerator %p.\n", iface, debugstr_w(type), enumerator);
++    if (!enumerator)
++        return E_POINTER;
++    *enumerator = NULL;
++    if (!type)
++        return E_POINTER;
++    return opc_rel_enum_create(set, type, enumerator);
+ }
+ 
+ static HRESULT WINAPI opc_relationship_set_GetRelationshipsContentStream(IOpcRelationshipSet *iface, IStream **stream)
+ {
+-    FIXME("iface %p, stream %p stub!\n", iface, stream);
++    IXmlWriter *writer;
++    IStream *content;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, stream %p.\n", iface, stream);
++    if (!stream)
++        return E_POINTER;
++    *stream = NULL;
++    if (FAILED(hr = CreateXmlWriter(&IID_IXmlWriter, (void **)&writer, NULL)))
++        return hr;
++    hr = opc_relationships_to_stream(iface, writer, &content);
++    if (SUCCEEDED(hr))
++    {
++        hr = opc_content_stream_create_readonly(content, stream);
++        IStream_Release(content);
++    }
++    IXmlWriter_Release(writer);
++    return hr;
+ }
+ 
+ static const IOpcRelationshipSetVtbl opc_relationship_set_vtbl =
+@@ -1881,31 +2088,20 @@ static HRESULT opc_package_write_rel(IOpcRelationship *rel, IXmlWriter *writer)
+     return IXmlWriter_WriteEndElement(writer);
+ }
+ 
+-static HRESULT opc_package_write_rels(struct zip_archive *archive, IOpcRelationshipSet *rels,
+-        IOpcUri *uri, IXmlWriter *writer)
++static HRESULT opc_relationships_to_stream(IOpcRelationshipSet *rels, IXmlWriter *writer, IStream **stream)
+ {
+     IOpcRelationshipEnumerator *enumerator;
+-    BSTR rels_part_uri = NULL;
+-    IOpcPartUri *rels_uri;
++    BOOL has_next = FALSE;
+     IStream *content;
+-    BOOL has_next;
++    LARGE_INTEGER start = {0};
+     HRESULT hr;
+ 
+-    if (FAILED(hr = IOpcRelationshipSet_GetEnumerator(rels, &enumerator)))
+-        return hr;
+-
+-    hr = IOpcRelationshipEnumerator_MoveNext(enumerator, &has_next);
+-    if (!has_next)
+-    {
+-        IOpcRelationshipEnumerator_Release(enumerator);
+-        return hr;
+-    }
+-
++    *stream = NULL;
+     if (FAILED(hr = CreateStreamOnHGlobal(NULL, TRUE, &content)))
+-    {
+-        IOpcRelationshipEnumerator_Release(enumerator);
+         return hr;
+-    }
++    hr = IOpcRelationshipSet_GetEnumerator(rels, &enumerator);
++    if (FAILED(hr))
++        goto done;
+ 
+     hr = IXmlWriter_SetOutput(writer, (IUnknown *)content);
+     if (SUCCEEDED(hr))
+@@ -1913,31 +2109,52 @@ static HRESULT opc_package_write_rels(struct zip_archive *archive, IOpcRelations
+     if (SUCCEEDED(hr))
+         hr = IXmlWriter_WriteStartElement(writer, NULL, L"Relationships",
+                 L"http://schemas.openxmlformats.org/package/2006/relationships");
++    if (SUCCEEDED(hr))
++        hr = IOpcRelationshipEnumerator_MoveNext(enumerator, &has_next);
+ 
+-    while (has_next)
++    while (SUCCEEDED(hr) && has_next)
+     {
+         IOpcRelationship *rel;
+ 
+         if (FAILED(hr = IOpcRelationshipEnumerator_GetCurrent(enumerator, &rel)))
+             break;
+-
+         hr = opc_package_write_rel(rel, writer);
+         IOpcRelationship_Release(rel);
+-        if (FAILED(hr))
+-            break;
+-
+-        IOpcRelationshipEnumerator_MoveNext(enumerator, &has_next);
++        if (SUCCEEDED(hr))
++            hr = IOpcRelationshipEnumerator_MoveNext(enumerator, &has_next);
+     }
+-
+     IOpcRelationshipEnumerator_Release(enumerator);
+ 
+     if (SUCCEEDED(hr))
+         hr = IXmlWriter_WriteEndDocument(writer);
+     if (SUCCEEDED(hr))
+         hr = IXmlWriter_Flush(writer);
+-
+     if (SUCCEEDED(hr))
+-        hr = IOpcUri_GetRelationshipsPartUri(uri, &rels_uri);
++        hr = IStream_Seek(content, start, STREAM_SEEK_SET, NULL);
++    if (SUCCEEDED(hr))
++    {
++        *stream = content;
++        return S_OK;
++    }
++done:
++    IStream_Release(content);
++    return hr;
++}
++
++static HRESULT opc_package_write_rels(struct zip_archive *archive, IOpcRelationshipSet *rels,
++        IOpcUri *uri, IXmlWriter *writer)
++{
++    BSTR rels_part_uri = NULL;
++    IOpcPartUri *rels_uri = NULL;
++    IStream *content = NULL;
++    HRESULT hr;
++
++    if (!opc_package_has_rels_part(rels))
++        return S_OK;
++    if (FAILED(hr = opc_relationships_to_stream(rels, writer, &content)))
++        return hr;
++
++    hr = IOpcUri_GetRelationshipsPartUri(uri, &rels_uri);
+     if (SUCCEEDED(hr))
+         hr = IOpcPartUri_GetRawUri(rels_uri, &rels_part_uri);
+     if (SUCCEEDED(hr))
+@@ -1947,8 +2164,9 @@ static HRESULT opc_package_write_rels(struct zip_archive *archive, IOpcRelations
+     }
+ 
+     SysFreeString(rels_part_uri);
++    if (rels_uri)
++        IOpcPartUri_Release(rels_uri);
+     IStream_Release(content);
+-
+     return hr;
+ }
+ 
+diff --git a/dlls/opcservices/tests/opcservices.c b/dlls/opcservices/tests/opcservices.c
+index 6336b22862b..2b7fa869f8b 100644
+--- a/dlls/opcservices/tests/opcservices.c
++++ b/dlls/opcservices/tests/opcservices.c
+@@ -617,7 +617,6 @@ static void test_rel_part_uri(void)
+ 
+             hr = IOpcPartUri_GetRawUri(rel_uri, &str);
+             ok(hr == S_OK, "Failed to get rel uri, hr %#lx.\n", hr);
+-            todo_wine_if(i == 3 || i == 4 || i == 8 || i == 9)
+             ok(!lstrcmpW(str, rel_part_uri_tests[i].rel_uri), "Unexpected rel uri %s, expected %s.\n",
+                     wine_dbgstr_w(str), wine_dbgstr_w(rel_part_uri_tests[i].rel_uri));
+             SysFreeString(str);
+@@ -1014,6 +1013,9 @@ static void test_relative_uri(void)
+         { L"/path2", L"/path", L"path" },
+         { L"../path", L"/path", L"" },
+         { L"../../path", L"/path", L"" },
++        { L"/a/b.xml", L"/a/c/d.xml", L"c/d.xml" },
++        { L"/a/b.xml", L"/e.xml", L"../e.xml" },
++        { L"/a/b.xml", L"/a/b.xml", L"" },
+     };
+     IOpcFactory *factory;
+     unsigned int i;
+@@ -1044,7 +1046,6 @@ static void test_relative_uri(void)
+         ok(hr == S_OK, "Failed to create part uri, hr %#lx.\n", hr);
+ 
+         hr = IOpcUri_GetRelativeUri(part_uri, combined_uri, &relative_uri);
+-    todo_wine
+         ok(hr == S_OK, "Failed to get relative uri, hr %#lx.\n", hr);
+ 
+     if (hr == S_OK)
+@@ -1121,7 +1122,6 @@ static void test_combine_uri(void)
+ 
+         hr = IOpcPartUri_GetRawUri(combined_uri, &str);
+         ok(hr == S_OK, "Failed to get raw uri, hr %#lx.\n", hr);
+-        todo_wine_if(i == 2 || i == 3)
+         ok(!lstrcmpW(str, combine_tests[i].combined), "Unexpected uri %s.\n", wine_dbgstr_w(str));
+         SysFreeString(str);
+ 
+@@ -1172,7 +1172,6 @@ static void test_create_part_uri(void)
+ 
+         hr = IOpcPartUri_GetRawUri(part_uri, &str);
+         ok(hr == S_OK, "Failed to get raw uri, hr %#lx.\n", hr);
+-        todo_wine_if(i == 1 || i == 2 || i == 4)
+         ok(!lstrcmpW(str, raw_uri), "Unexpected raw uri %s.\n", wine_dbgstr_w(str));
+         SysFreeString(str);
+ 
+@@ -1182,7 +1181,6 @@ static void test_create_part_uri(void)
+         ret = FALSE;
+         hr = IOpcPartUri_IsEqual(part_uri, uri, &ret);
+         ok(hr == S_OK, "IsEqual failed, hr %#lx.\n", hr);
+-        todo_wine_if(i == 1 || i == 2 || i == 4)
+         ok(!!ret, "Unexpected result %d.\n", ret);
+ 
+         IOpcPartUri_Release(part_uri);
+@@ -1286,6 +1284,7 @@ static void test_read_package(void)
+         { L"type2/subtype1", L"/entry7.21", OPC_COMPRESSION_NORMAL },
+         { L"type2/subtype2", L"/entry8.22", OPC_COMPRESSION_MAXIMUM },
+         { L"type1/subtype1", L"/dir1/entry1.11", OPC_COMPRESSION_FAST },
++        { L"type3/subtype3", L"/dir1/entry2.11", OPC_COMPRESSION_NORMAL },
+     };
+     const LARGE_INTEGER start = {0};
+     IOpcFactory *factory;
+@@ -1336,7 +1335,7 @@ static void test_read_package(void)
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IOpcFactory_ReadPackageFromStream(factory, stream, OPC_READ_DEFAULT, &package);
+-    todo_wine ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     IStream_Release(stream);
+     if (FAILED(hr)) goto done;
+ 
+@@ -1359,7 +1358,7 @@ static void test_read_package(void)
+ 
+         hr = IOpcPart_GetContentType(part, &type);
+         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-        todo_wine ok(!wcscmp(type, parts[i].type), "Unexpected type %s != %s.\n", debugstr_w(type), debugstr_w(parts[i].type));
++        ok(!wcscmp(type, parts[i].type), "Unexpected type %s != %s.\n", debugstr_w(type), debugstr_w(parts[i].type));
+         CoTaskMemFree(type);
+ 
+         options = ~0u;
+@@ -1389,6 +1388,462 @@ done:
+     IOpcFactory_Release(factory);
+ }
+ 
++static void test_file_stream_ops(void)
++{
++    IOpcFactory *factory = create_factory();
++    WCHAR path[MAX_PATH], temp[MAX_PATH];
++    IStream *stream, *clone, *dest;
++    LARGE_INTEGER start = {0};
++    ULARGE_INTEGER size, pos, read, written;
++    STATSTG stat;
++    char buffer[8];
++    HRESULT hr;
++    ULONG got;
++
++    GetTempPathW(ARRAY_SIZE(temp), temp);
++    lstrcpyW(path, temp);
++    lstrcatW(path, L"opcfileops.ext");
++    DeleteFileW(path);
++    hr = IOpcFactory_CreateStreamOnFile(factory, path, OPC_STREAM_IO_WRITE, NULL, 0, &stream);
++    ok(hr == S_OK, "CreateStreamOnFile failed, hr %#lx.\n", hr);
++    if (FAILED(hr))
++        goto done;
++    hr = IStream_Write(stream, "abc", 3, NULL);
++    ok(hr == S_OK, "Write failed, hr %#lx.\n", hr);
++    hr = IStream_Clone(stream, &clone);
++    ok(hr == S_OK, "Clone failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IStream_Seek(clone, start, STREAM_SEEK_SET, &pos);
++        ok(hr == S_OK && !pos.QuadPart, "Clone seek failed, hr %#lx.\n", hr);
++        hr = IStream_Write(clone, "X", 1, NULL);
++        ok(hr == S_OK, "Clone write failed, hr %#lx.\n", hr);
++        IStream_Release(clone);
++    }
++    hr = IStream_Seek(stream, start, STREAM_SEEK_CUR, &pos);
++    ok(hr == S_OK && pos.QuadPart == 3, "Clone changed original position %s.\n",
++            wine_dbgstr_longlong(pos.QuadPart));
++    size.QuadPart = 5;
++    hr = IStream_SetSize(stream, size);
++    ok(hr == S_OK, "SetSize failed, hr %#lx.\n", hr);
++    hr = IStream_Stat(stream, &stat, STATFLAG_NONAME);
++    ok(hr == S_OK && stat.cbSize.QuadPart == 5, "Unexpected file size %s.\n",
++            wine_dbgstr_longlong(stat.cbSize.QuadPart));
++    hr = IStream_Commit(stream, 0);
++    ok(hr == S_OK, "Commit failed, hr %#lx.\n", hr);
++    hr = IStream_Revert(stream);
++    ok(hr == S_OK, "Revert failed, hr %#lx.\n", hr);
++    hr = IStream_LockRegion(stream, size, size, LOCK_WRITE);
++    ok(hr == STG_E_INVALIDFUNCTION, "LockRegion returned %#lx.\n", hr);
++    hr = IStream_UnlockRegion(stream, size, size, LOCK_WRITE);
++    ok(hr == STG_E_INVALIDFUNCTION, "UnlockRegion returned %#lx.\n", hr);
++    IStream_Release(stream);
++
++    hr = IOpcFactory_CreateStreamOnFile(factory, path, OPC_STREAM_IO_READ, NULL, 0, &stream);
++    ok(hr == S_OK, "Read stream failed, hr %#lx.\n", hr);
++    if (FAILED(hr))
++        goto done;
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &dest);
++    ok(hr == S_OK, "Destination stream failed, hr %#lx.\n", hr);
++    size.QuadPart = 5;
++    hr = IStream_CopyTo(stream, dest, size, &read, &written);
++    ok(hr == S_OK && read.QuadPart == 5 && written.QuadPart == 5,
++            "File CopyTo failed, hr %#lx, read %s, written %s.\n", hr,
++            wine_dbgstr_longlong(read.QuadPart), wine_dbgstr_longlong(written.QuadPart));
++    hr = IStream_Seek(dest, start, STREAM_SEEK_SET, NULL);
++    ok(hr == S_OK, "Destination seek failed, hr %#lx.\n", hr);
++    got = 0;
++    hr = IStream_Read(dest, buffer, 5, &got);
++    ok(hr == S_OK && got == 5 && !memcmp(buffer, "Xbc\0\0", 5),
++            "Unexpected copied file data, hr %#lx, size %lu.\n", hr, got);
++    IStream_Release(dest);
++    IStream_Release(stream);
++done:
++    DeleteFileW(path);
++    IOpcFactory_Release(factory);
++}
++
++static void check_relationship(IOpcRelationshipSet *set, const WCHAR *id, const WCHAR *type,
++        const WCHAR *target, OPC_URI_TARGET_MODE expected_mode)
++{
++    OPC_URI_TARGET_MODE mode;
++    IOpcRelationship *rel;
++    IUri *target_uri;
++    WCHAR *value;
++    HRESULT hr;
++    BSTR raw;
++
++    hr = IOpcRelationshipSet_GetRelationship(set, id, &rel);
++    ok(hr == S_OK, "GetRelationship(%s) failed, hr %#lx.\n", wine_dbgstr_w(id), hr);
++    if (FAILED(hr))
++        return;
++    hr = IOpcRelationship_GetId(rel, &value);
++    ok(hr == S_OK && !wcscmp(value, id), "Unexpected id %s, hr %#lx.\n", wine_dbgstr_w(value), hr);
++    CoTaskMemFree(value);
++    hr = IOpcRelationship_GetRelationshipType(rel, &value);
++    ok(hr == S_OK && !wcscmp(value, type), "Unexpected type %s, hr %#lx.\n", wine_dbgstr_w(value), hr);
++    CoTaskMemFree(value);
++    hr = IOpcRelationship_GetTargetUri(rel, &target_uri);
++    ok(hr == S_OK, "GetTargetUri failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IUri_GetRawUri(target_uri, &raw);
++        ok(hr == S_OK && !wcscmp(raw, target), "Unexpected target %s, hr %#lx.\n", wine_dbgstr_w(raw), hr);
++        SysFreeString(raw);
++        IUri_Release(target_uri);
++    }
++    hr = IOpcRelationship_GetTargetMode(rel, &mode);
++    ok(hr == S_OK && mode == expected_mode, "Unexpected mode %d, hr %#lx.\n", mode, hr);
++    IOpcRelationship_Release(rel);
++}
++
++static void test_roundtrip_package(void)
++{
++    static const WCHAR content_type[] = L"application/vnd.test+xml";
++    static const WCHAR internal_type[] = L"urn:test:internal";
++    static const WCHAR external_type[] = L"urn:test:external";
++    static const WCHAR package_type[] = L"urn:test:package";
++    static const char rels_xml[] = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
++            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
++            "<Relationship Target=\"media/image.bin\" Id=\"internal\" Type=\"urn:test:internal\" />"
++            "<Relationship Target=\"https://example.com/\" Id=\"external\" Type=\"urn:test:external\" TargetMode=\"External\" />"
++            "</Relationships>";
++    IOpcFactory *factory = create_factory();
++    IOpcPackage *package = NULL, *read_package = NULL;
++    IOpcPartSet *parts = NULL, *read_parts = NULL;
++    IOpcPartUri *uri = NULL;
++    IOpcPart *part = NULL, *read_part = NULL;
++    IOpcRelationshipSet *rels = NULL, *package_rels = NULL, *read_rels = NULL;
++    IOpcRelationship *rel;
++    IOpcPartEnumerator *enumerator;
++    IStream *content = NULL, *zip = NULL, *xml = NULL;
++    IUri *target = NULL;
++    WCHAR *type;
++    OPC_COMPRESSION_OPTIONS options;
++    LARGE_INTEGER zero = {0};
++    HRESULT hr;
++    ULONG got;
++    BOOL next;
++    char buffer[1024];
++    unsigned int i;
++
++    hr = IOpcFactory_CreatePackage(factory, &package);
++    ok(hr == S_OK, "CreatePackage failed, hr %#lx.\n", hr);
++    hr = IOpcFactory_CreatePartUri(factory, L"/word/document.xml", &uri);
++    ok(hr == S_OK, "CreatePartUri failed, hr %#lx.\n", hr);
++    hr = IOpcPackage_GetPartSet(package, &parts);
++    ok(hr == S_OK, "GetPartSet failed, hr %#lx.\n", hr);
++    hr = IOpcPartSet_CreatePart(parts, uri, content_type, OPC_COMPRESSION_FAST, &part);
++    ok(hr == S_OK, "CreatePart failed, hr %#lx.\n", hr);
++    hr = IOpcPart_GetContentStream(part, &content);
++    ok(hr == S_OK, "GetContentStream failed, hr %#lx.\n", hr);
++    hr = IStream_Write(content, "document data", 13, NULL);
++    ok(hr == S_OK, "Write failed, hr %#lx.\n", hr);
++    IStream_Release(content);
++
++    hr = IOpcPart_GetRelationshipSet(part, &rels);
++    ok(hr == S_OK, "GetRelationshipSet failed, hr %#lx.\n", hr);
++    hr = CreateUri(L"media/image.bin", Uri_CREATE_ALLOW_RELATIVE, 0, &target);
++    ok(hr == S_OK, "CreateUri failed, hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_CreateRelationship(rels, L"internal", internal_type, target,
++            OPC_URI_TARGET_MODE_INTERNAL, &rel);
++    ok(hr == S_OK, "CreateRelationship failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++        IOpcRelationship_Release(rel);
++    IUri_Release(target);
++    hr = CreateUri(L"https://example.com/", 0, 0, &target);
++    ok(hr == S_OK, "CreateUri failed, hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_CreateRelationship(rels, L"external", external_type, target,
++            OPC_URI_TARGET_MODE_EXTERNAL, &rel);
++    ok(hr == S_OK, "CreateRelationship failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++        IOpcRelationship_Release(rel);
++    IUri_Release(target);
++    hr = IOpcPackage_GetRelationshipSet(package, &package_rels);
++    ok(hr == S_OK, "GetRelationshipSet failed, hr %#lx.\n", hr);
++    hr = CreateUri(L"word/document.xml", Uri_CREATE_ALLOW_RELATIVE, 0, &target);
++    ok(hr == S_OK, "CreateUri failed, hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_CreateRelationship(package_rels, L"package", package_type, target,
++            OPC_URI_TARGET_MODE_INTERNAL, &rel);
++    ok(hr == S_OK, "CreateRelationship failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++        IOpcRelationship_Release(rel);
++    IUri_Release(target);
++
++    hr = IOpcRelationshipSet_GetRelationshipsContentStream(rels, &xml);
++    ok(hr == S_OK, "GetRelationshipsContentStream failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        got = 0;
++        hr = IStream_Read(xml, buffer, sizeof(buffer) - 1, &got);
++        ok(hr == S_OK, "Read relationships XML failed, hr %#lx.\n", hr);
++        buffer[got] = 0;
++        ok(!strcmp(buffer, rels_xml), "Unexpected relationships XML: %s.\n", buffer);
++        hr = IStream_Write(xml, "x", 1, NULL);
++        ok(hr == STG_E_ACCESSDENIED, "Expected read-only stream, hr %#lx.\n", hr);
++        IStream_Release(xml);
++    }
++
++    for (i = 0; i < 2; ++i)
++    {
++        winetest_push_context("ZIP%u", i ? 64 : 32);
++        hr = CreateStreamOnHGlobal(NULL, TRUE, &zip);
++        ok(hr == S_OK, "CreateStreamOnHGlobal failed, hr %#lx.\n", hr);
++        hr = IOpcFactory_WritePackageToStream(factory, package,
++                i ? OPC_WRITE_DEFAULT : OPC_WRITE_FORCE_ZIP32, zip);
++        ok(hr == S_OK, "WritePackageToStream failed, hr %#lx.\n", hr);
++        hr = IStream_Seek(zip, zero, STREAM_SEEK_SET, NULL);
++        ok(hr == S_OK, "Seek failed, hr %#lx.\n", hr);
++        hr = IOpcFactory_ReadPackageFromStream(factory, zip,
++                i ? OPC_CACHE_ON_ACCESS : OPC_READ_DEFAULT, &read_package);
++        ok(hr == S_OK, "ReadPackageFromStream failed, hr %#lx.\n", hr);
++        IStream_Release(zip);
++        if (FAILED(hr))
++        {
++            winetest_pop_context();
++            continue;
++        }
++
++        hr = IOpcPackage_GetPartSet(read_package, &read_parts);
++        ok(hr == S_OK, "GetPartSet failed, hr %#lx.\n", hr);
++        hr = IOpcPartSet_GetPart(read_parts, uri, &read_part);
++        ok(hr == S_OK, "GetPart failed, hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IOpcPart_GetContentType(read_part, &type);
++            ok(hr == S_OK && !wcscmp(type, content_type), "Unexpected content type %s.\n", wine_dbgstr_w(type));
++            CoTaskMemFree(type);
++            hr = IOpcPart_GetCompressionOptions(read_part, &options);
++            ok(hr == S_OK && options == OPC_COMPRESSION_FAST, "Unexpected compression %d.\n", options);
++            hr = IOpcPart_GetContentStream(read_part, &content);
++            ok(hr == S_OK, "GetContentStream failed, hr %#lx.\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                got = 0;
++                hr = IStream_Read(content, buffer, sizeof(buffer), &got);
++                ok(hr == S_OK && got == 13 && !memcmp(buffer, "document data", 13),
++                        "Unexpected content length %lu, hr %#lx.\n", got, hr);
++                IStream_Release(content);
++            }
++            hr = IOpcPart_GetRelationshipSet(read_part, &read_rels);
++            ok(hr == S_OK, "GetRelationshipSet failed, hr %#lx.\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                check_relationship(read_rels, L"internal", internal_type, L"media/image.bin",
++                        OPC_URI_TARGET_MODE_INTERNAL);
++                check_relationship(read_rels, L"external", external_type, L"https://example.com/",
++                        OPC_URI_TARGET_MODE_EXTERNAL);
++                IOpcRelationshipSet_Release(read_rels);
++            }
++            IOpcPart_Release(read_part);
++        }
++        hr = IOpcPartSet_GetEnumerator(read_parts, &enumerator);
++        ok(hr == S_OK, "GetEnumerator failed, hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            IOpcPartEnumerator_MoveNext(enumerator, &next);
++            ok(next, "Missing part.\n");
++            IOpcPartEnumerator_MoveNext(enumerator, &next);
++            ok(!next, "Metadata was exposed as a part.\n");
++            IOpcPartEnumerator_Release(enumerator);
++        }
++        IOpcPartSet_Release(read_parts);
++        hr = IOpcPackage_GetRelationshipSet(read_package, &read_rels);
++        ok(hr == S_OK, "GetRelationshipSet failed, hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            check_relationship(read_rels, L"package", package_type, L"word/document.xml",
++                    OPC_URI_TARGET_MODE_INTERNAL);
++            IOpcRelationshipSet_Release(read_rels);
++        }
++        IOpcPackage_Release(read_package);
++        winetest_pop_context();
++    }
++    IOpcRelationshipSet_Release(package_rels);
++    IOpcRelationshipSet_Release(rels);
++    IOpcPart_Release(part);
++    IOpcPartUri_Release(uri);
++    IOpcPartSet_Release(parts);
++    IOpcPackage_Release(package);
++    IOpcFactory_Release(factory);
++}
++
++static void test_edit_package(void)
++{
++    IOpcFactory *factory = create_factory();
++    IOpcPackage *package;
++    IOpcPartSet *parts;
++    IOpcPartUri *uri, *other_uri;
++    IOpcPart *part, *other_part;
++    IOpcRelationshipSet *rels;
++    IOpcRelationshipEnumerator *enumerator;
++    IOpcRelationship *rel;
++    IStream *content, *clone, *dest;
++    IUri *target;
++    WCHAR *type;
++    ULARGE_INTEGER size, count, written, pos;
++    LARGE_INTEGER move = {0};
++    STATSTG stat;
++    HRESULT hr;
++    INT32 order;
++    BOOL next, exists;
++    char buffer[16];
++
++    IOpcFactory_CreatePackage(factory, &package);
++    IOpcPackage_GetPartSet(package, &parts);
++    IOpcFactory_CreatePartUri(factory, L"/word/document.xml", &uri);
++    IOpcFactory_CreatePartUri(factory, L"/WORD/DOCUMENT.XML", &other_uri);
++    hr = IOpcPartUri_ComparePartUri(uri, other_uri, &order);
++    ok(hr == S_OK && !order, "Expected equal part URIs, hr %#lx, order %d.\n", hr, order);
++    hr = IOpcPartUri_ComparePartUri(uri, NULL, &order);
++    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcPartUri_ComparePartUri(uri, other_uri, NULL);
++    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    IOpcPartUri_Release(other_uri);
++    IOpcFactory_CreatePartUri(factory, L"/word/earlier.xml", &other_uri);
++    hr = IOpcPartUri_ComparePartUri(uri, other_uri, &order);
++    ok(hr == S_OK && order < 0, "Unexpected ordering %d, hr %#lx.\n", order, hr);
++    IOpcPartUri_Release(other_uri);
++
++    IOpcPartSet_CreatePart(parts, uri, L"application/xml", OPC_COMPRESSION_NORMAL, &part);
++    IOpcFactory_CreatePartUri(factory, L"/WORD/DOCUMENT.XML", &other_uri);
++    other_part = (void *)0xdeadbeef;
++    hr = IOpcPartSet_CreatePart(parts, other_uri, L"application/xml", OPC_COMPRESSION_NORMAL, &other_part);
++    ok(hr == OPC_E_DUPLICATE_PART && other_part == NULL, "Case-variant duplicate accepted, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++        IOpcPart_Release(other_part);
++    hr = IOpcPartSet_GetPart(parts, other_uri, &other_part);
++    ok(hr == S_OK && other_part == part, "Case-variant lookup failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++        IOpcPart_Release(other_part);
++    IOpcPartUri_Release(other_uri);
++    IOpcPart_GetContentStream(part, &content);
++    size.QuadPart = 4;
++    hr = IStream_SetSize(content, size);
++    ok(hr == S_OK, "SetSize failed, hr %#lx.\n", hr);
++    hr = IStream_Stat(content, &stat, STATFLAG_NONAME);
++    ok(hr == S_OK && stat.cbSize.QuadPart == 4 && stat.grfMode == STGM_READWRITE,
++            "Unexpected stream stat, hr %#lx, size %s.\n", hr, wine_dbgstr_longlong(stat.cbSize.QuadPart));
++    hr = IStream_Write(content, "data", 4, NULL);
++    ok(hr == S_OK, "Write failed, hr %#lx.\n", hr);
++    hr = IStream_Clone(content, &clone);
++    ok(hr == S_OK, "Clone failed, hr %#lx.\n", hr);
++    hr = IStream_Seek(clone, move, STREAM_SEEK_SET, &pos);
++    ok(hr == S_OK && pos.QuadPart == 0, "Seek clone failed, hr %#lx.\n", hr);
++    hr = IStream_Read(clone, buffer, 4, NULL);
++    ok(hr == S_OK && !memcmp(buffer, "data", 4), "Clone did not share content.\n");
++    hr = IStream_Seek(content, move, STREAM_SEEK_CUR, &pos);
++    ok(hr == S_OK && pos.QuadPart == 4, "Clone changed original position.\n");
++    IStream_Release(clone);
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &dest);
++    ok(hr == S_OK, "CreateStreamOnHGlobal failed, hr %#lx.\n", hr);
++    IStream_Seek(content, move, STREAM_SEEK_SET, NULL);
++    size.QuadPart = 4;
++    hr = IStream_CopyTo(content, dest, size, &count, &written);
++    ok(hr == S_OK && count.QuadPart == 4 && written.QuadPart == 4,
++            "CopyTo failed, hr %#lx, counts %s / %s.\n", hr,
++            wine_dbgstr_longlong(count.QuadPart), wine_dbgstr_longlong(written.QuadPart));
++    IStream_Release(dest);
++    hr = IStream_Commit(content, 0);
++    ok(hr == S_OK, "Commit failed, hr %#lx.\n", hr);
++    hr = IStream_Revert(content);
++    ok(hr == S_OK, "Revert failed, hr %#lx.\n", hr);
++    hr = IStream_LockRegion(content, size, size, LOCK_WRITE);
++    ok(hr == STG_E_INVALIDFUNCTION, "LockRegion returned %#lx.\n", hr);
++    hr = IStream_UnlockRegion(content, size, size, LOCK_WRITE);
++    ok(hr == STG_E_INVALIDFUNCTION, "UnlockRegion returned %#lx.\n", hr);
++    IStream_Release(content);
++
++    IOpcPart_GetRelationshipSet(part, &rels);
++    hr = IOpcRelationshipSet_GetRelationshipsContentStream(rels, &content);
++    ok(hr == S_OK, "Empty relationships stream failed, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        char xml_buf[256];
++        ULONG got = 0;
++        hr = IStream_Read(content, xml_buf, sizeof(xml_buf) - 1, &got);
++        ok(hr == S_OK, "Read empty relationships failed, hr %#lx.\n", hr);
++        xml_buf[got] = 0;
++        ok(strstr(xml_buf, "<Relationships xmlns=") != NULL && strstr(xml_buf, "<Relationship ") == NULL,
++                "Unexpected empty relationships XML %s.\n", xml_buf);
++        IStream_Release(content);
++    }
++    CreateUri(L"target", Uri_CREATE_ALLOW_RELATIVE, 0, &target);
++    hr = IOpcRelationshipSet_CreateRelationship(rels, L"first", L"urn:one", target,
++            OPC_URI_TARGET_MODE_INTERNAL, &rel);
++    ok(hr == S_OK, "CreateRelationship failed, hr %#lx.\n", hr);
++    IOpcRelationship_Release(rel);
++    hr = IOpcRelationshipSet_CreateRelationship(rels, L"second", L"urn:two", target,
++            OPC_URI_TARGET_MODE_INTERNAL, &rel);
++    ok(hr == S_OK, "CreateRelationship failed, hr %#lx.\n", hr);
++    IOpcRelationship_Release(rel);
++    IUri_Release(target);
++    hr = IOpcRelationshipSet_GetEnumeratorForType(rels, NULL, &enumerator);
++    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_GetEnumeratorForType(rels, L"urn:one", NULL);
++    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_GetEnumeratorForType(rels, L"urn:one", &enumerator);
++    ok(hr == S_OK, "GetEnumeratorForType failed, hr %#lx.\n", hr);
++    IOpcRelationshipEnumerator_MoveNext(enumerator, &next);
++    ok(next, "Missing filtered relationship.\n");
++    IOpcRelationshipEnumerator_GetCurrent(enumerator, &rel);
++    IOpcRelationship_GetId(rel, &type);
++    ok(!wcscmp(type, L"first"), "Unexpected filtered ID %s.\n", wine_dbgstr_w(type));
++    CoTaskMemFree(type);
++    IOpcRelationship_Release(rel);
++    IOpcRelationshipEnumerator_MoveNext(enumerator, &next);
++    ok(!next, "Unfiltered relationship included.\n");
++    IOpcRelationshipEnumerator_Release(enumerator);
++    hr = IOpcRelationshipSet_DeleteRelationship(rels, NULL);
++    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_DeleteRelationship(rels, L"missing");
++    ok(hr == OPC_E_NO_SUCH_RELATIONSHIP, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_DeleteRelationship(rels, L"first");
++    ok(hr == S_OK, "DeleteRelationship failed, hr %#lx.\n", hr);
++    hr = IOpcRelationshipSet_RelationshipExists(rels, L"first", &exists);
++    ok(hr == S_OK && !exists, "Deleted relationship still exists.\n");
++    IOpcRelationshipSet_Release(rels);
++    IOpcPart_Release(part);
++    hr = IOpcPartSet_DeletePart(parts, NULL);
++    ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcPartSet_DeletePart(parts, uri);
++    ok(hr == S_OK, "DeletePart failed, hr %#lx.\n", hr);
++    hr = IOpcPartSet_DeletePart(parts, uri);
++    ok(hr == OPC_E_NO_SUCH_PART, "Unexpected hr %#lx.\n", hr);
++    hr = IOpcPartSet_PartExists(parts, uri, &exists);
++    ok(hr == S_OK && !exists, "Deleted part still exists.\n");
++    IOpcPartUri_Release(uri);
++    IOpcPartSet_Release(parts);
++    IOpcPackage_Release(package);
++    IOpcFactory_Release(factory);
++}
++
++static void test_invalid_packages(void)
++{
++    static const char bytes[] = "not a zip file";
++    static const BYTE no_content_types[22] = { 'P', 'K', 5, 6 };
++    IOpcFactory *factory = create_factory();
++    IOpcPackage *package;
++    IStream *stream;
++    HRESULT hr;
++    unsigned int i;
++
++    for (i = 0; i < 4; ++i)
++    {
++        hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++        ok(hr == S_OK, "CreateStreamOnHGlobal failed, hr %#lx.\n", hr);
++        if (i == 1)
++            IStream_Write(stream, bytes, sizeof(bytes), NULL);
++        else if (i >= 2)
++            IStream_Write(stream, no_content_types, sizeof(no_content_types) - (i == 3), NULL);
++        package = (void *)0xdeadbeef;
++        hr = IOpcFactory_ReadPackageFromStream(factory, stream, OPC_READ_DEFAULT, &package);
++        ok(FAILED(hr) && !package, "Unexpected invalid ZIP result %#lx, %p.\n", hr, package);
++        IStream_Release(stream);
++    }
++    IOpcFactory_Release(factory);
++}
++
+ START_TEST(opcservices)
+ {
+     IOpcFactory *factory;
+@@ -1405,6 +1860,7 @@ START_TEST(opcservices)
+ 
+     test_package();
+     test_file_stream();
++    test_file_stream_ops();
+     test_relationship();
+     test_rel_part_uri();
+     test_part_enumerator();
+@@ -1414,6 +1870,9 @@ START_TEST(opcservices)
+     test_create_part_uri();
+     test_write_package();
+     test_read_package();
++    test_roundtrip_package();
++    test_edit_package();
++    test_invalid_packages();
+ 
+     IOpcFactory_Release(factory);
+ 
+diff --git a/dlls/opcservices/uri.c b/dlls/opcservices/uri.c
+index a3ea617e297..ad6836103ee 100644
+--- a/dlls/opcservices/uri.c
++++ b/dlls/opcservices/uri.c
+@@ -349,9 +349,123 @@ static HRESULT WINAPI opc_uri_GetRelationshipsPartUri(IOpcPartUri *iface, IOpcPa
+ static HRESULT WINAPI opc_uri_GetRelativeUri(IOpcPartUri *iface, IOpcPartUri *part_uri,
+         IUri **relative_uri)
+ {
+-    FIXME("iface %p, part_uri %p, relative_uri %p stub!\n", iface, part_uri, relative_uri);
++    const WCHAR *source_pos, *target_pos, *source_end, *target_end;
++    BSTR source = NULL, target = NULL;
++    WCHAR *path, *end;
++    HRESULT hr;
++
++    TRACE("iface %p, part_uri %p, relative_uri %p.\n", iface, part_uri, relative_uri);
++
++    if (!relative_uri)
++        return E_POINTER;
++    *relative_uri = NULL;
++    if (!part_uri)
++        return E_POINTER;
+ 
+-    return E_NOTIMPL;
++    if (FAILED(hr = IOpcPartUri_GetRawUri(iface, &source)))
++        return hr;
++    if (FAILED(hr = IOpcPartUri_GetRawUri(part_uri, &target)))
++        goto done;
++
++    /* a part's reference to itself is empty, however deep it is */
++    if (!wcsicmp(source, target))
++    {
++        hr = CreateUri(L"", Uri_CREATE_ALLOW_RELATIVE, 0, relative_uri);
++        goto done;
++    }
++
++    source_pos = source + 1;
++    target_pos = target + 1;
++    while (*source_pos && *target_pos)
++    {
++        source_end = wcschr(source_pos, '/');
++        target_end = wcschr(target_pos, '/');
++        if (!source_end || !target_end || source_end - source_pos != target_end - target_pos ||
++                wcsnicmp(source_pos, target_pos, source_end - source_pos))
++            break;
++        source_pos = source_end + 1;
++        target_pos = target_end + 1;
++    }
++
++    if (!(path = malloc((wcslen(source) + wcslen(target) + 1) * sizeof(WCHAR))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    end = path;
++    while ((source_end = wcschr(source_pos, '/')))
++    {
++        *end++ = '.';
++        *end++ = '.';
++        *end++ = '/';
++        source_pos = source_end + 1;
++    }
++    /* The source part's last component is a file, not a directory. */
++    wcscpy(end, target_pos);
++    hr = CreateUri(path, Uri_CREATE_ALLOW_RELATIVE, 0, relative_uri);
++    free(path);
++done:
++    SysFreeString(source);
++    SysFreeString(target);
++    return hr;
++}
++
++HRESULT opc_normalize_part_uri(IUri *uri, IUri **normalized)
++{
++    WCHAR *path, *segment, *out, *end;
++    BSTR raw;
++    HRESULT hr;
++
++    if (FAILED(hr = IUri_GetRawUri(uri, &raw)))
++        return hr;
++    if (!(path = malloc((wcslen(raw) + 2) * sizeof(WCHAR))))
++    {
++        SysFreeString(raw);
++        return E_OUTOFMEMORY;
++    }
++
++    out = path;
++    *out++ = '/';
++    segment = raw;
++    while (*segment)
++    {
++        while (*segment == '/')
++            segment++;
++        if (!*segment)
++            break;
++        end = wcschr(segment, '/');
++        if (!end)
++            end = segment + wcslen(segment);
++        if (end - segment == 1 && segment[0] == '.')
++        {
++            segment = end;
++            continue;
++        }
++        if (end - segment == 2 && segment[0] == '.' && segment[1] == '.')
++        {
++            if (out > path + 1)
++            {
++                --out;
++                while (out > path + 1 && out[-1] != '/')
++                    --out;
++            }
++        }
++        else
++        {
++            memcpy(out, segment, (end - segment) * sizeof(WCHAR));
++            out += end - segment;
++            *out++ = '/';
++        }
++        segment = end;
++    }
++    if (out > path + 1 && raw[wcslen(raw) - 1] != '/')
++        --out;
++    *out = 0;
++
++    hr = CreateUri(path, Uri_CREATE_ALLOW_RELATIVE, 0, normalized);
++    free(path);
++    SysFreeString(raw);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI opc_uri_CombinePartUri(IOpcPartUri *iface, IUri *relative_uri, IOpcPartUri **combined)
+@@ -373,17 +487,41 @@ static HRESULT WINAPI opc_uri_CombinePartUri(IOpcPartUri *iface, IUri *relative_
+     if (FAILED(hr = CoInternetCombineIUri(uri->uri, relative_uri, 0, &combined_uri, 0)))
+         return hr;
+ 
+-    hr = opc_part_uri_create(combined_uri, NULL, combined);
+-    IUri_Release(combined_uri);
++    {
++        IUri *normalized;
++
++        hr = opc_normalize_part_uri(combined_uri, &normalized);
++        IUri_Release(combined_uri);
++        if (FAILED(hr))
++            return hr;
++        hr = opc_part_uri_create(normalized, NULL, combined);
++        IUri_Release(normalized);
++    }
+     return hr;
+ }
+ 
+ static HRESULT WINAPI opc_uri_ComparePartUri(IOpcPartUri *iface, IOpcPartUri *part_uri,
+         INT32 *result)
+ {
+-    FIXME("iface %p, part_uri %p, result %p stub!\n", iface, part_uri, result);
++    BSTR source, target;
++    HRESULT hr;
++
++    TRACE("iface %p, part_uri %p, result %p.\n", iface, part_uri, result);
+ 
+-    return E_NOTIMPL;
++    if (!part_uri || !result)
++        return E_POINTER;
++
++    if (FAILED(hr = IOpcPartUri_GetRawUri(iface, &source)))
++        return hr;
++    if (FAILED(hr = IOpcPartUri_GetRawUri(part_uri, &target)))
++    {
++        SysFreeString(source);
++        return hr;
++    }
++    *result = wcsicmp(source, target);
++    SysFreeString(source);
++    SysFreeString(target);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI opc_uri_GetSourceUri(IOpcPartUri *iface, IOpcUri **source_uri)

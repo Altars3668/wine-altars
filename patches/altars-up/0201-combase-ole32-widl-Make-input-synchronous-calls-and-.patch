@@ -1,0 +1,463 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:12:39 -0400
+Subject: [PATCH] combase, ole32, widl: Make input-synchronous calls, and only
+ those, from a sent message.
+
+A single-threaded apartment handling a message another thread sent, and
+waits in, could call out and wait for a thread that waits for it: Word,
+destroying the window Excel was active in, waited for Excel to handle
+WM_DESTROY while Excel waited for Word to answer a call.  As on Windows,
+such a thread can now make only the calls IDL marks [input_sync], and
+the others fail at once with RPC_E_CANTCALLOUT_ININPUTSYNCCALL, whether
+or not a call of its own is pending; the input-synchronous ones are sent
+to the thread called, which takes them while it waits in a message it
+sent itself.  widl puts RPCFLG_INPUT_SYNCHRONOUS in the procedure's
+flags, and the channel carries it in ORPCTHIS to the other process.
+
+The methods marked are those Windows 11 takes from a sent message:
+GetWindow, GetBorder, RequestBorderSpace, SetBorderSpace, SetMenu,
+SetStatusText, OnFrameWindowActivate, OnDocWindowActivate, ResizeBorder,
+SetObjectRects and IOleCommandTarget::QueryStatus.  The proxy of
+IOleInPlaceActiveObject::TranslateAccelerator answers S_FALSE itself,
+as there, without calling the object.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 548ca9ba417fd4055bc80852e7940653184bffb3)
+
+diff --git a/dlls/combase/apartment.c b/dlls/combase/apartment.c
+index d7aca645970..27f0cbfb217 100644
+--- a/dlls/combase/apartment.c
++++ b/dlls/combase/apartment.c
+@@ -1117,7 +1117,19 @@ static LRESULT CALLBACK apartment_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LP
+         rpc_execute_call((struct dispatch_params *)lParam);
+         return 0;
+     case DM_HOSTOBJECT:
+-        return apartment_hostobject(com_get_current_apt(), (const struct host_object_params *)lParam);
++    {
++        struct tlsdata *tlsdata;
++        DWORD flags;
++        LRESULT ret;
++
++        /* COM sends this itself, and the object made for the sender may call out as if it were not sent */
++        com_get_tlsdata(&tlsdata);
++        flags = tlsdata->flags;
++        tlsdata->flags |= OLETLS_HOSTINGOBJECT;
++        ret = apartment_hostobject(com_get_current_apt(), (const struct host_object_params *)lParam);
++        tlsdata->flags = (tlsdata->flags & ~OLETLS_HOSTINGOBJECT) | (flags & OLETLS_HOSTINGOBJECT);
++        return ret;
++    }
+     default:
+         return DefWindowProcW(hWnd, msg, wParam, lParam);
+     }
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index 5aabcc41bef..1016bad7631 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -68,6 +68,7 @@ enum tlsdata_flags
+     OLETLS_DISABLE_OLE1DDE = 0x40,
+     OLETLS_APARTMENTTHREADED = 0x80,
+     OLETLS_MULTITHREADED = 0x100,
++    OLETLS_HOSTINGOBJECT = 0x10000000, /* Wine: making an object for a thread that sent the request */
+ };
+ 
+ /* this is what is stored in TEB->ReservedForOle */
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+index dc33877825b..27d1676f365 100644
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -149,6 +149,9 @@ typedef struct
+     unsigned char extensions[1];
+ } WIRE_ORPCTHIS;
+ 
++/* the call is input-synchronous: the thread called takes it even while it waits in a message it sent */
++#define ORPCF_INPUT_SYNC ORPCF_RESERVED1
++
+ typedef struct
+ {
+     ULONG flags;
+@@ -1274,6 +1277,7 @@ static HRESULT WINAPI ClientRpcChannelBuffer_GetBuffer(LPRPCCHANNELBUFFER iface,
+         orpcthis->version.MajorVersion = COM_MAJOR_VERSION;
+         orpcthis->version.MinorVersion = COM_MINOR_VERSION;
+         orpcthis->flags = message_state->channel_hook_info.dwServerPid ? ORPCF_LOCAL : ORPCF_NULL;
++        if (msg->RpcFlags & RPCFLG_INPUT_SYNCHRONOUS) orpcthis->flags |= ORPCF_INPUT_SYNC;
+         orpcthis->reserved1 = 0;
+         orpcthis->cid = message_state->channel_hook_info.uCausality;
+ 
+@@ -1382,16 +1386,14 @@ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER ifac
+     if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+         return hr;
+ 
+-    /* This situation should be impossible in multi-threaded apartments,
+-     * because the calling thread isn't re-enterable.
+-     * Note: doing a COM call during the processing of a sent message is
+-     * only disallowed if a client call is already being waited for
+-     * completion */
+-    if (!apt->multi_threaded &&
+-        tlsdata->pending_call_count_client &&
+-        InSendMessage())
++    /* A single-threaded apartment handling a message another thread sent, and waits in until it is
++     * answered, can make only input-synchronous calls, which the thread called takes even while it waits
++     * in a message it sent itself.  Others could wait for a thread that waits for this one. */
++    if (!apt->multi_threaded && !(olemsg->rpcFlags & RPCFLG_INPUT_SYNCHRONOUS) &&
++        !(tlsdata->flags & OLETLS_HOSTINGOBJECT) &&
++        (InSendMessageEx(NULL) & (ISMEX_SEND | ISMEX_REPLIED)) == ISMEX_SEND)
+     {
+-        ERR("can't make an outgoing COM call in response to a sent message\n");
++        TRACE("can't make an outgoing COM call in response to a sent message\n");
+         apartment_release(apt);
+         return RPC_E_CANTCALLOUT_ININPUTSYNCCALL;
+     }
+@@ -1416,8 +1418,11 @@ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER ifac
+ 
+         msg->ProcNum &= ~RPC_FLAGS_VALID_BIT;
+ 
+-        if (!PostMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0,
+-                          (LPARAM)&message_state->params))
++        /* an input-synchronous call is sent, so that the thread takes it while it waits in a message it sent */
++        if (olemsg->rpcFlags & RPCFLG_INPUT_SYNCHRONOUS)
++            SendMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0, (LPARAM)&message_state->params);
++        else if (!PostMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0,
++                               (LPARAM)&message_state->params))
+         {
+             ERR("PostMessage failed with error %lu\n", GetLastError());
+ 
+@@ -2030,11 +2035,19 @@ static void __RPC_STUB dispatch_rpc(RPC_MESSAGE *msg)
+      * apartment (i.e. the one that pumps messages to the window) */
+     if (!apt->multi_threaded)
+     {
++        const WIRE_ORPCTHIS *orpcthis = msg->Buffer;
++
+         params->handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 
+         TRACE("Calling apartment thread %#lx...\n", apt->tid);
+ 
+-        if (PostMessageW(apartment_getwindow(apt), DM_EXECUTERPC, 0, (LPARAM)params))
++        /* an input-synchronous call is sent, so that the thread takes it while it waits in a message it sent */
++        if (msg->BufferLength >= FIELD_OFFSET(WIRE_ORPCTHIS, extensions) && (orpcthis->flags & ORPCF_INPUT_SYNC))
++        {
++            SendMessageW(apartment_getwindow(apt), DM_EXECUTERPC, 0, (LPARAM)params);
++            WaitForSingleObject(params->handle, INFINITE);
++        }
++        else if (PostMessageW(apartment_getwindow(apt), DM_EXECUTERPC, 0, (LPARAM)params))
+             WaitForSingleObject(params->handle, INFINITE);
+         else
+             ERR("PostMessage failed with error %lu\n", GetLastError());
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index 0e13c9d55b5..4699a5a0c2f 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -3448,6 +3448,193 @@ static void test_call_from_message(void)
+     DestroyWindow(hwnd_app);
+ }
+ 
++/* an object calls are made to while the thread making them handles a message the object's thread sent */
++static LONG input_sync_calls;
++
++static HRESULT WINAPI InputSync_QueryInterface(IOleInPlaceActiveObject *iface, REFIID riid, void **obj)
++{
++    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IOleWindow)
++            || IsEqualGUID(riid, &IID_IOleInPlaceActiveObject))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI InputSync_AddRef(IOleInPlaceActiveObject *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI InputSync_Release(IOleInPlaceActiveObject *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI InputSync_GetWindow(IOleInPlaceActiveObject *iface, HWND *hwnd)
++{
++    InterlockedIncrement(&input_sync_calls);
++    *hwnd = GetDesktopWindow();
++    return S_OK;
++}
++
++static HRESULT WINAPI InputSync_ContextSensitiveHelp(IOleInPlaceActiveObject *iface, BOOL enter)
++{
++    InterlockedIncrement(&input_sync_calls);
++    return S_OK;
++}
++
++static HRESULT WINAPI InputSync_TranslateAccelerator(IOleInPlaceActiveObject *iface, MSG *msg)
++{
++    InterlockedIncrement(&input_sync_calls);
++    return S_OK;
++}
++
++static HRESULT WINAPI InputSync_OnFrameWindowActivate(IOleInPlaceActiveObject *iface, BOOL activate)
++{
++    InterlockedIncrement(&input_sync_calls);
++    return S_OK;
++}
++
++static HRESULT WINAPI InputSync_OnDocWindowActivate(IOleInPlaceActiveObject *iface, BOOL activate)
++{
++    InterlockedIncrement(&input_sync_calls);
++    return S_OK;
++}
++
++static HRESULT WINAPI InputSync_ResizeBorder(IOleInPlaceActiveObject *iface, const RECT *border,
++                                             IOleInPlaceUIWindow *window, BOOL frame)
++{
++    InterlockedIncrement(&input_sync_calls);
++    return S_OK;
++}
++
++static HRESULT WINAPI InputSync_EnableModeless(IOleInPlaceActiveObject *iface, BOOL enable)
++{
++    InterlockedIncrement(&input_sync_calls);
++    return S_OK;
++}
++
++static const IOleInPlaceActiveObjectVtbl InputSyncVtbl =
++{
++    InputSync_QueryInterface,
++    InputSync_AddRef,
++    InputSync_Release,
++    InputSync_GetWindow,
++    InputSync_ContextSensitiveHelp,
++    InputSync_TranslateAccelerator,
++    InputSync_OnFrameWindowActivate,
++    InputSync_OnDocWindowActivate,
++    InputSync_ResizeBorder,
++    InputSync_EnableModeless,
++};
++
++static IOleInPlaceActiveObject InputSync_object = { &InputSyncVtbl };
++
++struct input_sync_params
++{
++    IStream *stream;
++    IOleInPlaceActiveObject *proxy;
++    HWND hwnd;
++    HANDLE ready, done;
++};
++
++static struct input_sync_params input_sync;
++
++static LRESULT CALLBACK input_sync_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    MSG accel = { 0 };
++    HWND window;
++    HRESULT hr, expect;
++    LONG calls;
++
++    if (msg != WM_USER && msg != WM_USER + 1) return DefWindowProcA(hwnd, msg, wparam, lparam);
++
++    /* once the thread that sent the message is answered, any call can be made */
++    if (msg == WM_USER + 1) ReplyMessage(0);
++    expect = msg == WM_USER ? RPC_E_CANTCALLOUT_ININPUTSYNCCALL : S_OK;
++
++    /* the waiting thread takes input-synchronous calls, and only those */
++    calls = input_sync_calls;
++    hr = IOleInPlaceActiveObject_GetWindow(input_sync.proxy, &window);
++    ok(hr == S_OK, "GetWindow returned %#lx.\n", hr);
++    ok(window == GetDesktopWindow(), "got window %p.\n", window);
++    hr = IOleInPlaceActiveObject_OnFrameWindowActivate(input_sync.proxy, TRUE);
++    ok(hr == S_OK, "OnFrameWindowActivate returned %#lx.\n", hr);
++    hr = IOleInPlaceActiveObject_ContextSensitiveHelp(input_sync.proxy, FALSE);
++    ok(hr == expect, "ContextSensitiveHelp returned %#lx.\n", hr);
++    hr = IOleInPlaceActiveObject_EnableModeless(input_sync.proxy, TRUE);
++    ok(hr == expect, "EnableModeless returned %#lx.\n", hr);
++    ok(input_sync_calls - calls == (msg == WM_USER ? 2 : 4), "object called %ld times.\n", input_sync_calls - calls);
++
++    /* the proxy answers TranslateAccelerator itself */
++    calls = input_sync_calls;
++    hr = IOleInPlaceActiveObject_TranslateAccelerator(input_sync.proxy, &accel);
++    ok(hr == S_FALSE, "TranslateAccelerator returned %#lx.\n", hr);
++    ok(input_sync_calls == calls, "object called %ld times.\n", input_sync_calls - calls);
++
++    SetEvent(input_sync.done);
++    return 0;
++}
++
++static DWORD CALLBACK input_sync_thread(void *arg)
++{
++    WNDCLASSA cls = { 0 };
++    HRESULT hr;
++    MSG msg;
++
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    cls.lpfnWndProc = input_sync_wndproc;
++    cls.lpszClassName = "WineInputSyncTest";
++    RegisterClassA(&cls);
++    input_sync.hwnd = CreateWindowA("WineInputSyncTest", NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
++    hr = CoGetInterfaceAndReleaseStream(input_sync.stream, &IID_IOleInPlaceActiveObject, (void **)&input_sync.proxy);
++    ok_ole_success(hr, CoGetInterfaceAndReleaseStream);
++    SetEvent(input_sync.ready);
++
++    while (GetMessageA(&msg, NULL, 0, 0)) DispatchMessageA(&msg);
++
++    IOleInPlaceActiveObject_Release(input_sync.proxy);
++    DestroyWindow(input_sync.hwnd);
++    UnregisterClassA("WineInputSyncTest", NULL);
++    CoUninitialize();
++    return 0;
++}
++
++static void test_input_sync_calls(void)
++{
++    DWORD_PTR result;
++    HANDLE thread;
++    DWORD index;
++    HRESULT hr;
++
++    hr = CoMarshalInterThreadInterfaceInStream(&IID_IOleInPlaceActiveObject, (IUnknown *)&InputSync_object,
++                                               &input_sync.stream);
++    ok_ole_success(hr, CoMarshalInterThreadInterfaceInStream);
++    input_sync.ready = CreateEventA(NULL, FALSE, FALSE, NULL);
++    input_sync.done = CreateEventA(NULL, FALSE, FALSE, NULL);
++    thread = CreateThread(NULL, 0, input_sync_thread, NULL, 0, NULL);
++    hr = CoWaitForMultipleHandles(0, 10000, 1, &input_sync.ready, &index);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++
++    /* the thread makes its calls while this one waits in the message it sent */
++    ok(SendMessageTimeoutA(input_sync.hwnd, WM_USER, 0, 0, SMTO_NORMAL, 5000, &result), "message timed out.\n");
++    ok(!WaitForSingleObject(input_sync.done, 0), "calls not made.\n");
++
++    ok(SendMessageTimeoutA(input_sync.hwnd, WM_USER + 1, 0, 0, SMTO_NORMAL, 5000, &result), "message timed out.\n");
++    hr = CoWaitForMultipleHandles(0, 10000, 1, &input_sync.done, &index);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++
++    PostMessageA(input_sync.hwnd, WM_QUIT, 0, 0);
++    hr = CoWaitForMultipleHandles(0, 10000, 1, &thread, &index);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    CloseHandle(thread);
++    CloseHandle(input_sync.ready);
++    CloseHandle(input_sync.done);
++}
++
+ static void test_WM_QUIT_handling(void)
+ {
+     MSG msg;
+@@ -4958,6 +5145,7 @@ START_TEST(marshal)
+     test_proxybuffer(&IID_IClassFactory);
+     test_message_reentrancy();
+     test_call_from_message();
++    test_input_sync_calls();
+     test_WM_QUIT_handling();
+     test_freethreadedmarshaler();
+     test_inproc_handler();
+diff --git a/dlls/ole32/usrmarshal.c b/dlls/ole32/usrmarshal.c
+index 574427092a1..c3af05c9cd5 100644
+--- a/dlls/ole32/usrmarshal.c
++++ b/dlls/ole32/usrmarshal.c
+@@ -2014,7 +2014,9 @@ HRESULT CALLBACK IOleInPlaceActiveObject_TranslateAccelerator_Proxy(
+     LPMSG lpmsg)
+ {
+     TRACE("(%p %p)\n", This, lpmsg);
+-    return IOleInPlaceActiveObject_RemoteTranslateAccelerator_Proxy(This);
++
++    /* an object of another apartment translates its accelerators in its own message loop */
++    return S_FALSE;
+ }
+ 
+ HRESULT __RPC_STUB IOleInPlaceActiveObject_TranslateAccelerator_Stub(
+diff --git a/include/docobj.idl b/include/docobj.idl
+index 119d4eab84e..b113edb5f10 100644
+--- a/include/docobj.idl
++++ b/include/docobj.idl
+@@ -289,6 +289,7 @@ interface IOleCommandTarget : IUnknown
+         OLECMDID_MEDIA_PLAYBACK = 78
+     } OLECMDID;
+ 
++    [input_sync]
+     HRESULT QueryStatus(
+         [in, unique] const GUID *pguidCmdGroup,
+         [in] ULONG cCmds,
+diff --git a/include/oleidl.idl b/include/oleidl.idl
+index 9a9d46656c9..8fc1b6e6c1b 100644
+--- a/include/oleidl.idl
++++ b/include/oleidl.idl
+@@ -69,6 +69,7 @@ interface IOleWindow : IUnknown
+ {
+     typedef [unique] IOleWindow *LPOLEWINDOW;
+ 
++    [input_sync]
+     HRESULT GetWindow(
+         [out] HWND *phwnd);
+ 
+@@ -93,6 +94,7 @@ interface IOleInPlaceObject : IOleWindow
+ 
+     HRESULT UIDeactivate();
+ 
++    [input_sync]
+     HRESULT SetObjectRects(
+         [in] LPCRECT lprcPosRect,
+         [in] LPCRECT lprcClipRect);
+@@ -118,12 +120,15 @@ interface IOleInPlaceUIWindow : IOleWindow
+     typedef LPRECT LPBORDERWIDTHS;
+     typedef LPCRECT LPCBORDERWIDTHS;
+ 
++    [input_sync]
+     HRESULT GetBorder(
+         [out] LPRECT lprectBorder);
+ 
++    [input_sync]
+     HRESULT RequestBorderSpace(
+         [in, unique] LPCBORDERWIDTHS pborderwidths);
+ 
++    [input_sync]
+     HRESULT SetBorderSpace(
+         [in, unique] LPCBORDERWIDTHS pborderwidths);
+ 
+@@ -170,6 +175,7 @@ interface IOleInPlaceFrame : IOleInPlaceUIWindow
+         [in] HMENU hmenuShared,
+         [in,out] LPOLEMENUGROUPWIDTHS lpMenuWidths);
+ 
++    [input_sync]
+     HRESULT SetMenu(
+         [in] HMENU hmenuShared,
+         [in] HOLEMENU holemenu,
+@@ -178,6 +184,7 @@ interface IOleInPlaceFrame : IOleInPlaceUIWindow
+     HRESULT RemoveMenus(
+         [in] HMENU hmenuShared);
+ 
++    [input_sync]
+     HRESULT SetStatusText(
+         [in, unique] LPCOLESTR pszStatusText);
+ 
+@@ -208,9 +215,11 @@ interface IOleInPlaceActiveObject : IOleWindow
+     [call_as(TranslateAccelerator)]
+     HRESULT RemoteTranslateAccelerator();
+ 
++    [input_sync]
+     HRESULT OnFrameWindowActivate(
+         [in] BOOL fActivate);
+ 
++    [input_sync]
+     HRESULT OnDocWindowActivate(
+         [in] BOOL fActivate);
+ 
+@@ -220,7 +229,7 @@ interface IOleInPlaceActiveObject : IOleWindow
+         [in, unique] IOleInPlaceUIWindow *pUIWindow,
+         [in] BOOL fFrameWindow);
+ 
+-    [call_as(ResizeBorder)]
++    [call_as(ResizeBorder), input_sync]
+     HRESULT RemoteResizeBorder(
+         [in] LPCRECT prcBorder,
+         [in] REFIID riid,
+diff --git a/tools/widl/typegen.c b/tools/widl/typegen.c
+index 76d7a2bde21..d831e580fa0 100644
+--- a/tools/widl/typegen.c
++++ b/tools/widl/typegen.c
+@@ -514,6 +514,7 @@ static unsigned int get_rpc_flags( const attr_list_t *attrs )
+     if (is_attr( attrs, ATTR_MAYBE )) flags |= 0x0004;
+     if (is_attr( attrs, ATTR_MESSAGE )) flags |= 0x0100;
+     if (is_attr( attrs, ATTR_ASYNC )) flags |= 0x4000;
++    if (is_attr( attrs, ATTR_INPUTSYNC )) flags |= 0x20000000; /* RPCFLG_INPUT_SYNCHRONOUS */
+     return flags;
+ }
+ 

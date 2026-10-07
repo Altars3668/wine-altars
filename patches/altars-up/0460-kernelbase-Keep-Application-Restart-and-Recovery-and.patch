@@ -1,0 +1,1709 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 15:34:04 -0400
+Subject: [PATCH] kernelbase: Keep Application Restart and Recovery and the WER
+ registrations as Windows 11 keeps them, and act on them when the process
+ crashes.
+
+What a process registers lives in the block PEB->WerRegistrationData points to, laid out as on Windows 11 x64
+(0x968 bytes, "PEB_SIGNATURE", the restart flags at 0x20 and command line at 0xa8, the recovery callback at
+0x8b0, the WER flags at 0x914), so GetApplicationRestartSettings, GetApplicationRecoveryCallback and WerGetFlags
+read it from another process with PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, as Windows does.
+
+As measured on Windows 11 build 29671:
+- a restart command line of 1024 characters or more is E_INVALIDARG; asking with no buffer gives the size, a
+  buffer too small comes back empty with ERROR_INSUFFICIENT_BUFFER, and after unregistering it is ERROR_NOT_FOUND
+  with a size of 0;
+- a recovery ping interval of 0 is 5000 ms and more than 300000 E_INVALIDARG; after unregistering the callback
+  reads back as zeros, before any registration as ERROR_NOT_FOUND;
+- WER files and memory blocks share 512 places, file names match whatever their case, memory blocks are up to
+  64 KiB; metadata keys start with a letter and go on in [A-Za-z0-9._-], values are under 128 characters, and
+  there are 8 of them; runtime exception modules are 16, told apart by path and context; any flags are kept.
+
+When the process crashes, before the debugger is started, the recovery callback runs on its own thread for as long
+as each ApplicationRecoveryInProgress buys it another ping interval, and the process is restarted with its
+registered command line if it asked to be, not with RESTART_NO_CRASH, and has run for a minute.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
+index e1fe97c522a..eda0ca999f3 100644
+--- a/dlls/kernel32/kernel32.spec
++++ b/dlls/kernel32/kernel32.spec
+@@ -155,8 +155,8 @@
+ @ stdcall -i386 -private AllocSLCallback(ptr ptr) krnl386.exe16.AllocSLCallback
+ @ stdcall -import AllocateUserPhysicalPages(long ptr ptr)
+ @ stdcall -import AllocateUserPhysicalPagesNuma(long ptr ptr long)
+-@ stdcall ApplicationRecoveryFinished(long)
+-@ stdcall ApplicationRecoveryInProgress(ptr)
++@ stdcall -import ApplicationRecoveryFinished(long)
++@ stdcall -import ApplicationRecoveryInProgress(ptr)
+ @ stdcall AppPolicyGetMediaFoundationCodecLoading(ptr ptr) kernelbase.AppPolicyGetMediaFoundationCodecLoading
+ @ stdcall AppPolicyGetWindowingModel(ptr ptr) kernelbase.AppPolicyGetWindowingModel
+ @ stdcall -import AreFileApisANSI()
+@@ -552,7 +552,7 @@
+ @ stdcall -import GetACP()
+ @ stdcall GetActiveProcessorCount(long)
+ @ stdcall GetActiveProcessorGroupCount()
+-# @ stub GetApplicationRecoveryCallback
++@ stdcall -import GetApplicationRecoveryCallback(long ptr ptr ptr ptr)
+ @ stdcall -import GetApplicationRestartSettings(long ptr ptr ptr)
+ @ stdcall GetAtomNameA(long ptr long)
+ @ stdcall GetAtomNameW(long ptr long)
+@@ -1289,8 +1289,8 @@
+ @ stdcall -private -import RegSetValueExW(long wstr long long ptr long)
+ @ stdcall -private -import RegUnLoadKeyA(long str)
+ @ stdcall -private -import RegUnLoadKeyW(long wstr)
+-@ stdcall RegisterApplicationRecoveryCallback(ptr ptr long long)
+-@ stdcall RegisterApplicationRestart(wstr long)
++@ stdcall -import RegisterApplicationRecoveryCallback(ptr ptr long long)
++@ stdcall -import RegisterApplicationRestart(wstr long)
+ @ stub RegisterConsoleIME
+ @ stub RegisterConsoleOS2
+ @ stub RegisterConsoleVDM
+@@ -1597,8 +1597,8 @@
+ @ stdcall -import UnlockFileEx(long long long long ptr)
+ @ stdcall -import UnmapViewOfFile(ptr)
+ @ stdcall -import UnmapViewOfFileEx(ptr long)
+-# @ stub UnregisterApplicationRecoveryCallback
+-@ stdcall UnregisterApplicationRestart()
++@ stdcall -import UnregisterApplicationRecoveryCallback()
++@ stdcall -import UnregisterApplicationRestart()
+ # @ stub UnregisterConsoleIME
+ @ stdcall UnregisterWait(long)
+ @ stdcall -import UnregisterWaitEx(long long)
+@@ -1646,12 +1646,16 @@
+ @ stdcall WakeAllConditionVariable(ptr) NTDLL.RtlWakeAllConditionVariable
+ @ stdcall WakeConditionVariable(ptr) NTDLL.RtlWakeConditionVariable
+ @ stdcall -import WerGetFlags(ptr ptr)
++@ stdcall -import WerRegisterAppLocalDump(wstr)
+ @ stdcall -import WerRegisterCustomMetadata(wstr wstr)
++@ stdcall -import WerRegisterExcludedMemoryBlock(ptr long)
+ @ stdcall -import WerRegisterFile(wstr long long)
+ @ stdcall -import WerRegisterMemoryBlock(ptr long)
+ @ stdcall -import WerRegisterRuntimeExceptionModule(wstr ptr)
+ @ stdcall -import WerSetFlags(long)
++@ stdcall -import WerUnregisterAppLocalDump()
+ @ stdcall -import WerUnregisterCustomMetadata(wstr)
++@ stdcall -import WerUnregisterExcludedMemoryBlock(ptr)
+ @ stdcall -import WerUnregisterFile(wstr)
+ @ stdcall -import WerUnregisterMemoryBlock(ptr)
+ @ stdcall -import WerUnregisterRuntimeExceptionModule(wstr ptr)
+diff --git a/dlls/kernel32/process.c b/dlls/kernel32/process.c
+index 0be80d90c51..8b8954906b5 100644
+--- a/dlls/kernel32/process.c
++++ b/dlls/kernel32/process.c
+@@ -523,16 +523,6 @@ BOOL WINAPI CmdBatNotification( BOOL bBatchRunning )
+     return FALSE;
+ }
+ 
+-/***********************************************************************
+- *           RegisterApplicationRestart       (KERNEL32.@)
+- */
+-HRESULT WINAPI RegisterApplicationRestart(PCWSTR pwzCommandLine, DWORD dwFlags)
+-{
+-    FIXME("(%s,%ld)\n", debugstr_w(pwzCommandLine), dwFlags);
+-
+-    return S_OK;
+-}
+-
+ /**********************************************************************
+  *           WTSGetActiveConsoleSessionId     (KERNEL32.@)
+  */
+@@ -567,34 +557,6 @@ BOOL WINAPI SetProcessDEPPolicy( DWORD flags )
+                                                   &dep_flags, sizeof(dep_flags) ) );
+ }
+ 
+-/**********************************************************************
+- *           ApplicationRecoveryFinished     (KERNEL32.@)
+- */
+-VOID WINAPI ApplicationRecoveryFinished(BOOL success)
+-{
+-    FIXME(": stub\n");
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-}
+-
+-/**********************************************************************
+- *           ApplicationRecoveryInProgress     (KERNEL32.@)
+- */
+-HRESULT WINAPI ApplicationRecoveryInProgress(PBOOL canceled)
+-{
+-    FIXME(":%p stub\n", canceled);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return E_FAIL;
+-}
+-
+-/**********************************************************************
+- *           RegisterApplicationRecoveryCallback     (KERNEL32.@)
+- */
+-HRESULT WINAPI RegisterApplicationRecoveryCallback(APPLICATION_RECOVERY_CALLBACK callback, PVOID param, DWORD pingint, DWORD flags)
+-{
+-    FIXME("%p, %p, %ld, %ld: stub, faking success\n", callback, param, pingint, flags);
+-    return S_OK;
+-}
+-
+ static SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *get_logical_processor_info(void)
+ {
+     DWORD size = 0;
+@@ -893,16 +855,6 @@ BOOL WINAPI IsUserCetAvailableInEnvironment( DWORD environment )
+     return FALSE;
+ }
+ 
+-/***********************************************************************
+- *           UnregisterApplicationRestart       (KERNEL32.@)
+- */
+-HRESULT WINAPI UnregisterApplicationRestart(void)
+-{
+-    FIXME(": stub\n");
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return S_OK;
+-}
+-
+ /***********************************************************************
+  *           CreateUmsCompletionList   (KERNEL32.@)
+  */
+diff --git a/dlls/kernel32/tests/Makefile.in b/dlls/kernel32/tests/Makefile.in
+index e9516603ce9..e72876acb35 100644
+--- a/dlls/kernel32/tests/Makefile.in
++++ b/dlls/kernel32/tests/Makefile.in
+@@ -37,4 +37,5 @@ SOURCES = \
+ 	toolhelp.c \
+ 	version.c \
+ 	virtual.c \
+-	volume.c
++	volume.c \
++	wer.c
+diff --git a/dlls/kernel32/tests/wer.c b/dlls/kernel32/tests/wer.c
+new file mode 100644
+index 00000000000..20862d0894a
+--- /dev/null
++++ b/dlls/kernel32/tests/wer.c
+@@ -0,0 +1,385 @@
++/*
++ * Application Restart and Recovery and Windows Error Reporting registration tests
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <wchar.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "werapi.h"
++
++#include "wine/test.h"
++
++static HRESULT (WINAPI *pGetApplicationRecoveryCallback)(HANDLE, APPLICATION_RECOVERY_CALLBACK *, void **, DWORD *,
++                                                         DWORD *);
++static HRESULT (WINAPI *pUnregisterApplicationRecoveryCallback)(void);
++
++static DWORD WINAPI recovery_callback( void *param )
++{
++    return 0;
++}
++
++static void test_restart(void)
++{
++    WCHAR buffer[2048], line[1100];
++    DWORD size, flags;
++    HRESULT hr;
++
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, &flags );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got %#lx\n", hr );
++    ok( size == ARRAY_SIZE(buffer), "got size %lu\n", size );
++
++    hr = RegisterApplicationRestart( L"/restart-line", 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++
++    /* without a buffer the size is all that comes back */
++    size = 0;
++    flags = 0xdeadbeef;
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), NULL, &size, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == 14, "got size %lu\n", size );
++    ok( !flags, "got flags %#lx\n", flags );
++
++    size = 5;
++    memset( buffer, 0xcc, sizeof(buffer) );
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, &flags );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), "got %#lx\n", hr );
++    ok( size == 14, "got size %lu\n", size );
++    ok( !buffer[0], "got %#x\n", buffer[0] );
++
++    size = 14;
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !wcscmp( buffer, L"/restart-line" ), "got %s\n", wine_dbgstr_w(buffer) );
++
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, NULL, &flags );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++
++    /* the flags are kept as they are, whatever they are */
++    hr = RegisterApplicationRestart( L"/x", 0x80000000 | RESTART_NO_PATCH );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( flags == (0x80000000 | RESTART_NO_PATCH), "got flags %#lx\n", flags );
++
++    hr = RegisterApplicationRestart( NULL, 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == 1, "got size %lu\n", size );
++
++    wmemset( line, 'a', 1023 );
++    line[1023] = 0;
++    hr = RegisterApplicationRestart( line, 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    line[1023] = 'a';
++    line[1024] = 0;
++    hr = RegisterApplicationRestart( line, 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == 1024, "got size %lu\n", size );
++
++    hr = UnregisterApplicationRestart();
++    ok( hr == S_OK, "got %#lx\n", hr );
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( GetCurrentProcess(), buffer, &size, &flags );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got %#lx\n", hr );
++    ok( !size, "got size %lu\n", size );
++    hr = UnregisterApplicationRestart();
++    ok( hr == S_OK, "got %#lx\n", hr );
++}
++
++static void test_recovery(void)
++{
++    APPLICATION_RECOVERY_CALLBACK callback;
++    DWORD ping, flags;
++    void *param;
++    BOOL cancelled;
++    HRESULT hr;
++
++    if (!pGetApplicationRecoveryCallback)
++    {
++        win_skip( "GetApplicationRecoveryCallback is not available\n" );
++        return;
++    }
++
++    hr = pGetApplicationRecoveryCallback( GetCurrentProcess(), &callback, &param, &ping, &flags );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got %#lx\n", hr );
++
++    hr = RegisterApplicationRecoveryCallback( NULL, NULL, 0, 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = RegisterApplicationRecoveryCallback( recovery_callback, NULL, RECOVERY_MAX_PING_INTERVAL + 1, 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++
++    hr = RegisterApplicationRecoveryCallback( recovery_callback, (void *)0x1234, 0, 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    callback = NULL;
++    param = NULL;
++    ping = flags = 0xdeadbeef;
++    hr = pGetApplicationRecoveryCallback( GetCurrentProcess(), &callback, &param, &ping, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( callback == recovery_callback, "got %p\n", callback );
++    ok( param == (void *)0x1234, "got %p\n", param );
++    ok( ping == RECOVERY_DEFAULT_PING_INTERVAL, "got %lu\n", ping );
++    ok( !flags, "got %#lx\n", flags );
++
++    hr = RegisterApplicationRecoveryCallback( recovery_callback, NULL, RECOVERY_MAX_PING_INTERVAL, 0x80000001 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = pGetApplicationRecoveryCallback( GetCurrentProcess(), &callback, &param, &ping, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( ping == RECOVERY_MAX_PING_INTERVAL, "got %lu\n", ping );
++    ok( flags == 0x80000001, "got %#lx\n", flags );
++
++    /* outside a recovery there is nothing to tell */
++    cancelled = 7;
++    hr = ApplicationRecoveryInProgress( &cancelled );
++    ok( hr == E_FAIL, "got %#lx\n", hr );
++    ok( !cancelled, "got %d\n", cancelled );
++    hr = ApplicationRecoveryInProgress( NULL );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    ApplicationRecoveryFinished( TRUE );
++
++    /* unregistered, the callback is still found, empty */
++    hr = pUnregisterApplicationRecoveryCallback();
++    ok( hr == S_OK, "got %#lx\n", hr );
++    callback = (void *)0xdead;
++    param = (void *)0xdead;
++    hr = pGetApplicationRecoveryCallback( GetCurrentProcess(), &callback, &param, &ping, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !callback, "got %p\n", callback );
++    ok( !param, "got %p\n", param );
++    ok( !ping, "got %lu\n", ping );
++    hr = pUnregisterApplicationRecoveryCallback();
++    ok( hr == S_OK, "got %#lx\n", hr );
++}
++
++static void test_wer_registrations(void)
++{
++    static BYTE blocks[2][128];
++    WCHAR name[400];
++    DWORD flags;
++    HRESULT hr;
++    unsigned int i;
++
++    hr = WerRegisterFile( L"C:\\nonexistent\\wer-test.dat", WerRegFileTypeOther,
++                          WER_FILE_DELETE_WHEN_DONE | WER_FILE_ANONYMOUS_DATA );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerRegisterFile( L"c:\\NONEXISTENT\\WER-TEST.DAT", WerRegFileTypeOther, 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    /* the same file, in any case */
++    hr = WerUnregisterFile( L"C:\\nonexistent\\wer-test.dat" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerUnregisterFile( L"C:\\nonexistent\\wer-test.dat" );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got %#lx\n", hr );
++    hr = WerRegisterFile( NULL, WerRegFileTypeOther, 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = WerRegisterFile( L"C:\\nonexistent\\wer-test.dat", 0, 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = WerRegisterFile( L"C:\\nonexistent\\wer-test.dat", WerRegFileTypeMax, 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = WerRegisterFile( L"C:\\nonexistent\\wer-test.dat", WerRegFileTypeUserDocument, 0x80 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    wcscpy( name, L"C:\\nonexistent\\" );
++    wmemset( name + 15, 'a', 300 );
++    name[315] = 0;
++    hr = WerRegisterFile( name, WerRegFileTypeOther, 0 );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE), "got %#lx\n", hr );
++
++    hr = WerRegisterMemoryBlock( blocks[0], sizeof(blocks[0]) );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerRegisterMemoryBlock( blocks[0], 64 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerUnregisterMemoryBlock( blocks[0] );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerUnregisterMemoryBlock( blocks[0] );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got %#lx\n", hr );
++    hr = WerRegisterMemoryBlock( NULL, 128 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = WerRegisterMemoryBlock( blocks[1], 0 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = WerRegisterMemoryBlock( blocks[1], WER_MAX_MEM_BLOCK_SIZE + 1 );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++
++    hr = WerRegisterCustomMetadata( L"Key_1.a-b", L"value" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerRegisterCustomMetadata( L"Key_1.a-b", L"another value" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerUnregisterCustomMetadata( L"Key_1.a-b" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerUnregisterCustomMetadata( L"Key_1.a-b" );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got %#lx\n", hr );
++    {
++        static const WCHAR *bad_keys[] = { L"", L"1Key", L"Key 1", L"K\x00e9y" };
++        for (i = 0; i < ARRAY_SIZE(bad_keys); i++)
++        {
++            hr = WerRegisterCustomMetadata( bad_keys[i], L"v" );
++            ok( hr == E_INVALIDARG, "%u: got %#lx\n", i, hr );
++        }
++    }
++    hr = WerRegisterCustomMetadata( L"Key", NULL );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    wmemset( name, 'v', 127 );
++    name[127] = 0;
++    hr = WerRegisterCustomMetadata( L"Key", name );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    WerUnregisterCustomMetadata( L"Key" );
++    name[127] = 'v';
++    name[128] = 0;
++    hr = WerRegisterCustomMetadata( L"Key", name );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    /* eight keys at most */
++    for (i = 0; i < 9; i++)
++    {
++        swprintf( name, ARRAY_SIZE(name), L"Key%u", i );
++        hr = WerRegisterCustomMetadata( name, L"v" );
++        ok( hr == (i < 8 ? S_OK : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)), "%u: got %#lx\n", i, hr );
++    }
++    for (i = 0; i < 8; i++)
++    {
++        swprintf( name, ARRAY_SIZE(name), L"Key%u", i );
++        WerUnregisterCustomMetadata( name );
++    }
++
++    hr = WerRegisterRuntimeExceptionModule( L"C:\\nonexistent\\wer-test.dll", (void *)0x1234 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerUnregisterRuntimeExceptionModule( L"C:\\nonexistent\\wer-test.dll", (void *)0x5678 );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), "got %#lx\n", hr );
++    hr = WerUnregisterRuntimeExceptionModule( L"C:\\nonexistent\\wer-test.dll", (void *)0x1234 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerRegisterRuntimeExceptionModule( NULL, NULL );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++
++    flags = 0xdeadbeef;
++    hr = WerGetFlags( GetCurrentProcess(), &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !flags, "got %#lx\n", flags );
++    hr = WerSetFlags( 0x80000000 | WER_FAULT_REPORTING_FLAG_NOHEAP );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = WerGetFlags( GetCurrentProcess(), &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( flags == (0x80000000 | WER_FAULT_REPORTING_FLAG_NOHEAP), "got %#lx\n", flags );
++    hr = WerGetFlags( GetCurrentProcess(), NULL );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = WerGetFlags( NULL, &flags );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    WerSetFlags( 0 );
++}
++
++/* another process's settings are read from its memory */
++static void test_other_process( const char *selfname )
++{
++    STARTUPINFOA si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    char cmdline[MAX_PATH + 64];
++    HANDLE ready, done, process;
++    WCHAR buffer[64];
++    DWORD size, flags;
++    HRESULT hr;
++
++    ready = CreateEventA( NULL, TRUE, FALSE, "wer_test_ready" );
++    done = CreateEventA( NULL, TRUE, FALSE, "wer_test_done" );
++    sprintf( cmdline, "\"%s\" wer child", selfname );
++    ok( CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ), "CreateProcess failed\n" );
++    ok( !WaitForSingleObject( ready, 10000 ), "the child did not get ready\n" );
++
++    process = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pi.dwProcessId );
++    size = ARRAY_SIZE(buffer);
++    flags = 0xdeadbeef;
++    hr = GetApplicationRestartSettings( process, buffer, &size, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !wcscmp( buffer, L"/child-line" ), "got %s\n", wine_dbgstr_w(buffer) );
++    ok( flags == RESTART_NO_PATCH, "got %#lx\n", flags );
++    if (pGetApplicationRecoveryCallback)
++    {
++        APPLICATION_RECOVERY_CALLBACK callback = NULL;
++        void *param = NULL;
++        DWORD ping = 0;
++
++        hr = pGetApplicationRecoveryCallback( process, &callback, &param, &ping, &flags );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        ok( callback == recovery_callback, "got %p\n", callback );
++        ok( param == (void *)0x777, "got %p\n", param );
++        ok( ping == 2000, "got %lu\n", ping );
++    }
++    hr = WerGetFlags( process, &flags );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( flags == WER_FAULT_REPORTING_FLAG_QUEUE, "got %#lx\n", flags );
++    CloseHandle( process );
++
++    /* reading needs more than a query */
++    process = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pi.dwProcessId );
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( process, buffer, &size, &flags );
++    ok( hr == E_ACCESSDENIED, "got %#lx\n", hr );
++    CloseHandle( process );
++    process = OpenProcess( PROCESS_VM_READ, FALSE, pi.dwProcessId );
++    size = ARRAY_SIZE(buffer);
++    hr = GetApplicationRestartSettings( process, buffer, &size, &flags );
++    ok( hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE), "got %#lx\n", hr );
++    CloseHandle( process );
++
++    SetEvent( done );
++    wait_child_process( &pi );
++    CloseHandle( pi.hProcess );
++    CloseHandle( pi.hThread );
++    CloseHandle( ready );
++    CloseHandle( done );
++}
++
++static void child(void)
++{
++    HANDLE ready = OpenEventA( EVENT_MODIFY_STATE, FALSE, "wer_test_ready" );
++    HANDLE done = OpenEventA( SYNCHRONIZE, FALSE, "wer_test_done" );
++
++    RegisterApplicationRestart( L"/child-line", RESTART_NO_PATCH );
++    RegisterApplicationRecoveryCallback( recovery_callback, (void *)0x777, 2000, 0 );
++    WerSetFlags( WER_FAULT_REPORTING_FLAG_QUEUE );
++    SetEvent( ready );
++    WaitForSingleObject( done, 30000 );
++}
++
++START_TEST(wer)
++{
++    HMODULE kernel32 = GetModuleHandleA( "kernel32.dll" );
++    char selfname[MAX_PATH], **argv;
++    int argc;
++
++    pGetApplicationRecoveryCallback = (void *)GetProcAddress( kernel32, "GetApplicationRecoveryCallback" );
++    pUnregisterApplicationRecoveryCallback = (void *)GetProcAddress( kernel32, "UnregisterApplicationRecoveryCallback" );
++
++    argc = winetest_get_mainargs( &argv );
++    if (argc >= 3 && !strcmp( argv[2], "child" ))
++    {
++        child();
++        return;
++    }
++    GetModuleFileNameA( NULL, selfname, sizeof(selfname) );
++
++    test_restart();
++    test_recovery();
++    test_wer_registrations();
++    test_other_process( selfname );
++}
+diff --git a/dlls/kernelbase/Makefile.in b/dlls/kernelbase/Makefile.in
+index 2e33b6b5801..bf387e10886 100644
+--- a/dlls/kernelbase/Makefile.in
++++ b/dlls/kernelbase/Makefile.in
+@@ -25,4 +25,5 @@ SOURCES = \
+ 	thread.c \
+ 	version.c \
+ 	volume.c \
++	wer.c \
+ 	winerror.mc
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 5cfeef8fb63..a6f3f921f51 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -846,6 +846,9 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
+             if (ret != EXCEPTION_CONTINUE_SEARCH) return ret;
+         }
+ 
++        /* what Windows Error Reporting does, recovering and restarting the process, comes before the debugger */
++        if (!(GetErrorMode() & SEM_NOGPFAULTERRORBOX) && !nested) wer_handle_crash( epointers );
++
+         if ((GetErrorMode() & SEM_NOGPFAULTERRORBOX) ||
+             !start_debugger_atomic( epointers ) || !NtCurrentTeb()->Peb->BeingDebugged)
+             return nested ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
+@@ -854,107 +857,6 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
+ }
+ 
+ 
+-/***********************************************************************
+- *         WerGetFlags   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerGetFlags( HANDLE process, DWORD *flags )
+-{
+-    FIXME( "(%p, %p) stub\n", process, flags );
+-    return E_NOTIMPL;
+-}
+-
+-
+-/***********************************************************************
+- *         WerRegisterCustomMetadata  (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterCustomMetadata( const WCHAR *key, const WCHAR *value )
+-{
+-    FIXME( "(%s, %s) stub\n", debugstr_w(key), debugstr_w(value) );
+-    return S_OK;
+-}
+-
+-
+-/***********************************************************************
+- *         WerRegisterFile   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterFile( const WCHAR *file, WER_REGISTER_FILE_TYPE type,
+-                                                        DWORD flags )
+-{
+-    FIXME( "(%s, %d, %ld) stub\n", debugstr_w(file), type, flags );
+-    return E_NOTIMPL;
+-}
+-
+-
+-/***********************************************************************
+- *         WerRegisterMemoryBlock   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterMemoryBlock( void *block, DWORD size )
+-{
+-    FIXME( "(%p %ld) stub\n", block, size );
+-    return E_NOTIMPL;
+-}
+-
+-
+-/***********************************************************************
+- *         WerRegisterRuntimeExceptionModule   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterRuntimeExceptionModule( const WCHAR *dll, void *context )
+-{
+-    FIXME( "(%s, %p) stub\n", debugstr_w(dll), context );
+-    return S_OK;
+-}
+-
+-
+-/***********************************************************************
+- *         WerSetFlags   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerSetFlags( DWORD flags )
+-{
+-    FIXME("(%ld) stub\n", flags);
+-    return S_OK;
+-}
+-
+-
+-/***********************************************************************
+- *         WerUnregisterCustomMetadata  (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterCustomMetadata( const WCHAR *key )
+-{
+-    FIXME( "(%s) stub\n", debugstr_w(key));
+-    return S_OK;
+-}
+-
+-
+-/***********************************************************************
+- *         WerUnregisterFile   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterFile( const WCHAR *file )
+-{
+-    FIXME( "(%s) stub\n", debugstr_w(file) );
+-    return E_NOTIMPL;
+-}
+-
+-
+-/***********************************************************************
+- *         WerUnregisterMemoryBlock   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterMemoryBlock( void *block )
+-{
+-    FIXME( "(%p) stub\n", block );
+-    return E_NOTIMPL;
+-}
+-
+-
+-/***********************************************************************
+- *         WerUnregisterRuntimeExceptionModule   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterRuntimeExceptionModule( const WCHAR *dll, void *context )
+-{
+-    FIXME( "(%s, %p) stub\n", debugstr_w(dll), context );
+-    return S_OK;
+-}
+-
+-
+ /***********************************************************************
+  * psapi functions
+  ***********************************************************************/
+diff --git a/dlls/kernelbase/kernelbase.h b/dlls/kernelbase/kernelbase.h
+index e46ca0f6257..ca4e4162922 100644
+--- a/dlls/kernelbase/kernelbase.h
++++ b/dlls/kernelbase/kernelbase.h
+@@ -56,4 +56,6 @@ static inline BOOL set_ntstatus( NTSTATUS status )
+ #define HeapReAlloc(heap, flags, ptr, size) RtlReAllocateHeap(heap, flags, ptr, size)
+ #define HeapFree(heap, flags, ptr) RtlFreeHeap(heap, flags, ptr)
+ 
++extern void wer_handle_crash( EXCEPTION_POINTERS *epointers );
++
+ #endif /* __WINE_KERNELBASE_H */
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 62853f229eb..2620df69b65 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -42,6 +42,8 @@
+ # @ stub AppContainerLookupMoniker
+ # @ stub AppContainerRegisterSid
+ # @ stub AppContainerUnregisterSid
++@ stdcall ApplicationRecoveryFinished(long)
++@ stdcall ApplicationRecoveryInProgress(ptr)
+ # @ stub AppPolicyGetClrCompat
+ # @ stub AppPolicyGetCreateFileAccess
+ # @ stub AppPolicyGetLifecycleManagement
+@@ -424,7 +426,7 @@
+ # @ stub GetAppContainerNamedObjectPath
+ # @ stub GetAppDataFolder
+ # @ stub GetAppModelVersion
+-# @ stub GetApplicationRecoveryCallback
++@ stdcall GetApplicationRecoveryCallback(long ptr ptr ptr ptr)
+ @ stdcall GetApplicationRestartSettings(long ptr ptr ptr)
+ # @ stub GetApplicationUserModelId
+ # @ stub GetApplicationUserModelIdFromToken
+@@ -1281,6 +1283,8 @@
+ # @ stub QuirkIsEnabledForProcess
+ @ stdcall RaiseException(long long long ptr)
+ @ stdcall RaiseFailFastException(ptr ptr long)
++@ stdcall RegisterApplicationRecoveryCallback(ptr ptr long long)
++@ stdcall RegisterApplicationRestart(wstr long)
+ @ stdcall ReOpenFile(ptr long long long)
+ @ stdcall ReadConsoleA(long ptr long ptr ptr)
+ @ stdcall ReadConsoleInputA(long ptr long ptr)
+@@ -1673,6 +1677,8 @@
+ @ stdcall UnmapViewOfFile(ptr)
+ @ stdcall UnmapViewOfFile2(long ptr long)
+ @ stdcall UnmapViewOfFileEx(ptr long)
++@ stdcall UnregisterApplicationRecoveryCallback()
++@ stdcall UnregisterApplicationRestart()
+ # @ stub UnregisterBadMemoryNotification
+ # @ stub UnregisterGPNotificationInternal
+ # @ stub UnregisterStateChangeNotification
+@@ -1739,6 +1745,10 @@
+ @ stdcall VirtualQuery(ptr ptr long)
+ @ stdcall VirtualQueryEx(long ptr ptr long)
+ @ stdcall VirtualUnlock(ptr long)
++@ stdcall WerRegisterAppLocalDump(wstr)
++@ stdcall WerRegisterExcludedMemoryBlock(ptr long)
++@ stdcall WerUnregisterAppLocalDump()
++@ stdcall WerUnregisterExcludedMemoryBlock(ptr)
+ # @ stub WTSGetServiceSessionId
+ # @ stub WTSIsServerContainer
+ @ stdcall WaitCommEvent(long ptr ptr)
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index ec44c2ce23f..4002ebbda2d 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -751,17 +751,6 @@ BOOL WINAPI DECLSPEC_HOTPATCH DuplicateHandle( HANDLE source_process, HANDLE sou
+ }
+ 
+ 
+-/***********************************************************************
+- *           GetApplicationRestartSettings   (kernelbase.@)
+- */
+-HRESULT WINAPI /* DECLSPEC_HOTPATCH */ GetApplicationRestartSettings( HANDLE process, WCHAR *cmdline,
+-                                                                      DWORD *size, DWORD *flags )
+-{
+-    FIXME( "%p, %p, %p, %p)\n", process, cmdline, size, flags );
+-    return E_NOTIMPL;
+-}
+-
+-
+ /***********************************************************************
+  *           GetCurrentProcess   (kernelbase.@)
+  */
+diff --git a/dlls/kernelbase/wer.c b/dlls/kernelbase/wer.c
+new file mode 100644
+index 00000000000..a512f6a3b95
+--- /dev/null
++++ b/dlls/kernelbase/wer.c
+@@ -0,0 +1,860 @@
++/*
++ * Application Restart and Recovery, and Windows Error Reporting registrations
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <string.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "werapi.h"
++
++#include "kernelbase.h"
++#include "wine/list.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(seh);
++
++/* What the process registered, in the block the PEB's WerRegistrationData points to, laid out as Windows 11 lays it
++ * out so that another process reads the restart command line, the recovery callback and the flags from it.  The lists
++ * of files, memory blocks, metadata and runtime exception modules are the process's own. */
++struct wer_block
++{
++    LONG   length;
++    WCHAR  signature[14];
++    DWORD  restart_flags;
++    DWORD  restart_registered;
++    WCHAR  app_data_path[64];
++    WCHAR  restart_cmdline[RESTART_MAX_CMD_LINE];
++    struct
++    {
++        DWORD  length;
++        DWORD  registered;      /* ever, as Windows tells by an encoded null callback */
++        APPLICATION_RECOVERY_CALLBACK callback;
++        void  *param;
++        HANDLE started;
++        HANDLE finished;
++        HANDLE in_progress;
++        LONG   last_error;
++        BOOL   successful;
++        DWORD  ping_interval;
++        DWORD  flags;
++    } recovery;
++    void  *gather;
++    void  *metadata;
++    void  *runtime_dlls;
++    void  *dumps;
++    LONG   gather_count;
++    LONG   metadata_count;
++    LONG   dump_count;
++    LONG   flags;
++    BYTE   heap[0x40];
++    void  *reserved[2];
++};
++
++#ifdef _WIN64
++C_ASSERT( offsetof(struct wer_block, restart_flags) == 0x20 );
++C_ASSERT( offsetof(struct wer_block, restart_cmdline) == 0xa8 );
++C_ASSERT( offsetof(struct wer_block, recovery.callback) == 0x8b0 );
++C_ASSERT( offsetof(struct wer_block, recovery.ping_interval) == 0x8e0 );
++C_ASSERT( offsetof(struct wer_block, gather) == 0x8e8 );
++C_ASSERT( offsetof(struct wer_block, flags) == 0x914 );
++C_ASSERT( sizeof(struct wer_block) == 0x968 );
++#endif
++
++#define WER_MAX_GATHERS          512
++#define WER_MAX_METADATA         8
++#define WER_MAX_RUNTIME_DLLS     16
++#define WER_MAX_METADATA_KEY     64
++#define WER_MAX_METADATA_VALUE   128
++
++struct gather
++{
++    struct list entry;
++    WCHAR      *file;       /* a file, or else a memory block */
++    DWORD       type;
++    DWORD       flags;
++    const void *block;
++    DWORD       size;
++};
++
++struct metadata
++{
++    struct list entry;
++    WCHAR      *key;
++    WCHAR      *value;
++};
++
++struct runtime_dll
++{
++    struct list entry;
++    WCHAR      *path;
++    void       *context;
++};
++
++static struct list gathers = LIST_INIT( gathers );
++static struct list excluded = LIST_INIT( excluded );
++static struct list metadata_list = LIST_INIT( metadata_list );
++static struct list runtime_dlls = LIST_INIT( runtime_dlls );
++static WCHAR *app_local_dump;
++
++static CRITICAL_SECTION wer_cs;
++static CRITICAL_SECTION_DEBUG wer_cs_debug =
++{
++    0, 0, &wer_cs,
++    { &wer_cs_debug.ProcessLocksList, &wer_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": wer_cs") }
++};
++static CRITICAL_SECTION wer_cs = { &wer_cs_debug, -1, 0, 0, 0, 0 };
++
++static WCHAR *heap_strdupW( const WCHAR *str )
++{
++    SIZE_T size = (lstrlenW( str ) + 1) * sizeof(WCHAR);
++    WCHAR *ret = HeapAlloc( GetProcessHeap(), 0, size );
++
++    if (ret) memcpy( ret, str, size );
++    return ret;
++}
++
++/* the block, made the first time something is registered; the lock is held */
++static struct wer_block *get_block(void)
++{
++    PEB *peb = NtCurrentTeb()->Peb;
++    struct wer_block *block = peb->WerRegistrationData;
++
++    if (block) return block;
++    if (!(block = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*block) ))) return NULL;
++    block->length = sizeof(*block);
++    memcpy( block->signature, L"PEB_SIGNATURE", sizeof(L"PEB_SIGNATURE") );
++    block->gather = &gathers;
++    block->metadata = &metadata_list;
++    block->runtime_dlls = &runtime_dlls;
++    peb->WerRegistrationData = block;
++    return block;
++}
++
++/* the block of another process, read into a copy */
++static HRESULT read_block( HANDLE process, struct wer_block *copy )
++{
++    PROCESS_BASIC_INFORMATION pbi;
++    void *remote = NULL;
++    NTSTATUS status;
++
++    if (NtQueryInformationProcess( process, ProcessBasicInformation, &pbi, sizeof(pbi), NULL ))
++        return HRESULT_FROM_WIN32( ERROR_INVALID_HANDLE );
++    status = NtReadVirtualMemory( process, (char *)pbi.PebBaseAddress + offsetof(PEB, WerRegistrationData),
++                                  &remote, sizeof(remote), NULL );
++    if (status) return HRESULT_FROM_WIN32( RtlNtStatusToDosError( status ) );
++    if (!remote) return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    if ((status = NtReadVirtualMemory( process, remote, copy, sizeof(*copy), NULL )))
++        return HRESULT_FROM_WIN32( RtlNtStatusToDosError( status ) );
++    if (copy->length < sizeof(*copy) || memcmp( copy->signature, L"PEB_SIGNATURE", sizeof(L"PEB_SIGNATURE") ))
++        return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    return S_OK;
++}
++
++static BOOL is_current_process( HANDLE process )
++{
++    return process == GetCurrentProcess() || GetProcessId( process ) == GetCurrentProcessId();
++}
++
++
++/***********************************************************************
++ *           RegisterApplicationRestart   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ RegisterApplicationRestart( const WCHAR *cmdline, DWORD flags )
++{
++    struct wer_block *block;
++    SIZE_T len = cmdline ? lstrlenW( cmdline ) : 0;
++
++    TRACE( "%s, %#lx\n", debugstr_w(cmdline), flags );
++
++    if (len >= RESTART_MAX_CMD_LINE) return E_INVALIDARG;
++    RtlEnterCriticalSection( &wer_cs );
++    if (!(block = get_block()))
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        return E_OUTOFMEMORY;
++    }
++    if (len) memcpy( block->restart_cmdline, cmdline, len * sizeof(WCHAR) );
++    block->restart_cmdline[len] = 0;
++    block->restart_flags = flags;
++    block->restart_registered = TRUE;
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *           UnregisterApplicationRestart   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ UnregisterApplicationRestart(void)
++{
++    struct wer_block *block;
++
++    TRACE( "\n" );
++
++    RtlEnterCriticalSection( &wer_cs );
++    if ((block = NtCurrentTeb()->Peb->WerRegistrationData))
++    {
++        /* the flags stay; the command line is cut */
++        block->restart_registered = FALSE;
++        block->restart_cmdline[0] = 0;
++    }
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *           GetApplicationRestartSettings   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ GetApplicationRestartSettings( HANDLE process, WCHAR *cmdline,
++                                                                      DWORD *size, DWORD *flags )
++{
++    struct wer_block copy, *block = &copy;
++    HRESULT hr = S_OK;
++    DWORD len;
++
++    TRACE( "%p, %p, %p, %p\n", process, cmdline, size, flags );
++
++    if (!size) return E_INVALIDARG;
++    if (is_current_process( process ))
++    {
++        RtlEnterCriticalSection( &wer_cs );
++        if ((block = NtCurrentTeb()->Peb->WerRegistrationData)) copy = *block;
++        else hr = HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++        RtlLeaveCriticalSection( &wer_cs );
++        block = &copy;
++    }
++    else hr = read_block( process, &copy );
++    if (FAILED(hr)) return hr;
++
++    if (!block->restart_registered)
++    {
++        *size = 0;
++        return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    }
++    block->restart_cmdline[RESTART_MAX_CMD_LINE - 1] = 0;
++    len = lstrlenW( block->restart_cmdline ) + 1;
++    /* with no buffer the size is all that is asked for */
++    if (cmdline)
++    {
++        if (*size >= len) memcpy( cmdline, block->restart_cmdline, len * sizeof(WCHAR) );
++        else
++        {
++            /* a buffer too small comes back empty */
++            if (*size) cmdline[0] = 0;
++            hr = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        }
++    }
++    *size = len;
++    if (flags && SUCCEEDED(hr)) *flags = block->restart_flags;
++    return hr;
++}
++
++
++/***********************************************************************
++ *           RegisterApplicationRecoveryCallback   (kernelbase.@)
++ */
++HRESULT WINAPI RegisterApplicationRecoveryCallback( APPLICATION_RECOVERY_CALLBACK callback, void *param,
++                                                    DWORD ping_interval, DWORD flags )
++{
++    struct wer_block *block;
++
++    TRACE( "%p, %p, %lu, %#lx\n", callback, param, ping_interval, flags );
++
++    if (!callback || ping_interval > RECOVERY_MAX_PING_INTERVAL) return E_INVALIDARG;
++    RtlEnterCriticalSection( &wer_cs );
++    if (!(block = get_block()))
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        return E_OUTOFMEMORY;
++    }
++    block->recovery.length = sizeof(block->recovery);
++    block->recovery.registered = TRUE;
++    block->recovery.callback = callback;
++    block->recovery.param = param;
++    block->recovery.ping_interval = ping_interval ? ping_interval : RECOVERY_DEFAULT_PING_INTERVAL;
++    block->recovery.flags = flags;
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *           UnregisterApplicationRecoveryCallback   (kernelbase.@)
++ */
++HRESULT WINAPI UnregisterApplicationRecoveryCallback(void)
++{
++    struct wer_block *block;
++
++    TRACE( "\n" );
++
++    RtlEnterCriticalSection( &wer_cs );
++    if ((block = NtCurrentTeb()->Peb->WerRegistrationData))
++    {
++        block->recovery.callback = NULL;
++        block->recovery.param = NULL;
++        block->recovery.ping_interval = 0;
++        block->recovery.flags = 0;
++    }
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *           GetApplicationRecoveryCallback   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ GetApplicationRecoveryCallback( HANDLE process,
++                                                                       APPLICATION_RECOVERY_CALLBACK *callback,
++                                                                       void **param, DWORD *ping_interval,
++                                                                       DWORD *flags )
++{
++    struct wer_block copy;
++    HRESULT hr = S_OK;
++
++    TRACE( "%p, %p, %p, %p, %p\n", process, callback, param, ping_interval, flags );
++
++    if (!callback || !param) return E_INVALIDARG;
++    if (is_current_process( process ))
++    {
++        RtlEnterCriticalSection( &wer_cs );
++        if (NtCurrentTeb()->Peb->WerRegistrationData)
++            copy = *(struct wer_block *)NtCurrentTeb()->Peb->WerRegistrationData;
++        else hr = HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++        RtlLeaveCriticalSection( &wer_cs );
++    }
++    else hr = read_block( process, &copy );
++    if (FAILED(hr)) return hr;
++
++    if (!copy.recovery.registered) return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    *callback = copy.recovery.callback;
++    *param = copy.recovery.param;
++    if (ping_interval) *ping_interval = copy.recovery.ping_interval;
++    if (flags) *flags = copy.recovery.flags;
++    return S_OK;
++}
++
++
++/* the recovery that runs when the process crashes; ApplicationRecoveryInProgress and ApplicationRecoveryFinished
++ * talk to it through the block's events */
++static BOOL in_recovery;
++
++/***********************************************************************
++ *           ApplicationRecoveryInProgress   (kernelbase.@)
++ */
++HRESULT WINAPI ApplicationRecoveryInProgress( BOOL *cancelled )
++{
++    struct wer_block *block = NtCurrentTeb()->Peb->WerRegistrationData;
++
++    TRACE( "%p\n", cancelled );
++
++    if (!cancelled) return E_INVALIDARG;
++    *cancelled = FALSE;
++    if (!in_recovery || !block || !block->recovery.in_progress) return E_FAIL;
++    SetEvent( block->recovery.in_progress );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *           ApplicationRecoveryFinished   (kernelbase.@)
++ */
++void WINAPI ApplicationRecoveryFinished( BOOL success )
++{
++    struct wer_block *block = NtCurrentTeb()->Peb->WerRegistrationData;
++
++    TRACE( "%d\n", success );
++
++    if (!in_recovery || !block || !block->recovery.finished) return;
++    block->recovery.successful = success;
++    SetEvent( block->recovery.finished );
++}
++
++static DWORD WINAPI recovery_thread( void *arg )
++{
++    struct wer_block *block = arg;
++
++    return block->recovery.callback( block->recovery.param );
++}
++
++/* the restart command line: the image path quoted and the registered arguments */
++static void restart_process( const struct wer_block *block )
++{
++    STARTUPINFOW si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    WCHAR *cmdline, path[MAX_PATH];
++    DWORD len;
++
++    if (!(len = GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) )) || len == ARRAY_SIZE(path)) return;
++    if (!(cmdline = HeapAlloc( GetProcessHeap(), 0, (len + 4 + RESTART_MAX_CMD_LINE) * sizeof(WCHAR) ))) return;
++    cmdline[0] = '"';
++    memcpy( cmdline + 1, path, len * sizeof(WCHAR) );
++    cmdline[len + 1] = '"';
++    cmdline[len + 2] = ' ';
++    memcpy( cmdline + len + 3, block->restart_cmdline, (lstrlenW( block->restart_cmdline ) + 1) * sizeof(WCHAR) );
++    TRACE( "restarting %s\n", debugstr_w(cmdline) );
++    if (CreateProcessW( path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
++    {
++        CloseHandle( pi.hThread );
++        CloseHandle( pi.hProcess );
++    }
++    HeapFree( GetProcessHeap(), 0, cmdline );
++}
++
++/***********************************************************************
++ *           wer_handle_crash
++ *
++ * What Windows Error Reporting does for a process that crashed, before the debugger: run its recovery callback while
++ * it keeps telling it is in progress, and restart it if it asked to be and has run for a minute.
++ */
++void wer_handle_crash( EXCEPTION_POINTERS *epointers )
++{
++    struct wer_block *block = NtCurrentTeb()->Peb->WerRegistrationData;
++    KERNEL_USER_TIMES times;
++    LARGE_INTEGER now;
++
++    if (!block || in_recovery) return;
++    in_recovery = TRUE;
++
++    if (block->recovery.callback)
++    {
++        HANDLE thread, handles[3];
++        DWORD ret;
++
++        block->recovery.finished = CreateEventW( NULL, TRUE, FALSE, NULL );
++        block->recovery.in_progress = CreateEventW( NULL, FALSE, FALSE, NULL );
++        TRACE( "recovering through %p\n", block->recovery.callback );
++        if (block->recovery.finished && block->recovery.in_progress &&
++            (thread = CreateThread( NULL, 0, recovery_thread, block, 0, NULL )))
++        {
++            handles[0] = block->recovery.finished;
++            handles[1] = thread;
++            handles[2] = block->recovery.in_progress;
++            /* each call of ApplicationRecoveryInProgress buys another ping interval */
++            while ((ret = WaitForMultipleObjects( 3, handles, FALSE, block->recovery.ping_interval ))
++                   == WAIT_OBJECT_0 + 2);
++            TRACE( "recovery ended, %lu\n", ret );
++            CloseHandle( thread );
++        }
++    }
++
++    NtQuerySystemTime( &now );
++    if (block->restart_registered && !(block->restart_flags & RESTART_NO_CRASH) &&
++        !NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &times, sizeof(times), NULL ) &&
++        now.QuadPart - times.CreateTime.QuadPart >= 60 * (LONGLONG)10000000)
++        restart_process( block );
++}
++
++
++/* Windows Error Reporting's registrations */
++
++static HRESULT add_gather( struct list *list, const WCHAR *file, DWORD type, DWORD flags, const void *block,
++                           DWORD size )
++{
++    struct wer_block *wer;
++    struct gather *gather;
++
++    RtlEnterCriticalSection( &wer_cs );
++    LIST_FOR_EACH_ENTRY( gather, list, struct gather, entry )
++    {
++        if (file ? (gather->file && !wcsicmp( gather->file, file )) : (!gather->file && gather->block == block))
++        {
++            /* registering again changes nothing but what it says */
++            gather->type = type;
++            gather->flags = flags;
++            gather->size = size;
++            RtlLeaveCriticalSection( &wer_cs );
++            return S_OK;
++        }
++    }
++    if (list_count( list ) >= WER_MAX_GATHERS)
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    }
++    if (!(wer = get_block()) || !(gather = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*gather) )))
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        return E_OUTOFMEMORY;
++    }
++    if (file && !(gather->file = heap_strdupW( file )))
++    {
++        HeapFree( GetProcessHeap(), 0, gather );
++        RtlLeaveCriticalSection( &wer_cs );
++        return E_OUTOFMEMORY;
++    }
++    gather->type = type;
++    gather->flags = flags;
++    gather->block = block;
++    gather->size = size;
++    list_add_tail( list, &gather->entry );
++    if (list == &gathers) wer->gather_count = list_count( list );
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++static HRESULT remove_gather( struct list *list, const WCHAR *file, const void *block )
++{
++    struct wer_block *wer = NtCurrentTeb()->Peb->WerRegistrationData;
++    struct gather *gather;
++
++    RtlEnterCriticalSection( &wer_cs );
++    LIST_FOR_EACH_ENTRY( gather, list, struct gather, entry )
++    {
++        if (file ? !(gather->file && !wcsicmp( gather->file, file )) : (gather->file || gather->block != block))
++            continue;
++        list_remove( &gather->entry );
++        if (wer && list == &gathers) wer->gather_count = list_count( list );
++        RtlLeaveCriticalSection( &wer_cs );
++        HeapFree( GetProcessHeap(), 0, gather->file );
++        HeapFree( GetProcessHeap(), 0, gather );
++        return S_OK;
++    }
++    RtlLeaveCriticalSection( &wer_cs );
++    return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++}
++
++
++/***********************************************************************
++ *         WerRegisterFile   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterFile( const WCHAR *file, WER_REGISTER_FILE_TYPE type,
++                                                        DWORD flags )
++{
++    TRACE( "(%s, %d, %#lx)\n", debugstr_w(file), type, flags );
++
++    if (!file || type <= 0 || type >= WerRegFileTypeMax) return E_INVALIDARG;
++    if (flags & ~(WER_FILE_DELETE_WHEN_DONE | WER_FILE_ANONYMOUS_DATA | WER_FILE_COMPRESSED)) return E_INVALIDARG;
++    if (lstrlenW( file ) >= MAX_PATH) return HRESULT_FROM_WIN32( ERROR_FILENAME_EXCED_RANGE );
++    return add_gather( &gathers, file, type, flags, NULL, 0 );
++}
++
++
++/***********************************************************************
++ *         WerUnregisterFile   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterFile( const WCHAR *file )
++{
++    TRACE( "(%s)\n", debugstr_w(file) );
++
++    if (!file) return E_INVALIDARG;
++    return remove_gather( &gathers, file, NULL );
++}
++
++
++/***********************************************************************
++ *         WerRegisterMemoryBlock   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterMemoryBlock( void *block, DWORD size )
++{
++    TRACE( "(%p %lu)\n", block, size );
++
++    if (!block || !size || size > WER_MAX_MEM_BLOCK_SIZE) return E_INVALIDARG;
++    return add_gather( &gathers, NULL, 0, 0, block, size );
++}
++
++
++/***********************************************************************
++ *         WerUnregisterMemoryBlock   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterMemoryBlock( void *block )
++{
++    TRACE( "(%p)\n", block );
++
++    if (!block) return E_INVALIDARG;
++    return remove_gather( &gathers, NULL, block );
++}
++
++
++/***********************************************************************
++ *         WerRegisterExcludedMemoryBlock   (kernelbase.@)
++ */
++HRESULT WINAPI WerRegisterExcludedMemoryBlock( const void *block, DWORD size )
++{
++    TRACE( "(%p %lu)\n", block, size );
++
++    if (!block || !size) return E_INVALIDARG;
++    return add_gather( &excluded, NULL, 0, 0, block, size );
++}
++
++
++/***********************************************************************
++ *         WerUnregisterExcludedMemoryBlock   (kernelbase.@)
++ */
++HRESULT WINAPI WerUnregisterExcludedMemoryBlock( const void *block )
++{
++    TRACE( "(%p)\n", block );
++
++    if (!block) return E_INVALIDARG;
++    return remove_gather( &excluded, NULL, block );
++}
++
++
++/* a key starts with a letter and goes on with letters, digits, dots, underscores and dashes, all ASCII */
++static BOOL is_valid_metadata_key( const WCHAR *key )
++{
++    const WCHAR *p;
++
++    if (!((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= 'a' && key[0] <= 'z'))) return FALSE;
++    for (p = key; *p; p++)
++        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
++              *p == '.' || *p == '_' || *p == '-'))
++            return FALSE;
++    return p - key <= WER_MAX_METADATA_KEY;
++}
++
++/***********************************************************************
++ *         WerRegisterCustomMetadata  (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterCustomMetadata( const WCHAR *key, const WCHAR *value )
++{
++    struct metadata *entry;
++    struct wer_block *wer;
++    WCHAR *copy;
++
++    TRACE( "(%s, %s)\n", debugstr_w(key), debugstr_w(value) );
++
++    if (!key || !value || !is_valid_metadata_key( key ) || lstrlenW( value ) >= WER_MAX_METADATA_VALUE)
++        return E_INVALIDARG;
++    if (!(copy = heap_strdupW( value ))) return E_OUTOFMEMORY;
++
++    RtlEnterCriticalSection( &wer_cs );
++    LIST_FOR_EACH_ENTRY( entry, &metadata_list, struct metadata, entry )
++    {
++        if (wcscmp( entry->key, key )) continue;
++        HeapFree( GetProcessHeap(), 0, entry->value );
++        entry->value = copy;
++        RtlLeaveCriticalSection( &wer_cs );
++        return S_OK;
++    }
++    if (list_count( &metadata_list ) >= WER_MAX_METADATA)
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        HeapFree( GetProcessHeap(), 0, copy );
++        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    }
++    if (!(wer = get_block()) || !(entry = HeapAlloc( GetProcessHeap(), 0, sizeof(*entry) )))
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        HeapFree( GetProcessHeap(), 0, copy );
++        return E_OUTOFMEMORY;
++    }
++    if (!(entry->key = heap_strdupW( key )))
++    {
++        HeapFree( GetProcessHeap(), 0, entry );
++        RtlLeaveCriticalSection( &wer_cs );
++        HeapFree( GetProcessHeap(), 0, copy );
++        return E_OUTOFMEMORY;
++    }
++    entry->value = copy;
++    list_add_tail( &metadata_list, &entry->entry );
++    wer->metadata_count = list_count( &metadata_list );
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *         WerUnregisterCustomMetadata  (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterCustomMetadata( const WCHAR *key )
++{
++    struct wer_block *wer = NtCurrentTeb()->Peb->WerRegistrationData;
++    struct metadata *entry;
++
++    TRACE( "(%s)\n", debugstr_w(key) );
++
++    if (!key) return E_INVALIDARG;
++    RtlEnterCriticalSection( &wer_cs );
++    LIST_FOR_EACH_ENTRY( entry, &metadata_list, struct metadata, entry )
++    {
++        if (wcscmp( entry->key, key )) continue;
++        list_remove( &entry->entry );
++        if (wer) wer->metadata_count = list_count( &metadata_list );
++        RtlLeaveCriticalSection( &wer_cs );
++        HeapFree( GetProcessHeap(), 0, entry->key );
++        HeapFree( GetProcessHeap(), 0, entry->value );
++        HeapFree( GetProcessHeap(), 0, entry );
++        return S_OK;
++    }
++    RtlLeaveCriticalSection( &wer_cs );
++    return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++}
++
++
++/***********************************************************************
++ *         WerRegisterRuntimeExceptionModule   (kernelbase.@)
++ *
++ * The module's out of process callbacks are for Windows Error Reporting's own process, which Wine does not have;
++ * the registration is kept.
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerRegisterRuntimeExceptionModule( const WCHAR *dll, void *context )
++{
++    struct runtime_dll *entry;
++
++    TRACE( "(%s, %p)\n", debugstr_w(dll), context );
++
++    if (!dll) return E_INVALIDARG;
++    if (lstrlenW( dll ) >= MAX_PATH) return HRESULT_FROM_WIN32( ERROR_FILENAME_EXCED_RANGE );
++    RtlEnterCriticalSection( &wer_cs );
++    LIST_FOR_EACH_ENTRY( entry, &runtime_dlls, struct runtime_dll, entry )
++    {
++        if (entry->context == context && !wcsicmp( entry->path, dll ))
++        {
++            RtlLeaveCriticalSection( &wer_cs );
++            return S_OK;
++        }
++    }
++    if (list_count( &runtime_dlls ) >= WER_MAX_RUNTIME_DLLS)
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    }
++    if (!get_block() || !(entry = HeapAlloc( GetProcessHeap(), 0, sizeof(*entry) )))
++    {
++        RtlLeaveCriticalSection( &wer_cs );
++        return E_OUTOFMEMORY;
++    }
++    if (!(entry->path = heap_strdupW( dll )))
++    {
++        HeapFree( GetProcessHeap(), 0, entry );
++        RtlLeaveCriticalSection( &wer_cs );
++        return E_OUTOFMEMORY;
++    }
++    entry->context = context;
++    list_add_tail( &runtime_dlls, &entry->entry );
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *         WerUnregisterRuntimeExceptionModule   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerUnregisterRuntimeExceptionModule( const WCHAR *dll, void *context )
++{
++    struct runtime_dll *entry;
++
++    TRACE( "(%s, %p)\n", debugstr_w(dll), context );
++
++    if (!dll) return E_INVALIDARG;
++    RtlEnterCriticalSection( &wer_cs );
++    LIST_FOR_EACH_ENTRY( entry, &runtime_dlls, struct runtime_dll, entry )
++    {
++        if (entry->context != context || wcsicmp( entry->path, dll )) continue;
++        list_remove( &entry->entry );
++        RtlLeaveCriticalSection( &wer_cs );
++        HeapFree( GetProcessHeap(), 0, entry->path );
++        HeapFree( GetProcessHeap(), 0, entry );
++        return S_OK;
++    }
++    RtlLeaveCriticalSection( &wer_cs );
++    return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
++}
++
++
++/***********************************************************************
++ *         WerSetFlags   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerSetFlags( DWORD flags )
++{
++    struct wer_block *block;
++
++    TRACE( "(%#lx)\n", flags );
++
++    RtlEnterCriticalSection( &wer_cs );
++    if ((block = get_block())) block->flags = flags;
++    RtlLeaveCriticalSection( &wer_cs );
++    return block ? S_OK : E_OUTOFMEMORY;
++}
++
++
++/***********************************************************************
++ *         WerGetFlags   (kernelbase.@)
++ */
++HRESULT WINAPI /* DECLSPEC_HOTPATCH */ WerGetFlags( HANDLE process, DWORD *flags )
++{
++    struct wer_block copy;
++    HRESULT hr;
++
++    TRACE( "(%p, %p)\n", process, flags );
++
++    if (!process || !flags) return E_INVALIDARG;
++    if (is_current_process( process ))
++    {
++        RtlEnterCriticalSection( &wer_cs );
++        *flags = NtCurrentTeb()->Peb->WerRegistrationData ?
++                 ((struct wer_block *)NtCurrentTeb()->Peb->WerRegistrationData)->flags : 0;
++        RtlLeaveCriticalSection( &wer_cs );
++        return S_OK;
++    }
++    if ((hr = read_block( process, &copy )) == HRESULT_FROM_WIN32( ERROR_NOT_FOUND ))
++    {
++        *flags = 0;
++        return S_OK;
++    }
++    if (SUCCEEDED(hr)) *flags = copy.flags;
++    return hr;
++}
++
++
++/***********************************************************************
++ *         WerRegisterAppLocalDump   (kernelbase.@)
++ */
++HRESULT WINAPI WerRegisterAppLocalDump( const WCHAR *path )
++{
++    WCHAR *copy;
++
++    TRACE( "(%s)\n", debugstr_w(path) );
++
++    if (!path || lstrlenW( path ) >= MAX_PATH) return E_INVALIDARG;
++    if (!(copy = heap_strdupW( path ))) return E_OUTOFMEMORY;
++    RtlEnterCriticalSection( &wer_cs );
++    HeapFree( GetProcessHeap(), 0, app_local_dump );
++    app_local_dump = copy;
++    RtlLeaveCriticalSection( &wer_cs );
++    return S_OK;
++}
++
++
++/***********************************************************************
++ *         WerUnregisterAppLocalDump   (kernelbase.@)
++ */
++HRESULT WINAPI WerUnregisterAppLocalDump(void)
++{
++    HRESULT hr = S_OK;
++
++    TRACE( "\n" );
++
++    RtlEnterCriticalSection( &wer_cs );
++    if (app_local_dump)
++    {
++        HeapFree( GetProcessHeap(), 0, app_local_dump );
++        app_local_dump = NULL;
++    }
++    else hr = HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    RtlLeaveCriticalSection( &wer_cs );
++    return hr;
++}
+diff --git a/include/werapi.h b/include/werapi.h
+index 344cecbd814..2360aacce28 100644
+--- a/include/werapi.h
++++ b/include/werapi.h
+@@ -55,6 +55,23 @@ extern "C" {
+ #define WER_SUBMIT_REPORT_MACHINE_ID        0x2000
+ 
+ #define WER_MAX_PREFERRED_MODULES           128
++#define WER_MAX_MEM_BLOCK_SIZE              (64 * 1024)
++
++#define WER_FAULT_REPORTING_FLAG_NOHEAP                     0x001
++#define WER_FAULT_REPORTING_FLAG_QUEUE                      0x002
++#define WER_FAULT_REPORTING_FLAG_DISABLE_THREAD_SUSPENSION  0x004
++#define WER_FAULT_REPORTING_FLAG_QUEUE_UPLOAD               0x008
++#define WER_FAULT_REPORTING_ALWAYS_SHOW_UI                  0x010
++#define WER_FAULT_REPORTING_NO_UI                           0x020
++#define WER_FAULT_REPORTING_FLAG_NO_HEAP_ON_QUEUE           0x040
++#define WER_FAULT_REPORTING_DISABLE_SNAPSHOT_CRASH          0x080
++#define WER_FAULT_REPORTING_DISABLE_SNAPSHOT_HANG           0x100
++#define WER_FAULT_REPORTING_CRITICAL                        0x200
++#define WER_FAULT_REPORTING_DURABLE                         0x400
++
++#define WER_FILE_DELETE_WHEN_DONE           0x1
++#define WER_FILE_ANONYMOUS_DATA             0x2
++#define WER_FILE_COMPRESSED                 0x4
+ #define WER_MAX_PREFERRED_MODULES_BUFFER    256
+ 
+ /* #### */
+@@ -175,8 +192,10 @@ typedef struct _WER_EXCEPTION_INFORMATION
+ 
+ HRESULT WINAPI WerAddExcludedApplication(PCWSTR, BOOL);
+ HRESULT WINAPI WerGetFlags(HANDLE process, DWORD *flags);
++HRESULT WINAPI WerRegisterAppLocalDump(PCWSTR path);
+ HRESULT WINAPI WerRegisterCustomMetadata(PCWSTR key, PCWSTR value);
+ HRESULT WINAPI WerRegisterFile(PCWSTR file, WER_REGISTER_FILE_TYPE regfiletype, DWORD flags);
++HRESULT WINAPI WerRegisterExcludedMemoryBlock(const void *block, DWORD size);
+ HRESULT WINAPI WerRegisterMemoryBlock(void *block, DWORD size);
+ HRESULT WINAPI WerRegisterRuntimeExceptionModule(PCWSTR callbackdll, void *context);
+ HRESULT WINAPI WerRemoveExcludedApplication(PCWSTR, BOOL);
+@@ -187,7 +206,9 @@ HRESULT WINAPI WerReportSetParameter(HREPORT, DWORD, PCWSTR, PCWSTR);
+ HRESULT WINAPI WerReportSetUIOption(HREPORT, WER_REPORT_UI, PCWSTR);
+ HRESULT WINAPI WerReportSubmit(HREPORT, WER_CONSENT, DWORD, PWER_SUBMIT_RESULT);
+ HRESULT WINAPI WerSetFlags(DWORD flags);
++HRESULT WINAPI WerUnregisterAppLocalDump(void);
+ HRESULT WINAPI WerUnregisterCustomMetadata(PCWSTR key);
++HRESULT WINAPI WerUnregisterExcludedMemoryBlock(const void *block);
+ HRESULT WINAPI WerUnregisterFile(PCWSTR file);
+ HRESULT WINAPI WerUnregisterMemoryBlock(void *block);
+ HRESULT WINAPI WerUnregisterRuntimeExceptionModule(PCWSTR callbackdll, void *context);
+diff --git a/include/winbase.h b/include/winbase.h
+index f6022614126..e41ec1eb0be 100644
+--- a/include/winbase.h
++++ b/include/winbase.h
+@@ -1749,6 +1749,7 @@ WINADVAPI  BOOL        WINAPI GetAce(PACL,DWORD,LPVOID*);
+ WINADVAPI  BOOL        WINAPI GetAclInformation(PACL,LPVOID,DWORD,ACL_INFORMATION_CLASS);
+ WINBASEAPI DWORD       WINAPI GetActiveProcessorCount(WORD);
+ WINBASEAPI WORD        WINAPI GetActiveProcessorGroupCount(void);
++WINBASEAPI HRESULT     WINAPI GetApplicationRecoveryCallback(HANDLE,APPLICATION_RECOVERY_CALLBACK*,PVOID*,DWORD*,DWORD*);
+ WINBASEAPI HRESULT     WINAPI GetApplicationRestartSettings(HANDLE,WCHAR*,DWORD*,DWORD*);
+ WINBASEAPI UINT        WINAPI GetAtomNameA(ATOM,LPSTR,INT);
+ WINBASEAPI UINT        WINAPI GetAtomNameW(ATOM,LPWSTR,INT);

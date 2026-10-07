@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 09:51:30 -0400
+Subject: [PATCH] inkobj: Keep the metrics of each packet property of a stroke.
+
+Keeping the ink of a slide show makes PowerPoint turn each stroke into an
+ink shape, and it reads the metrics of X and Y first; the method was a
+stub, so no shape came of the ink.  A stroke now answers
+GetPacketDescriptionPropertyMetrics from the metrics it holds: those of
+the tablet the packets came from, which rtscom's stroke builder passes
+on through IWineInkStroke::SetPropertyMetrics, or for a stroke made by
+CreateStroke X and Y in HIMETRIC (0 to INT_MAX, centimetres, a thousand
+to the centimetre) and the other properties without a unit (not
+measured).  Copies and split strokes keep them.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/inkobj/ink.c b/dlls/inkobj/ink.c
+index 333c8ce5d25..a727bc680bd 100644
+--- a/dlls/inkobj/ink.c
++++ b/dlls/inkobj/ink.c
+@@ -19,12 +19,17 @@
+  */
+ 
+ #include <float.h>
++#include <limits.h>
+ #include <math.h>
+ 
+ #include "inkobj_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(inkobj);
+ 
++/* what a stroke without a tablet's own says of its properties: X and Y in HIMETRIC, a
++ * thousand to the centimetre, the others without a unit (not measured) */
++static void default_metrics(const GUID *guid, struct property_metrics *metrics);
++
+ /* the packet properties every stroke has, first */
+ static const GUID GUID_PACKETPROPERTY_GUID_X = {0x598a6a8f, 0x52c0, 0x4ba0, {0x93, 0xaf, 0xaf, 0x35, 0x74, 0x11, 0xa5, 0x61}};
+ static const GUID GUID_PACKETPROPERTY_GUID_Y = {0xb53f9f75, 0x04e0, 0x4498, {0xa7, 0xee, 0xc3, 0x0d, 0xbb, 0x5a, 0x90, 0x11}};
+@@ -68,6 +73,7 @@ void stroke_data_release(struct stroke_data *data)
+         return;
+ 
+     free(data->description);
++    free(data->metrics);
+     free(data->packets);
+     if (data->attributes) IInkDrawingAttributes_Release(data->attributes);
+     if (data->properties) IInkExtendedProperties_Release(data->properties);
+@@ -86,12 +92,15 @@ static HRESULT stroke_data_create(unsigned int packet_size, const GUID *descript
+     data->packet_size = packet_size;
+     data->packet_count = packet_count;
+     if (!(data->description = malloc(packet_size * sizeof(*description)))
++            || !(data->metrics = malloc(packet_size * sizeof(*data->metrics)))
+             || !(data->packets = malloc(max(1, packet_count * packet_size) * sizeof(*packets))))
+     {
+         stroke_data_release(data);
+         return E_OUTOFMEMORY;
+     }
+     memcpy(data->description, description, packet_size * sizeof(*description));
++    for (unsigned int i = 0; i < packet_size; ++i)
++        default_metrics(&description[i], &data->metrics[i]);
+     memcpy(data->packets, packets, packet_count * packet_size * sizeof(*packets));
+ 
+     if (attributes) hr = drawing_attributes_clone(attributes, &data->attributes);
+@@ -120,9 +129,26 @@ static HRESULT stroke_data_copy(const struct stroke_data *src, struct stroke_dat
+         stroke_data_release(*out);
+         return hr;
+     }
++    memcpy((*out)->metrics, src->metrics, src->packet_size * sizeof(*src->metrics));
+     return S_OK;
+ }
+ 
++static void default_metrics(const GUID *guid, struct property_metrics *metrics)
++{
++    metrics->minimum = 0;
++    metrics->maximum = INT_MAX;
++    if (IsEqualGUID(guid, &GUID_PACKETPROPERTY_GUID_X) || IsEqualGUID(guid, &GUID_PACKETPROPERTY_GUID_Y))
++    {
++        metrics->units = TPMU_Centimeters;
++        metrics->resolution = 1000.0f;
++    }
++    else
++    {
++        metrics->units = TPMU_Default;
++        metrics->resolution = 1.0f;
++    }
++}
++
+ static unsigned int stroke_data_property(const struct stroke_data *data, const GUID *guid)
+ {
+     unsigned int i;
+@@ -984,6 +1010,7 @@ static HRESULT WINAPI stroke_Split(IInkStrokeDisp *iface, float at, IInkStrokeDi
+     if (SUCCEEDED(hr = stroke_data_create(size, data->description, n, packets, data->attributes, &tail)))
+     {
+         extended_properties_copy(tail->properties, data->properties);
++        memcpy(tail->metrics, data->metrics, size * sizeof(*data->metrics));
+         /* this stroke ends at the split point */
+         if (t > 0.0f)
+         {
+@@ -1007,9 +1034,30 @@ static HRESULT WINAPI stroke_Split(IInkStrokeDisp *iface, float at, IInkStrokeDi
+ static HRESULT WINAPI stroke_GetPacketDescriptionPropertyMetrics(IInkStrokeDisp *iface, BSTR name, LONG *minimum,
+         LONG *maximum, TabletPropertyMetricUnit *units, float *resolution)
+ {
+-    FIXME("iface %p, name %s, minimum %p, maximum %p, units %p, resolution %p, not implemented.\n", iface,
++    struct stroke *stroke = impl_from_IInkStrokeDisp(iface);
++    const struct property_metrics *metrics;
++    unsigned int property;
++    HRESULT hr;
++    GUID guid;
++
++    TRACE("iface %p, name %s, minimum %p, maximum %p, units %p, resolution %p.\n", iface,
+             debugstr_w(name), minimum, maximum, units, resolution);
+-    return E_NOTIMPL;
++
++    if (!minimum || !maximum || !units || !resolution) return E_POINTER;
++    if (!name || FAILED(IIDFromString(name, &guid))) return E_INVALIDARG;
++    if (FAILED(hr = stroke_lock(stroke))) return hr;
++    if ((property = stroke_data_property(stroke->data, &guid)) == ~0u)
++        hr = E_INVALIDARG;
++    else
++    {
++        metrics = &stroke->data->metrics[property];
++        *minimum = metrics->minimum;
++        *maximum = metrics->maximum;
++        *units = metrics->units;
++        *resolution = metrics->resolution;
++    }
++    stroke_unlock(stroke, FALSE);
++    return hr;
+ }
+ 
+ static HRESULT get_packet_values(struct stroke *stroke, unsigned int property, LONG index, LONG count, VARIANT *out)
+@@ -1365,12 +1413,37 @@ static HRESULT WINAPI wine_stroke_AppendPackets(IWineInkStroke *iface, ULONG cou
+     return S_OK;
+ }
+ 
++/* the metrics of the tablet the packets came from, for the properties the stroke has */
++static HRESULT WINAPI wine_stroke_SetPropertyMetrics(IWineInkStroke *iface, ULONG count, const PACKET_PROPERTY *properties)
++{
++    struct stroke *stroke = impl_from_IWineInkStroke(iface);
++    struct stroke_data *data = stroke->data;
++    unsigned int i, property;
++    HRESULT hr;
++
++    TRACE("iface %p, count %lu, properties %p.\n", iface, count, properties);
++
++    if (count && !properties) return E_POINTER;
++    if (FAILED(hr = stroke_lock(stroke))) return hr;
++    for (i = 0; i < count; ++i)
++    {
++        if ((property = stroke_data_property(data, &properties[i].guid)) == ~0u) continue;
++        data->metrics[property].minimum = properties[i].PropertyMetrics.nLogicalMin;
++        data->metrics[property].maximum = properties[i].PropertyMetrics.nLogicalMax;
++        data->metrics[property].units = properties[i].PropertyMetrics.Units;
++        data->metrics[property].resolution = properties[i].PropertyMetrics.fResolution;
++    }
++    stroke_unlock(stroke, FALSE);
++    return S_OK;
++}
++
+ static const IWineInkStrokeVtbl wine_stroke_vtbl =
+ {
+     wine_stroke_QueryInterface,
+     wine_stroke_AddRef,
+     wine_stroke_Release,
+     wine_stroke_AppendPackets,
++    wine_stroke_SetPropertyMetrics,
+ };
+ 
+ static HRESULT stroke_create(struct ink *ink, struct stroke_data *data, IInkStrokeDisp **out)
+diff --git a/dlls/inkobj/inkobj_private.h b/dlls/inkobj/inkobj_private.h
+index 38bbba6aa28..4e8f2f6c731 100644
+--- a/dlls/inkobj/inkobj_private.h
++++ b/dlls/inkobj/inkobj_private.h
+@@ -128,6 +128,14 @@ HRESULT extended_properties_create(IInkExtendedProperties **out);
+ HRESULT extended_properties_copy(IInkExtendedProperties *dst, IInkExtendedProperties *src);
+ 
+ /* InkDisp, its strokes and the collections of them */
++struct property_metrics
++{
++    LONG minimum;
++    LONG maximum;
++    TabletPropertyMetricUnit units;
++    float resolution;
++};
++
+ struct stroke_data
+ {
+     LONG refcount;
+@@ -136,6 +144,7 @@ struct stroke_data
+     BOOL deleted;
+     unsigned int packet_size;
+     GUID *description;
++    struct property_metrics *metrics;
+     unsigned int packet_count;
+     LONG *packets;
+     IInkDrawingAttributes *attributes;
+diff --git a/dlls/inkobj/tests/inkobj.c b/dlls/inkobj/tests/inkobj.c
+index 58b97da4244..27e2095a2c6 100644
+--- a/dlls/inkobj/tests/inkobj.c
++++ b/dlls/inkobj/tests/inkobj.c
+@@ -282,6 +282,18 @@ static void test_ink(void)
+     trace("default bounds %s.\n", wine_dbgstr_rect(&rect));
+     IInkRectangle_Release(box);
+ 
++    {
++        BSTR name = SysAllocString(L"{598A6A8F-52C0-4BA0-93AF-AF357411A561}");
++        TabletPropertyMetricUnit units;
++        float resolution;
++        LONG minimum, maximum;
++
++        hr = IInkStrokeDisp_GetPacketDescriptionPropertyMetrics(stroke, name, &minimum, &maximum, &units, &resolution);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        trace("X metrics %ld..%ld, units %d, resolution %f.\n", minimum, maximum, units, resolution);
++        SysFreeString(name);
++    }
++
+     hr = IInkStrokeDisp_get_Ink(stroke, &other);
+     ok(hr == S_OK && other == ink, "Got hr %#lx, ink %p.\n", hr, other);
+     IInkDisp_Release(other);
+diff --git a/include/wine/inkobj.idl b/include/wine/inkobj.idl
+index 64da11bdad9..4cf4211a4d0 100644
+--- a/include/wine/inkobj.idl
++++ b/include/wine/inkobj.idl
+@@ -19,6 +19,7 @@
+ #pragma makedep header
+ 
+ import "unknwn.idl";
++import "tpcshrd.idl";
+ 
+ /* inkobj's strokes grow through this while rtscom's stroke builder takes packets for them */
+ [
+@@ -29,4 +30,5 @@ import "unknwn.idl";
+ interface IWineInkStroke : IUnknown
+ {
+     HRESULT AppendPackets([in] ULONG count, [in] const LONG *packets);
++    HRESULT SetPropertyMetrics([in] ULONG count, [in] const PACKET_PROPERTY *props);
+ }

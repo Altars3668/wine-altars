@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 18:10:57 -0400
+Subject: [PATCH] wintypes: Give the caller its own copy of an array property
+ value.
+
+IPropertyValue's array getters handed out the value's own storage, where
+the caller owns what it is given and frees it with CoTaskMemFree, as for
+any array a WinRT method returns.  A caller doing that freed the value's
+storage, which the value freed again on its release; GetStringArray even
+duplicated the strings over the value's own array.  PowerPoint building
+a shadow as a composition effect went through dcomp reading an effect's
+colour this way, and the heap was corrupted from there on (the heap
+checks call it a double free).
+
+The getters now give a CoTaskMemAlloc copy, the strings of GetStringArray
+duplicated into it.  The tests take two copies of each and free them; 18
+kinds of arrays gave the same array twice before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7b345173c6826ef5acb20b0bd9be312d902c1d45)
+
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index 6a92383ec9f..1fbb78d0cdf 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -438,6 +438,7 @@ struct property_value
+     } irefs;
+     PropertyType type;
+     unsigned int value_size;
++    size_t unit_size;
+     void *value;
+     LONG ref;
+ };
+@@ -478,8 +479,11 @@ static HRESULT _property_value_get_primitive_array(IPropertyValue *iface, Proper
+     if (impl->type != type)
+         return TYPE_E_TYPEMISMATCH;
+ 
++    /* What the caller is given is its own, to free with CoTaskMemFree. */
++    if (!(*value = CoTaskMemAlloc(max(impl->unit_size * impl->value_size, 1))))
++        return E_OUTOFMEMORY;
++    memcpy(*value, impl->value, impl->unit_size * impl->value_size);
+     *value_size = impl->value_size;
+-    *value = impl->value;
+     return S_OK;
+ }
+ 
+@@ -996,6 +1000,7 @@ static HRESULT _create_primitive_property_value(PropertyType type, void *value,
+         }
+         memcpy(impl->value, value, unit_size * count);
+         impl->value_size = count;
++        impl->unit_size = unit_size;
+     }
+ 
+     *property_value = (IInspectable *)&impl->IPropertyValue_iface;
+@@ -1683,6 +1688,7 @@ static HRESULT STDMETHODCALLTYPE property_value_statics_CreateStringArray(IPrope
+     impl->ref = 1;
+     impl->value = new_value;
+     impl->value_size = value_size;
++    impl->unit_size = sizeof(HSTRING);
+ 
+     *property_value = (IInspectable *)&impl->IPropertyValue_iface;
+     return S_OK;
+diff --git a/dlls/wintypes/tests/wintypes.c b/dlls/wintypes/tests/wintypes.c
+index 60012a5c7a2..7124550a828 100644
+--- a/dlls/wintypes/tests/wintypes.c
++++ b/dlls/wintypes/tests/wintypes.c
+@@ -1089,7 +1089,7 @@ static void test_IPropertyValueStatics(void)
+ #define TEST_PROPERTY_VALUE_ARRAY(PROPERTY_TYPE, TYPE, VALUE)                                   \
+     do                                                                                          \
+     {                                                                                           \
+-        TYPE values[TEST_PROPERTY_COUNT], *expected_values;                                     \
++        TYPE values[TEST_PROPERTY_COUNT], *expected_values, *values2;                           \
+                                                                                                 \
+         for (i = 0; i < TEST_PROPERTY_COUNT; i++)                                               \
+             memcpy(&values[i], &VALUE, sizeof(VALUE));                                          \
+@@ -1126,6 +1126,17 @@ static void test_IPropertyValueStatics(void)
+         for (i = 0; i < TEST_PROPERTY_COUNT; i++)                                               \
+             ok(!memcmp(&VALUE, &expected_values[i], sizeof(VALUE)), "Got unexpected value.\n"); \
+                                                                                                 \
++        /* Each call gives the caller an array of its own, to free. */                          \
++        values2 = NULL;                                                                         \
++        hr = IPropertyValue_Get##PROPERTY_TYPE(value, &count, &values2);                        \
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);                                        \
++        ok(values2 != expected_values, "Got the same array twice.\n");                          \
++        if (values2 != expected_values)                                                         \
++        {                                                                                       \
++            CoTaskMemFree(values2);                                                             \
++            CoTaskMemFree(expected_values);                                                     \
++        }                                                                                       \
++                                                                                                \
+         IPropertyValue_Release(value);                                                          \
+     } while (0);
+ 
+@@ -1148,6 +1159,43 @@ static void test_IPropertyValueStatics(void)
+     TEST_PROPERTY_VALUE_ARRAY(SizeArray, Size, size_value)
+     TEST_PROPERTY_VALUE_ARRAY(RectArray, Rect, rect_value)
+ 
++    /* The strings GetStringArray gives are the caller's too: letting them go leaves the value as it was. */
++    {
++        HSTRING strings[2], *got, *got2;
++
++        hr = WindowsCreateString(L"one", 3, &strings[0]);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        hr = WindowsCreateString(L"two", 3, &strings[1]);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        hr = IPropertyValueStatics_CreateStringArray(statics, 2, strings, &inspectable);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        WindowsDeleteString(strings[0]);
++        WindowsDeleteString(strings[1]);
++        hr = IInspectable_QueryInterface(inspectable, &IID_IPropertyValue, (void **)&value);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        IInspectable_Release(inspectable);
++
++        hr = IPropertyValue_GetStringArray(value, &count, &got);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        hr = IPropertyValue_GetStringArray(value, &count, &got2);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ok(got != got2, "Got the same array twice.\n");
++        if (got != got2)
++        {
++            WindowsDeleteString(got[0]);
++            WindowsDeleteString(got[1]);
++            CoTaskMemFree(got);
++
++            ok(count == 2, "Got count %u.\n", count);
++            ok(!wcscmp(WindowsGetStringRawBuffer(got2[0], NULL), L"one"), "Got %s.\n", debugstr_hstring(got2[0]));
++            ok(!wcscmp(WindowsGetStringRawBuffer(got2[1], NULL), L"two"), "Got %s.\n", debugstr_hstring(got2[1]));
++            WindowsDeleteString(got2[0]);
++            WindowsDeleteString(got2[1]);
++            CoTaskMemFree(got2);
++        }
++        IPropertyValue_Release(value);
++    }
++
+ #undef TEST_PROPERTY_VALUE_ARRAY
+ #undef TEST_PROPERTY_COUNT
+ 

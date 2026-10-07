@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 08:52:17 -0400
+Subject: [PATCH] crypt32: Hash the value of a signed message's content, and
+ check it is what was signed.
+
+What a signer hashes is the content's value: the octets of the OCTET
+STRING that data, and in CMS any content, comes in, and of other PKCS #7
+content the contents octets without its tag and length.  Content of
+other types was hashed whole, tag and length and all, and returned so:
+a time stamp token's TSTInfo came back still in its OCTET STRING.  And
+a signer with authenticated attributes signs those, which hold the
+content's hash; that hash was never compared, so any content passed with
+any signature over attributes.  Now a message digest that is not the
+content's hash is CRYPT_E_HASH_VALUE and a missing one
+CRYPT_E_AUTH_ATTR_MISSING; Windows 11 says CRYPT_E_HASH_VALUE for a
+time stamp token whose TSTInfo was changed after it was signed.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/crypt32/msg.c b/dlls/crypt32/msg.c
+index d73fe9c419d..be0f2291627 100644
+--- a/dlls/crypt32/msg.c
++++ b/dlls/crypt32/msg.c
+@@ -61,6 +61,49 @@ static BOOL extract_hash(HCRYPTHASH hash, BYTE **data, DWORD *size)
+     return FALSE;
+ }
+ 
++/*
++ * The value of a signed message's content, which is what its signers hashed:
++ * the octets of the OCTET STRING that data, and in CMS any content, is
++ * encoded in, else the contents octets of the content's own encoding, as
++ * PKCS #7 has it.  *value is NULL when it points into content, else it is to
++ * be freed with LocalFree.
++ */
++static BOOL CRYPT_GetContentValue(const char *type, const CRYPT_DER_BLOB *content,
++ CRYPT_DATA_BLOB **value, const BYTE **data, DWORD *size)
++{
++    DWORD len, lenBytes;
++
++    *value = NULL;
++    if (!strcmp(type, szOID_RSA_data) || (content->cbData &&
++     (content->pbData[0] & ~ASN_CONSTRUCTOR) == ASN_OCTETSTRING))
++    {
++        if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_OCTET_STRING,
++         content->pbData, content->cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, value,
++         &len))
++            return FALSE;
++        *data = (*value)->pbData;
++        *size = (*value)->cbData;
++        return TRUE;
++    }
++    if (content->cbData < 2)
++    {
++        SetLastError(CRYPT_E_ASN1_EOD);
++        return FALSE;
++    }
++    lenBytes = content->pbData[1] <= 0x80 ? 1 : 1 + (content->pbData[1] & 0x7f);
++    if (1 + lenBytes > content->cbData)
++    {
++        SetLastError(CRYPT_E_ASN1_EOD);
++        return FALSE;
++    }
++    *data = content->pbData + 1 + lenBytes;
++    *size = content->cbData - 1 - lenBytes;
++    /* an indefinite length ends with two zero bytes */
++    if (content->pbData[1] == 0x80 && *size >= 2)
++        *size -= 2;
++    return TRUE;
++}
++
+ static BOOL CRYPT_DefaultMsgControl(HCRYPTMSG hCryptMsg, DWORD dwFlags,
+  DWORD dwCtrlType, const void *pvCtrlPara)
+ {
+@@ -2463,23 +2506,22 @@ static BOOL CDecodeMsg_FinalizeSignedContent(CDecodeMsg *msg,
+             content = &msg->u.signed_data.info->content.Content;
+         if (content->cbData)
+         {
+-            /* If the message is not detached, have to decode the message's
+-             * content if the type is szOID_RSA_data.
++            /* If the message is not detached, what was hashed is the value of
++             * its content.
+              */
+-            if (!(msg->base.open_flags & CMSG_DETACHED_FLAG) &&
+-             !strcmp(msg->u.signed_data.info->content.pszObjId,
+-             szOID_RSA_data))
++            if (!(msg->base.open_flags & CMSG_DETACHED_FLAG))
+             {
+-                CRYPT_DATA_BLOB *rsa_blob;
++                CRYPT_DATA_BLOB *value;
++                const BYTE *data;
+ 
+-                ret = CryptDecodeObjectEx(X509_ASN_ENCODING,
+-                 X509_OCTET_STRING, content->pbData, content->cbData,
+-                 CRYPT_DECODE_ALLOC_FLAG, NULL, &rsa_blob, &size);
++                ret = CRYPT_GetContentValue(
++                 msg->u.signed_data.info->content.pszObjId, content, &value,
++                 &data, &size);
+                 if (ret)
+                 {
+-                    ret = CSignedMsgData_Update(&msg->u.signed_data,
+-                     rsa_blob->pbData, rsa_blob->cbData, TRUE, Verify);
+-                    LocalFree(rsa_blob);
++                    ret = CSignedMsgData_Update(&msg->u.signed_data, data, size,
++                     TRUE, Verify);
++                    LocalFree(value);
+                 }
+             }
+             else
+@@ -3080,16 +3122,21 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
+     case CMSG_CONTENT_PARAM:
+         if (msg->u.signed_data.info)
+         {
++            const CRYPT_DER_BLOB *content = &msg->u.signed_data.info->content.Content;
++
++            /* data, and CMS content of other types, in its OCTET STRING;
++             * other PKCS #7 content as it is encoded
++             */
+             if (!strcmp(msg->u.signed_data.info->content.pszObjId,
+-             szOID_RSA_data))
++             szOID_RSA_data) || (content->cbData &&
++             (content->pbData[0] & ~ASN_CONSTRUCTOR) == ASN_OCTETSTRING))
+             {
+                 CRYPT_DATA_BLOB *blob;
+                 DWORD size;
+ 
+                 ret = CryptDecodeObjectEx(X509_ASN_ENCODING, X509_OCTET_STRING,
+-                 msg->u.signed_data.info->content.Content.pbData,
+-                 msg->u.signed_data.info->content.Content.cbData,
+-                 CRYPT_DECODE_ALLOC_FLAG, NULL, &blob, &size);
++                 content->pbData, content->cbData, CRYPT_DECODE_ALLOC_FLAG, NULL,
++                 &blob, &size);
+                 if (ret)
+                 {
+                     ret = CRYPT_CopyParam(pvData, pcbData, blob->pbData,
+@@ -3098,9 +3145,8 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
+                 }
+             }
+             else
+-                ret = CRYPT_CopyParam(pvData, pcbData,
+-                 msg->u.signed_data.info->content.Content.pbData,
+-                 msg->u.signed_data.info->content.Content.cbData);
++                ret = CRYPT_CopyParam(pvData, pcbData, content->pbData,
++                 content->cbData);
+         }
+         else
+             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
+@@ -3436,6 +3482,45 @@ done:
+     return ret;
+ }
+ 
++/* checks a signer's messageDigest attribute against the hash of the content */
++static BOOL CDecodeSignedMsg_CheckMessageDigest(CDecodeMsg *msg,
++ DWORD signerIndex)
++{
++    const CRYPT_ATTRIBUTES *attrs =
++     &msg->u.signed_data.info->rgSignerInfo[signerIndex].AuthAttrs;
++    CRYPT_DATA_BLOB *digest = NULL;
++    BYTE *hash = NULL;
++    DWORD i, size;
++    BOOL ret = FALSE;
++
++    for (i = 0; i < attrs->cAttr; i++)
++        if (!strcmp(attrs->rgAttr[i].pszObjId, szOID_RSA_messageDigest)) break;
++    if (i == attrs->cAttr || attrs->rgAttr[i].cValue != 1)
++    {
++        WARN("signer %lu has no message digest\n", signerIndex);
++        SetLastError(CRYPT_E_AUTH_ATTR_MISSING);
++        return FALSE;
++    }
++    if (CryptDecodeObjectEx(X509_ASN_ENCODING, X509_OCTET_STRING,
++     attrs->rgAttr[i].rgValue[0].pbData, attrs->rgAttr[i].rgValue[0].cbData,
++     CRYPT_DECODE_ALLOC_FLAG, NULL, &digest, &size) &&
++     extract_hash(msg->u.signed_data.signerHandles[signerIndex].contentHash,
++     &hash, &size))
++    {
++        if (digest->cbData == size && !memcmp(digest->pbData, hash, size))
++            ret = TRUE;
++        else
++        {
++            WARN("signer %lu's message digest is not the content's hash\n",
++             signerIndex);
++            SetLastError(CRYPT_E_HASH_VALUE);
++        }
++    }
++    LocalFree(digest);
++    CryptMemFree(hash);
++    return ret;
++}
++
+ static BOOL CDecodeSignedMsg_VerifySignatureWithKey(CDecodeMsg *msg,
+  HCRYPTPROV prov, DWORD signerIndex, PCERT_PUBLIC_KEY_INFO keyInfo)
+ {
+@@ -3445,7 +3530,12 @@ static BOOL CDecodeSignedMsg_VerifySignatureWithKey(CDecodeMsg *msg,
+     ALG_ID alg_id = 0;
+ 
+     if (msg->u.signed_data.info->rgSignerInfo[signerIndex].AuthAttrs.cAttr)
++    {
++        /* what is signed is the attributes, which bind the content through its hash */
++        if (!CDecodeSignedMsg_CheckMessageDigest(msg, signerIndex))
++            return FALSE;
+         hash = msg->u.signed_data.signerHandles[signerIndex].authAttrHash;
++    }
+     else
+         hash = msg->u.signed_data.signerHandles[signerIndex].contentHash;
+ 

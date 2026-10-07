@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 01:49:06 -0400
+Subject: [PATCH] ntdll: Refuse to write over a hidden or system file without
+ the same attributes.
+
+[MS-FSA] 2.1.5.1.2: overwriting or superseding an existing file stored as
+hidden or system fails with STATUS_ACCESS_DENIED unless the attributes
+asked for include it, which is what makes CreateFile(CREATE_ALWAYS) and
+CopyFile refuse a hidden destination on Windows.  Only the attributes
+stored with the file count; a dot file merely looks hidden under Wine.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ntdll/tests/file.c b/dlls/ntdll/tests/file.c
+index b213bf6a105..403df1b32d4 100644
+--- a/dlls/ntdll/tests/file.c
++++ b/dlls/ntdll/tests/file.c
+@@ -1748,6 +1748,70 @@ static void test_file_allocation_information(void)
+     CloseHandle( h );
+ }
+ 
++static void test_overwrite_hidden_file(void)
++{
++    static const ULONG dispositions[] = {FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE};
++    static const DWORD kinds[] = {FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
++    char path[MAX_PATH], name[MAX_PATH];
++    WIN32_FILE_ATTRIBUTE_DATA data;
++    UNICODE_STRING nt_name;
++    OBJECT_ATTRIBUTES attr;
++    WCHAR nameW[MAX_PATH];
++    unsigned int i, j;
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++    DWORD size;
++    HANDLE h;
++
++    GetTempPathA( MAX_PATH, path );
++    GetTempFileNameA( path, "ovh", 0, name );
++    MultiByteToWideChar( CP_ACP, 0, name, -1, nameW, MAX_PATH );
++    pRtlDosPathNameToNtPathName_U( nameW, &nt_name, NULL, NULL );
++    InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
++
++    for (i = 0; i < ARRAY_SIZE(kinds); i++)
++    {
++        for (j = 0; j < ARRAY_SIZE(dispositions); j++)
++        {
++            SetFileAttributesA( name, FILE_ATTRIBUTE_NORMAL );
++            h = CreateFileA( name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, 0 );
++            ok( h != INVALID_HANDLE_VALUE, "failed to create %s, error %lu\n", name, GetLastError() );
++            WriteFile( h, "data", 4, &size, NULL );
++            CloseHandle( h );
++            SetFileAttributesA( name, kinds[i] );
++
++            /* written over only when the attribute is asked for again */
++            status = pNtCreateFile( &h, GENERIC_WRITE | DELETE | SYNCHRONIZE, &attr, &io, NULL, FILE_ATTRIBUTE_NORMAL,
++                                    0, dispositions[j], FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
++            ok( status == STATUS_ACCESS_DENIED, "%#lx, %lu: got %#lx\n", kinds[i], dispositions[j], status );
++            if (!status) CloseHandle( h );
++            ok( GetFileAttributesExA( name, GetFileExInfoStandard, &data ), "error %lu\n", GetLastError() );
++            ok( data.dwFileAttributes & kinds[i], "%#lx, %lu: got attributes %#lx\n",
++                kinds[i], dispositions[j], data.dwFileAttributes );
++            ok( data.nFileSizeLow == 4, "%#lx, %lu: got size %lu\n", kinds[i], dispositions[j], data.nFileSizeLow );
++
++            status = pNtCreateFile( &h, GENERIC_WRITE | DELETE | SYNCHRONIZE, &attr, &io, NULL, kinds[i],
++                                    0, dispositions[j], FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
++            ok( !status, "%#lx, %lu: got %#lx\n", kinds[i], dispositions[j], status );
++            if (!status) CloseHandle( h );
++            ok( GetFileAttributesExA( name, GetFileExInfoStandard, &data ), "error %lu\n", GetLastError() );
++            ok( !data.nFileSizeLow, "%#lx, %lu: got size %lu\n", kinds[i], dispositions[j], data.nFileSizeLow );
++        }
++
++        /* as CreateFile's CREATE_ALWAYS */
++        SetFileAttributesA( name, kinds[i] );
++        SetLastError( 0xdeadbeef );
++        h = CreateFileA( name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0 );
++        ok( h == INVALID_HANDLE_VALUE, "%#lx: CreateFile succeeded\n", kinds[i] );
++        ok( GetLastError() == ERROR_ACCESS_DENIED, "%#lx: got error %lu\n", kinds[i], GetLastError() );
++        if (h != INVALID_HANDLE_VALUE) CloseHandle( h );
++    }
++
++    SetFileAttributesA( name, FILE_ATTRIBUTE_NORMAL );
++    DeleteFileA( name );
++    pRtlFreeUnicodeString( &nt_name );
++}
++
+ static void test_file_all_information(void)
+ {
+     IO_STATUS_BLOCK io;
+@@ -8602,6 +8666,7 @@ START_TEST(file)
+     test_file_basic_information();
+     test_file_basic_information_access();
+     test_file_allocation_information();
++    test_overwrite_hidden_file();
+     test_file_all_information();
+     test_file_both_information();
+     test_file_name_information();
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index c68421a79ff..413da035173 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -4823,6 +4823,21 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
+         status = STATUS_SUCCESS;
+     }
+ 
++    if (status == STATUS_SUCCESS && !created &&
++        (disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF || disposition == FILE_SUPERSEDE))
++    {
++        struct stat st;
++        char data[65];
++        int len;
++
++        /* a file stored as hidden or system is written over only when the same attributes are asked
++         * for; a dot file only looks hidden, and a directory is not written over at all */
++        if (!stat( unix_name, &st ) && !S_ISDIR( st.st_mode ) &&
++            (len = xattr_get( unix_name, SAMBA_XATTR_DOS_ATTRIB, data, sizeof(data) - 1 )) != -1 &&
++            (parse_samba_dos_attrib_data( data, len ) & ~attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
++            status = STATUS_ACCESS_DENIED;
++    }
++
+     if (status == STATUS_SUCCESS)
+     {
+         name_hidden = is_hidden_file( unix_name );

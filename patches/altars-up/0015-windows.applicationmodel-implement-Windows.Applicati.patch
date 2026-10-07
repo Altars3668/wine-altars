@@ -1,0 +1,644 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 07:03:44 -0400
+Subject: [PATCH] windows.applicationmodel: implement
+ Windows.ApplicationModel.Core.CoreApplication.
+
+Word asks combase for this class on its main thread during startup. Wine
+had the IDL but no implementation, so RoGetActivationFactory failed with
+REGDB_E_CLASSNOTREG and Office threw a C++ exception out of it.
+
+CoreApplication is a statics-only class, so everything hangs off the
+activation factory: ICoreApplication, ICoreApplication2/3,
+ICoreApplicationExit, ICoreApplicationUnhandledError and
+ICoreApplicationUseCount.
+
+What a desktop process can legitimately get is Id (empty -- no
+package-relative id) and Properties, which is the process-wide bag it is
+actually meant for; wintypes already implements PropertySet, so that is
+activated rather than growing a second map here. GetCurrentView and Run
+stay E_NOTIMPL because there is no CoreApplicationView outside a
+CoreApplication-hosted process. The lifetime events accept handlers and
+return a token: nothing suspends a desktop process, and refusing to
+register is worse than never firing.
+
+Measured: Word calls get_Properties, and the REGDB_E_CLASSNOTREG is gone.
+
+Note for anyone adding a class here: windows.applicationmodel.h includes
+windows.applicationmodel.core.h itself, so WIDL_using_Windows_ApplicationModel_Core
+has to be defined before that include or the header guard eats the aliases.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit c85879ed2a80a741a1ff1aad502b58eabcb1b4ff)
+
+diff --git a/dlls/windows.applicationmodel/Makefile.in b/dlls/windows.applicationmodel/Makefile.in
+index fb6bf8e55ea..f5bcfdb64ea 100644
+--- a/dlls/windows.applicationmodel/Makefile.in
++++ b/dlls/windows.applicationmodel/Makefile.in
+@@ -3,6 +3,7 @@ IMPORTS = combase kernelbase
+ 
+ SOURCES = \
+ 	classes.idl \
++	coreapplication.c \
+ 	designmode.c \
+ 	main.c \
+ 	package.c
+diff --git a/dlls/windows.applicationmodel/classes.idl b/dlls/windows.applicationmodel/classes.idl
+index 0dfd9808b59..b7a5b493d71 100644
+--- a/dlls/windows.applicationmodel/classes.idl
++++ b/dlls/windows.applicationmodel/classes.idl
+@@ -25,8 +25,13 @@ import "windows.foundation.idl";
+ import "windows.storage.idl";
+ import "windows.system.idl";
+ import "windows.applicationmodel.idl";
++import "windows.applicationmodel.core.idl";
+ 
+ namespace Windows.ApplicationModel {
+     runtimeclass Package;
+     runtimeclass DesignMode;
+ }
++
++namespace Windows.ApplicationModel.Core {
++    runtimeclass CoreApplication;
++}
+diff --git a/dlls/windows.applicationmodel/coreapplication.c b/dlls/windows.applicationmodel/coreapplication.c
+new file mode 100644
+index 00000000000..c10b2d7f653
+--- /dev/null
++++ b/dlls/windows.applicationmodel/coreapplication.c
+@@ -0,0 +1,539 @@
++/* WinRT Windows.ApplicationModel.Core.CoreApplication Implementation
++ *
++ * Copyright (C) 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(model);
++
++/* CoreApplication is a statics-only class: there is no instance to activate,
++ * every interface on it hangs off the activation factory. Desktop processes
++ * are not CoreApplication-hosted, so there is no view and no application to
++ * run -- what a desktop caller can legitimately get is Id and Properties,
++ * and the ability to register for lifetime events that will never fire. */
++
++struct core_application_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ICoreApplication ICoreApplication_iface;
++    ICoreApplication2 ICoreApplication2_iface;
++    ICoreApplication3 ICoreApplication3_iface;
++    ICoreApplicationExit ICoreApplicationExit_iface;
++    ICoreApplicationUnhandledError ICoreApplicationUnhandledError_iface;
++    ICoreApplicationUseCount ICoreApplicationUseCount_iface;
++    LONG ref;
++
++    CRITICAL_SECTION cs;
++    IPropertySet *properties;
++    LONG next_token;
++    LONG use_count;
++};
++
++static inline struct core_application_statics *impl_from_IActivationFactory(IActivationFactory *iface)
++{
++    return CONTAINING_RECORD(iface, struct core_application_statics, IActivationFactory_iface);
++}
++
++static HRESULT WINAPI activation_factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
++{
++    struct core_application_statics *impl = impl_from_IActivationFactory(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) ||
++        IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) ||
++        IsEqualGUID(iid, &IID_IActivationFactory))
++    {
++        *out = &impl->IActivationFactory_iface;
++        IInspectable_AddRef(*out);
++        return S_OK;
++    }
++    else if (IsEqualGUID(iid, &IID_ICoreApplication))
++    {
++        *out = &impl->ICoreApplication_iface;
++        ICoreApplication_AddRef(*out);
++        return S_OK;
++    }
++    else if (IsEqualGUID(iid, &IID_ICoreApplication2))
++    {
++        *out = &impl->ICoreApplication2_iface;
++        ICoreApplication2_AddRef(*out);
++        return S_OK;
++    }
++    else if (IsEqualGUID(iid, &IID_ICoreApplication3))
++    {
++        *out = &impl->ICoreApplication3_iface;
++        ICoreApplication3_AddRef(*out);
++        return S_OK;
++    }
++    else if (IsEqualGUID(iid, &IID_ICoreApplicationExit))
++    {
++        *out = &impl->ICoreApplicationExit_iface;
++        ICoreApplicationExit_AddRef(*out);
++        return S_OK;
++    }
++    else if (IsEqualGUID(iid, &IID_ICoreApplicationUnhandledError))
++    {
++        *out = &impl->ICoreApplicationUnhandledError_iface;
++        ICoreApplicationUnhandledError_AddRef(*out);
++        return S_OK;
++    }
++    else if (IsEqualGUID(iid, &IID_ICoreApplicationUseCount))
++    {
++        *out = &impl->ICoreApplicationUseCount_iface;
++        ICoreApplicationUseCount_AddRef(*out);
++        return S_OK;
++    }
++
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI activation_factory_AddRef(IActivationFactory *iface)
++{
++    struct core_application_statics *impl = impl_from_IActivationFactory(iface);
++    ULONG ref = InterlockedIncrement(&impl->ref);
++    TRACE("iface %p increasing refcount to %lu.\n", iface, ref);
++    return ref;
++}
++
++static ULONG WINAPI activation_factory_Release(IActivationFactory *iface)
++{
++    struct core_application_statics *impl = impl_from_IActivationFactory(iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++    TRACE("iface %p decreasing refcount to %lu.\n", iface, ref);
++    return ref;
++}
++
++static HRESULT WINAPI activation_factory_GetIids(IActivationFactory *iface, ULONG *iid_count, IID **iids)
++{
++    FIXME("iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI activation_factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *class_name)
++{
++    TRACE("iface %p, class_name %p.\n", iface, class_name);
++    return WindowsCreateString(RuntimeClass_Windows_ApplicationModel_Core_CoreApplication,
++                               ARRAY_SIZE(RuntimeClass_Windows_ApplicationModel_Core_CoreApplication) - 1,
++                               class_name);
++}
++
++static HRESULT WINAPI activation_factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *trust_level)
++{
++    TRACE("iface %p, trust_level %p.\n", iface, trust_level);
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI activation_factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance)
++{
++    /* statics-only class, this is what Windows returns too */
++    TRACE("iface %p, instance %p.\n", iface, instance);
++    *instance = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl activation_factory_vtbl =
++{
++    activation_factory_QueryInterface,
++    activation_factory_AddRef,
++    activation_factory_Release,
++    /* IInspectable methods */
++    activation_factory_GetIids,
++    activation_factory_GetRuntimeClassName,
++    activation_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    activation_factory_ActivateInstance,
++};
++
++static struct core_application_statics core_application_statics;
++
++/* The property set is the one part of CoreApplication that a desktop caller
++ * can actually use for what it is meant for: a process-wide bag shared
++ * between components. wintypes already implements one, so activate that
++ * rather than growing a second map here. */
++static HRESULT core_application_get_properties(IPropertySet **value)
++{
++    struct core_application_statics *impl = &core_application_statics;
++    IInspectable *inspectable;
++    HSTRING str;
++    HRESULT hr;
++
++    EnterCriticalSection(&impl->cs);
++    if (!impl->properties)
++    {
++        static const WCHAR class_name[] = L"Windows.Foundation.Collections.PropertySet";
++
++        if (SUCCEEDED(hr = WindowsCreateString(class_name, ARRAY_SIZE(class_name) - 1, &str)))
++        {
++            hr = RoActivateInstance(str, &inspectable);
++            WindowsDeleteString(str);
++        }
++        if (SUCCEEDED(hr))
++        {
++            hr = IInspectable_QueryInterface(inspectable, &IID_IPropertySet, (void **)&impl->properties);
++            IInspectable_Release(inspectable);
++        }
++        if (FAILED(hr))
++        {
++            LeaveCriticalSection(&impl->cs);
++            WARN("failed to create the property set, hr %#lx.\n", hr);
++            *value = NULL;
++            return hr;
++        }
++    }
++    IPropertySet_AddRef((*value = impl->properties));
++    LeaveCriticalSection(&impl->cs);
++    return S_OK;
++}
++
++DEFINE_IINSPECTABLE(core_application, ICoreApplication, struct core_application_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI core_application_get_Id(ICoreApplication *iface, HSTRING *value)
++{
++    /* a desktop process has no package-relative application id */
++    TRACE("iface %p, value %p.\n", iface, value);
++    return WindowsCreateString(NULL, 0, value);
++}
++
++static HRESULT WINAPI core_application_add_Suspending(ICoreApplication *iface,
++                                                     IEventHandler_SuspendingEventArgs *handler,
++                                                     EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplication(iface);
++
++    /* nothing suspends a desktop process, so the handler is accepted and
++     * never called -- a failure here aborts callers that only want to be
++     * told about a lifetime event that will not happen. */
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_remove_Suspending(ICoreApplication *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_add_Resuming(ICoreApplication *iface,
++                                                    IEventHandler_IInspectable *handler,
++                                                    EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplication(iface);
++
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_remove_Resuming(ICoreApplication *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_get_Properties(ICoreApplication *iface, IPropertySet **value)
++{
++    TRACE("iface %p, value %p.\n", iface, value);
++
++    if (!value) return E_POINTER;
++    return core_application_get_properties(value);
++}
++
++static HRESULT WINAPI core_application_GetCurrentView(ICoreApplication *iface, ICoreApplicationView **value)
++{
++    /* there is no CoreApplicationView outside a CoreApplication-hosted process */
++    FIXME("iface %p, value %p stub!\n", iface, value);
++    if (value) *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI core_application_Run(ICoreApplication *iface, IFrameworkViewSource *view_source)
++{
++    FIXME("iface %p, view_source %p stub!\n", iface, view_source);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI core_application_RunWithActivationFactories(ICoreApplication *iface,
++                                                                  IGetActivationFactory *factory)
++{
++    FIXME("iface %p, factory %p stub!\n", iface, factory);
++    return E_NOTIMPL;
++}
++
++static const struct ICoreApplicationVtbl core_application_vtbl =
++{
++    core_application_QueryInterface,
++    core_application_AddRef,
++    core_application_Release,
++    /* IInspectable methods */
++    core_application_GetIids,
++    core_application_GetRuntimeClassName,
++    core_application_GetTrustLevel,
++    /* ICoreApplication methods */
++    core_application_get_Id,
++    core_application_add_Suspending,
++    core_application_remove_Suspending,
++    core_application_add_Resuming,
++    core_application_remove_Resuming,
++    core_application_get_Properties,
++    core_application_GetCurrentView,
++    core_application_Run,
++    core_application_RunWithActivationFactories,
++};
++
++DEFINE_IINSPECTABLE(core_application2, ICoreApplication2, struct core_application_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI core_application2_add_BackgroundActivated(ICoreApplication2 *iface,
++                                                                IEventHandler_BackgroundActivatedEventArgs *handler,
++                                                                EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplication2(iface);
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application2_remove_BackgroundActivated(ICoreApplication2 *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application2_add_LeavingBackground(ICoreApplication2 *iface,
++                                                              IEventHandler_LeavingBackgroundEventArgs *handler,
++                                                              EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplication2(iface);
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application2_remove_LeavingBackground(ICoreApplication2 *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application2_add_EnteredBackground(ICoreApplication2 *iface,
++                                                              IEventHandler_EnteredBackgroundEventArgs *handler,
++                                                              EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplication2(iface);
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application2_remove_EnteredBackground(ICoreApplication2 *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application2_EnablePrelaunch(ICoreApplication2 *iface, boolean value)
++{
++    TRACE("iface %p, value %d.\n", iface, value);
++    return S_OK;
++}
++
++static const struct ICoreApplication2Vtbl core_application2_vtbl =
++{
++    core_application2_QueryInterface,
++    core_application2_AddRef,
++    core_application2_Release,
++    /* IInspectable methods */
++    core_application2_GetIids,
++    core_application2_GetRuntimeClassName,
++    core_application2_GetTrustLevel,
++    /* ICoreApplication2 methods */
++    core_application2_add_BackgroundActivated,
++    core_application2_remove_BackgroundActivated,
++    core_application2_add_LeavingBackground,
++    core_application2_remove_LeavingBackground,
++    core_application2_add_EnteredBackground,
++    core_application2_remove_EnteredBackground,
++    core_application2_EnablePrelaunch,
++};
++
++DEFINE_IINSPECTABLE(core_application3, ICoreApplication3, struct core_application_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI core_application3_RequestRestartAsync(ICoreApplication3 *iface, HSTRING launch_arguments,
++                                                            IAsyncOperation_AppRestartFailureReason **operation)
++{
++    FIXME("iface %p, launch_arguments %s, operation %p stub!\n", iface, debugstr_hstring(launch_arguments), operation);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI core_application3_RequestRestartForUserAsync(ICoreApplication3 *iface, __x_ABI_CWindows_CSystem_CIUser *user,
++                                                                   HSTRING launch_arguments,
++                                                                   IAsyncOperation_AppRestartFailureReason **operation)
++{
++    FIXME("iface %p, user %p, launch_arguments %s, operation %p stub!\n", iface, user,
++          debugstr_hstring(launch_arguments), operation);
++    return E_NOTIMPL;
++}
++
++static const struct ICoreApplication3Vtbl core_application3_vtbl =
++{
++    core_application3_QueryInterface,
++    core_application3_AddRef,
++    core_application3_Release,
++    /* IInspectable methods */
++    core_application3_GetIids,
++    core_application3_GetRuntimeClassName,
++    core_application3_GetTrustLevel,
++    /* ICoreApplication3 methods */
++    core_application3_RequestRestartAsync,
++    core_application3_RequestRestartForUserAsync,
++};
++
++DEFINE_IINSPECTABLE(core_application_exit, ICoreApplicationExit, struct core_application_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI core_application_exit_Exit(ICoreApplicationExit *iface)
++{
++    FIXME("iface %p stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI core_application_exit_add_Exiting(ICoreApplicationExit *iface,
++                                                        IEventHandler_IInspectable *handler,
++                                                        EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplicationExit(iface);
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_exit_remove_Exiting(ICoreApplicationExit *iface, EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static const struct ICoreApplicationExitVtbl core_application_exit_vtbl =
++{
++    core_application_exit_QueryInterface,
++    core_application_exit_AddRef,
++    core_application_exit_Release,
++    /* IInspectable methods */
++    core_application_exit_GetIids,
++    core_application_exit_GetRuntimeClassName,
++    core_application_exit_GetTrustLevel,
++    /* ICoreApplicationExit methods */
++    core_application_exit_Exit,
++    core_application_exit_add_Exiting,
++    core_application_exit_remove_Exiting,
++};
++
++DEFINE_IINSPECTABLE(core_application_unhandled_error, ICoreApplicationUnhandledError,
++                    struct core_application_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI core_application_unhandled_error_add_UnhandledErrorDetected(ICoreApplicationUnhandledError *iface,
++        IEventHandler_UnhandledErrorDetectedEventArgs *handler, EventRegistrationToken *token)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplicationUnhandledError(iface);
++    FIXME("iface %p, handler %p, token %p: event never raised.\n", iface, handler, token);
++    if (!token) return E_POINTER;
++    token->value = InterlockedIncrement(&impl->next_token);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_unhandled_error_remove_UnhandledErrorDetected(ICoreApplicationUnhandledError *iface,
++        EventRegistrationToken token)
++{
++    TRACE("iface %p, token %#I64x.\n", iface, token.value);
++    return S_OK;
++}
++
++static const struct ICoreApplicationUnhandledErrorVtbl core_application_unhandled_error_vtbl =
++{
++    core_application_unhandled_error_QueryInterface,
++    core_application_unhandled_error_AddRef,
++    core_application_unhandled_error_Release,
++    /* IInspectable methods */
++    core_application_unhandled_error_GetIids,
++    core_application_unhandled_error_GetRuntimeClassName,
++    core_application_unhandled_error_GetTrustLevel,
++    /* ICoreApplicationUnhandledError methods */
++    core_application_unhandled_error_add_UnhandledErrorDetected,
++    core_application_unhandled_error_remove_UnhandledErrorDetected,
++};
++
++DEFINE_IINSPECTABLE(core_application_use_count, ICoreApplicationUseCount,
++                    struct core_application_statics, IActivationFactory_iface)
++
++static HRESULT WINAPI core_application_use_count_IncrementApplicationUseCount(ICoreApplicationUseCount *iface)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplicationUseCount(iface);
++    LONG count = InterlockedIncrement(&impl->use_count);
++    TRACE("iface %p, use count now %ld.\n", iface, count);
++    return S_OK;
++}
++
++static HRESULT WINAPI core_application_use_count_DecrementApplicationUseCount(ICoreApplicationUseCount *iface)
++{
++    struct core_application_statics *impl = impl_from_ICoreApplicationUseCount(iface);
++    LONG count = InterlockedDecrement(&impl->use_count);
++    TRACE("iface %p, use count now %ld.\n", iface, count);
++    return S_OK;
++}
++
++static const struct ICoreApplicationUseCountVtbl core_application_use_count_vtbl =
++{
++    core_application_use_count_QueryInterface,
++    core_application_use_count_AddRef,
++    core_application_use_count_Release,
++    /* IInspectable methods */
++    core_application_use_count_GetIids,
++    core_application_use_count_GetRuntimeClassName,
++    core_application_use_count_GetTrustLevel,
++    /* ICoreApplicationUseCount methods */
++    core_application_use_count_IncrementApplicationUseCount,
++    core_application_use_count_DecrementApplicationUseCount,
++};
++
++static struct core_application_statics core_application_statics =
++{
++    {&activation_factory_vtbl},
++    {&core_application_vtbl},
++    {&core_application2_vtbl},
++    {&core_application3_vtbl},
++    {&core_application_exit_vtbl},
++    {&core_application_unhandled_error_vtbl},
++    {&core_application_use_count_vtbl},
++    1,
++    {NULL, -1, 0, 0, 0, 0},
++};
++
++IActivationFactory *core_application_factory = &core_application_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.applicationmodel/main.c b/dlls/windows.applicationmodel/main.c
+index 5d1e4e2a0ee..d3b3e504b57 100644
+--- a/dlls/windows.applicationmodel/main.c
++++ b/dlls/windows.applicationmodel/main.c
+@@ -42,6 +42,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( package_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DesignMode ))
+         IActivationFactory_QueryInterface( design_mode_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_Core_CoreApplication ))
++        IActivationFactory_QueryInterface( core_application_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.applicationmodel/private.h b/dlls/windows.applicationmodel/private.h
+index d2538718835..68d59d49dca 100644
+--- a/dlls/windows.applicationmodel/private.h
++++ b/dlls/windows.applicationmodel/private.h
+@@ -34,10 +34,18 @@
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_ApplicationModel
+ #define WIDL_using_Windows_Storage
++/* windows.applicationmodel.h pulls in windows.applicationmodel.core.h itself,
++ * so the Core "using" aliases have to be asked for before that include or the
++ * header guard swallows them. */
++#define WIDL_using_Windows_ApplicationModel_Core
+ #include "windows.applicationmodel.h"
++#include "windows.applicationmodel.core.h"
++
++#include "roapi.h"
+ 
+ extern IActivationFactory *package_factory;
+ extern IActivationFactory *design_mode_factory;
++extern IActivationFactory *core_application_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \

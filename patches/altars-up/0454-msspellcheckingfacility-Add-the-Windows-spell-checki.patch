@@ -1,0 +1,3631 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 12:36:37 -0400
+Subject: [PATCH] msspellcheckingfacility: Add the Windows spell checking API,
+ with the host's Hunspell dictionaries.
+
+Word creates the spell checker factory at every start, to register
+Office's custom dictionary for every language; Wine had no such class
+(the only error Word logged at start).  Measured on Windows 11 build
+29671 with tools/spellprobe:
+
+- The factory lists the languages of the host's Hunspell dictionaries,
+  as tags (en_US is en-US), in order; IsSupported and CreateSpellChecker
+  take a tag in any case and nothing else (no "en" for "en-US"), an
+  empty one being E_INVALIDARG; a checker gives back its tag as it was
+  asked for.  Its id is MsSpell, its name "Microsoft Windows Spell
+  Checker" in the user's language, and it has no options.
+- Checking: words in capitals, with digits, addresses and mail
+  addresses are not checked; apostrophes and hyphens join a word, and
+  in a compound only the wrong parts are errors; a word that repeats
+  the one before, with only spaces between them and in any case, is to
+  be deleted; a word with a correction is to be replaced.  A
+  comprehensive check gives the replacement when there is only one
+  suggestion.  Errors with no replacement give an empty one.
+- The user's words are Windows': added words in
+  %APPDATA%\Microsoft\Spelling\neutral\default.dic for every language,
+  removed ones in <language>\default.exc, corrections in
+  <language>\default.acl as "word|correction", UTF-16 with a byte order
+  mark.  They are read again when they change, and changed under a
+  mutex the processes share.  Ignored words are the checker's own.
+  Adding tells every checker once, removing and correcting twice, as
+  Windows does.
+- A user dictionary can be registered for a language, any tag, or for
+  every language with an empty one, as Office does; those for a
+  language are kept as Windows keeps them, in
+  HKCU\Software\Microsoft\Spelling\Dictionaries.
+
+Hunspell is loaded at run time; without it, or without dictionaries,
+no language is supported.  Its suggestions are not Windows' own:
+"wrold" has two, so a comprehensive check offers to choose where
+Windows replaces it (todo_wine).  The interfaces are in
+include/spellcheck.idl, their IIDs in libuuid.  The tests have no
+failures on Windows (341) or under Wine; they put the user's word
+lists back as they were.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/configure b/configure
+index 9dec9e528e2..19a85e03a27 100755
+--- a/configure
++++ b/configure
+@@ -1314,6 +1314,7 @@ enable_mspatcha
+ enable_msports
+ enable_msrle32
+ enable_msscript_ocx
++enable_msspellcheckingfacility
+ enable_mssign32
+ enable_mssip32
+ enable_mstask
+@@ -22543,6 +22544,8 @@ wine_fn_config_makefile dlls/msrle32 enable_msrle32
+ wine_fn_config_makefile dlls/msrle32/tests enable_tests
+ wine_fn_config_makefile dlls/msscript.ocx enable_msscript_ocx
+ wine_fn_config_makefile dlls/msscript.ocx/tests enable_tests
++wine_fn_config_makefile dlls/msspellcheckingfacility enable_msspellcheckingfacility
++wine_fn_config_makefile dlls/msspellcheckingfacility/tests enable_tests
+ wine_fn_config_makefile dlls/mssign32 enable_mssign32
+ wine_fn_config_makefile dlls/mssip32 enable_mssip32
+ wine_fn_config_makefile dlls/mstask enable_mstask
+diff --git a/configure.ac b/configure.ac
+index 6f68609491b..e063aa16277 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2971,6 +2971,8 @@ WINE_CONFIG_MAKEFILE(dlls/msrle32)
+ WINE_CONFIG_MAKEFILE(dlls/msrle32/tests)
+ WINE_CONFIG_MAKEFILE(dlls/msscript.ocx)
+ WINE_CONFIG_MAKEFILE(dlls/msscript.ocx/tests)
++WINE_CONFIG_MAKEFILE(dlls/msspellcheckingfacility)
++WINE_CONFIG_MAKEFILE(dlls/msspellcheckingfacility/tests)
+ WINE_CONFIG_MAKEFILE(dlls/mssign32)
+ WINE_CONFIG_MAKEFILE(dlls/mssip32)
+ WINE_CONFIG_MAKEFILE(dlls/mstask)
+diff --git a/dlls/msspellcheckingfacility/Makefile.in b/dlls/msspellcheckingfacility/Makefile.in
+new file mode 100644
+index 00000000000..52c86caf11d
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/Makefile.in
+@@ -0,0 +1,11 @@
++MODULE    = msspellcheckingfacility.dll
++UNIXLIB   = msspellcheckingfacility.so
++IMPORTS   = ole32 uuid advapi32
++
++SOURCES = \
++	checker.c \
++	classes.idl \
++	lists.c \
++	main.c \
++	msspellcheckingfacility.rc \
++	unixlib.c
+diff --git a/dlls/msspellcheckingfacility/checker.c b/dlls/msspellcheckingfacility/checker.c
+new file mode 100644
+index 00000000000..17ab0534666
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/checker.c
+@@ -0,0 +1,873 @@
++/*
++ * Spell checkers, as Windows 11 checks: the errors, the suggestions and the words a user adds
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdlib.h>
++
++#include "private.h"
++#include "winnls.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(spell);
++
++/* the most suggestions Windows gives */
++#define MAX_SUGGESTIONS 10
++
++/* ISpellingError */
++
++struct spelling_error
++{
++    ISpellingError ISpellingError_iface;
++    LONG refcount;
++    ULONG start;
++    ULONG length;
++    CORRECTIVE_ACTION action;
++    WCHAR *replacement;
++};
++
++static inline struct spelling_error *impl_from_ISpellingError( ISpellingError *iface )
++{
++    return CONTAINING_RECORD( iface, struct spelling_error, ISpellingError_iface );
++}
++
++static HRESULT WINAPI error_QueryInterface( ISpellingError *iface, REFIID iid, void **out )
++{
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_ISpellingError ))
++    {
++        ISpellingError_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    WARN( "%s not implemented\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI error_AddRef( ISpellingError *iface )
++{
++    return InterlockedIncrement( &impl_from_ISpellingError( iface )->refcount );
++}
++
++static ULONG WINAPI error_Release( ISpellingError *iface )
++{
++    struct spelling_error *error = impl_from_ISpellingError( iface );
++    ULONG ref = InterlockedDecrement( &error->refcount );
++
++    if (!ref)
++    {
++        free( error->replacement );
++        free( error );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI error_get_StartIndex( ISpellingError *iface, ULONG *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_ISpellingError( iface )->start;
++    return S_OK;
++}
++
++static HRESULT WINAPI error_get_Length( ISpellingError *iface, ULONG *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_ISpellingError( iface )->length;
++    return S_OK;
++}
++
++static HRESULT WINAPI error_get_CorrectiveAction( ISpellingError *iface, CORRECTIVE_ACTION *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_ISpellingError( iface )->action;
++    return S_OK;
++}
++
++/* an empty string for an error that has no replacement */
++static HRESULT WINAPI error_get_Replacement( ISpellingError *iface, WCHAR **value )
++{
++    struct spelling_error *error = impl_from_ISpellingError( iface );
++
++    if (!value) return E_POINTER;
++    if (!(*value = co_strdupW( error->replacement ? error->replacement : L"" ))) return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++static const ISpellingErrorVtbl error_vtbl =
++{
++    error_QueryInterface,
++    error_AddRef,
++    error_Release,
++    error_get_StartIndex,
++    error_get_Length,
++    error_get_CorrectiveAction,
++    error_get_Replacement,
++};
++
++/* IEnumSpellingError */
++
++struct error_enum
++{
++    IEnumSpellingError IEnumSpellingError_iface;
++    LONG refcount;
++    ISpellingError **errors;
++    unsigned int count;
++    unsigned int capacity;
++    unsigned int pos;
++};
++
++static inline struct error_enum *impl_from_IEnumSpellingError( IEnumSpellingError *iface )
++{
++    return CONTAINING_RECORD( iface, struct error_enum, IEnumSpellingError_iface );
++}
++
++static HRESULT WINAPI error_enum_QueryInterface( IEnumSpellingError *iface, REFIID iid, void **out )
++{
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_IEnumSpellingError ))
++    {
++        IEnumSpellingError_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    WARN( "%s not implemented\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI error_enum_AddRef( IEnumSpellingError *iface )
++{
++    return InterlockedIncrement( &impl_from_IEnumSpellingError( iface )->refcount );
++}
++
++static ULONG WINAPI error_enum_Release( IEnumSpellingError *iface )
++{
++    struct error_enum *errors = impl_from_IEnumSpellingError( iface );
++    ULONG ref = InterlockedDecrement( &errors->refcount );
++
++    if (!ref)
++    {
++        while (errors->count) ISpellingError_Release( errors->errors[--errors->count] );
++        free( errors->errors );
++        free( errors );
++    }
++    return ref;
++}
++
++/* S_FALSE once there are no more */
++static HRESULT WINAPI error_enum_Next( IEnumSpellingError *iface, ISpellingError **value )
++{
++    struct error_enum *errors = impl_from_IEnumSpellingError( iface );
++
++    if (!value) return E_POINTER;
++    if (errors->pos >= errors->count)
++    {
++        *value = NULL;
++        return S_FALSE;
++    }
++    ISpellingError_AddRef( (*value = errors->errors[errors->pos++]) );
++    return S_OK;
++}
++
++static const IEnumSpellingErrorVtbl error_enum_vtbl =
++{
++    error_enum_QueryInterface,
++    error_enum_AddRef,
++    error_enum_Release,
++    error_enum_Next,
++};
++
++static BOOL add_error( struct error_enum *errors, ULONG start, ULONG length, CORRECTIVE_ACTION action,
++                       const WCHAR *replacement )
++{
++    struct spelling_error *error;
++
++    if (errors->count == errors->capacity)
++    {
++        unsigned int capacity = max( 8, errors->capacity * 2 );
++        ISpellingError **array = realloc( errors->errors, capacity * sizeof(*array) );
++
++        if (!array) return FALSE;
++        errors->errors = array;
++        errors->capacity = capacity;
++    }
++    if (!(error = calloc( 1, sizeof(*error) ))) return FALSE;
++    error->ISpellingError_iface.lpVtbl = &error_vtbl;
++    error->refcount = 1;
++    error->start = start;
++    error->length = length;
++    error->action = action;
++    if (replacement && !(error->replacement = strdupW( replacement )))
++    {
++        free( error );
++        return FALSE;
++    }
++    errors->errors[errors->count++] = &error->ISpellingError_iface;
++    return TRUE;
++}
++
++/* ISpellChecker */
++
++struct handler
++{
++    struct list entry;
++    DWORD cookie;
++    ISpellCheckerChangedEventHandler *handler;
++};
++
++struct checker
++{
++    ISpellChecker2 ISpellChecker2_iface;
++    LONG refcount;
++    struct list entry;              /* in the list of checkers, to tell them of changes */
++    struct language *language;
++    WCHAR *tag;                     /* as it was asked for */
++    CRITICAL_SECTION cs;
++    WCHAR **ignored;                /* this checker's alone, for as long as it lives */
++    unsigned int ignored_count;
++    struct list handlers;
++    DWORD next_cookie;
++};
++
++static struct list checkers = LIST_INIT( checkers );
++static CRITICAL_SECTION checkers_cs;
++static CRITICAL_SECTION_DEBUG checkers_cs_debug =
++{
++    0, 0, &checkers_cs,
++    { &checkers_cs_debug.ProcessLocksList, &checkers_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": checkers_cs") }
++};
++static CRITICAL_SECTION checkers_cs = { &checkers_cs_debug, -1, 0, 0, 0, 0 };
++
++static inline struct checker *impl_from_ISpellChecker2( ISpellChecker2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct checker, ISpellChecker2_iface );
++}
++
++struct invocation
++{
++    ISpellCheckerChangedEventHandler *handler;
++    ISpellChecker2 *sender;
++};
++
++/* call the handlers of the checkers of a language, all of them for NULL, or of one checker */
++static void invoke_handlers( const struct language *language, struct checker *only )
++{
++    struct invocation *invocations = NULL;
++    unsigned int count = 0, capacity = 0, i;
++    struct checker *checker;
++    struct handler *handler;
++
++    EnterCriticalSection( &checkers_cs );
++    LIST_FOR_EACH_ENTRY( checker, &checkers, struct checker, entry )
++    {
++        if (only ? checker != only : language && checker->language != language) continue;
++        EnterCriticalSection( &checker->cs );
++        LIST_FOR_EACH_ENTRY( handler, &checker->handlers, struct handler, entry )
++        {
++            if (count == capacity)
++            {
++                struct invocation *array;
++                capacity = max( 8, capacity * 2 );
++                if (!(array = realloc( invocations, capacity * sizeof(*array) ))) break;
++                invocations = array;
++            }
++            ISpellCheckerChangedEventHandler_AddRef( (invocations[count].handler = handler->handler) );
++            ISpellChecker2_AddRef( (invocations[count].sender = &checker->ISpellChecker2_iface) );
++            count++;
++        }
++        LeaveCriticalSection( &checker->cs );
++    }
++    LeaveCriticalSection( &checkers_cs );
++
++    for (i = 0; i < count; i++)
++    {
++        ISpellCheckerChangedEventHandler_Invoke( invocations[i].handler, (ISpellChecker *)invocations[i].sender );
++        ISpellCheckerChangedEventHandler_Release( invocations[i].handler );
++        ISpellChecker2_Release( invocations[i].sender );
++    }
++    free( invocations );
++}
++
++void notify_checkers( const struct language *language )
++{
++    invoke_handlers( language, NULL );
++}
++
++static HRESULT WINAPI checker_QueryInterface( ISpellChecker2 *iface, REFIID iid, void **out )
++{
++    TRACE( "%p, %s, %p\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_ISpellChecker ) ||
++        IsEqualIID( iid, &IID_ISpellChecker2 ))
++    {
++        ISpellChecker2_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    WARN( "%s not implemented\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI checker_AddRef( ISpellChecker2 *iface )
++{
++    return InterlockedIncrement( &impl_from_ISpellChecker2( iface )->refcount );
++}
++
++static ULONG WINAPI checker_Release( ISpellChecker2 *iface )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++    struct handler *handler, *next;
++    ULONG ref = InterlockedDecrement( &checker->refcount );
++
++    if (!ref)
++    {
++        EnterCriticalSection( &checkers_cs );
++        list_remove( &checker->entry );
++        LeaveCriticalSection( &checkers_cs );
++        LIST_FOR_EACH_ENTRY_SAFE( handler, next, &checker->handlers, struct handler, entry )
++        {
++            ISpellCheckerChangedEventHandler_Release( handler->handler );
++            free( handler );
++        }
++        free_words( checker->ignored, checker->ignored_count );
++        free( checker->tag );
++        checker->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &checker->cs );
++        free( checker );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI checker_get_LanguageTag( ISpellChecker2 *iface, WCHAR **value )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++
++    TRACE( "%p, %p\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (!(*value = co_strdupW( checker->tag ))) return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++static BOOL is_word_char( WCHAR c )
++{
++    WORD type1, type3;
++
++    GetStringTypeW( CT_CTYPE1, &c, 1, &type1 );
++    if (type1 & (C1_ALPHA | C1_DIGIT)) return TRUE;
++    GetStringTypeW( CT_CTYPE3, &c, 1, &type3 );
++    return (type3 & C3_NONSPACING) != 0;
++}
++
++static BOOL is_joiner( WCHAR c )
++{
++    return c == '\'' || c == 0x2019 /* right single quotation mark */ || c == '-' || c == 0x2010 /* hyphen */;
++}
++
++static BOOL is_hyphen( WCHAR c )
++{
++    return c == '-' || c == 0x2010;
++}
++
++static BOOL is_space( WCHAR c )
++{
++    WORD type;
++
++    GetStringTypeW( CT_CTYPE1, &c, 1, &type );
++    return (type & (C1_SPACE | C1_BLANK)) != 0;
++}
++
++/* addresses are not words: a URL, a mail address, a host name */
++static BOOL is_address( const WCHAR *chunk, unsigned int len )
++{
++    unsigned int i, at = len;
++
++    for (i = 0; i + 2 < len; i++) if (chunk[i] == ':' && chunk[i + 1] == '/' && chunk[i + 2] == '/') return TRUE;
++    if (len > 4 && !wcsnicmp( chunk, L"www.", 4 )) return TRUE;
++    for (i = 0; i < len; i++)
++    {
++        if (chunk[i] == '@' && i && at == len) at = i;
++        else if (chunk[i] == '.' && at < i) return TRUE;
++    }
++    return FALSE;
++}
++
++/* a word is not checked when it holds a digit, or is in capitals, as names and abbreviations are */
++static BOOL is_checked( const WCHAR *word, unsigned int len )
++{
++    BOOL upper = FALSE, lower = FALSE;
++    unsigned int i;
++    WORD type;
++
++    for (i = 0; i < len; i++)
++    {
++        GetStringTypeW( CT_CTYPE1, word + i, 1, &type );
++        if (type & C1_DIGIT) return FALSE;
++        if (type & C1_UPPER) upper = TRUE;
++        if (type & C1_LOWER) lower = TRUE;
++    }
++    return !upper || lower;
++}
++
++static BOOL is_ignored( struct checker *checker, const WCHAR *word, unsigned int len )
++{
++    unsigned int i;
++    BOOL ret = FALSE;
++
++    EnterCriticalSection( &checker->cs );
++    for (i = 0; !ret && i < checker->ignored_count; i++)
++        ret = wcslen( checker->ignored[i] ) == len && !wcsnicmp( checker->ignored[i], word, len );
++    LeaveCriticalSection( &checker->cs );
++    return ret;
++}
++
++static BOOL is_word_right( struct checker *checker, const WCHAR *word, unsigned int len )
++{
++    if (is_word_excluded( checker->language, word, len )) return FALSE;
++    if (is_ignored( checker, word, len ) || is_word_added( checker->language, word, len )) return TRUE;
++    return spell_word( checker->language, word, len );
++}
++
++/* the edits from one word to another, a transposition counting as one */
++static unsigned int word_distance( const WCHAR *a, unsigned int la, const WCHAR *b, unsigned int lb )
++{
++    unsigned int d[33][33], i, j, cost;
++
++    if (la > 32 || lb > 32) return ~0u;
++    for (i = 0; i <= la; i++) d[i][0] = i;
++    for (j = 0; j <= lb; j++) d[0][j] = j;
++    for (i = 1; i <= la; i++)
++        for (j = 1; j <= lb; j++)
++        {
++            cost = towlower( a[i - 1] ) != towlower( b[j - 1] );
++            d[i][j] = min( min( d[i - 1][j] + 1, d[i][j - 1] + 1 ), d[i - 1][j - 1] + cost );
++            if (i > 1 && j > 1 && towlower( a[i - 1] ) == towlower( b[j - 2] ) &&
++                towlower( a[i - 2] ) == towlower( b[j - 1] ))
++                d[i][j] = min( d[i][j], d[i - 2][j - 2] + 1 );
++        }
++    return d[la][lb];
++}
++
++/* the suggestions for a word: its correction where it has one, else the words the user added that are close
++ * to it, then the dictionary's */
++static unsigned int get_suggestions( struct checker *checker, const WCHAR *word, unsigned int len, WCHAR ***out )
++{
++    WCHAR **ret, **words, *correction;
++    unsigned int count = 0, nb, i, j;
++
++    *out = NULL;
++    if (!(ret = calloc( MAX_SUGGESTIONS, sizeof(*ret) ))) return 0;
++    if ((correction = find_autocorrect( checker->language, word, len )))
++    {
++        ret[count++] = correction;
++        *out = ret;
++        return count;
++    }
++    nb = added_words( &words );
++    for (i = 0; i < nb && count < MAX_SUGGESTIONS; i++)
++    {
++        unsigned int lw = wcslen( words[i] );
++        if (lw == len && !wcsnicmp( words[i], word, len )) continue;
++        if (word_distance( words[i], lw, word, len ) > 2) continue;
++        if ((ret[count] = strdupW( words[i] ))) count++;
++    }
++    free_words( words, nb );
++    nb = suggest_words( checker->language, word, len, &words );
++    for (i = 0; i < nb && count < MAX_SUGGESTIONS; i++)
++    {
++        if (is_word_excluded( checker->language, words[i], wcslen( words[i] ) )) continue;
++        for (j = 0; j < count; j++) if (!wcscmp( ret[j], words[i] )) break;
++        if (j < count) continue;
++        if ((ret[count] = strdupW( words[i] ))) count++;
++    }
++    free_words( words, nb );
++    *out = ret;
++    return count;
++}
++
++/* an error for a misspelt word: a comprehensive check gives the replacement when there is only one */
++static BOOL add_misspelling( struct checker *checker, struct error_enum *errors, const WCHAR *text, ULONG start,
++                             ULONG len, BOOL comprehensive )
++{
++    WCHAR **suggestions;
++    unsigned int count;
++    BOOL ret;
++
++    if (!comprehensive) return add_error( errors, start, len, CORRECTIVE_ACTION_GET_SUGGESTIONS, NULL );
++    count = get_suggestions( checker, text + start, len, &suggestions );
++    if (count == 1) ret = add_error( errors, start, len, CORRECTIVE_ACTION_REPLACE, suggestions[0] );
++    else ret = add_error( errors, start, len, CORRECTIVE_ACTION_GET_SUGGESTIONS, NULL );
++    free_words( suggestions, count );
++    return ret;
++}
++
++static BOOL check_word( struct checker *checker, struct error_enum *errors, const WCHAR *text, ULONG start,
++                        ULONG len, BOOL comprehensive )
++{
++    WCHAR *correction;
++    ULONG part, end;
++    BOOL ret = TRUE;
++
++    if ((correction = find_autocorrect( checker->language, text + start, len )))
++    {
++        ret = add_error( errors, start, len, CORRECTIVE_ACTION_REPLACE, correction );
++        free( correction );
++        return ret;
++    }
++    if (is_word_right( checker, text + start, len )) return TRUE;
++    /* in a compound, the parts that are wrong */
++    for (part = start; part < start + len && !is_hyphen( text[part] ); part++) ;
++    if (part == start + len) return add_misspelling( checker, errors, text, start, len, comprehensive );
++    for (part = start; ret && part < start + len; part = end + 1)
++    {
++        for (end = part; end < start + len && !is_hyphen( text[end] ); end++) ;
++        if (end > part && is_checked( text + part, end - part ) && !is_word_right( checker, text + part, end - part ))
++            ret = add_misspelling( checker, errors, text, part, end - part, comprehensive );
++    }
++    return ret;
++}
++
++static HRESULT check_text( struct checker *checker, const WCHAR *text, BOOL comprehensive, IEnumSpellingError **out )
++{
++    ULONG len = wcslen( text ), pos = 0, end, prev_start = 0, prev_len = 0;
++    struct error_enum *errors;
++    BOOL repeatable = FALSE, ok = TRUE;
++
++    if (!(errors = calloc( 1, sizeof(*errors) ))) return E_OUTOFMEMORY;
++    errors->IEnumSpellingError_iface.lpVtbl = &error_enum_vtbl;
++    errors->refcount = 1;
++    refresh_lists( checker->language );
++
++    while (ok && pos < len)
++    {
++        /* only spaces between them make a word a repetition of the one before */
++        if (is_space( text[pos] ))
++        {
++            if (text[pos] != ' ') repeatable = FALSE;
++            pos++;
++            continue;
++        }
++        if (!pos || is_space( text[pos - 1] ))
++        {
++            for (end = pos; end < len && !is_space( text[end] ); end++) ;
++            if (is_address( text + pos, end - pos ))
++            {
++                repeatable = FALSE;
++                pos = end;
++                continue;
++            }
++        }
++        if (!is_word_char( text[pos] ))
++        {
++            repeatable = FALSE;
++            pos++;
++            continue;
++        }
++        /* a word, apostrophes and hyphens included where letters are on both sides */
++        for (end = pos; end < len; end++)
++        {
++            if (is_word_char( text[end] )) continue;
++            if (is_joiner( text[end] ) && end + 1 < len && is_word_char( text[end + 1] )) continue;
++            break;
++        }
++        if (!is_checked( text + pos, end - pos ))
++        {
++            /* a number is no repetition, a word in capitals can be one */
++            WORD type;
++            GetStringTypeW( CT_CTYPE1, text + pos, 1, &type );
++            if (repeatable && end - pos == prev_len && !wcsnicmp( text + pos, text + prev_start, prev_len ) &&
++                !(type & C1_DIGIT))
++                ok = add_error( errors, pos, end - pos, CORRECTIVE_ACTION_DELETE, NULL );
++            repeatable = !(type & C1_DIGIT);
++        }
++        else if (repeatable && end - pos == prev_len && !wcsnicmp( text + pos, text + prev_start, prev_len ))
++            ok = add_error( errors, pos, end - pos, CORRECTIVE_ACTION_DELETE, NULL );
++        else
++        {
++            ok = check_word( checker, errors, text, pos, end - pos, comprehensive );
++            repeatable = TRUE;
++        }
++        prev_start = pos;
++        prev_len = end - pos;
++        pos = end;
++    }
++    if (!ok)
++    {
++        IEnumSpellingError_Release( &errors->IEnumSpellingError_iface );
++        return E_OUTOFMEMORY;
++    }
++    *out = &errors->IEnumSpellingError_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI checker_Check( ISpellChecker2 *iface, const WCHAR *text, IEnumSpellingError **out )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(text), out );
++
++    if (!text || !out) return E_POINTER;
++    *out = NULL;
++    if (!*text) return E_INVALIDARG;
++    return check_text( checker, text, FALSE, out );
++}
++
++static HRESULT WINAPI checker_Suggest( ISpellChecker2 *iface, const WCHAR *word, IEnumString **out )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++    WCHAR **suggestions;
++    unsigned int count;
++    HRESULT hr;
++
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(word), out );
++
++    if (!word || !out) return E_POINTER;
++    *out = NULL;
++    if (!*word) return E_INVALIDARG;
++    refresh_lists( checker->language );
++    count = get_suggestions( checker, word, wcslen( word ), &suggestions );
++    hr = create_string_enum( suggestions, count, out );
++    free_words( suggestions, count );
++    return hr;
++}
++
++static HRESULT WINAPI checker_Add( ISpellChecker2 *iface, const WCHAR *word )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++
++    TRACE( "%p, %s\n", iface, debugstr_w(word) );
++
++    if (!word) return E_POINTER;
++    if (!*word) return E_INVALIDARG;
++    return add_word( checker->language, word );
++}
++
++static HRESULT WINAPI checker_Ignore( ISpellChecker2 *iface, const WCHAR *word )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++    WCHAR **ignored, *copy;
++
++    TRACE( "%p, %s\n", iface, debugstr_w(word) );
++
++    if (!word) return E_POINTER;
++    if (!*word) return E_INVALIDARG;
++    if (!(copy = strdupW( word ))) return E_OUTOFMEMORY;
++    EnterCriticalSection( &checker->cs );
++    if (!(ignored = realloc( checker->ignored, (checker->ignored_count + 1) * sizeof(*ignored) )))
++    {
++        LeaveCriticalSection( &checker->cs );
++        free( copy );
++        return E_OUTOFMEMORY;
++    }
++    checker->ignored = ignored;
++    checker->ignored[checker->ignored_count++] = copy;
++    LeaveCriticalSection( &checker->cs );
++    invoke_handlers( NULL, checker );
++    return S_OK;
++}
++
++static HRESULT WINAPI checker_AutoCorrect( ISpellChecker2 *iface, const WCHAR *from, const WCHAR *to )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++
++    TRACE( "%p, %s, %s\n", iface, debugstr_w(from), debugstr_w(to) );
++
++    if (!from || !to) return E_POINTER;
++    if (!*from || !*to) return E_INVALIDARG;
++    return add_autocorrect( checker->language, from, to );
++}
++
++/* Windows has no options for its own dictionaries */
++static HRESULT WINAPI checker_GetOptionValue( ISpellChecker2 *iface, const WCHAR *id, BYTE *value )
++{
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(id), value );
++
++    if (!id || !value) return E_POINTER;
++    *value = 0;
++    return E_INVALIDARG;
++}
++
++static HRESULT WINAPI checker_get_OptionIds( ISpellChecker2 *iface, IEnumString **value )
++{
++    TRACE( "%p, %p\n", iface, value );
++
++    if (!value) return E_POINTER;
++    return create_string_enum( NULL, 0, value );
++}
++
++static HRESULT WINAPI checker_get_Id( ISpellChecker2 *iface, WCHAR **value )
++{
++    TRACE( "%p, %p\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (!(*value = co_strdupW( L"MsSpell" ))) return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++/* a string of the resources in the user's language, without user32 */
++static const WCHAR *load_string( UINT id, unsigned int *len )
++{
++    const WCHAR *str;
++    unsigned int i;
++    HRSRC rsrc;
++
++    if (!(rsrc = FindResourceW( instance, MAKEINTRESOURCEW( (id >> 4) + 1 ), (const WCHAR *)RT_STRING ))) return NULL;
++    if (!(str = LockResource( LoadResource( instance, rsrc ) ))) return NULL;
++    for (i = 0; i < (id & 15); i++) str += *str + 1;
++    *len = *str;
++    return *len ? str + 1 : NULL;
++}
++
++static HRESULT WINAPI checker_get_LocalizedName( ISpellChecker2 *iface, WCHAR **value )
++{
++    const WCHAR *name;
++    unsigned int len;
++    WCHAR *copy;
++
++    TRACE( "%p, %p\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (!(name = load_string( IDS_LOCALIZED_NAME, &len )))
++    {
++        name = L"Microsoft Windows Spell Checker";
++        len = wcslen( name );
++    }
++    if (!(copy = CoTaskMemAlloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    memcpy( copy, name, len * sizeof(WCHAR) );
++    copy[len] = 0;
++    *value = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI checker_add_SpellCheckerChanged( ISpellChecker2 *iface, ISpellCheckerChangedEventHandler *handler,
++                                                       DWORD *cookie )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++    struct handler *entry;
++
++    TRACE( "%p, %p, %p\n", iface, handler, cookie );
++
++    if (!handler || !cookie) return E_POINTER;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    ISpellCheckerChangedEventHandler_AddRef( (entry->handler = handler) );
++    EnterCriticalSection( &checker->cs );
++    entry->cookie = *cookie = ++checker->next_cookie;
++    list_add_tail( &checker->handlers, &entry->entry );
++    LeaveCriticalSection( &checker->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI checker_remove_SpellCheckerChanged( ISpellChecker2 *iface, DWORD cookie )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++    struct handler *entry, *found = NULL;
++
++    TRACE( "%p, %#lx\n", iface, cookie );
++
++    EnterCriticalSection( &checker->cs );
++    LIST_FOR_EACH_ENTRY( entry, &checker->handlers, struct handler, entry )
++    {
++        if (entry->cookie != cookie) continue;
++        list_remove( &entry->entry );
++        found = entry;
++        break;
++    }
++    LeaveCriticalSection( &checker->cs );
++    if (found)
++    {
++        ISpellCheckerChangedEventHandler_Release( found->handler );
++        free( found );
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI checker_GetOptionDescription( ISpellChecker2 *iface, const WCHAR *id, IOptionDescription **out )
++{
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(id), out );
++
++    if (!id || !out) return E_POINTER;
++    *out = NULL;
++    return E_INVALIDARG;
++}
++
++static HRESULT WINAPI checker_ComprehensiveCheck( ISpellChecker2 *iface, const WCHAR *text, IEnumSpellingError **out )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(text), out );
++
++    if (!text || !out) return E_POINTER;
++    *out = NULL;
++    if (!*text) return E_INVALIDARG;
++    return check_text( checker, text, TRUE, out );
++}
++
++static HRESULT WINAPI checker_Remove( ISpellChecker2 *iface, const WCHAR *word )
++{
++    struct checker *checker = impl_from_ISpellChecker2( iface );
++
++    TRACE( "%p, %s\n", iface, debugstr_w(word) );
++
++    if (!word) return E_POINTER;
++    if (!*word) return E_INVALIDARG;
++    return remove_word( checker->language, word );
++}
++
++static const ISpellChecker2Vtbl checker_vtbl =
++{
++    checker_QueryInterface,
++    checker_AddRef,
++    checker_Release,
++    checker_get_LanguageTag,
++    checker_Check,
++    checker_Suggest,
++    checker_Add,
++    checker_Ignore,
++    checker_AutoCorrect,
++    checker_GetOptionValue,
++    checker_get_OptionIds,
++    checker_get_Id,
++    checker_get_LocalizedName,
++    checker_add_SpellCheckerChanged,
++    checker_remove_SpellCheckerChanged,
++    checker_GetOptionDescription,
++    checker_ComprehensiveCheck,
++    checker_Remove,
++};
++
++HRESULT create_spell_checker( struct language *language, const WCHAR *tag, ISpellChecker **out )
++{
++    struct checker *checker;
++
++    if (!(checker = calloc( 1, sizeof(*checker) ))) return E_OUTOFMEMORY;
++    checker->ISpellChecker2_iface.lpVtbl = &checker_vtbl;
++    checker->refcount = 1;
++    checker->language = language;
++    if (!(checker->tag = strdupW( tag )))
++    {
++        free( checker );
++        return E_OUTOFMEMORY;
++    }
++    list_init( &checker->handlers );
++    InitializeCriticalSectionEx( &checker->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    checker->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": checker.cs");
++    EnterCriticalSection( &checkers_cs );
++    list_add_tail( &checkers, &checker->entry );
++    LeaveCriticalSection( &checkers_cs );
++    *out = (ISpellChecker *)&checker->ISpellChecker2_iface;
++    return S_OK;
++}
+diff --git a/dlls/msspellcheckingfacility/classes.idl b/dlls/msspellcheckingfacility/classes.idl
+new file mode 100644
+index 00000000000..dd04ecc8a9b
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/classes.idl
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++
++/* as Windows registers it, free-threaded */
++[
++    helpstring("Microsoft Spell Checker Factory Class"),
++    threading(free),
++    uuid(7ab36653-1796-484b-bdfa-e74f1db7c1dc)
++]
++coclass SpellCheckerFactory {}
+diff --git a/dlls/msspellcheckingfacility/lists.c b/dlls/msspellcheckingfacility/lists.c
+new file mode 100644
+index 00000000000..7e17e92ad02
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/lists.c
+@@ -0,0 +1,668 @@
++/*
++ * The user's word lists
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdlib.h>
++
++#include "private.h"
++#include "winreg.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(spell);
++
++/* Where Windows keeps them, in %APPDATA%\Microsoft\Spelling: the words added, in neutral\default.dic for every
++ * language, and for each language the words taken out, <language>\default.exc, and the words corrected,
++ * <language>\default.acl, a "word|correction" line each.  UTF-16 with a byte order mark, a word to a line.  Other
++ * programs, and other processes, change them as well: a list is read again when its file has changed, and is
++ * changed by reading it, changing it and writing it while holding a mutex every process shares. */
++
++struct word_list
++{
++    WCHAR       *path;
++    FILETIME     time;          /* the file's when it was read */
++    BOOL         loaded;
++    BOOL         autocorrect;   /* "word|correction" lines */
++    WCHAR      **words;
++    WCHAR      **corrections;
++    unsigned int count;
++    unsigned int capacity;
++};
++
++struct language_lists
++{
++    struct list      entry;
++    WCHAR            tag[32];
++    struct word_list exclude;
++    struct word_list autocorrect;
++};
++
++enum dictionary_type
++{
++    DICTIONARY_ADD,
++    DICTIONARY_EXCLUDE,
++    DICTIONARY_AUTOCORRECT,
++};
++
++/* a user dictionary a program registered for a language, or for every language with no language at all, as
++ * Office registers its own custom dictionary each time it starts */
++struct user_dictionary
++{
++    struct list          entry;
++    WCHAR                tag[32];
++    enum dictionary_type type;
++    struct word_list     words;
++};
++
++static struct word_list added;
++static struct list language_lists = LIST_INIT( language_lists );
++static struct list user_dictionaries = LIST_INIT( user_dictionaries );
++static BOOL user_dictionaries_loaded;
++
++static CRITICAL_SECTION lists_cs;
++static CRITICAL_SECTION_DEBUG lists_cs_debug =
++{
++    0, 0, &lists_cs,
++    { &lists_cs_debug.ProcessLocksList, &lists_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": lists_cs") }
++};
++static CRITICAL_SECTION lists_cs = { &lists_cs_debug, -1, 0, 0, 0, 0 };
++
++static const WCHAR user_dictionaries_key[] = L"Software\\Microsoft\\Spelling\\Dictionaries";
++
++/* %APPDATA%\Microsoft\Spelling\<dir>\default.<ext> */
++static WCHAR *list_path( const WCHAR *dir, const WCHAR *ext )
++{
++    WCHAR appdata[MAX_PATH], *path;
++    DWORD len;
++
++    if (!(len = GetEnvironmentVariableW( L"APPDATA", appdata, ARRAY_SIZE(appdata) )) || len >= ARRAY_SIZE(appdata))
++        return NULL;
++    len = len + wcslen( dir ) + 40;
++    if ((path = malloc( len * sizeof(WCHAR) )))
++        swprintf( path, len, L"%s\\Microsoft\\Spelling\\%s\\default.%s", appdata, dir, ext );
++    return path;
++}
++
++static void clear_list( struct word_list *list )
++{
++    unsigned int i;
++
++    for (i = 0; i < list->count; i++)
++    {
++        free( list->words[i] );
++        if (list->corrections) free( list->corrections[i] );
++    }
++    list->count = 0;
++}
++
++static BOOL append_word( struct word_list *list, const WCHAR *word, unsigned int len, const WCHAR *correction )
++{
++    WCHAR *copy, *copy2 = NULL;
++
++    if (list->count == list->capacity)
++    {
++        unsigned int capacity = max( 16, list->capacity * 2 );
++        WCHAR **words, **corrections = NULL;
++
++        if (!(words = realloc( list->words, capacity * sizeof(*words) ))) return FALSE;
++        list->words = words;
++        if (list->autocorrect)
++        {
++            if (!(corrections = realloc( list->corrections, capacity * sizeof(*corrections) ))) return FALSE;
++            list->corrections = corrections;
++        }
++        list->capacity = capacity;
++    }
++    if (!(copy = malloc( (len + 1) * sizeof(WCHAR) ))) return FALSE;
++    memcpy( copy, word, len * sizeof(WCHAR) );
++    copy[len] = 0;
++    if (list->autocorrect && !(copy2 = strdupW( correction )))
++    {
++        free( copy );
++        return FALSE;
++    }
++    list->words[list->count] = copy;
++    if (list->autocorrect) list->corrections[list->count] = copy2;
++    list->count++;
++    return TRUE;
++}
++
++static void remove_entry( struct word_list *list, unsigned int i )
++{
++    free( list->words[i] );
++    if (list->autocorrect) free( list->corrections[i] );
++    list->count--;
++    memmove( list->words + i, list->words + i + 1, (list->count - i) * sizeof(*list->words) );
++    if (list->autocorrect)
++        memmove( list->corrections + i, list->corrections + i + 1, (list->count - i) * sizeof(*list->corrections) );
++}
++
++/* the file's text: UTF-16 with or without its byte order mark, or UTF-8 with one */
++static WCHAR *read_text( const WCHAR *path, FILETIME *time )
++{
++    WIN32_FILE_ATTRIBUTE_DATA info;
++    DWORD size, read;
++    HANDLE file;
++    BYTE *data;
++    WCHAR *text = NULL;
++    int len;
++
++    if (!GetFileAttributesExW( path, GetFileExInfoStandard, &info )) return NULL;
++    *time = info.ftLastWriteTime;
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                        OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return NULL;
++    size = GetFileSize( file, NULL );
++    if (size != INVALID_FILE_SIZE && (data = malloc( size + 2 )))
++    {
++        if (ReadFile( file, data, size, &read, NULL ))
++        {
++            data[read] = data[read + 1] = 0;
++            if (read >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf)
++            {
++                len = MultiByteToWideChar( CP_UTF8, 0, (char *)data + 3, read - 3, NULL, 0 );
++                if ((text = malloc( (len + 1) * sizeof(WCHAR) )))
++                {
++                    MultiByteToWideChar( CP_UTF8, 0, (char *)data + 3, read - 3, text, len );
++                    text[len] = 0;
++                }
++                free( data );
++            }
++            else if (read >= 2 && data[0] == 0xff && data[1] == 0xfe)
++            {
++                memmove( data, data + 2, read );
++                text = (WCHAR *)data;
++            }
++            else text = (WCHAR *)data;
++        }
++        else free( data );
++    }
++    CloseHandle( file );
++    return text;
++}
++
++static void load_list( struct word_list *list )
++{
++    WCHAR *text, *line, *end, *bar;
++    FILETIME time = { 0 };
++
++    clear_list( list );
++    list->loaded = TRUE;
++    list->time = time;
++    if (!list->path || !(text = read_text( list->path, &list->time ))) return;
++    for (line = text; *line; line = end)
++    {
++        for (end = line; *end && *end != '\n'; end++) ;
++        if (*end) *end++ = 0;
++        if (*line && line[wcslen( line ) - 1] == '\r') line[wcslen( line ) - 1] = 0;
++        if (!*line) continue;
++        if (list->autocorrect)
++        {
++            if (!(bar = wcschr( line, '|' )) || bar == line || !bar[1]) continue;
++            *bar = 0;
++            append_word( list, line, bar - line, bar + 1 );
++        }
++        else append_word( list, line, wcslen( line ), NULL );
++    }
++    free( text );
++}
++
++/* read the list again if its file changed */
++static void refresh_list( struct word_list *list )
++{
++    WIN32_FILE_ATTRIBUTE_DATA info;
++    FILETIME none = { 0 };
++
++    if (!list->path) return;
++    if (!GetFileAttributesExW( list->path, GetFileExInfoStandard, &info )) info.ftLastWriteTime = none;
++    if (list->loaded && !CompareFileTime( &info.ftLastWriteTime, &list->time )) return;
++    TRACE( "reading %s\n", debugstr_w(list->path) );
++    load_list( list );
++}
++
++static BOOL create_dirs( const WCHAR *path )
++{
++    WCHAR *copy = strdupW( path ), *p;
++    BOOL ret = TRUE;
++
++    if (!copy) return FALSE;
++    for (p = copy + 3; (p = wcschr( p, '\\' )); p++)
++    {
++        *p = 0;
++        if (!CreateDirectoryW( copy, NULL ) && GetLastError() != ERROR_ALREADY_EXISTS) ret = FALSE;
++        *p = '\\';
++    }
++    free( copy );
++    return ret;
++}
++
++static HRESULT write_list( struct word_list *list )
++{
++    static const WCHAR bom = 0xfeff;
++    WIN32_FILE_ATTRIBUTE_DATA info;
++    unsigned int i;
++    DWORD written;
++    HANDLE file;
++    BOOL ret;
++
++    if (!list->path) return S_OK;
++    create_dirs( list->path );
++    file = CreateFileW( list->path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32( GetLastError() );
++    ret = WriteFile( file, &bom, sizeof(bom), &written, NULL );
++    for (i = 0; ret && i < list->count; i++)
++    {
++        ret = WriteFile( file, list->words[i], wcslen( list->words[i] ) * sizeof(WCHAR), &written, NULL );
++        if (ret && list->autocorrect)
++        {
++            ret = WriteFile( file, L"|", sizeof(WCHAR), &written, NULL ) &&
++                  WriteFile( file, list->corrections[i], wcslen( list->corrections[i] ) * sizeof(WCHAR),
++                             &written, NULL );
++        }
++        if (ret) ret = WriteFile( file, L"\r\n", 2 * sizeof(WCHAR), &written, NULL );
++    }
++    CloseHandle( file );
++    if (!ret) return HRESULT_FROM_WIN32( GetLastError() );
++    if (GetFileAttributesExW( list->path, GetFileExInfoStandard, &info )) list->time = info.ftLastWriteTime;
++    return S_OK;
++}
++
++static int find_word( const struct word_list *list, const WCHAR *word, unsigned int len, BOOL match_case )
++{
++    unsigned int i;
++
++    for (i = 0; i < list->count; i++)
++    {
++        if (wcslen( list->words[i] ) != len) continue;
++        if (match_case ? !wcsncmp( list->words[i], word, len ) : !wcsnicmp( list->words[i], word, len ))
++            return i;
++    }
++    return -1;
++}
++
++/* the lists of a language; in lists_cs */
++static struct language_lists *get_language_lists( const struct language *language )
++{
++    struct language_lists *lists;
++
++    LIST_FOR_EACH_ENTRY( lists, &language_lists, struct language_lists, entry )
++        if (!wcscmp( lists->tag, language->tag )) return lists;
++    if (!(lists = calloc( 1, sizeof(*lists) ))) return NULL;
++    lstrcpynW( lists->tag, language->tag, ARRAY_SIZE(lists->tag) );
++    lists->exclude.path = list_path( language->tag, L"exc" );
++    lists->autocorrect.path = list_path( language->tag, L"acl" );
++    lists->autocorrect.autocorrect = TRUE;
++    list_add_tail( &language_lists, &lists->entry );
++    return lists;
++}
++
++static enum dictionary_type dictionary_type( const WCHAR *path )
++{
++    const WCHAR *ext = wcsrchr( path, '.' );
++
++    if (ext && !wcsicmp( ext, L".dic" )) return DICTIONARY_ADD;
++    if (ext && !wcsicmp( ext, L".exc" )) return DICTIONARY_EXCLUDE;
++    if (ext && !wcsicmp( ext, L".acl" )) return DICTIONARY_AUTOCORRECT;
++    return -1;
++}
++
++static struct user_dictionary *add_user_dictionary( const WCHAR *path, const WCHAR *tag )
++{
++    struct user_dictionary *dict;
++
++    if (!(dict = calloc( 1, sizeof(*dict) ))) return NULL;
++    if (!(dict->words.path = strdupW( path )))
++    {
++        free( dict );
++        return NULL;
++    }
++    lstrcpynW( dict->tag, tag, ARRAY_SIZE(dict->tag) );
++    dict->type = dictionary_type( path );
++    dict->words.autocorrect = dict->type == DICTIONARY_AUTOCORRECT;
++    list_add_tail( &user_dictionaries, &dict->entry );
++    return dict;
++}
++
++static void free_user_dictionary( struct user_dictionary *dict )
++{
++    list_remove( &dict->entry );
++    clear_list( &dict->words );
++    free( dict->words.words );
++    free( dict->words.corrections );
++    free( dict->words.path );
++    free( dict );
++}
++
++/* The dictionaries registered before, which stay until they are unregistered: as Windows keeps them, a value for
++ * each language, the paths of its dictionaries one after the other.  Those for every language are not kept, as
++ * Windows does not keep them.  In lists_cs. */
++static void load_user_dictionaries(void)
++{
++    WCHAR tag[64], *data, *path;
++    DWORD i, tag_len, size, type;
++    HKEY key;
++
++    if (user_dictionaries_loaded) return;
++    user_dictionaries_loaded = TRUE;
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, user_dictionaries_key, 0, KEY_READ, &key )) return;
++    for (i = 0; ; i++)
++    {
++        tag_len = ARRAY_SIZE(tag);
++        if (RegEnumValueW( key, i, tag, &tag_len, NULL, &type, NULL, &size ) == ERROR_NO_MORE_ITEMS) break;
++        if (type != REG_MULTI_SZ || !*tag || !(data = malloc( size + 2 * sizeof(WCHAR) ))) continue;
++        tag_len = ARRAY_SIZE(tag);
++        if (!RegEnumValueW( key, i, tag, &tag_len, NULL, NULL, (BYTE *)data, &size ))
++        {
++            data[size / sizeof(WCHAR)] = data[size / sizeof(WCHAR) + 1] = 0;
++            for (path = data; *path; path += wcslen( path ) + 1) add_user_dictionary( path, tag );
++        }
++        free( data );
++    }
++    RegCloseKey( key );
++}
++
++/* write the dictionaries of a language; in lists_cs */
++static void save_user_dictionaries( const WCHAR *tag )
++{
++    struct user_dictionary *dict;
++    WCHAR *data, *p;
++    size_t size = 1;
++    HKEY key;
++
++    if (!*tag) return;
++    LIST_FOR_EACH_ENTRY( dict, &user_dictionaries, struct user_dictionary, entry )
++        if (!wcsicmp( dict->tag, tag )) size += wcslen( dict->words.path ) + 1;
++    if (RegCreateKeyExW( HKEY_CURRENT_USER, user_dictionaries_key, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL ))
++        return;
++    if (size == 1) RegDeleteValueW( key, tag );
++    else if ((data = malloc( size * sizeof(WCHAR) )))
++    {
++        p = data;
++        LIST_FOR_EACH_ENTRY( dict, &user_dictionaries, struct user_dictionary, entry )
++        {
++            if (wcsicmp( dict->tag, tag )) continue;
++            wcscpy( p, dict->words.path );
++            p += wcslen( p ) + 1;
++        }
++        *p = 0;
++        RegSetValueExW( key, tag, 0, REG_MULTI_SZ, (BYTE *)data, size * sizeof(WCHAR) );
++        free( data );
++    }
++    RegCloseKey( key );
++}
++
++/* whether a dictionary is for a language: those registered for none are for every one */
++static BOOL is_dictionary_for( const struct user_dictionary *dict, const WCHAR *tag )
++{
++    return !tag || !dict->tag[0] || !wcsicmp( dict->tag, tag );
++}
++
++void refresh_lists( const struct language *language )
++{
++    struct language_lists *lists;
++    struct user_dictionary *dict;
++
++    EnterCriticalSection( &lists_cs );
++    if (!added.path) added.path = list_path( L"neutral", L"dic" );
++    refresh_list( &added );
++    if ((lists = get_language_lists( language )))
++    {
++        refresh_list( &lists->exclude );
++        refresh_list( &lists->autocorrect );
++    }
++    load_user_dictionaries();
++    LIST_FOR_EACH_ENTRY( dict, &user_dictionaries, struct user_dictionary, entry )
++        if (is_dictionary_for( dict, language->tag )) refresh_list( &dict->words );
++    LeaveCriticalSection( &lists_cs );
++}
++
++/* the lists are case-insensitive, as a word that starts a sentence is the same word */
++static BOOL in_user_dictionaries( const WCHAR *tag, enum dictionary_type type, const WCHAR *word, unsigned int len )
++{
++    struct user_dictionary *dict;
++
++    LIST_FOR_EACH_ENTRY( dict, &user_dictionaries, struct user_dictionary, entry )
++        if (dict->type == type && is_dictionary_for( dict, tag ) && find_word( &dict->words, word, len, FALSE ) >= 0)
++            return TRUE;
++    return FALSE;
++}
++
++BOOL is_word_added( const struct language *language, const WCHAR *word, unsigned int len )
++{
++    BOOL ret;
++
++    EnterCriticalSection( &lists_cs );
++    ret = find_word( &added, word, len, FALSE ) >= 0 ||
++          in_user_dictionaries( language->tag, DICTIONARY_ADD, word, len );
++    LeaveCriticalSection( &lists_cs );
++    return ret;
++}
++
++BOOL is_word_excluded( const struct language *language, const WCHAR *word, unsigned int len )
++{
++    struct language_lists *lists;
++    BOOL ret = FALSE;
++
++    EnterCriticalSection( &lists_cs );
++    if ((lists = get_language_lists( language ))) ret = find_word( &lists->exclude, word, len, FALSE ) >= 0;
++    if (!ret) ret = in_user_dictionaries( language->tag, DICTIONARY_EXCLUDE, word, len );
++    LeaveCriticalSection( &lists_cs );
++    return ret;
++}
++
++/* a correction is for the word as it is written; a copy, to be freed */
++WCHAR *find_autocorrect( const struct language *language, const WCHAR *word, unsigned int len )
++{
++    struct language_lists *lists;
++    struct user_dictionary *dict;
++    const WCHAR *found = NULL;
++    WCHAR *ret = NULL;
++    int i;
++
++    EnterCriticalSection( &lists_cs );
++    if ((lists = get_language_lists( language )) && (i = find_word( &lists->autocorrect, word, len, TRUE )) >= 0)
++        found = lists->autocorrect.corrections[i];
++    LIST_FOR_EACH_ENTRY( dict, &user_dictionaries, struct user_dictionary, entry )
++    {
++        if (found) break;
++        if (dict->type != DICTIONARY_AUTOCORRECT || !is_dictionary_for( dict, language->tag )) continue;
++        if ((i = find_word( &dict->words, word, len, TRUE )) >= 0) found = dict->words.corrections[i];
++    }
++    if (found) ret = strdupW( found );
++    LeaveCriticalSection( &lists_cs );
++    return ret;
++}
++
++/* the words added that are close to one, for suggestions; to be freed */
++unsigned int added_words( WCHAR ***words )
++{
++    unsigned int i, count = 0;
++    WCHAR **ret;
++
++    *words = NULL;
++    EnterCriticalSection( &lists_cs );
++    if (added.count && (ret = calloc( added.count, sizeof(*ret) )))
++    {
++        for (i = 0; i < added.count; i++) if ((ret[count] = strdupW( added.words[i] ))) count++;
++        *words = ret;
++    }
++    LeaveCriticalSection( &lists_cs );
++    return count;
++}
++
++/* changes are made under a mutex every process shares, to the lists as they are on disk */
++static HANDLE lock_lists(void)
++{
++    HANDLE mutex = CreateMutexW( NULL, FALSE, L"Local\\WineSpellingLists" );
++
++    if (mutex) WaitForSingleObject( mutex, INFINITE );
++    EnterCriticalSection( &lists_cs );
++    return mutex;
++}
++
++static void unlock_lists( HANDLE mutex )
++{
++    LeaveCriticalSection( &lists_cs );
++    if (mutex)
++    {
++        ReleaseMutex( mutex );
++        CloseHandle( mutex );
++    }
++}
++
++/* a word added is the user's in every language, and is no longer taken out of this one */
++HRESULT add_word( const struct language *language, const WCHAR *word )
++{
++    struct language_lists *lists;
++    unsigned int len = wcslen( word );
++    HRESULT hr = S_OK;
++    HANDLE mutex;
++    int i;
++
++    mutex = lock_lists();
++    if (!added.path) added.path = list_path( L"neutral", L"dic" );
++    load_list( &added );
++    if (find_word( &added, word, len, TRUE ) < 0)
++    {
++        if (!append_word( &added, word, len, NULL )) hr = E_OUTOFMEMORY;
++        else hr = write_list( &added );
++    }
++    if (SUCCEEDED(hr) && (lists = get_language_lists( language )))
++    {
++        load_list( &lists->exclude );
++        if ((i = find_word( &lists->exclude, word, len, FALSE )) >= 0)
++        {
++            remove_entry( &lists->exclude, i );
++            hr = write_list( &lists->exclude );
++        }
++    }
++    unlock_lists( mutex );
++    notify_checkers( NULL );
++    return hr;
++}
++
++/* a word removed is taken out of the language, even one of its dictionary */
++HRESULT remove_word( const struct language *language, const WCHAR *word )
++{
++    struct language_lists *lists;
++    unsigned int len = wcslen( word );
++    HRESULT hr = S_OK;
++    HANDLE mutex;
++    int i;
++
++    mutex = lock_lists();
++    if (!added.path) added.path = list_path( L"neutral", L"dic" );
++    load_list( &added );
++    if ((i = find_word( &added, word, len, FALSE )) >= 0)
++    {
++        remove_entry( &added, i );
++        hr = write_list( &added );
++    }
++    if (SUCCEEDED(hr) && (lists = get_language_lists( language )))
++    {
++        load_list( &lists->exclude );
++        if (find_word( &lists->exclude, word, len, FALSE ) < 0)
++        {
++            if (!append_word( &lists->exclude, word, len, NULL )) hr = E_OUTOFMEMORY;
++            else hr = write_list( &lists->exclude );
++        }
++    }
++    unlock_lists( mutex );
++    /* as Windows, once for each list */
++    notify_checkers( NULL );
++    notify_checkers( NULL );
++    return hr;
++}
++
++HRESULT add_autocorrect( const struct language *language, const WCHAR *from, const WCHAR *to )
++{
++    struct language_lists *lists;
++    unsigned int len = wcslen( from );
++    HRESULT hr = E_OUTOFMEMORY;
++    WCHAR *copy;
++    HANDLE mutex;
++    int i;
++
++    mutex = lock_lists();
++    if ((lists = get_language_lists( language )))
++    {
++        load_list( &lists->autocorrect );
++        if ((i = find_word( &lists->autocorrect, from, len, TRUE )) >= 0)
++        {
++            if ((copy = strdupW( to )))
++            {
++                free( lists->autocorrect.corrections[i] );
++                lists->autocorrect.corrections[i] = copy;
++                hr = write_list( &lists->autocorrect );
++            }
++        }
++        else if (append_word( &lists->autocorrect, from, len, to )) hr = write_list( &lists->autocorrect );
++    }
++    unlock_lists( mutex );
++    /* Windows tells twice of a correction as well */
++    notify_checkers( language );
++    notify_checkers( language );
++    return hr;
++}
++
++HRESULT register_user_dictionary( const WCHAR *path, const WCHAR *tag )
++{
++    struct user_dictionary *dict;
++    DWORD attrs;
++    HRESULT hr = S_OK;
++
++    if (!*path || dictionary_type( path ) == -1) return E_INVALIDARG;
++    attrs = GetFileAttributesW( path );
++    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return E_INVALIDARG;
++
++    EnterCriticalSection( &lists_cs );
++    load_user_dictionaries();
++    LIST_FOR_EACH_ENTRY( dict, &user_dictionaries, struct user_dictionary, entry )
++        if (!wcsicmp( dict->words.path, path ) && !wcsicmp( dict->tag, tag )) hr = S_FALSE;
++    if (hr == S_OK)
++    {
++        if (!add_user_dictionary( path, tag )) hr = E_OUTOFMEMORY;
++        else save_user_dictionaries( tag );
++    }
++    LeaveCriticalSection( &lists_cs );
++    if (hr == S_OK) notify_checkers( NULL );
++    return hr;
++}
++
++HRESULT unregister_user_dictionary( const WCHAR *path, const WCHAR *tag )
++{
++    struct user_dictionary *dict, *next;
++    HRESULT hr = S_FALSE;
++
++    if (!*path) return E_INVALIDARG;
++
++    EnterCriticalSection( &lists_cs );
++    load_user_dictionaries();
++    LIST_FOR_EACH_ENTRY_SAFE( dict, next, &user_dictionaries, struct user_dictionary, entry )
++    {
++        if (wcsicmp( dict->words.path, path ) || wcsicmp( dict->tag, tag )) continue;
++        free_user_dictionary( dict );
++        hr = S_OK;
++    }
++    if (hr == S_OK) save_user_dictionaries( tag );
++    LeaveCriticalSection( &lists_cs );
++    if (hr == S_OK) notify_checkers( NULL );
++    return hr;
++}
+diff --git a/dlls/msspellcheckingfacility/main.c b/dlls/msspellcheckingfacility/main.c
+new file mode 100644
+index 00000000000..35b9d27d628
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/main.c
+@@ -0,0 +1,605 @@
++/*
++ * The Windows spell checking API, with the host's dictionaries
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdlib.h>
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(spell);
++
++#define SPELL_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
++
++HINSTANCE instance;
++
++WCHAR *strdupW( const WCHAR *str )
++{
++    size_t size = (wcslen( str ) + 1) * sizeof(WCHAR);
++    WCHAR *ret = malloc( size );
++
++    if (ret) memcpy( ret, str, size );
++    return ret;
++}
++
++WCHAR *co_strdupW( const WCHAR *str )
++{
++    size_t size = (wcslen( str ) + 1) * sizeof(WCHAR);
++    WCHAR *ret = CoTaskMemAlloc( size );
++
++    if (ret) memcpy( ret, str, size );
++    return ret;
++}
++
++/* the languages, one for each of the host's dictionaries, found the first time they are asked for */
++
++static struct list languages = LIST_INIT( languages );
++static INIT_ONCE languages_once = INIT_ONCE_STATIC_INIT;
++
++/* the code page of a dictionary's words, from its SET line */
++static UINT encoding_codepage( const char *encoding )
++{
++    static const struct { const char *name; UINT codepage; } encodings[] =
++    {
++        { "UTF-8", CP_UTF8 }, { "ISO8859-1", 28591 }, { "ISO8859-2", 28592 }, { "ISO8859-3", 28593 },
++        { "ISO8859-4", 28594 }, { "ISO8859-5", 28595 }, { "ISO8859-6", 28596 }, { "ISO8859-7", 28597 },
++        { "ISO8859-8", 28598 }, { "ISO8859-9", 28599 }, { "ISO8859-13", 28603 }, { "ISO8859-15", 28605 },
++        { "KOI8-R", 20866 }, { "KOI8-U", 21866 }, { "microsoft-cp1251", 1251 }, { "TIS620-2533", 874 },
++        { "ISCII-DEVANAGARI", 57002 },
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(encodings); i++)
++        if (!_stricmp( encoding, encodings[i].name )) return encodings[i].codepage;
++    FIXME( "encoding %s, taken as ISO8859-1\n", debugstr_a(encoding) );
++    return 28591;
++}
++
++static int __cdecl compare_languages( const void *a, const void *b )
++{
++    const struct language *const *l1 = a, *const *l2 = b;
++    return wcsicmp( (*l1)->tag, (*l2)->tag );
++}
++
++static BOOL WINAPI init_languages( INIT_ONCE *once, void *param, void **context )
++{
++    struct list_dictionaries_params params = { 0 };
++    struct language **sorted, *language;
++    unsigned int count = 0, i;
++    char *names = NULL, *name;
++
++    for (;;)
++    {
++        params.buffer = (UINT_PTR)names;
++        if (SPELL_CALL( list_dictionaries, &params ) != STATUS_BUFFER_TOO_SMALL) break;
++        free( names );
++        if (!(names = malloc( params.needed ))) return TRUE;
++        params.size = params.needed;
++    }
++    if (!names) return TRUE;
++
++    for (name = names; *name; name += strlen( name ) + 1) count++;
++    if (!(sorted = calloc( count, sizeof(*sorted) )))
++    {
++        free( names );
++        return TRUE;
++    }
++    count = 0;
++    for (name = names; *name; name += strlen( name ) + 1)
++    {
++        if (!(language = calloc( 1, sizeof(*language) ))) break;
++        lstrcpynA( language->name, name, sizeof(language->name) );
++        /* a dictionary's name is its language with an underscore, its tag is the language with a hyphen */
++        MultiByteToWideChar( CP_UTF8, 0, name, -1, language->tag, ARRAY_SIZE(language->tag) );
++        for (i = 0; language->tag[i]; i++) if (language->tag[i] == '_') language->tag[i] = '-';
++        InitializeCriticalSectionEx( &language->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++        language->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": language.cs");
++        sorted[count++] = language;
++        TRACE( "%s\n", debugstr_w(language->tag) );
++    }
++    /* as Windows lists them */
++    qsort( sorted, count, sizeof(*sorted), compare_languages );
++    for (i = 0; i < count; i++) list_add_tail( &languages, &sorted[i]->entry );
++    free( sorted );
++    free( names );
++    return TRUE;
++}
++
++struct language *find_language( const WCHAR *tag )
++{
++    struct language *language;
++
++    InitOnceExecuteOnce( &languages_once, init_languages, NULL, NULL );
++    LIST_FOR_EACH_ENTRY( language, &languages, struct language, entry )
++        if (!wcsicmp( language->tag, tag )) return language;
++    return NULL;
++}
++
++/* open the dictionary the first time it is used; called in its critical section */
++static BOOL open_language( struct language *language )
++{
++    struct open_dictionary_params params = { { 0 } };
++
++    if (language->opened) return language->handle != 0;
++    language->opened = TRUE;
++    lstrcpynA( params.name, language->name, sizeof(params.name) );
++    if (SPELL_CALL( open_dictionary, &params ))
++    {
++        WARN( "cannot open %s\n", debugstr_a(language->name) );
++        return FALSE;
++    }
++    language->handle = params.handle;
++    language->codepage = encoding_codepage( params.encoding );
++    return TRUE;
++}
++
++/* a word in the dictionary's encoding, with the typographic apostrophe as the plain one dictionaries have;
++ * NULL where a character has no place in that encoding */
++static char *encode_word( const struct language *language, const WCHAR *word, unsigned int len )
++{
++    BOOL lossy = FALSE, *plossy = language->codepage == CP_UTF8 ? NULL : &lossy;
++    WCHAR *copy;
++    char *ret;
++    int size;
++
++    if (!(copy = malloc( (len + 1) * sizeof(WCHAR) ))) return NULL;
++    memcpy( copy, word, len * sizeof(WCHAR) );
++    copy[len] = 0;
++    for (size = 0; size < len; size++) if (copy[size] == 0x2019) copy[size] = '\'';
++    size = WideCharToMultiByte( language->codepage, 0, copy, -1, NULL, 0, NULL, plossy );
++    if (!size || lossy || !(ret = malloc( size )))
++    {
++        free( copy );
++        return NULL;
++    }
++    WideCharToMultiByte( language->codepage, 0, copy, -1, ret, size, NULL, NULL );
++    free( copy );
++    return ret;
++}
++
++BOOL spell_word( struct language *language, const WCHAR *word, unsigned int len )
++{
++    struct spell_params params = { 0 };
++    char *encoded;
++
++    EnterCriticalSection( &language->cs );
++    if (open_language( language ) && (encoded = encode_word( language, word, len )))
++    {
++        params.handle = language->handle;
++        params.word = (UINT_PTR)encoded;
++        SPELL_CALL( spell, &params );
++        free( encoded );
++    }
++    LeaveCriticalSection( &language->cs );
++    return params.correct;
++}
++
++void free_words( WCHAR **words, unsigned int count )
++{
++    while (count) free( words[--count] );
++    free( words );
++}
++
++unsigned int suggest_words( struct language *language, const WCHAR *word, unsigned int len, WCHAR ***words )
++{
++    struct suggest_params params = { 0 };
++    unsigned int count = 0, i;
++    char *encoded, *buffer = NULL, *p;
++    WCHAR **ret = NULL, *str;
++    int size;
++
++    *words = NULL;
++    EnterCriticalSection( &language->cs );
++    if (open_language( language ) && (encoded = encode_word( language, word, len )))
++    {
++        params.handle = language->handle;
++        params.word = (UINT_PTR)encoded;
++        for (;;)
++        {
++            params.buffer = (UINT_PTR)buffer;
++            if (SPELL_CALL( suggest, &params ) != STATUS_BUFFER_TOO_SMALL) break;
++            free( buffer );
++            if (!(buffer = malloc( params.needed ))) break;
++            params.size = params.needed;
++        }
++        free( encoded );
++    }
++    LeaveCriticalSection( &language->cs );
++    if (!buffer) return 0;
++
++    for (p = buffer; *p; p += strlen( p ) + 1) count++;
++    if (count && (ret = calloc( count, sizeof(*ret) )))
++    {
++        count = 0;
++        for (p = buffer; *p; p += strlen( p ) + 1)
++        {
++            size = MultiByteToWideChar( language->codepage, 0, p, -1, NULL, 0 );
++            if (!size || !(str = malloc( size * sizeof(WCHAR) ))) continue;
++            MultiByteToWideChar( language->codepage, 0, p, -1, str, size );
++            /* the word itself is no suggestion */
++            if (wcslen( str ) == len && !wcsncmp( str, word, len ))
++            {
++                free( str );
++                continue;
++            }
++            for (i = 0; i < count; i++) if (!wcscmp( ret[i], str )) break;
++            if (i < count) free( str );
++            else ret[count++] = str;
++        }
++    }
++    else count = 0;
++    free( buffer );
++    *words = ret;
++    return count;
++}
++
++/* IEnumString over a copy of some strings */
++
++struct string_enum
++{
++    IEnumString IEnumString_iface;
++    LONG refcount;
++    WCHAR **strings;
++    unsigned int count;
++    unsigned int pos;
++};
++
++static inline struct string_enum *impl_from_IEnumString( IEnumString *iface )
++{
++    return CONTAINING_RECORD( iface, struct string_enum, IEnumString_iface );
++}
++
++static HRESULT WINAPI string_enum_QueryInterface( IEnumString *iface, REFIID iid, void **out )
++{
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_IEnumString ))
++    {
++        IEnumString_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    WARN( "%s not implemented\n", debugstr_guid(iid) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI string_enum_AddRef( IEnumString *iface )
++{
++    struct string_enum *strings = impl_from_IEnumString( iface );
++    return InterlockedIncrement( &strings->refcount );
++}
++
++static ULONG WINAPI string_enum_Release( IEnumString *iface )
++{
++    struct string_enum *strings = impl_from_IEnumString( iface );
++    ULONG ref = InterlockedDecrement( &strings->refcount );
++
++    if (!ref)
++    {
++        free_words( strings->strings, strings->count );
++        free( strings );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI string_enum_Next( IEnumString *iface, ULONG count, LPOLESTR *out, ULONG *fetched )
++{
++    struct string_enum *strings = impl_from_IEnumString( iface );
++    ULONG done = 0;
++
++    if (!out) return E_POINTER;
++    if (count > 1 && !fetched) return E_INVALIDARG;
++    while (done < count && strings->pos < strings->count)
++    {
++        if (!(out[done] = co_strdupW( strings->strings[strings->pos] )))
++        {
++            while (done) CoTaskMemFree( out[--done] );
++            return E_OUTOFMEMORY;
++        }
++        strings->pos++;
++        done++;
++    }
++    if (fetched) *fetched = done;
++    return done == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI string_enum_Skip( IEnumString *iface, ULONG count )
++{
++    struct string_enum *strings = impl_from_IEnumString( iface );
++
++    if (count > strings->count - strings->pos)
++    {
++        strings->pos = strings->count;
++        return S_FALSE;
++    }
++    strings->pos += count;
++    return S_OK;
++}
++
++static HRESULT WINAPI string_enum_Reset( IEnumString *iface )
++{
++    impl_from_IEnumString( iface )->pos = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI string_enum_Clone( IEnumString *iface, IEnumString **out )
++{
++    struct string_enum *strings = impl_from_IEnumString( iface );
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    if (SUCCEEDED(hr = create_string_enum( strings->strings, strings->count, out )))
++        impl_from_IEnumString( *out )->pos = strings->pos;
++    return hr;
++}
++
++static const IEnumStringVtbl string_enum_vtbl =
++{
++    string_enum_QueryInterface,
++    string_enum_AddRef,
++    string_enum_Release,
++    string_enum_Next,
++    string_enum_Skip,
++    string_enum_Reset,
++    string_enum_Clone,
++};
++
++HRESULT create_string_enum( WCHAR **strings, unsigned int count, IEnumString **out )
++{
++    struct string_enum *ret;
++
++    if (!(ret = calloc( 1, sizeof(*ret) ))) return E_OUTOFMEMORY;
++    ret->IEnumString_iface.lpVtbl = &string_enum_vtbl;
++    ret->refcount = 1;
++    if (count && !(ret->strings = calloc( count, sizeof(*ret->strings) )))
++    {
++        free( ret );
++        return E_OUTOFMEMORY;
++    }
++    for (ret->count = 0; ret->count < count; ret->count++)
++    {
++        if (!(ret->strings[ret->count] = strdupW( strings[ret->count] )))
++        {
++            IEnumString_Release( &ret->IEnumString_iface );
++            return E_OUTOFMEMORY;
++        }
++    }
++    *out = &ret->IEnumString_iface;
++    return S_OK;
++}
++
++/* the factory, which is also where user dictionaries are registered */
++
++struct factory
++{
++    ISpellCheckerFactory ISpellCheckerFactory_iface;
++    IUserDictionariesRegistrar IUserDictionariesRegistrar_iface;
++    LONG refcount;
++};
++
++static inline struct factory *impl_from_ISpellCheckerFactory( ISpellCheckerFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct factory, ISpellCheckerFactory_iface );
++}
++
++static inline struct factory *impl_from_IUserDictionariesRegistrar( IUserDictionariesRegistrar *iface )
++{
++    return CONTAINING_RECORD( iface, struct factory, IUserDictionariesRegistrar_iface );
++}
++
++static HRESULT WINAPI spell_factory_QueryInterface( ISpellCheckerFactory *iface, REFIID iid, void **out )
++{
++    struct factory *factory = impl_from_ISpellCheckerFactory( iface );
++
++    TRACE( "%p, %s, %p\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_ISpellCheckerFactory ))
++        *out = &factory->ISpellCheckerFactory_iface;
++    else if (IsEqualIID( iid, &IID_IUserDictionariesRegistrar ))
++        *out = &factory->IUserDictionariesRegistrar_iface;
++    else
++    {
++        WARN( "%s not implemented\n", debugstr_guid(iid) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI spell_factory_AddRef( ISpellCheckerFactory *iface )
++{
++    struct factory *factory = impl_from_ISpellCheckerFactory( iface );
++    return InterlockedIncrement( &factory->refcount );
++}
++
++static ULONG WINAPI spell_factory_Release( ISpellCheckerFactory *iface )
++{
++    struct factory *factory = impl_from_ISpellCheckerFactory( iface );
++    ULONG ref = InterlockedDecrement( &factory->refcount );
++
++    if (!ref) free( factory );
++    return ref;
++}
++
++static HRESULT WINAPI spell_factory_get_SupportedLanguages( ISpellCheckerFactory *iface, IEnumString **out )
++{
++    struct language *language;
++    WCHAR **tags = NULL;
++    unsigned int count = 0;
++    HRESULT hr;
++
++    TRACE( "%p, %p\n", iface, out );
++
++    if (!out) return E_POINTER;
++    find_language( L"" );
++    if ((tags = calloc( list_count( &languages ) + 1, sizeof(*tags) )))
++        LIST_FOR_EACH_ENTRY( language, &languages, struct language, entry ) tags[count++] = language->tag;
++    hr = create_string_enum( tags, count, out );
++    free( tags );
++    return hr;
++}
++
++static HRESULT WINAPI spell_factory_IsSupported( ISpellCheckerFactory *iface, const WCHAR *tag, BOOL *value )
++{
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(tag), value );
++
++    if (!tag || !value) return E_POINTER;
++    if (!*tag) return E_INVALIDARG;
++    *value = find_language( tag ) != NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI spell_factory_CreateSpellChecker( ISpellCheckerFactory *iface, const WCHAR *tag,
++                                                        ISpellChecker **out )
++{
++    struct language *language;
++
++    TRACE( "%p, %s, %p\n", iface, debugstr_w(tag), out );
++
++    if (!tag || !out) return E_POINTER;
++    *out = NULL;
++    if (!(language = find_language( tag ))) return E_INVALIDARG;
++    return create_spell_checker( language, tag, out );
++}
++
++static const ISpellCheckerFactoryVtbl spell_factory_vtbl =
++{
++    spell_factory_QueryInterface,
++    spell_factory_AddRef,
++    spell_factory_Release,
++    spell_factory_get_SupportedLanguages,
++    spell_factory_IsSupported,
++    spell_factory_CreateSpellChecker,
++};
++
++static HRESULT WINAPI registrar_QueryInterface( IUserDictionariesRegistrar *iface, REFIID iid, void **out )
++{
++    struct factory *factory = impl_from_IUserDictionariesRegistrar( iface );
++    return ISpellCheckerFactory_QueryInterface( &factory->ISpellCheckerFactory_iface, iid, out );
++}
++
++static ULONG WINAPI registrar_AddRef( IUserDictionariesRegistrar *iface )
++{
++    struct factory *factory = impl_from_IUserDictionariesRegistrar( iface );
++    return ISpellCheckerFactory_AddRef( &factory->ISpellCheckerFactory_iface );
++}
++
++static ULONG WINAPI registrar_Release( IUserDictionariesRegistrar *iface )
++{
++    struct factory *factory = impl_from_IUserDictionariesRegistrar( iface );
++    return ISpellCheckerFactory_Release( &factory->ISpellCheckerFactory_iface );
++}
++
++static HRESULT WINAPI registrar_RegisterUserDictionary( IUserDictionariesRegistrar *iface, const WCHAR *path,
++                                                        const WCHAR *tag )
++{
++    TRACE( "%p, %s, %s\n", iface, debugstr_w(path), debugstr_w(tag) );
++
++    if (!path || !tag) return E_POINTER;
++    return register_user_dictionary( path, tag );
++}
++
++static HRESULT WINAPI registrar_UnregisterUserDictionary( IUserDictionariesRegistrar *iface, const WCHAR *path,
++                                                          const WCHAR *tag )
++{
++    TRACE( "%p, %s, %s\n", iface, debugstr_w(path), debugstr_w(tag) );
++
++    if (!path || !tag) return E_POINTER;
++    return unregister_user_dictionary( path, tag );
++}
++
++static const IUserDictionariesRegistrarVtbl registrar_vtbl =
++{
++    registrar_QueryInterface,
++    registrar_AddRef,
++    registrar_Release,
++    registrar_RegisterUserDictionary,
++    registrar_UnregisterUserDictionary,
++};
++
++static HRESULT WINAPI class_factory_QueryInterface( IClassFactory *iface, REFIID iid, void **out )
++{
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_IClassFactory ))
++    {
++        IClassFactory_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI class_factory_AddRef( IClassFactory *iface ) { return 2; }
++static ULONG WINAPI class_factory_Release( IClassFactory *iface ) { return 1; }
++
++static HRESULT WINAPI class_factory_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID iid, void **out )
++{
++    struct factory *factory;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %s, %p\n", iface, outer, debugstr_guid(iid), out );
++
++    *out = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(factory = calloc( 1, sizeof(*factory) ))) return E_OUTOFMEMORY;
++    factory->ISpellCheckerFactory_iface.lpVtbl = &spell_factory_vtbl;
++    factory->IUserDictionariesRegistrar_iface.lpVtbl = &registrar_vtbl;
++    factory->refcount = 1;
++    hr = ISpellCheckerFactory_QueryInterface( &factory->ISpellCheckerFactory_iface, iid, out );
++    ISpellCheckerFactory_Release( &factory->ISpellCheckerFactory_iface );
++    return hr;
++}
++
++static HRESULT WINAPI class_factory_LockServer( IClassFactory *iface, BOOL lock )
++{
++    return S_OK;
++}
++
++static const IClassFactoryVtbl class_factory_vtbl =
++{
++    class_factory_QueryInterface,
++    class_factory_AddRef,
++    class_factory_Release,
++    class_factory_CreateInstance,
++    class_factory_LockServer,
++};
++
++static IClassFactory class_factory = { &class_factory_vtbl };
++
++HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID iid, void **out )
++{
++    TRACE( "%s, %s, %p\n", debugstr_guid(clsid), debugstr_guid(iid), out );
++
++    if (IsEqualCLSID( clsid, &CLSID_SpellCheckerFactory ))
++        return IClassFactory_QueryInterface( &class_factory, iid, out );
++
++    FIXME( "class %s not available\n", debugstr_guid(clsid) );
++    *out = NULL;
++    return CLASS_E_CLASSNOTAVAILABLE;
++}
++
++BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
++{
++    if (reason == DLL_PROCESS_ATTACH)
++    {
++        instance = inst;
++        DisableThreadLibraryCalls( inst );
++        if (__wine_init_unix_call()) ERR( "no unix side\n" );
++    }
++    return TRUE;
++}
+diff --git a/dlls/msspellcheckingfacility/msspellcheckingfacility.rc b/dlls/msspellcheckingfacility/msspellcheckingfacility.rc
+new file mode 100644
+index 00000000000..6d372df1fa3
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/msspellcheckingfacility.rc
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "windef.h"
++
++#pragma makedep po
++
++LANGUAGE LANG_ENGLISH, SUBLANG_DEFAULT
++
++STRINGTABLE
++{
++    1 "Microsoft Windows Spell Checker"
++}
+diff --git a/dlls/msspellcheckingfacility/msspellcheckingfacility.spec b/dlls/msspellcheckingfacility/msspellcheckingfacility.spec
+new file mode 100644
+index 00000000000..b16365d0c9f
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/msspellcheckingfacility.spec
+@@ -0,0 +1,4 @@
++@ stdcall -private DllCanUnloadNow()
++@ stdcall -private DllGetClassObject(ptr ptr ptr)
++@ stdcall -private DllRegisterServer()
++@ stdcall -private DllUnregisterServer()
+diff --git a/dlls/msspellcheckingfacility/private.h b/dlls/msspellcheckingfacility/private.h
+new file mode 100644
+index 00000000000..a4a784889ec
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/private.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_MSSPELLCHECKINGFACILITY_PRIVATE_H
++#define __WINE_MSSPELLCHECKINGFACILITY_PRIVATE_H
++
++#include <stdarg.h>
++
++#define COBJMACROS
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "objbase.h"
++#include "spellcheck.h"
++
++#include "wine/list.h"
++#include "wine/unixlib.h"
++#include "unixlib.h"
++
++#define IDS_LOCALIZED_NAME 1
++
++/* one of the host's dictionaries */
++struct language
++{
++    struct list      entry;
++    WCHAR            tag[32];       /* en-US */
++    char             name[32];      /* en_US */
++    UINT64           handle;        /* the dictionary, once opened */
++    UINT             codepage;      /* of its words */
++    BOOL             opened;
++    CRITICAL_SECTION cs;            /* a dictionary does one thing at a time */
++};
++
++extern HINSTANCE instance;
++
++/* main.c */
++extern struct language *find_language( const WCHAR *tag );
++extern HRESULT create_string_enum( WCHAR **strings, unsigned int count, IEnumString **out );
++extern WCHAR *strdupW( const WCHAR *str );
++extern WCHAR *co_strdupW( const WCHAR *str );
++extern BOOL spell_word( struct language *language, const WCHAR *word, unsigned int len );
++extern unsigned int suggest_words( struct language *language, const WCHAR *word, unsigned int len, WCHAR ***words );
++extern void free_words( WCHAR **words, unsigned int count );
++
++/* lists.c: the user's word lists */
++extern void refresh_lists( const struct language *language );
++extern BOOL is_word_added( const struct language *language, const WCHAR *word, unsigned int len );
++extern BOOL is_word_excluded( const struct language *language, const WCHAR *word, unsigned int len );
++extern WCHAR *find_autocorrect( const struct language *language, const WCHAR *word, unsigned int len );
++extern unsigned int added_words( WCHAR ***words );
++extern HRESULT add_word( const struct language *language, const WCHAR *word );
++extern HRESULT remove_word( const struct language *language, const WCHAR *word );
++extern HRESULT add_autocorrect( const struct language *language, const WCHAR *from, const WCHAR *to );
++extern HRESULT register_user_dictionary( const WCHAR *path, const WCHAR *tag );
++extern HRESULT unregister_user_dictionary( const WCHAR *path, const WCHAR *tag );
++
++/* checker.c */
++extern HRESULT create_spell_checker( struct language *language, const WCHAR *tag, ISpellChecker **out );
++extern void notify_checkers( const struct language *language );
++
++#endif /* __WINE_MSSPELLCHECKINGFACILITY_PRIVATE_H */
+diff --git a/dlls/msspellcheckingfacility/tests/Makefile.in b/dlls/msspellcheckingfacility/tests/Makefile.in
+new file mode 100644
+index 00000000000..08708201542
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/tests/Makefile.in
+@@ -0,0 +1,5 @@
++TESTDLL   = msspellcheckingfacility.dll
++IMPORTS   = ole32 uuid
++
++SOURCES = \
++	spellcheck.c
+diff --git a/dlls/msspellcheckingfacility/tests/spellcheck.c b/dlls/msspellcheckingfacility/tests/spellcheck.c
+new file mode 100644
+index 00000000000..d831be187d7
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/tests/spellcheck.c
+@@ -0,0 +1,569 @@
++/*
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++#include <stdarg.h>
++#include <stdio.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "objbase.h"
++#include "spellcheck.h"
++
++#include "wine/test.h"
++
++struct expected_error
++{
++    ULONG start, length;
++    CORRECTIVE_ACTION action;
++    const WCHAR *replacement;
++    BOOL todo;
++};
++
++#define check_errors(a, b, c, d) check_errors_(__LINE__, a, b, c, d)
++static void check_errors_( unsigned int line, ISpellChecker *checker, const WCHAR *text, BOOL comprehensive,
++                           const struct expected_error *expected )
++{
++    IEnumSpellingError *errors = NULL;
++    CORRECTIVE_ACTION action;
++    ISpellingError *error;
++    ULONG start, length;
++    unsigned int i = 0;
++    WCHAR *replacement;
++    HRESULT hr;
++
++    if (comprehensive) hr = ISpellChecker_ComprehensiveCheck( checker, text, &errors );
++    else hr = ISpellChecker_Check( checker, text, &errors );
++    ok_(__FILE__, line)( hr == S_OK, "%s: got %#lx\n", debugstr_w(text), hr );
++    if (FAILED(hr)) return;
++    while ((hr = IEnumSpellingError_Next( errors, &error )) == S_OK)
++    {
++        ISpellingError_get_StartIndex( error, &start );
++        ISpellingError_get_Length( error, &length );
++        ISpellingError_get_CorrectiveAction( error, &action );
++        replacement = NULL;
++        ISpellingError_get_Replacement( error, &replacement );
++        ok_(__FILE__, line)( expected[i].length != 0, "%s: unexpected error %lu,%lu\n", debugstr_w(text), start, length );
++        if (expected[i].length)
++        {
++            ok_(__FILE__, line)( start == expected[i].start && length == expected[i].length,
++                                 "%s: error %u at %lu,%lu\n", debugstr_w(text), i, start, length );
++            todo_wine_if( expected[i].todo )
++            ok_(__FILE__, line)( action == expected[i].action, "%s: error %u action %d\n", debugstr_w(text), i, action );
++            todo_wine_if( expected[i].todo )
++            ok_(__FILE__, line)( replacement && !wcscmp( replacement, expected[i].replacement ? expected[i].replacement : L"" ),
++                                 "%s: error %u replacement %s\n", debugstr_w(text), i, debugstr_w(replacement) );
++            i++;
++        }
++        CoTaskMemFree( replacement );
++        ISpellingError_Release( error );
++    }
++    ok_(__FILE__, line)( hr == S_FALSE, "%s: Next returned %#lx\n", debugstr_w(text), hr );
++    ok_(__FILE__, line)( !expected[i].length, "%s: %u errors, error %u missing\n", debugstr_w(text), i, i );
++    IEnumSpellingError_Release( errors );
++}
++
++/* whether a word is among the suggestions, and how many there are */
++static BOOL has_suggestion( ISpellChecker *checker, const WCHAR *word, const WCHAR *suggestion, unsigned int *count )
++{
++    IEnumString *strings = NULL;
++    BOOL found = FALSE;
++    WCHAR *str;
++    HRESULT hr;
++
++    *count = 0;
++    hr = ISpellChecker_Suggest( checker, word, &strings );
++    ok( hr == S_OK, "%s: got %#lx\n", debugstr_w(word), hr );
++    if (FAILED(hr)) return FALSE;
++    while (IEnumString_Next( strings, 1, &str, NULL ) == S_OK)
++    {
++        if (!wcscmp( str, suggestion )) found = TRUE;
++        (*count)++;
++        CoTaskMemFree( str );
++    }
++    IEnumString_Release( strings );
++    return found;
++}
++
++static LONG events;
++
++static HRESULT WINAPI handler_QueryInterface( ISpellCheckerChangedEventHandler *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_ISpellCheckerChangedEventHandler ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI handler_AddRef( ISpellCheckerChangedEventHandler *iface ) { return 2; }
++static ULONG WINAPI handler_Release( ISpellCheckerChangedEventHandler *iface ) { return 1; }
++
++static HRESULT WINAPI handler_Invoke( ISpellCheckerChangedEventHandler *iface, ISpellChecker *sender )
++{
++    InterlockedIncrement( &events );
++    return S_OK;
++}
++
++static ISpellCheckerChangedEventHandlerVtbl handler_vtbl =
++{
++    handler_QueryInterface, handler_AddRef, handler_Release, handler_Invoke,
++};
++static ISpellCheckerChangedEventHandler handler = { &handler_vtbl };
++
++/* Windows tells of changes from another thread, a moment after */
++static BOOL wait_events( LONG count )
++{
++    DWORD start = GetTickCount();
++
++    while (events < count && GetTickCount() - start < 3000) Sleep( 50 );
++    return events >= count;
++}
++
++/* the user's lists, which the tests change, kept to be put back */
++static const WCHAR *list_names[] = { L"neutral\\default.dic", L"en-US\\default.exc", L"en-US\\default.acl" };
++static BYTE *list_data[3];
++static DWORD list_size[3];
++
++static void list_path( unsigned int i, WCHAR *path )
++{
++    WCHAR appdata[MAX_PATH];
++
++    GetEnvironmentVariableW( L"APPDATA", appdata, ARRAY_SIZE(appdata) );
++    swprintf( path, MAX_PATH, L"%s\\Microsoft\\Spelling\\%s", appdata, list_names[i] );
++}
++
++static BYTE *read_file( const WCHAR *path, DWORD *size )
++{
++    HANDLE file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                               OPEN_EXISTING, 0, NULL );
++    BYTE *data;
++
++    if (file == INVALID_HANDLE_VALUE) return NULL;
++    *size = GetFileSize( file, NULL );
++    data = malloc( *size + 2 );
++    ReadFile( file, data, *size, size, NULL );
++    data[*size] = data[*size + 1] = 0;
++    CloseHandle( file );
++    return data;
++}
++
++static void save_lists(void)
++{
++    WCHAR path[MAX_PATH];
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(list_names); i++)
++    {
++        list_path( i, path );
++        list_data[i] = read_file( path, &list_size[i] );
++    }
++}
++
++static void restore_lists(void)
++{
++    WCHAR path[MAX_PATH];
++    unsigned int i;
++    DWORD written;
++    HANDLE file;
++
++    for (i = 0; i < ARRAY_SIZE(list_names); i++)
++    {
++        list_path( i, path );
++        if (!list_data[i])
++        {
++            DeleteFileW( path );
++            continue;
++        }
++        file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++        WriteFile( file, list_data[i], list_size[i], &written, NULL );
++        CloseHandle( file );
++        free( list_data[i] );
++    }
++}
++
++static void test_factory( ISpellCheckerFactory *factory )
++{
++    static const struct { const WCHAR *tag; BOOL supported; } tags[] =
++    {
++        { L"en-US", TRUE }, { L"en-us", TRUE }, { L"EN-US", TRUE }, { L"en", FALSE }, { L"en_US", FALSE },
++        { L" en-US", FALSE }, { L"xx-XX", FALSE },
++    };
++    IUserDictionariesRegistrar *registrar;
++    ISpellChecker *checker;
++    IEnumString *strings;
++    BOOL supported, found = FALSE;
++    unsigned int i;
++    WCHAR *str;
++    HRESULT hr;
++
++    hr = ISpellCheckerFactory_QueryInterface( factory, &IID_IUserDictionariesRegistrar, (void **)&registrar );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    IUserDictionariesRegistrar_Release( registrar );
++
++    hr = ISpellCheckerFactory_get_SupportedLanguages( factory, &strings );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    while (IEnumString_Next( strings, 1, &str, NULL ) == S_OK)
++    {
++        if (!wcscmp( str, L"en-US" )) found = TRUE;
++        CoTaskMemFree( str );
++    }
++    IEnumString_Release( strings );
++    ok( found, "en-US not listed\n" );
++
++    hr = ISpellCheckerFactory_IsSupported( factory, NULL, &supported );
++    ok( hr == E_POINTER, "got %#lx\n", hr );
++    hr = ISpellCheckerFactory_IsSupported( factory, L"", &supported );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    for (i = 0; i < ARRAY_SIZE(tags); i++)
++    {
++        supported = 0xdead;
++        hr = ISpellCheckerFactory_IsSupported( factory, tags[i].tag, &supported );
++        ok( hr == S_OK, "%s: got %#lx\n", debugstr_w(tags[i].tag), hr );
++        ok( supported == tags[i].supported, "%s: got %d\n", debugstr_w(tags[i].tag), supported );
++        checker = (void *)0xdeadbeef;
++        hr = ISpellCheckerFactory_CreateSpellChecker( factory, tags[i].tag, &checker );
++        ok( hr == (tags[i].supported ? S_OK : E_INVALIDARG), "%s: got %#lx\n", debugstr_w(tags[i].tag), hr );
++        if (hr == S_OK)
++        {
++            hr = ISpellChecker_get_LanguageTag( checker, &str );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( !wcscmp( str, tags[i].tag ), "got %s\n", debugstr_w(str) );
++            CoTaskMemFree( str );
++            ISpellChecker_Release( checker );
++        }
++        else ok( !checker, "got %p\n", checker );
++    }
++    hr = ISpellCheckerFactory_CreateSpellChecker( factory, NULL, &checker );
++    ok( hr == E_POINTER, "got %#lx\n", hr );
++    hr = ISpellCheckerFactory_CreateSpellChecker( factory, L"", &checker );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++}
++
++static void test_checker( ISpellChecker *checker )
++{
++    static const struct expected_error none[] = { { 0 } };
++    static const struct expected_error helo_wrold[] = { { 0, 4, CORRECTIVE_ACTION_GET_SUGGESTIONS },
++                                                        { 5, 5, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    /* Windows has one suggestion for "wrold", Hunspell has "wold" as well */
++    static const struct expected_error helo_wrold_comprehensive[] =
++        { { 0, 4, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 5, 5, CORRECTIVE_ACTION_REPLACE, L"world", TRUE }, { 0 } };
++    static const struct expected_error the_the_cat[] = { { 4, 3, CORRECTIVE_ACTION_DELETE }, { 0 } };
++    static const struct expected_error dont[] = { { 0, 4, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error capitals[] = { { 10, 5, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error i_i[] = { { 6, 1, CORRECTIVE_ACTION_DELETE }, { 0 } };
++    static const struct expected_error world_caps[] = { { 6, 5, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error a_a[] = { { 2, 1, CORRECTIVE_ACTION_DELETE }, { 0 } };
++    static const struct expected_error the_the[] = { { 4, 3, CORRECTIVE_ACTION_DELETE }, { 0 } };
++    static const struct expected_error the_2_the[] = { { 5, 3, CORRECTIVE_ACTION_DELETE }, { 0 } };
++    static const struct expected_error hello3[] = { { 6, 5, CORRECTIVE_ACTION_DELETE },
++                                                    { 12, 5, CORRECTIVE_ACTION_DELETE }, { 0 } };
++    static const struct expected_error wrolds[] = { { 0, 7, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error helo_world[] = { { 0, 4, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error in_brackets[] = { { 1, 5, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error chinese[] = { { 0, 2, CORRECTIVE_ACTION_GET_SUGGESTIONS },
++                                                     { 3, 5, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct
++    {
++        const WCHAR *text;
++        const struct expected_error *errors;
++    }
++    tests[] =
++    {
++        { L"hello world", none },
++        { L"helo wrold", helo_wrold },
++        { L"the the cat", the_the_cat },
++        { L"Hello, world. hello", none },
++        { L"dont don't", dont },
++        { L"e-mail", none },
++        { L"1234 abc123 3rd", none },
++        { L"IBM WORLD Wrold", capitals },
++        { L"http://example.com/foo user@example.com", none },
++        { L"   ", none },
++        { L"Hello\nworld", none },
++        { L"x a I i", i_i },
++        { L"Mr. Smith U.S.A. OK", none },
++        { L"it's its", none },
++        { L"HELLO wORLD", world_caps },
++        { L"a a", a_a },
++        { L"The the", the_the },
++        { L"the, the", none },
++        { L"the  the", the_2_the },
++        { L"the\nthe", none },
++        { L"hello hello hello", hello3 },
++        { L"Wrold's", wrolds },
++        { L"helo-world", helo_world },
++        { L"(wrold)", in_brackets },
++        { L"\x4f60\x597d wrold", chinese },
++    };
++    IOptionDescription *description;
++    IEnumSpellingError *errors;
++    IEnumString *strings;
++    unsigned int i, count;
++    WCHAR *str;
++    BYTE value;
++    HRESULT hr;
++
++    hr = ISpellChecker_get_Id( checker, &str );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !wcscmp( str, L"MsSpell" ), "got %s\n", debugstr_w(str) );
++    CoTaskMemFree( str );
++    hr = ISpellChecker_get_LocalizedName( checker, &str );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( str && *str, "got %s\n", debugstr_w(str) );
++    CoTaskMemFree( str );
++
++    hr = ISpellChecker_get_OptionIds( checker, &strings );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IEnumString_Next( strings, 1, &str, NULL );
++    ok( hr == S_FALSE, "got %#lx\n", hr );
++    IEnumString_Release( strings );
++    value = 0xcc;
++    hr = ISpellChecker_GetOptionValue( checker, L"no:such:option", &value );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    ok( !value, "got %u\n", value );
++    hr = ISpellChecker_GetOptionDescription( checker, L"no:such:option", &description );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++
++    hr = ISpellChecker_Check( checker, NULL, &errors );
++    ok( hr == E_POINTER, "got %#lx\n", hr );
++    hr = ISpellChecker_Check( checker, L"", &errors );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = ISpellChecker_ComprehensiveCheck( checker, L"", &errors );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    for (i = 0; i < ARRAY_SIZE(tests); i++) check_errors( checker, tests[i].text, FALSE, tests[i].errors );
++    check_errors( checker, L"helo wrold", TRUE, helo_wrold_comprehensive );
++    check_errors( checker, L"the the cat", TRUE, the_the_cat );
++
++    hr = ISpellChecker_Suggest( checker, NULL, &strings );
++    ok( hr == E_POINTER, "got %#lx\n", hr );
++    hr = ISpellChecker_Suggest( checker, L"", &strings );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    ok( has_suggestion( checker, L"wrold", L"world", &count ), "no world\n" );
++    ok( has_suggestion( checker, L"helo", L"hello", &count ), "no hello\n" );
++    ok( count > 1 && count <= 10, "got %u\n", count );
++    ok( has_suggestion( checker, L"Helo", L"Hello", &count ), "no Hello\n" );
++    ok( has_suggestion( checker, L"teh", L"the", &count ), "no the\n" );
++}
++
++static void test_word_lists( ISpellCheckerFactory *factory, ISpellChecker *checker )
++{
++    static const struct expected_error none[] = { { 0 } };
++    static const struct expected_error misspelt[] = { { 0, 13, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error misspelt_ignored[] = { { 0, 16, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error hello[] = { { 0, 5, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    static const struct expected_error corrected[] =
++        { { 0, 11, CORRECTIVE_ACTION_REPLACE, L"wineprobereplacement" }, { 0 } };
++    static const struct expected_error corrected_capital[] = { { 0, 11, CORRECTIVE_ACTION_GET_SUGGESTIONS }, { 0 } };
++    WCHAR path[MAX_PATH], *text;
++    ISpellChecker *other;
++    ISpellChecker2 *checker2;
++    unsigned int count;
++    DWORD cookie, size;
++    BYTE *data;
++    HRESULT hr;
++    LONG seen;
++
++    hr = ISpellCheckerFactory_CreateSpellChecker( factory, L"en-US", &other );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = ISpellChecker_add_SpellCheckerChanged( checker, &handler, &cookie );
++    ok( hr == S_OK, "got %#lx\n", hr );
++
++    check_errors( checker, L"wineprobeword", FALSE, misspelt );
++    hr = ISpellChecker_Add( checker, L"" );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    seen = events;
++    hr = ISpellChecker_Add( checker, L"wineprobeword" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( wait_events( seen + 1 ), "no event\n" );
++    check_errors( checker, L"wineprobeword", FALSE, none );
++    check_errors( checker, L"Wineprobeword", FALSE, none );
++    check_errors( other, L"wineprobeword", FALSE, none );
++    ok( has_suggestion( checker, L"wineprobewrd", L"wineprobeword", &count ), "no wineprobeword\n" );
++
++    /* a word ignored is ignored by that checker */
++    seen = events;
++    hr = ISpellChecker_Ignore( checker, L"wineprobeignored" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( wait_events( seen + 1 ), "no event\n" );
++    check_errors( checker, L"wineprobeignored", FALSE, none );
++    check_errors( other, L"wineprobeignored", FALSE, misspelt_ignored );
++
++    hr = ISpellChecker_QueryInterface( checker, &IID_ISpellChecker2, (void **)&checker2 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    /* removing tells twice, once for each list */
++    seen = events;
++    hr = ISpellChecker2_Remove( checker2, L"wineprobeword" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( wait_events( seen + 2 ), "%ld events\n", events - seen );
++    check_errors( checker, L"wineprobeword", FALSE, misspelt );
++    check_errors( other, L"wineprobeword", FALSE, misspelt );
++    /* a word of the dictionary is taken out as well */
++    seen = events;
++    hr = ISpellChecker2_Remove( checker2, L"hello" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( wait_events( seen + 2 ), "%ld events\n", events - seen );
++    check_errors( checker, L"hello", FALSE, hello );
++    hr = ISpellChecker2_Remove( checker2, L"" );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    ISpellChecker2_Release( checker2 );
++
++    hr = ISpellChecker_AutoCorrect( checker, L"", L"x" );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    hr = ISpellChecker_AutoCorrect( checker, L"x", L"" );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    seen = events;
++    hr = ISpellChecker_AutoCorrect( checker, L"wineprobeac", L"wineprobereplacement" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( wait_events( seen + 2 ), "%ld events\n", events - seen );
++    check_errors( checker, L"wineprobeac", FALSE, corrected );
++    check_errors( checker, L"wineprobeac", TRUE, corrected );
++    check_errors( other, L"wineprobeac", FALSE, corrected );
++    /* the correction is for the word as written */
++    check_errors( checker, L"Wineprobeac", FALSE, corrected_capital );
++    ok( has_suggestion( checker, L"wineprobeac", L"wineprobereplacement", &count ), "no correction\n" );
++    ok( count == 1, "got %u\n", count );
++
++    list_path( 2, path );
++    data = read_file( path, &size );
++    ok( data != NULL, "no %s\n", debugstr_w(path) );
++    if (data)
++    {
++        ok( size >= 2 && data[0] == 0xff && data[1] == 0xfe, "no byte order mark\n" );
++        text = (WCHAR *)(data + 2);
++        ok( wcsstr( text, L"wineprobeac|wineprobereplacement\r\n" ) != NULL, "got %s\n", debugstr_w(text) );
++        free( data );
++    }
++
++    hr = ISpellChecker_remove_SpellCheckerChanged( checker, cookie );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ISpellChecker_Release( other );
++}
++
++/* whether a word is right, as it is once a change is taken in */
++static BOOL wait_word_right( ISpellChecker *checker, const WCHAR *word, BOOL right )
++{
++    IEnumSpellingError *errors;
++    ISpellingError *error;
++    DWORD start = GetTickCount();
++    BOOL ret;
++
++    do
++    {
++        if (FAILED(ISpellChecker_Check( checker, word, &errors ))) return FALSE;
++        ret = IEnumSpellingError_Next( errors, &error ) != S_OK;
++        if (!ret) ISpellingError_Release( error );
++        IEnumSpellingError_Release( errors );
++        if (ret == right) return TRUE;
++        Sleep( 100 );
++    } while (GetTickCount() - start < 5000);
++    return FALSE;
++}
++
++static void test_user_dictionaries( ISpellCheckerFactory *factory, ISpellChecker *checker )
++{
++    IUserDictionariesRegistrar *registrar;
++    WCHAR temp[MAX_PATH], path[MAX_PATH];
++    DWORD written;
++    HANDLE file;
++    HRESULT hr;
++
++    ISpellCheckerFactory_QueryInterface( factory, &IID_IUserDictionariesRegistrar, (void **)&registrar );
++    GetTempPathW( ARRAY_SIZE(temp), temp );
++    swprintf( path, ARRAY_SIZE(path), L"%swineprobe.dic", temp );
++    file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    WriteFile( file, L"\xfeffwineprobeuser\r\n", 16 * sizeof(WCHAR), &written, NULL );
++    CloseHandle( file );
++
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, NULL, L"en-US" );
++    ok( hr == E_POINTER, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, NULL );
++    ok( hr == E_POINTER, "got %#lx\n", hr );
++    ok( wait_word_right( checker, L"wineprobeuser", FALSE ), "wineprobeuser right\n" );
++    /* with no language, for every language, as Office registers its custom dictionary */
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"" );
++    ok( hr == S_FALSE, "got %#lx\n", hr );
++    ok( wait_word_right( checker, L"wineprobeuser", TRUE ), "wineprobeuser not right\n" );
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"en-US" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"EN-us" );
++    ok( hr == S_FALSE, "got %#lx\n", hr );
++    /* any language */
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"xx-XX" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_UnregisterUserDictionary( registrar, path, L"xx-XX" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_UnregisterUserDictionary( registrar, path, L"" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_UnregisterUserDictionary( registrar, path, L"en-US" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUserDictionariesRegistrar_UnregisterUserDictionary( registrar, path, L"en-US" );
++    ok( hr == S_FALSE, "got %#lx\n", hr );
++    ok( wait_word_right( checker, L"wineprobeuser", FALSE ), "wineprobeuser still right\n" );
++    DeleteFileW( path );
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"en-US" );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    swprintf( path, ARRAY_SIZE(path), L"%swineprobe.txt", temp );
++    file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    CloseHandle( file );
++    hr = IUserDictionariesRegistrar_RegisterUserDictionary( registrar, path, L"en-US" );
++    ok( hr == E_INVALIDARG, "got %#lx\n", hr );
++    DeleteFileW( path );
++    IUserDictionariesRegistrar_Release( registrar );
++}
++
++START_TEST(spellcheck)
++{
++    ISpellCheckerFactory *factory;
++    ISpellChecker *checker;
++    BOOL supported = FALSE;
++    HRESULT hr;
++
++    CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    hr = CoCreateInstance( &CLSID_SpellCheckerFactory, NULL, CLSCTX_INPROC_SERVER, &IID_ISpellCheckerFactory,
++                           (void **)&factory );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    if (FAILED(hr))
++    {
++        CoUninitialize();
++        return;
++    }
++    ISpellCheckerFactory_IsSupported( factory, L"en-US", &supported );
++    if (!supported)
++    {
++        skip( "no en-US dictionary\n" );
++        ISpellCheckerFactory_Release( factory );
++        CoUninitialize();
++        return;
++    }
++    test_factory( factory );
++    hr = ISpellCheckerFactory_CreateSpellChecker( factory, L"en-US", &checker );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    test_checker( checker );
++    save_lists();
++    test_word_lists( factory, checker );
++    restore_lists();
++    test_user_dictionaries( factory, checker );
++    ISpellChecker_Release( checker );
++    ISpellCheckerFactory_Release( factory );
++    CoUninitialize();
++}
+diff --git a/dlls/msspellcheckingfacility/unixlib.c b/dlls/msspellcheckingfacility/unixlib.c
+new file mode 100644
+index 00000000000..24a5a6d086a
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/unixlib.c
+@@ -0,0 +1,319 @@
++/*
++ * The host's spell checker: Hunspell and its dictionaries
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <dirent.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#include "unixlib.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(spell);
++
++/* Hunspell's C interface, which has been the same since 1.2 */
++typedef struct Hunhandle Hunhandle;
++static Hunhandle *(*pHunspell_create)( const char *aff, const char *dic );
++static void (*pHunspell_destroy)( Hunhandle *handle );
++static int (*pHunspell_spell)( Hunhandle *handle, const char *word );
++static char *(*pHunspell_get_dic_encoding)( Hunhandle *handle );
++static int (*pHunspell_suggest)( Hunhandle *handle, char ***list, const char *word );
++static void (*pHunspell_free_list)( Hunhandle *handle, char ***list, int count );
++static int (*pHunspell_add)( Hunhandle *handle, const char *word );
++static int (*pHunspell_remove)( Hunhandle *handle, const char *word );
++
++static pthread_once_t init_once = PTHREAD_ONCE_INIT;
++static void *libhunspell;
++
++static void load_hunspell(void)
++{
++    static const char *names[] =
++    {
++#ifdef __APPLE__
++        "libhunspell-1.7.0.dylib", "libhunspell-1.6.0.dylib", "libhunspell.dylib",
++#else
++        "libhunspell-1.7.so.0", "libhunspell-1.6.so.0", "libhunspell-1.5.so.0", "libhunspell.so",
++#endif
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(names) && !libhunspell; i++) libhunspell = dlopen( names[i], RTLD_NOW );
++    if (!libhunspell)
++    {
++        WARN( "no Hunspell library: there is no spell checker\n" );
++        return;
++    }
++#define LOAD(name) if (!(p##name = dlsym( libhunspell, #name ))) goto fail
++    LOAD(Hunspell_create);
++    LOAD(Hunspell_destroy);
++    LOAD(Hunspell_spell);
++    LOAD(Hunspell_get_dic_encoding);
++    LOAD(Hunspell_suggest);
++    LOAD(Hunspell_free_list);
++    LOAD(Hunspell_add);
++    LOAD(Hunspell_remove);
++#undef LOAD
++    return;
++fail:
++    WARN( "Hunspell has no %s\n", dlerror() );
++    dlclose( libhunspell );
++    libhunspell = NULL;
++}
++
++static BOOL hunspell_loaded(void)
++{
++    pthread_once( &init_once, load_hunspell );
++    return libhunspell != NULL;
++}
++
++/* where distributions put the dictionaries, after those DICPATH names, as hunspell itself looks */
++static const char *dictionary_dirs[] =
++{
++    "/usr/share/hunspell", "/usr/local/share/hunspell", "/usr/share/myspell", "/usr/share/myspell/dicts",
++    "/usr/local/share/myspell", "/opt/homebrew/share/hunspell", "/Library/Spelling",
++};
++
++/* a dictionary's name is a language, en, or a language and a region, en_US; hyphenation patterns and thesauri
++ * share the directory with other names */
++static BOOL is_dictionary_name( const char *name, size_t len )
++{
++    size_t i = 0;
++
++    while (i < len && name[i] >= 'a' && name[i] <= 'z') i++;
++    if (i < 2 || i > 3) return FALSE;
++    if (i == len) return TRUE;
++    if (name[i++] != '_' || len - i != 2) return FALSE;
++    for (; i < len; i++) if (name[i] < 'A' || name[i] > 'Z') return FALSE;
++    return TRUE;
++}
++
++/* call back for each directory to look in */
++static void for_each_dictionary_dir( void (*func)( const char *dir, void *context ), void *context )
++{
++    const char *dicpath = getenv( "DICPATH" );
++    unsigned int i;
++
++    if (dicpath)
++    {
++        char *copy = strdup( dicpath ), *dir, *next;
++
++        for (dir = copy; dir && *dir; dir = next)
++        {
++            if ((next = strchr( dir, ':' ))) *next++ = 0;
++            func( dir, context );
++        }
++        free( copy );
++    }
++    for (i = 0; i < ARRAY_SIZE(dictionary_dirs); i++) func( dictionary_dirs[i], context );
++}
++
++/* the path of a dictionary's file, if the directory has both of its files */
++static BOOL dictionary_files( const char *dir, const char *name, char *aff, char *dic, size_t size )
++{
++    struct stat st;
++
++    if ((size_t)snprintf( aff, size, "%s/%s.aff", dir, name ) >= size) return FALSE;
++    if ((size_t)snprintf( dic, size, "%s/%s.dic", dir, name ) >= size) return FALSE;
++    return !stat( aff, &st ) && S_ISREG( st.st_mode ) && !stat( dic, &st ) && S_ISREG( st.st_mode );
++}
++
++struct name_list
++{
++    char  *buffer;
++    UINT32 size;
++    UINT32 needed;
++};
++
++static BOOL list_has( const struct name_list *list, const char *name )
++{
++    const char *p = list->buffer;
++    UINT32 pos = 0;
++
++    while (pos < list->needed && pos < list->size && p[pos])
++    {
++        if (!strcmp( p + pos, name )) return TRUE;
++        pos += strlen( p + pos ) + 1;
++    }
++    return FALSE;
++}
++
++static void list_add( struct name_list *list, const char *name )
++{
++    size_t len = strlen( name ) + 1;
++
++    if (list->needed + len <= list->size) memcpy( list->buffer + list->needed, name, len );
++    list->needed += len;
++}
++
++static void add_dir_dictionaries( const char *dir, void *context )
++{
++    struct name_list *list = context;
++    char aff[4096], dic[4096], name[32];
++    struct dirent *de;
++    DIR *d;
++
++    if (!(d = opendir( dir ))) return;
++    while ((de = readdir( d )))
++    {
++        size_t len = strlen( de->d_name );
++
++        if (len < 5 || strcmp( de->d_name + len - 4, ".dic" )) continue;
++        len -= 4;
++        if (len >= sizeof(name) || !is_dictionary_name( de->d_name, len )) continue;
++        memcpy( name, de->d_name, len );
++        name[len] = 0;
++        if (list_has( list, name ) || !dictionary_files( dir, name, aff, dic, sizeof(aff) )) continue;
++        list_add( list, name );
++    }
++    closedir( d );
++}
++
++static NTSTATUS list_dictionaries( void *args )
++{
++    struct list_dictionaries_params *params = args;
++    struct name_list list = { (void *)(UINT_PTR)params->buffer, params->size, 0 };
++
++    if (hunspell_loaded()) for_each_dictionary_dir( add_dir_dictionaries, &list );
++    list_add( &list, "" );
++    params->needed = list.needed;
++    return list.needed <= list.size ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL;
++}
++
++struct find_dictionary
++{
++    const char *name;
++    Hunhandle  *handle;
++};
++
++static void open_dir_dictionary( const char *dir, void *context )
++{
++    struct find_dictionary *find = context;
++    char aff[4096], dic[4096];
++
++    if (find->handle || !dictionary_files( dir, find->name, aff, dic, sizeof(aff) )) return;
++    find->handle = pHunspell_create( aff, dic );
++    TRACE( "%s from %s: %p\n", find->name, dir, find->handle );
++}
++
++static NTSTATUS open_dictionary( void *args )
++{
++    struct open_dictionary_params *params = args;
++    struct find_dictionary find = { params->name, NULL };
++    const char *encoding;
++
++    params->handle = 0;
++    params->name[sizeof(params->name) - 1] = 0;
++    if (!hunspell_loaded() || !is_dictionary_name( params->name, strlen( params->name ) ))
++        return STATUS_NOT_FOUND;
++    for_each_dictionary_dir( open_dir_dictionary, &find );
++    if (!find.handle) return STATUS_NOT_FOUND;
++    params->handle = (UINT_PTR)find.handle;
++    encoding = pHunspell_get_dic_encoding( find.handle );
++    snprintf( params->encoding, sizeof(params->encoding), "%s", encoding ? encoding : "ISO8859-1" );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS close_dictionary( void *args )
++{
++    struct close_dictionary_params *params = args;
++
++    if (params->handle) pHunspell_destroy( (Hunhandle *)(UINT_PTR)params->handle );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS spell( void *args )
++{
++    struct spell_params *params = args;
++
++    params->correct = pHunspell_spell( (Hunhandle *)(UINT_PTR)params->handle, (void *)(UINT_PTR)params->word ) != 0;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS suggest( void *args )
++{
++    struct suggest_params *params = args;
++    Hunhandle *handle = (Hunhandle *)(UINT_PTR)params->handle;
++    struct name_list list = { (void *)(UINT_PTR)params->buffer, params->size, 0 };
++    char **words = NULL;
++    int i, count;
++
++    count = pHunspell_suggest( handle, &words, (void *)(UINT_PTR)params->word );
++    for (i = 0; i < count; i++) list_add( &list, words[i] );
++    if (words) pHunspell_free_list( handle, &words, count );
++    list_add( &list, "" );
++    params->needed = list.needed;
++    return list.needed <= list.size ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL;
++}
++
++static NTSTATUS add_word( void *args )
++{
++    struct word_params *params = args;
++
++    pHunspell_add( (Hunhandle *)(UINT_PTR)params->handle, (void *)(UINT_PTR)params->word );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS remove_word( void *args )
++{
++    struct word_params *params = args;
++
++    pHunspell_remove( (Hunhandle *)(UINT_PTR)params->handle, (void *)(UINT_PTR)params->word );
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    list_dictionaries,
++    open_dictionary,
++    close_dictionary,
++    spell,
++    suggest,
++    add_word,
++    remove_word,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
++
++#ifdef _WIN64
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    list_dictionaries,
++    open_dictionary,
++    close_dictionary,
++    spell,
++    suggest,
++    add_word,
++    remove_word,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
++
++#endif /* _WIN64 */
+diff --git a/dlls/msspellcheckingfacility/unixlib.h b/dlls/msspellcheckingfacility/unixlib.h
+new file mode 100644
+index 00000000000..b7e8dc90f44
+--- /dev/null
++++ b/dlls/msspellcheckingfacility/unixlib.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_MSSPELLCHECKINGFACILITY_UNIXLIB_H
++#define __WINE_MSSPELLCHECKINGFACILITY_UNIXLIB_H
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "wine/unixlib.h"
++
++/* The host's dictionaries are Hunspell's.  Pointers and handles are 64-bit fields throughout, so that a 32-bit
++ * caller hands over the same layout. */
++
++/* the dictionaries found: their names (en_US, de_DE...), one after the other, each ending in a null, and a null
++ * after the last */
++struct list_dictionaries_params
++{
++    UINT64 buffer;      /* in: where the names go */
++    UINT32 size;        /* in: its size */
++    UINT32 needed;      /* out: the size the names need */
++};
++
++struct open_dictionary_params
++{
++    char   name[32];    /* in: the dictionary's name, en_US */
++    UINT64 handle;      /* out: 0 if it cannot be opened */
++    char   encoding[32];/* out: the encoding of its words, UTF-8 or ISO8859-1 say */
++};
++
++struct close_dictionary_params
++{
++    UINT64 handle;
++};
++
++/* a word, in the dictionary's encoding and ending in a null */
++struct spell_params
++{
++    UINT64 handle;
++    UINT64 word;
++    UINT32 correct;     /* out */
++};
++
++/* suggestions, as list_dictionaries gives names */
++struct suggest_params
++{
++    UINT64 handle;
++    UINT64 word;
++    UINT64 buffer;
++    UINT32 size;
++    UINT32 needed;      /* out */
++};
++
++/* a word the dictionary takes as right, or no longer takes, for as long as it is open */
++struct word_params
++{
++    UINT64 handle;
++    UINT64 word;
++};
++
++enum msspellcheckingfacility_funcs
++{
++    unix_list_dictionaries,
++    unix_open_dictionary,
++    unix_close_dictionary,
++    unix_spell,
++    unix_suggest,
++    unix_add_word,
++    unix_remove_word,
++    unix_funcs_count
++};
++
++#endif /* __WINE_MSSPELLCHECKINGFACILITY_UNIXLIB_H */
+diff --git a/include/Makefile.in b/include/Makefile.in
+index e06daf6dd0d..bc46f339d13 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -914,6 +914,7 @@ SOURCES = \
+ 	spatialaudioclient.idl \
+ 	specstrings.h \
+ 	specstrings_strict.h \
++	spellcheck.idl \
+ 	sperror.h \
+ 	sql.h \
+ 	sqlext.h \
+diff --git a/include/spellcheck.idl b/include/spellcheck.idl
+new file mode 100644
+index 00000000000..75ba09d3570
+--- /dev/null
++++ b/include/spellcheck.idl
+@@ -0,0 +1,159 @@
++/*
++ * Spell checking API
++ *
++ * Copyright 2026 the Wine Altars project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++import "oaidl.idl";
++import "ocidl.idl";
++import "objidl.idl";
++
++typedef enum WORDLIST_TYPE
++{
++    WORDLIST_TYPE_IGNORE = 0,
++    WORDLIST_TYPE_ADD = 1,
++    WORDLIST_TYPE_EXCLUDE = 2,
++    WORDLIST_TYPE_AUTOCORRECT = 3
++} WORDLIST_TYPE;
++
++typedef enum CORRECTIVE_ACTION
++{
++    CORRECTIVE_ACTION_NONE = 0,
++    CORRECTIVE_ACTION_GET_SUGGESTIONS = 1,
++    CORRECTIVE_ACTION_REPLACE = 2,
++    CORRECTIVE_ACTION_DELETE = 3
++} CORRECTIVE_ACTION;
++
++[
++    object,
++    uuid(b7c82d61-fbe8-4b47-9b27-6c0d2e0de0a3),
++    pointer_default(unique)
++]
++interface ISpellingError : IUnknown
++{
++    [propget] HRESULT StartIndex([out, retval] ULONG *val);
++    [propget] HRESULT Length([out, retval] ULONG *val);
++    [propget] HRESULT CorrectiveAction([out, retval] CORRECTIVE_ACTION *val);
++    [propget] HRESULT Replacement([out, retval, string] LPWSTR *val);
++}
++
++[
++    object,
++    uuid(803e3bd4-2828-4410-8290-418d1d73c762),
++    pointer_default(unique)
++]
++interface IEnumSpellingError : IUnknown
++{
++    HRESULT Next([out] ISpellingError **value);
++}
++
++[
++    object,
++    uuid(432e5f85-35cf-4606-a801-6f70277e1d7a),
++    pointer_default(unique)
++]
++interface IOptionDescription : IUnknown
++{
++    [propget] HRESULT Id([out, retval, string] LPWSTR *val);
++    [propget] HRESULT Heading([out, retval, string] LPWSTR *val);
++    [propget] HRESULT Description([out, retval, string] LPWSTR *val);
++    [propget] HRESULT Labels([out, retval] IEnumString **val);
++}
++
++interface ISpellChecker;
++
++[
++    object,
++    uuid(0b83a5b0-792f-4eab-9799-acf52c5ed08a),
++    pointer_default(unique)
++]
++interface ISpellCheckerChangedEventHandler : IUnknown
++{
++    HRESULT Invoke([in] ISpellChecker *sender);
++}
++
++[
++    object,
++    uuid(b6fd0b71-e2bc-4653-8d05-f197e412770b),
++    pointer_default(unique)
++]
++interface ISpellChecker : IUnknown
++{
++    [propget] HRESULT LanguageTag([out, retval, string] LPWSTR *val);
++    HRESULT Check([in, string] LPCWSTR text, [out, retval] IEnumSpellingError **value);
++    HRESULT Suggest([in, string] LPCWSTR word, [out, retval] IEnumString **value);
++    HRESULT Add([in, string] LPCWSTR word);
++    HRESULT Ignore([in, string] LPCWSTR word);
++    HRESULT AutoCorrect([in, string] LPCWSTR from, [in, string] LPCWSTR to);
++    HRESULT GetOptionValue([in, string] LPCWSTR option_id, [out, retval] BYTE *val);
++    [propget] HRESULT OptionIds([out, retval] IEnumString **val);
++    [propget] HRESULT Id([out, retval, string] LPWSTR *val);
++    [propget] HRESULT LocalizedName([out, retval, string] LPWSTR *val);
++    HRESULT add_SpellCheckerChanged([in] ISpellCheckerChangedEventHandler *handler, [out, retval] DWORD *event_cookie);
++    HRESULT remove_SpellCheckerChanged([in] DWORD event_cookie);
++    HRESULT GetOptionDescription([in, string] LPCWSTR option_id, [out, retval] IOptionDescription **value);
++    HRESULT ComprehensiveCheck([in, string] LPCWSTR text, [out, retval] IEnumSpellingError **value);
++}
++
++[
++    object,
++    uuid(e7ed1c71-87f7-4378-a840-c9200dacee47),
++    pointer_default(unique)
++]
++interface ISpellChecker2 : ISpellChecker
++{
++    HRESULT Remove([in, string] LPCWSTR word);
++}
++
++[
++    object,
++    uuid(8e018a9d-2415-4677-bf08-794ea61f94bb),
++    pointer_default(unique)
++]
++interface ISpellCheckerFactory : IUnknown
++{
++    [propget] HRESULT SupportedLanguages([out, retval] IEnumString **value);
++    HRESULT IsSupported([in, string] LPCWSTR language_tag, [out, retval] BOOL *value);
++    HRESULT CreateSpellChecker([in, string] LPCWSTR language_tag, [out, retval] ISpellChecker **value);
++}
++
++[
++    object,
++    uuid(aa176b85-0e12-4844-8e1a-eef1da77f586),
++    pointer_default(unique)
++]
++interface IUserDictionariesRegistrar : IUnknown
++{
++    HRESULT RegisterUserDictionary([in, string] LPCWSTR dictionary_path, [in, string] LPCWSTR language_tag);
++    HRESULT UnregisterUserDictionary([in, string] LPCWSTR dictionary_path, [in, string] LPCWSTR language_tag);
++}
++
++[
++    uuid(4a250e01-61ea-400b-a27d-bf3744bcc9f5),
++    version(1.0)
++]
++library MsSpellCheckLib
++{
++    [
++        uuid(7ab36653-1796-484b-bdfa-e74f1db7c1dc)
++    ]
++    coclass SpellCheckerFactory
++    {
++        [default] interface ISpellCheckerFactory;
++        interface IUserDictionariesRegistrar;
++    }
++}
+diff --git a/libs/uuid/uuid.c b/libs/uuid/uuid.c
+index d1fef42140d..f31b9bf7802 100644
+--- a/libs/uuid/uuid.c
++++ b/libs/uuid/uuid.c
+@@ -102,6 +102,7 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+ #include "devguid.h"
+ #include "propkey.h"
+ #include "thumbcache.h"
++#include "spellcheck.h"
+ 
+ #define __WINE_INIT_NPI_MODULEID
+ #include "netiodef.h"
+diff --git a/po/zh_CN.po b/po/zh_CN.po
+index 9ecaf000e1e..81946b570ad 100644
+--- a/po/zh_CN.po
++++ b/po/zh_CN.po
+@@ -21542,3 +21542,7 @@ msgstr "无效的 include 文件\n"
+ #: dlls/wmiutils/wmiutils.mc
+ msgid "Invalid DeleteClass syntax\n"
+ msgstr "无效的 DeleteClass 语法\n"
++
++#: dlls/msspellcheckingfacility/msspellcheckingfacility.rc
++msgid "Microsoft Windows Spell Checker"
++msgstr "Microsoft Windows 拼写检查器"

@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 00:32:05 -0400
+Subject: [PATCH] ntdll, server: Take FILE_WRITE_ATTRIBUTES to set a file's
+ times and attributes, and keep attributes given as zero.
+
+Setting FileBasicInformation needed no access right at all, and FileAttributes 0, which means "leave
+them", cleared the hidden and system attributes and made a read-only file writable: SetFileTime()
+sends it, so setting a hidden file's time showed it.  The fd cache now keeps FILE_WRITE_ATTRIBUTES
+next to the data rights, in the bit the file type did not use.
+
+A read-only file could not be opened for FILE_WRITE_ATTRIBUTES at all, as the server opened it for
+Unix write; fchmod() and futimens() need no more than a read-only descriptor, so only truncating
+still asks for one.  SetFileAttributesW() opens the file for FILE_WRITE_ATTRIBUTES as Windows does.
+
+The eighteen SetFileTime todos of kernel32's test_CreateFile pass.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/file.c b/dlls/kernel32/tests/file.c
+index 627471f82f8..393a47ded47 100644
+--- a/dlls/kernel32/tests/file.c
++++ b/dlls/kernel32/tests/file.c
+@@ -4784,11 +4784,8 @@ static void test_CreateFile(void)
+                 ok(ret, "%ld: SetFileTime error %ld\n", i, GetLastError());
+             else
+             {
+-                todo_wine
+-                {
+                 ok(!ret, "%ld: SetFileTime should fail\n", i);
+                 ok(GetLastError() == ERROR_ACCESS_DENIED, "%ld: expected ERROR_ACCESS_DENIED, got %ld\n", i, GetLastError());
+-                }
+             }
+             CloseHandle(hfile);
+         }
+diff --git a/dlls/kernelbase/file.c b/dlls/kernelbase/file.c
+index 3b4bfc165da..a559bab9681 100644
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -3074,7 +3074,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetFileAttributesW( LPCWSTR name, DWORD attributes
+     }
+ 
+     InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+-    status = NtOpenFile( &handle, SYNCHRONIZE, &attr, &io, 0,
++    status = NtOpenFile( &handle, FILE_WRITE_ATTRIBUTES | SYNCHRONIZE, &attr, &io, 0,
+                          FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT );
+     RtlFreeUnicodeString( &nt_name );
+ 
+diff --git a/dlls/ntdll/tests/file.c b/dlls/ntdll/tests/file.c
+index 53af9b896ef..e28bd2c94f9 100644
+--- a/dlls/ntdll/tests/file.c
++++ b/dlls/ntdll/tests/file.c
+@@ -1601,6 +1601,22 @@ static void test_file_basic_information(void)
+     ok ( res == STATUS_SUCCESS, "can't get hidden attribute\n");
+     ok ( (fbi.FileAttributes & attrib_mask) == FILE_ATTRIBUTE_HIDDEN, "attribute %lx not FILE_ATTRIBUTE_HIDDEN\n", fbi.FileAttributes );
+ 
++    /* setting only a time leaves the attributes */
++    fbi2 = fbi;
++    fbi2.CreationTime.QuadPart = fbi2.LastAccessTime.QuadPart = fbi2.ChangeTime.QuadPart = 0;
++    fbi2.LastWriteTime.QuadPart -= 10000000;
++    fbi2.FileAttributes = 0;
++    io.Status = 0xdeadbeef;
++    res = pNtSetInformationFile(h, &io, &fbi2, sizeof fbi2, FileBasicInformation);
++    ok ( res == STATUS_SUCCESS, "can't set write time, NtSetInformationFile returned %x\n", res );
++    ok ( io.Status == STATUS_SUCCESS, "can't set write time, io.Status is %lx\n", io.Status );
++    memset(&fbi, 0, sizeof(fbi));
++    res = pNtQueryInformationFile(h, &io, &fbi, sizeof fbi, FileBasicInformation);
++    ok ( res == STATUS_SUCCESS, "can't get attributes\n");
++    ok ( (fbi.FileAttributes & attrib_mask) == FILE_ATTRIBUTE_HIDDEN, "attribute %lx not FILE_ATTRIBUTE_HIDDEN\n", fbi.FileAttributes );
++    ok ( fbi.LastWriteTime.QuadPart == fbi2.LastWriteTime.QuadPart, "write time %s, set %s\n",
++         wine_dbgstr_longlong(fbi.LastWriteTime.QuadPart), wine_dbgstr_longlong(fbi2.LastWriteTime.QuadPart) );
++
+     /* Check NORMAL last of all (to make sure we can clear attributes) */
+     memset(&fbi, 0, sizeof(fbi));
+     fbi.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+@@ -1617,6 +1633,45 @@ static void test_file_basic_information(void)
+     CloseHandle( h );
+ }
+ 
++static void test_file_basic_information_access(void)
++{
++    char path[MAX_PATH], name[MAX_PATH];
++    FILE_BASIC_INFORMATION fbi;
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++    HANDLE h;
++
++    GetTempPathA( MAX_PATH, path );
++    GetTempFileNameA( path, "fbi", 0, name );
++
++    /* setting the basic information takes FILE_WRITE_ATTRIBUTES */
++    h = CreateFileA( name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, 0 );
++    ok( h != INVALID_HANDLE_VALUE, "failed to open %s, error %lu\n", name, GetLastError() );
++    memset( &fbi, 0, sizeof(fbi) );
++    fbi.FileAttributes = FILE_ATTRIBUTE_HIDDEN;
++    status = pNtSetInformationFile( h, &io, &fbi, sizeof(fbi), FileBasicInformation );
++    ok( status == STATUS_ACCESS_DENIED, "got %#lx\n", status );
++    fbi.FileAttributes = 0;
++    status = pNtSetInformationFile( h, &io, &fbi, sizeof(fbi), FileBasicInformation );
++    ok( status == STATUS_ACCESS_DENIED, "got %#lx\n", status );
++    CloseHandle( h );
++    ok( !(GetFileAttributesA( name ) & FILE_ATTRIBUTE_HIDDEN), "file is hidden\n" );
++
++    /* a read-only file can be opened to write its attributes, and made writable */
++    ok( SetFileAttributesA( name, FILE_ATTRIBUTE_READONLY ), "SetFileAttributes failed, error %lu\n", GetLastError() );
++    h = CreateFileA( name, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, 0 );
++    ok( h != INVALID_HANDLE_VALUE, "failed to open %s for its attributes, error %lu\n", name, GetLastError() );
++    memset( &fbi, 0, sizeof(fbi) );
++    fbi.FileAttributes = FILE_ATTRIBUTE_NORMAL;
++    status = pNtSetInformationFile( h, &io, &fbi, sizeof(fbi), FileBasicInformation );
++    ok( !status, "got %#lx\n", status );
++    CloseHandle( h );
++    ok( !(GetFileAttributesA( name ) & FILE_ATTRIBUTE_READONLY), "file is still read-only\n" );
++
++    SetFileAttributesA( name, FILE_ATTRIBUTE_NORMAL );
++    DeleteFileA( name );
++}
++
+ static void test_file_all_information(void)
+ {
+     IO_STATUS_BLOCK io;
+@@ -8474,6 +8529,7 @@ START_TEST(file)
+     test_set_io_completion_ex();
+     test_file_io_completion();
+     test_file_basic_information();
++    test_file_basic_information_access();
+     test_file_all_information();
+     test_file_both_information();
+     test_file_name_information();
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index eb894c62dc0..4f165a5e94d 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5363,7 +5363,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             LARGE_INTEGER mtime, atime;
+             char *unix_name;
+ 
+-            if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
++            if ((status = server_get_unix_fd( handle, FILE_WRITE_ATTRIBUTES, &fd, &needs_close, NULL, NULL )))
+                 return io->Status = status;
+ 
+             if (server_get_unix_name( handle, &unix_name )) unix_name = NULL;
+@@ -5374,7 +5374,8 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+             if (atime.QuadPart || mtime.QuadPart)
+                 status = set_file_times( fd, &mtime, &atime );
+ 
+-            if (status == STATUS_SUCCESS)
++            /* no attributes leave them as they are, as setting only the times does */
++            if (status == STATUS_SUCCESS && info->FileAttributes)
+                 status = fd_set_file_info( fd, info->FileAttributes,
+                                            unix_name && is_hidden_file( unix_name ));
+ 
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index fa9138d2bf6..ca2671852e1 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1042,12 +1042,28 @@ union fd_cache_entry
+     struct
+     {
+         int fd;
+-        enum server_fd_type type : 5;
+-        unsigned int        access : 3;
++        enum server_fd_type type : 4;
++        unsigned int        access : 4;  /* FD_CACHE_ACCESS, as cache_access() packs it */
+         unsigned int        options : 24;
+     } s;
+ };
+ 
++/* the access rights that server_get_unix_fd() checks: the data rights, and the right to write the
++ * attributes, which the cache keeps in its fourth bit */
++#define FD_CACHE_ACCESS (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES)
++
++static inline unsigned int cache_access( unsigned int access )
++{
++    return (access & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA)) |
++           ((access & FILE_WRITE_ATTRIBUTES) ? 8 : 0);
++}
++
++static inline unsigned int uncache_access( unsigned int bits )
++{
++    return (bits & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA)) |
++           ((bits & 8) ? FILE_WRITE_ATTRIBUTES : 0);
++}
++
+ C_ASSERT( sizeof(union fd_cache_entry) == sizeof(LONG64) );
+ 
+ #define FD_CACHE_BLOCK_SIZE  (65536 / sizeof(union fd_cache_entry))
+@@ -1096,7 +1112,7 @@ static BOOL add_fd_to_cache( HANDLE handle, int fd, enum server_fd_type type,
+     /* store fd+1 so that 0 can be used as the unset value */
+     cache.s.fd = fd + 1;
+     cache.s.type = type;
+-    cache.s.access = access;
++    cache.s.access = cache_access( access );
+     cache.s.options = options;
+     cache.data = interlocked_xchg64( &fd_cache[entry][idx].data, cache.data );
+     assert( !cache.s.fd );
+@@ -1123,7 +1139,7 @@ static inline NTSTATUS get_cached_fd( HANDLE handle, int *fd, enum server_fd_typ
+ 
+     *fd = cache.s.fd - 1;
+     if (type) *type = cache.s.type;
+-    if (access) *access = cache.s.access;
++    if (access) *access = uncache_access( cache.s.access );
+     if (options) *options = cache.s.options;
+     return STATUS_SUCCESS;
+ }
+@@ -1163,7 +1179,7 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+ 
+     *unix_fd = -1;
+     *needs_close = 0;
+-    wanted_access &= FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA;
++    wanted_access &= FD_CACHE_ACCESS;
+ 
+     ret = get_cached_fd( handle, &fd, type, &access, options );
+     if (ret != STATUS_INVALID_HANDLE) goto done;
+diff --git a/server/fd.c b/server/fd.c
+index b246b150d11..198f7e71a48 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2006,6 +2006,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+     struct closed_fd *closed_fd;
+     struct fd *fd;
+     int root_fd = -1;
++    unsigned int unix_write_access;
+     int rw_mode;
+     char *path;
+ 
+@@ -2050,7 +2051,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+         flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+     }
+ 
+-    if ((access & FILE_UNIX_WRITE_ACCESS) && !(options & FILE_DIRECTORY_FILE))
++    /* the attributes of a read-only file can be written, with fchmod() and futimens(), which need no
++     * more than a read-only descriptor; overwriting it asks for write access to its attributes and
++     * has to fail as writing its data does */
++    unix_write_access = access & FILE_UNIX_WRITE_ACCESS;
++    if (!(flags & O_TRUNC)) unix_write_access &= ~FILE_WRITE_ATTRIBUTES;
++
++    if (unix_write_access && !(options & FILE_DIRECTORY_FILE))
+     {
+         if (access & FILE_UNIX_READ_ACCESS) rw_mode = O_RDWR;
+         else rw_mode = O_WRONLY;
+@@ -2062,7 +2069,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+         /* if we tried to open a directory for write access, retry read-only */
+         if (errno == EISDIR)
+         {
+-            if ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT))
++            if (unix_write_access || (flags & O_CREAT))
+                 fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
+         }
+ 

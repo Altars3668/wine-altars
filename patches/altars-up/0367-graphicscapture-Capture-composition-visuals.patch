@@ -1,0 +1,2367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 06:43:14 -0400
+Subject: [PATCH] graphicscapture: Capture composition visuals.
+
+Office's AirSpace captures a visual for its grid animations with
+GraphicsCaptureItem.CreateFromVisual, a free-threaded
+Direct3D11CaptureFramePool and a session, and fails fast on nearly any
+unexpected answer along the way; without the class it took another
+path.
+
+An item takes a visual of Wine's composition, and has its size.  A pool
+keeps its buffers on the device it was made with; a buffer is free,
+drawn into, ready, or held by a frame until the frame is closed.  Each
+frame drawn raises FrameArrived once, on the thread pool for a pool made
+free-threaded, through the dispatcher queue of the thread that made it
+otherwise.  A session draws the item into the pool from StartCapture
+until closed.  Windows and displays cannot be captured yet, and
+IsSupported still says so.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/graphicscapture/Makefile.in b/dlls/graphicscapture/Makefile.in
+index c17d4a448a8..4a85c8dcca0 100644
+--- a/dlls/graphicscapture/Makefile.in
++++ b/dlls/graphicscapture/Makefile.in
+@@ -1,7 +1,9 @@
+ MODULE  = graphicscapture.dll
+-IMPORTS = combase
++IMPORTS = combase d3d11
+ 
+ SOURCES = \
+ 	classes.idl \
++	framepool.c \
++	item.c \
+ 	main.c \
+ 	session.c
+diff --git a/dlls/graphicscapture/classes.idl b/dlls/graphicscapture/classes.idl
+index 73c05124843..73265f8da06 100644
+--- a/dlls/graphicscapture/classes.idl
++++ b/dlls/graphicscapture/classes.idl
+@@ -24,5 +24,7 @@
+ import "windows.graphics.capture.idl";
+ 
+ namespace Windows.Graphics.Capture {
++    runtimeclass Direct3D11CaptureFramePool;
++    runtimeclass GraphicsCaptureItem;
+     runtimeclass GraphicsCaptureSession;
+ }
+diff --git a/dlls/graphicscapture/framepool.c b/dlls/graphicscapture/framepool.c
+new file mode 100644
+index 00000000000..875f2f96379
+--- /dev/null
++++ b/dlls/graphicscapture/framepool.c
+@@ -0,0 +1,1060 @@
++/*
++ * Windows.Graphics.Capture.Direct3D11CaptureFramePool and Direct3D11CaptureFrame
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(capture);
++
++/*
++ * A pool keeps the textures frames are drawn into.  A buffer is free, being
++ * drawn into by the composition, ready (drawn, waiting in the queue
++ * TryGetNextFrame takes from), or held by a frame until the frame is closed
++ * or released.  With no buffer free no frame is drawn.  FrameArrived is raised
++ * once for each frame drawn: on a thread of the thread pool for a pool made
++ * free-threaded, on the thread the pool was made on otherwise, through its
++ * dispatcher queue.
++ */
++enum buffer_state
++{
++    BUFFER_FREE,
++    BUFFER_DRAWING,
++    BUFFER_READY,
++    BUFFER_HELD,
++};
++
++struct buffer
++{
++    ID3D11Texture2D *texture;
++    enum buffer_state state;
++    struct list entry;          /* in the ready queue */
++    UINT width, height;         /* of what was drawn */
++    LONGLONG time;
++};
++
++struct frame_pool
++{
++    IDirect3D11CaptureFramePool IDirect3D11CaptureFramePool_iface;
++    IClosable IClosable_iface;
++    IWineCompositionCaptureSink IWineCompositionCaptureSink_iface;
++    LONG ref;
++
++    CRITICAL_SECTION cs;
++    BOOL closed;
++    BOOL free_threaded;
++    IDispatcherQueue *queue;    /* of the thread a pool that is not free-threaded was made on */
++    IDirect3DDevice *device;
++    ID3D11Device *d3d;
++    DirectXPixelFormat format;
++    SizeInt32 size;
++    struct buffer *buffers;
++    UINT buffer_count;
++    UINT generation;            /* counts the times the buffers were made again */
++    struct list ready;          /* oldest first */
++    struct list arrived_handlers;
++    INT64 next_token;
++};
++
++static inline struct frame_pool *impl_from_IDirect3D11CaptureFramePool( IDirect3D11CaptureFramePool *iface )
++{
++    return CONTAINING_RECORD( iface, struct frame_pool, IDirect3D11CaptureFramePool_iface );
++}
++
++/*** frames ***/
++
++struct frame
++{
++    IDirect3D11CaptureFrame IDirect3D11CaptureFrame_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++    struct frame_pool *pool;
++    UINT index, generation;     /* the pool's buffer it holds, until closed */
++    BOOL closed;
++    ID3D11Texture2D *texture;
++    UINT width, height;
++    LONGLONG time;
++};
++
++static inline struct frame *impl_from_IDirect3D11CaptureFrame( IDirect3D11CaptureFrame *iface )
++{
++    return CONTAINING_RECORD( iface, struct frame, IDirect3D11CaptureFrame_iface );
++}
++
++/* the buffer goes back to the pool, if the pool still has it */
++static void frame_close( struct frame *frame )
++{
++    struct frame_pool *pool = frame->pool;
++
++    EnterCriticalSection( &pool->cs );
++    if (!frame->closed && !pool->closed && frame->generation == pool->generation)
++        pool->buffers[frame->index].state = BUFFER_FREE;
++    frame->closed = TRUE;
++    LeaveCriticalSection( &pool->cs );
++}
++
++static HRESULT WINAPI frame_QueryInterface( IDirect3D11CaptureFrame *iface, REFIID iid, void **out )
++{
++    struct frame *frame = impl_from_IDirect3D11CaptureFrame( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDirect3D11CaptureFrame ))
++        *out = &frame->IDirect3D11CaptureFrame_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &frame->IClosable_iface;
++    else
++    {
++        WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI frame_AddRef( IDirect3D11CaptureFrame *iface )
++{
++    struct frame *frame = impl_from_IDirect3D11CaptureFrame( iface );
++    ULONG ref = InterlockedIncrement( &frame->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI frame_Release( IDirect3D11CaptureFrame *iface )
++{
++    struct frame *frame = impl_from_IDirect3D11CaptureFrame( iface );
++    ULONG ref = InterlockedDecrement( &frame->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        frame_close( frame );
++        ID3D11Texture2D_Release( frame->texture );
++        IDirect3D11CaptureFramePool_Release( &frame->pool->IDirect3D11CaptureFramePool_iface );
++        free( frame );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI frame_GetIids( IDirect3D11CaptureFrame *iface, ULONG *iid_count, IID **iids )
++{
++    TRACE( "iface %p, iid_count %p, iids %p.\n", iface, iid_count, iids );
++
++    if (!(*iids = CoTaskMemAlloc( 2 * sizeof(**iids) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = IID_IDirect3D11CaptureFrame;
++    (*iids)[1] = IID_IClosable;
++    *iid_count = 2;
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_GetRuntimeClassName( IDirect3D11CaptureFrame *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Graphics.Capture.Direct3D11CaptureFrame";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI frame_GetTrustLevel( IDirect3D11CaptureFrame *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_get_Surface( IDirect3D11CaptureFrame *iface, IDirect3DSurface **value )
++{
++    struct frame *frame = impl_from_IDirect3D11CaptureFrame( iface );
++    IInspectable *inspectable;
++    IDXGISurface *surface;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (frame->closed) return RO_E_CLOSED;
++    if (FAILED(hr = ID3D11Texture2D_QueryInterface( frame->texture, &IID_IDXGISurface, (void **)&surface ))) return hr;
++    hr = CreateDirect3D11SurfaceFromDXGISurface( surface, &inspectable );
++    IDXGISurface_Release( surface );
++    if (FAILED(hr)) return hr;
++    hr = IInspectable_QueryInterface( inspectable, &IID_IDirect3DSurface, (void **)value );
++    IInspectable_Release( inspectable );
++    return hr;
++}
++
++static HRESULT WINAPI frame_get_SystemRelativeTime( IDirect3D11CaptureFrame *iface, TimeSpan *value )
++{
++    struct frame *frame = impl_from_IDirect3D11CaptureFrame( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    value->Duration = frame->time;
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_get_ContentSize( IDirect3D11CaptureFrame *iface, SizeInt32 *value )
++{
++    struct frame *frame = impl_from_IDirect3D11CaptureFrame( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    value->Width = frame->width;
++    value->Height = frame->height;
++    return S_OK;
++}
++
++static const struct IDirect3D11CaptureFrameVtbl frame_vtbl =
++{
++    frame_QueryInterface,
++    frame_AddRef,
++    frame_Release,
++    /* IInspectable methods */
++    frame_GetIids,
++    frame_GetRuntimeClassName,
++    frame_GetTrustLevel,
++    /* IDirect3D11CaptureFrame methods */
++    frame_get_Surface,
++    frame_get_SystemRelativeTime,
++    frame_get_ContentSize,
++};
++
++DEFINE_IINSPECTABLE_( frame_closable, IClosable, struct frame, frame_from_IClosable, IClosable_iface,
++                      &impl->IDirect3D11CaptureFrame_iface )
++
++static HRESULT WINAPI frame_closable_Close( IClosable *iface )
++{
++    struct frame *frame = frame_from_IClosable( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    frame_close( frame );
++    return S_OK;
++}
++
++static const struct IClosableVtbl frame_closable_vtbl =
++{
++    frame_closable_QueryInterface,
++    frame_closable_AddRef,
++    frame_closable_Release,
++    /* IInspectable methods */
++    frame_closable_GetIids,
++    frame_closable_GetRuntimeClassName,
++    frame_closable_GetTrustLevel,
++    /* IClosable methods */
++    frame_closable_Close,
++};
++
++/*** raising FrameArrived ***/
++
++static void frame_pool_raise_arrived( struct frame_pool *pool )
++{
++    ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable **handlers;
++    unsigned int count = 0, i;
++    struct handler *entry;
++
++    EnterCriticalSection( &pool->cs );
++    if (pool->closed || !(handlers = calloc( list_count( &pool->arrived_handlers ) + 1, sizeof(*handlers) )))
++    {
++        LeaveCriticalSection( &pool->cs );
++        return;
++    }
++    LIST_FOR_EACH_ENTRY( entry, &pool->arrived_handlers, struct handler, entry )
++    {
++        handlers[count] = (ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable *)entry->handler;
++        ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable_AddRef( handlers[count] );
++        count++;
++    }
++    LeaveCriticalSection( &pool->cs );
++
++    for (i = 0; i < count; i++)
++    {
++        ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable_Invoke( handlers[i],
++                &pool->IDirect3D11CaptureFramePool_iface, NULL );
++        ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable_Release( handlers[i] );
++    }
++    free( handlers );
++}
++
++static void CALLBACK arrived_callback( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    struct frame_pool *pool = context;
++
++    frame_pool_raise_arrived( pool );
++    IDirect3D11CaptureFramePool_Release( &pool->IDirect3D11CaptureFramePool_iface );
++}
++
++/* what a pool that is not free-threaded queues on its thread's dispatcher queue */
++struct arrived_work
++{
++    IDispatcherQueueHandler IDispatcherQueueHandler_iface;
++    LONG ref;
++    struct frame_pool *pool;
++};
++
++static inline struct arrived_work *impl_from_IDispatcherQueueHandler( IDispatcherQueueHandler *iface )
++{
++    return CONTAINING_RECORD( iface, struct arrived_work, IDispatcherQueueHandler_iface );
++}
++
++static HRESULT WINAPI arrived_work_QueryInterface( IDispatcherQueueHandler *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDispatcherQueueHandler ))
++    {
++        IDispatcherQueueHandler_AddRef( iface );
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI arrived_work_AddRef( IDispatcherQueueHandler *iface )
++{
++    struct arrived_work *work = impl_from_IDispatcherQueueHandler( iface );
++    return InterlockedIncrement( &work->ref );
++}
++
++static ULONG WINAPI arrived_work_Release( IDispatcherQueueHandler *iface )
++{
++    struct arrived_work *work = impl_from_IDispatcherQueueHandler( iface );
++    ULONG ref = InterlockedDecrement( &work->ref );
++
++    if (!ref)
++    {
++        IDirect3D11CaptureFramePool_Release( &work->pool->IDirect3D11CaptureFramePool_iface );
++        free( work );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI arrived_work_Invoke( IDispatcherQueueHandler *iface )
++{
++    struct arrived_work *work = impl_from_IDispatcherQueueHandler( iface );
++
++    frame_pool_raise_arrived( work->pool );
++    return S_OK;
++}
++
++static const struct IDispatcherQueueHandlerVtbl arrived_work_vtbl =
++{
++    arrived_work_QueryInterface,
++    arrived_work_AddRef,
++    arrived_work_Release,
++    /* IDispatcherQueueHandler methods */
++    arrived_work_Invoke,
++};
++
++/* called with no lock held that raising the event could need */
++static void frame_pool_queue_arrived( struct frame_pool *pool )
++{
++    struct arrived_work *work;
++    boolean queued = FALSE;
++
++    IDirect3D11CaptureFramePool_AddRef( &pool->IDirect3D11CaptureFramePool_iface );
++    if (pool->free_threaded)
++    {
++        if (!TrySubmitThreadpoolCallback( arrived_callback, pool, NULL ))
++        {
++            WARN( "could not raise FrameArrived, error %lu.\n", GetLastError() );
++            IDirect3D11CaptureFramePool_Release( &pool->IDirect3D11CaptureFramePool_iface );
++        }
++        return;
++    }
++    if (!(work = calloc( 1, sizeof(*work) )))
++    {
++        IDirect3D11CaptureFramePool_Release( &pool->IDirect3D11CaptureFramePool_iface );
++        return;
++    }
++    work->IDispatcherQueueHandler_iface.lpVtbl = &arrived_work_vtbl;
++    work->ref = 1;
++    work->pool = pool;
++    if (FAILED(IDispatcherQueue_TryEnqueue( pool->queue, &work->IDispatcherQueueHandler_iface, &queued )) || !queued)
++        WARN( "could not queue FrameArrived on the dispatcher queue.\n" );
++    IDispatcherQueueHandler_Release( &work->IDispatcherQueueHandler_iface );
++}
++
++/*** buffers ***/
++
++static void frame_pool_drop_buffers( struct frame_pool *pool )
++{
++    UINT i;
++
++    for (i = 0; i < pool->buffer_count; i++) ID3D11Texture2D_Release( pool->buffers[i].texture );
++    free( pool->buffers );
++    pool->buffers = NULL;
++    pool->buffer_count = 0;
++    list_init( &pool->ready );
++    pool->generation++;
++}
++
++static HRESULT get_d3d_device( IDirect3DDevice *device, ID3D11Device **out )
++{
++    IDirect3DDxgiInterfaceAccess *access;
++    HRESULT hr;
++
++    if (FAILED(hr = IDirect3DDevice_QueryInterface( device, &IID_IDirect3DDxgiInterfaceAccess, (void **)&access )))
++    {
++        WARN( "device %p cannot give its Direct3D device, hr %#lx.\n", device, hr );
++        return E_INVALIDARG;
++    }
++    hr = IDirect3DDxgiInterfaceAccess_GetInterface( access, &IID_ID3D11Device, (void **)out );
++    IDirect3DDxgiInterfaceAccess_Release( access );
++    return hr;
++}
++
++static BOOL format_supported( DirectXPixelFormat format )
++{
++    return format == DirectXPixelFormat_B8G8R8A8UIntNormalized || format == DirectXPixelFormat_R16G16B16A16Float;
++}
++
++/* called with the pool's lock held */
++static HRESULT frame_pool_set( struct frame_pool *pool, IDirect3DDevice *device, DirectXPixelFormat format,
++                               INT32 count, SizeInt32 size )
++{
++    D3D11_TEXTURE2D_DESC desc = {0};
++    struct buffer *buffers;
++    ID3D11Device *d3d;
++    HRESULT hr;
++    INT32 i;
++
++    if (!device) return E_INVALIDARG;
++    if (!format_supported( format ) || count <= 0 || size.Width <= 0 || size.Height <= 0)
++    {
++        WARN( "format %u, %d buffers of %dx%d.\n", format, count, size.Width, size.Height );
++        return E_INVALIDARG;
++    }
++    if (FAILED(hr = get_d3d_device( device, &d3d ))) return hr;
++    if (!(buffers = calloc( count, sizeof(*buffers) )))
++    {
++        ID3D11Device_Release( d3d );
++        return E_OUTOFMEMORY;
++    }
++
++    desc.Width = size.Width;
++    desc.Height = size.Height;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Format = format;
++    desc.SampleDesc.Count = 1;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    for (i = 0; i < count; i++)
++    {
++        if (FAILED(hr = ID3D11Device_CreateTexture2D( d3d, &desc, NULL, &buffers[i].texture )))
++        {
++            WARN( "failed to create a %dx%d buffer, format %u, hr %#lx.\n", size.Width, size.Height, format, hr );
++            while (i--) ID3D11Texture2D_Release( buffers[i].texture );
++            free( buffers );
++            ID3D11Device_Release( d3d );
++            return hr;
++        }
++    }
++
++    frame_pool_drop_buffers( pool );
++    if (pool->d3d) ID3D11Device_Release( pool->d3d );
++    if (pool->device) IDirect3DDevice_Release( pool->device );
++    pool->d3d = d3d;
++    pool->device = device;
++    IDirect3DDevice_AddRef( device );
++    pool->format = format;
++    pool->size = size;
++    pool->buffers = buffers;
++    pool->buffer_count = count;
++    return S_OK;
++}
++
++/*** IDirect3D11CaptureFramePool ***/
++
++static HRESULT WINAPI frame_pool_QueryInterface( IDirect3D11CaptureFramePool *iface, REFIID iid, void **out )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDirect3D11CaptureFramePool ))
++        *out = &pool->IDirect3D11CaptureFramePool_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &pool->IClosable_iface;
++    else if (IsEqualGUID( iid, &IID_IWineCompositionCaptureSink ))
++        *out = &pool->IWineCompositionCaptureSink_iface;
++    else
++    {
++        WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI frame_pool_AddRef( IDirect3D11CaptureFramePool *iface )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    ULONG ref = InterlockedIncrement( &pool->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI frame_pool_Release( IDirect3D11CaptureFramePool *iface )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    ULONG ref = InterlockedDecrement( &pool->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        frame_pool_drop_buffers( pool );
++        handlers_clear( &pool->arrived_handlers );
++        if (pool->d3d) ID3D11Device_Release( pool->d3d );
++        if (pool->device) IDirect3DDevice_Release( pool->device );
++        if (pool->queue) IDispatcherQueue_Release( pool->queue );
++        pool->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &pool->cs );
++        free( pool );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI frame_pool_GetIids( IDirect3D11CaptureFramePool *iface, ULONG *iid_count, IID **iids )
++{
++    TRACE( "iface %p, iid_count %p, iids %p.\n", iface, iid_count, iids );
++
++    if (!(*iids = CoTaskMemAlloc( 2 * sizeof(**iids) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = IID_IDirect3D11CaptureFramePool;
++    (*iids)[1] = IID_IClosable;
++    *iid_count = 2;
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_pool_GetRuntimeClassName( IDirect3D11CaptureFramePool *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Graphics.Capture.Direct3D11CaptureFramePool";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI frame_pool_GetTrustLevel( IDirect3D11CaptureFramePool *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_pool_Recreate( IDirect3D11CaptureFramePool *iface, IDirect3DDevice *device,
++                                           DirectXPixelFormat format, INT32 count, SizeInt32 size )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p, device %p, format %u, count %d, size %dx%d.\n", iface, device, format, count,
++           size.Width, size.Height );
++
++    EnterCriticalSection( &pool->cs );
++    if (pool->closed) hr = RO_E_CLOSED;
++    else hr = frame_pool_set( pool, device, format, count, size );
++    LeaveCriticalSection( &pool->cs );
++    return hr;
++}
++
++static HRESULT WINAPI frame_pool_TryGetNextFrame( IDirect3D11CaptureFramePool *iface, IDirect3D11CaptureFrame **result )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    struct buffer *buffer;
++    struct frame *frame;
++    struct list *head;
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++
++    EnterCriticalSection( &pool->cs );
++    if (pool->closed)
++    {
++        LeaveCriticalSection( &pool->cs );
++        return RO_E_CLOSED;
++    }
++    if (!(head = list_head( &pool->ready )))
++    {
++        LeaveCriticalSection( &pool->cs );
++        return S_OK;
++    }
++    if (!(frame = calloc( 1, sizeof(*frame) )))
++    {
++        LeaveCriticalSection( &pool->cs );
++        return E_OUTOFMEMORY;
++    }
++    buffer = LIST_ENTRY( head, struct buffer, entry );
++    list_remove( &buffer->entry );
++    buffer->state = BUFFER_HELD;
++    frame->IDirect3D11CaptureFrame_iface.lpVtbl = &frame_vtbl;
++    frame->IClosable_iface.lpVtbl = &frame_closable_vtbl;
++    frame->ref = 1;
++    frame->pool = pool;
++    IDirect3D11CaptureFramePool_AddRef( iface );
++    frame->index = buffer - pool->buffers;
++    frame->generation = pool->generation;
++    frame->texture = buffer->texture;
++    ID3D11Texture2D_AddRef( frame->texture );
++    frame->width = buffer->width;
++    frame->height = buffer->height;
++    frame->time = buffer->time;
++    LeaveCriticalSection( &pool->cs );
++
++    *result = &frame->IDirect3D11CaptureFrame_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_pool_add_FrameArrived( IDirect3D11CaptureFramePool *iface,
++        ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable *handler, EventRegistrationToken *token )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++
++    EnterCriticalSection( &pool->cs );
++    hr = handlers_add( &pool->arrived_handlers, &pool->next_token, (IUnknown *)handler, token );
++    LeaveCriticalSection( &pool->cs );
++    return hr;
++}
++
++static HRESULT WINAPI frame_pool_remove_FrameArrived( IDirect3D11CaptureFramePool *iface, EventRegistrationToken token )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++
++    EnterCriticalSection( &pool->cs );
++    handlers_remove( &pool->arrived_handlers, token );
++    LeaveCriticalSection( &pool->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI frame_pool_CreateCaptureSession( IDirect3D11CaptureFramePool *iface, IGraphicsCaptureItem *item,
++                                                       IGraphicsCaptureSession **result )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    BOOL closed;
++
++    TRACE( "iface %p, item %p, result %p.\n", iface, item, result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!item) return E_INVALIDARG;
++    EnterCriticalSection( &pool->cs );
++    closed = pool->closed;
++    LeaveCriticalSection( &pool->cs );
++    if (closed) return RO_E_CLOSED;
++    return session_create( iface, item, result );
++}
++
++static HRESULT WINAPI frame_pool_get_DispatcherQueue( IDirect3D11CaptureFramePool *iface, IDispatcherQueue **value )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if ((*value = pool->queue)) IDispatcherQueue_AddRef( *value );
++    return S_OK;
++}
++
++static const struct IDirect3D11CaptureFramePoolVtbl frame_pool_vtbl =
++{
++    frame_pool_QueryInterface,
++    frame_pool_AddRef,
++    frame_pool_Release,
++    /* IInspectable methods */
++    frame_pool_GetIids,
++    frame_pool_GetRuntimeClassName,
++    frame_pool_GetTrustLevel,
++    /* IDirect3D11CaptureFramePool methods */
++    frame_pool_Recreate,
++    frame_pool_TryGetNextFrame,
++    frame_pool_add_FrameArrived,
++    frame_pool_remove_FrameArrived,
++    frame_pool_CreateCaptureSession,
++    frame_pool_get_DispatcherQueue,
++};
++
++DEFINE_IINSPECTABLE_( pool_closable, IClosable, struct frame_pool, pool_from_IClosable, IClosable_iface,
++                      &impl->IDirect3D11CaptureFramePool_iface )
++
++/* the buffers go, and nothing more is drawn into the pool nor taken from it */
++static HRESULT WINAPI pool_closable_Close( IClosable *iface )
++{
++    struct frame_pool *pool = pool_from_IClosable( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &pool->cs );
++    if (!pool->closed)
++    {
++        pool->closed = TRUE;
++        frame_pool_drop_buffers( pool );
++        handlers_clear( &pool->arrived_handlers );
++    }
++    LeaveCriticalSection( &pool->cs );
++    return S_OK;
++}
++
++static const struct IClosableVtbl pool_closable_vtbl =
++{
++    pool_closable_QueryInterface,
++    pool_closable_AddRef,
++    pool_closable_Release,
++    /* IInspectable methods */
++    pool_closable_GetIids,
++    pool_closable_GetRuntimeClassName,
++    pool_closable_GetTrustLevel,
++    /* IClosable methods */
++    pool_closable_Close,
++};
++
++/*** IWineCompositionCaptureSink, called by the composition ***/
++
++static inline struct frame_pool *impl_from_IWineCompositionCaptureSink( IWineCompositionCaptureSink *iface )
++{
++    return CONTAINING_RECORD( iface, struct frame_pool, IWineCompositionCaptureSink_iface );
++}
++
++static HRESULT WINAPI sink_QueryInterface( IWineCompositionCaptureSink *iface, REFIID iid, void **out )
++{
++    struct frame_pool *pool = impl_from_IWineCompositionCaptureSink( iface );
++    return frame_pool_QueryInterface( &pool->IDirect3D11CaptureFramePool_iface, iid, out );
++}
++
++static ULONG WINAPI sink_AddRef( IWineCompositionCaptureSink *iface )
++{
++    struct frame_pool *pool = impl_from_IWineCompositionCaptureSink( iface );
++    return frame_pool_AddRef( &pool->IDirect3D11CaptureFramePool_iface );
++}
++
++static ULONG WINAPI sink_Release( IWineCompositionCaptureSink *iface )
++{
++    struct frame_pool *pool = impl_from_IWineCompositionCaptureSink( iface );
++    return frame_pool_Release( &pool->IDirect3D11CaptureFramePool_iface );
++}
++
++static HRESULT WINAPI sink_get_buffer( IWineCompositionCaptureSink *iface, ID3D11Texture2D **texture )
++{
++    struct frame_pool *pool = impl_from_IWineCompositionCaptureSink( iface );
++    HRESULT hr = S_FALSE;
++    UINT i;
++
++    *texture = NULL;
++    EnterCriticalSection( &pool->cs );
++    for (i = 0; !pool->closed && i < pool->buffer_count; i++)
++    {
++        if (pool->buffers[i].state != BUFFER_FREE) continue;
++        pool->buffers[i].state = BUFFER_DRAWING;
++        *texture = pool->buffers[i].texture;
++        ID3D11Texture2D_AddRef( *texture );
++        hr = S_OK;
++        break;
++    }
++    LeaveCriticalSection( &pool->cs );
++    if (hr != S_OK) TRACE( "pool %p: no buffer free.\n", pool );
++    return hr;
++}
++
++static void WINAPI sink_frame_drawn( IWineCompositionCaptureSink *iface, ID3D11Texture2D *texture, UINT width,
++                                     UINT height, LONGLONG time )
++{
++    struct frame_pool *pool = impl_from_IWineCompositionCaptureSink( iface );
++    BOOL arrived = FALSE;
++    UINT i;
++
++    TRACE( "pool %p, texture %p, %ux%u.\n", pool, texture, width, height );
++
++    EnterCriticalSection( &pool->cs );
++    for (i = 0; !pool->closed && i < pool->buffer_count; i++)
++    {
++        struct buffer *buffer = &pool->buffers[i];
++
++        if (buffer->texture != texture || buffer->state != BUFFER_DRAWING) continue;
++        buffer->state = BUFFER_READY;
++        buffer->width = width;
++        buffer->height = height;
++        buffer->time = time;
++        list_add_tail( &pool->ready, &buffer->entry );
++        arrived = TRUE;
++        break;
++    }
++    LeaveCriticalSection( &pool->cs );
++    if (arrived) frame_pool_queue_arrived( pool );
++}
++
++static const struct IWineCompositionCaptureSinkVtbl sink_vtbl =
++{
++    sink_QueryInterface,
++    sink_AddRef,
++    sink_Release,
++    /* IWineCompositionCaptureSink methods */
++    sink_get_buffer,
++    sink_frame_drawn,
++};
++
++HRESULT frame_pool_start( IDirect3D11CaptureFramePool *iface, IGraphicsCaptureItem *item, IUnknown **capture )
++{
++    struct frame_pool *pool = impl_from_IDirect3D11CaptureFramePool( iface );
++    IWineCompositionVisualCapture *visual;
++    ID3D11Device *d3d;
++    HRESULT hr;
++
++    if (!(visual = item_visual( item ))) return E_INVALIDARG;
++    EnterCriticalSection( &pool->cs );
++    if ((d3d = pool->closed ? NULL : pool->d3d)) ID3D11Device_AddRef( d3d );
++    LeaveCriticalSection( &pool->cs );
++    if (!d3d) return RO_E_CLOSED;
++    /* not with the pool's lock held: the composition takes its own, and holds it when it calls the sink */
++    hr = IWineCompositionVisualCapture_start( visual, d3d, &pool->IWineCompositionCaptureSink_iface, capture );
++    ID3D11Device_Release( d3d );
++    return hr;
++}
++
++/*** the statics ***/
++
++struct frame_pool_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IDirect3D11CaptureFramePoolStatics IDirect3D11CaptureFramePoolStatics_iface;
++    IDirect3D11CaptureFramePoolStatics2 IDirect3D11CaptureFramePoolStatics2_iface;
++    LONG ref;
++};
++
++static inline struct frame_pool_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct frame_pool_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct frame_pool_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IDirect3D11CaptureFramePoolStatics ))
++        *out = &impl->IDirect3D11CaptureFramePoolStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IDirect3D11CaptureFramePoolStatics2 ))
++        *out = &impl->IDirect3D11CaptureFramePoolStatics2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    struct frame_pool_statics *impl = impl_from_IActivationFactory( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    struct frame_pool_statics *impl = impl_from_IActivationFactory( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++/* pools are made by the statics only */
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static HRESULT current_dispatcher_queue( IDispatcherQueue **queue )
++{
++    static const WCHAR name[] = L"Windows.System.DispatcherQueue";
++    IDispatcherQueueStatics *statics;
++    HSTRING str;
++    HRESULT hr;
++
++    *queue = NULL;
++    if (FAILED(hr = WindowsCreateString( name, ARRAY_SIZE(name) - 1, &str ))) return hr;
++    hr = RoGetActivationFactory( str, &IID_IDispatcherQueueStatics, (void **)&statics );
++    WindowsDeleteString( str );
++    if (FAILED(hr)) return hr;
++    hr = IDispatcherQueueStatics_GetForCurrentThread( statics, queue );
++    IDispatcherQueueStatics_Release( statics );
++    return hr;
++}
++
++static HRESULT frame_pool_create( IDirect3DDevice *device, DirectXPixelFormat format, INT32 count, SizeInt32 size,
++                                  BOOL free_threaded, IDirect3D11CaptureFramePool **result )
++{
++    IDispatcherQueue *queue = NULL;
++    struct frame_pool *pool;
++    HRESULT hr;
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    /* the events of a pool that is not free-threaded are raised on this thread's dispatcher queue */
++    if (!free_threaded && (FAILED(hr = current_dispatcher_queue( &queue )) || !queue))
++    {
++        WARN( "no dispatcher queue on this thread, hr %#lx.\n", hr );
++        return RPC_E_WRONG_THREAD;
++    }
++
++    if (!(pool = calloc( 1, sizeof(*pool) )))
++    {
++        if (queue) IDispatcherQueue_Release( queue );
++        return E_OUTOFMEMORY;
++    }
++    pool->IDirect3D11CaptureFramePool_iface.lpVtbl = &frame_pool_vtbl;
++    pool->IClosable_iface.lpVtbl = &pool_closable_vtbl;
++    pool->IWineCompositionCaptureSink_iface.lpVtbl = &sink_vtbl;
++    pool->ref = 1;
++    pool->free_threaded = free_threaded;
++    pool->queue = queue;
++    InitializeCriticalSectionEx( &pool->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    pool->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": frame_pool.cs");
++    list_init( &pool->ready );
++    list_init( &pool->arrived_handlers );
++
++    if (FAILED(hr = frame_pool_set( pool, device, format, count, size )))
++    {
++        IDirect3D11CaptureFramePool_Release( &pool->IDirect3D11CaptureFramePool_iface );
++        return hr;
++    }
++
++    TRACE( "created pool %p.\n", pool );
++    *result = &pool->IDirect3D11CaptureFramePool_iface;
++    return S_OK;
++}
++
++DEFINE_IINSPECTABLE( frame_pool_statics, IDirect3D11CaptureFramePoolStatics, struct frame_pool_statics,
++                     IActivationFactory_iface )
++
++static HRESULT WINAPI frame_pool_statics_Create( IDirect3D11CaptureFramePoolStatics *iface, IDirect3DDevice *device,
++                                                 DirectXPixelFormat format, INT32 count, SizeInt32 size,
++                                                 IDirect3D11CaptureFramePool **result )
++{
++    TRACE( "iface %p, device %p, format %u, count %d, size %dx%d, result %p.\n", iface, device, format, count,
++           size.Width, size.Height, result );
++
++    return frame_pool_create( device, format, count, size, FALSE, result );
++}
++
++static const struct IDirect3D11CaptureFramePoolStaticsVtbl frame_pool_statics_vtbl =
++{
++    frame_pool_statics_QueryInterface,
++    frame_pool_statics_AddRef,
++    frame_pool_statics_Release,
++    /* IInspectable methods */
++    frame_pool_statics_GetIids,
++    frame_pool_statics_GetRuntimeClassName,
++    frame_pool_statics_GetTrustLevel,
++    /* IDirect3D11CaptureFramePoolStatics methods */
++    frame_pool_statics_Create,
++};
++
++DEFINE_IINSPECTABLE( frame_pool_statics2, IDirect3D11CaptureFramePoolStatics2, struct frame_pool_statics,
++                     IActivationFactory_iface )
++
++static HRESULT WINAPI frame_pool_statics2_CreateFreeThreaded( IDirect3D11CaptureFramePoolStatics2 *iface,
++                                                              IDirect3DDevice *device, DirectXPixelFormat format,
++                                                              INT32 count, SizeInt32 size,
++                                                              IDirect3D11CaptureFramePool **result )
++{
++    TRACE( "iface %p, device %p, format %u, count %d, size %dx%d, result %p.\n", iface, device, format, count,
++           size.Width, size.Height, result );
++
++    return frame_pool_create( device, format, count, size, TRUE, result );
++}
++
++static const struct IDirect3D11CaptureFramePoolStatics2Vtbl frame_pool_statics2_vtbl =
++{
++    frame_pool_statics2_QueryInterface,
++    frame_pool_statics2_AddRef,
++    frame_pool_statics2_Release,
++    /* IInspectable methods */
++    frame_pool_statics2_GetIids,
++    frame_pool_statics2_GetRuntimeClassName,
++    frame_pool_statics2_GetTrustLevel,
++    /* IDirect3D11CaptureFramePoolStatics2 methods */
++    frame_pool_statics2_CreateFreeThreaded,
++};
++
++static struct frame_pool_statics frame_pool_statics =
++{
++    {&factory_vtbl},
++    {&frame_pool_statics_vtbl},
++    {&frame_pool_statics2_vtbl},
++    1,
++};
++
++IActivationFactory *frame_pool_factory = &frame_pool_statics.IActivationFactory_iface;
+diff --git a/dlls/graphicscapture/item.c b/dlls/graphicscapture/item.c
+new file mode 100644
+index 00000000000..3808525b588
+--- /dev/null
++++ b/dlls/graphicscapture/item.c
+@@ -0,0 +1,377 @@
++/*
++ * Windows.Graphics.Capture.GraphicsCaptureItem
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(capture);
++
++/*
++ * An item is what a session captures.  Only composition visuals can be one
++ * here, and a visual does not go while its item holds it, so Closed is never
++ * raised.
++ */
++struct item
++{
++    IGraphicsCaptureItem IGraphicsCaptureItem_iface;
++    LONG ref;
++    IWineCompositionVisualCapture *visual;
++    CRITICAL_SECTION cs;
++    struct list closed_handlers;
++    INT64 next_token;
++};
++
++static inline struct item *impl_from_IGraphicsCaptureItem( IGraphicsCaptureItem *iface )
++{
++    return CONTAINING_RECORD( iface, struct item, IGraphicsCaptureItem_iface );
++}
++
++static HRESULT WINAPI item_QueryInterface( IGraphicsCaptureItem *iface, REFIID iid, void **out )
++{
++    struct item *item = impl_from_IGraphicsCaptureItem( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IGraphicsCaptureItem ))
++    {
++        *out = &item->IGraphicsCaptureItem_iface;
++        IGraphicsCaptureItem_AddRef( &item->IGraphicsCaptureItem_iface );
++        return S_OK;
++    }
++
++    WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI item_AddRef( IGraphicsCaptureItem *iface )
++{
++    struct item *item = impl_from_IGraphicsCaptureItem( iface );
++    ULONG ref = InterlockedIncrement( &item->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI item_Release( IGraphicsCaptureItem *iface )
++{
++    struct item *item = impl_from_IGraphicsCaptureItem( iface );
++    ULONG ref = InterlockedDecrement( &item->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        handlers_clear( &item->closed_handlers );
++        IWineCompositionVisualCapture_Release( item->visual );
++        item->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &item->cs );
++        free( item );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI item_GetIids( IGraphicsCaptureItem *iface, ULONG *iid_count, IID **iids )
++{
++    TRACE( "iface %p, iid_count %p, iids %p.\n", iface, iid_count, iids );
++
++    if (!(*iids = CoTaskMemAlloc( sizeof(**iids) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = IID_IGraphicsCaptureItem;
++    *iid_count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI item_GetRuntimeClassName( IGraphicsCaptureItem *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Graphics.Capture.GraphicsCaptureItem";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI item_GetTrustLevel( IGraphicsCaptureItem *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++/* a visual has no name to show */
++static HRESULT WINAPI item_get_DisplayName( IGraphicsCaptureItem *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI item_get_Size( IGraphicsCaptureItem *iface, SizeInt32 *value )
++{
++    struct item *item = impl_from_IGraphicsCaptureItem( iface );
++    UINT width, height;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (FAILED(hr = IWineCompositionVisualCapture_get_size( item->visual, &width, &height ))) return hr;
++    value->Width = width;
++    value->Height = height;
++    return S_OK;
++}
++
++static HRESULT WINAPI item_add_Closed( IGraphicsCaptureItem *iface,
++                                       ITypedEventHandler_GraphicsCaptureItem_IInspectable *handler,
++                                       EventRegistrationToken *token )
++{
++    struct item *item = impl_from_IGraphicsCaptureItem( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++
++    EnterCriticalSection( &item->cs );
++    hr = handlers_add( &item->closed_handlers, &item->next_token, (IUnknown *)handler, token );
++    LeaveCriticalSection( &item->cs );
++    return hr;
++}
++
++static HRESULT WINAPI item_remove_Closed( IGraphicsCaptureItem *iface, EventRegistrationToken token )
++{
++    struct item *item = impl_from_IGraphicsCaptureItem( iface );
++
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++
++    EnterCriticalSection( &item->cs );
++    handlers_remove( &item->closed_handlers, token );
++    LeaveCriticalSection( &item->cs );
++    return S_OK;
++}
++
++static const struct IGraphicsCaptureItemVtbl item_vtbl =
++{
++    item_QueryInterface,
++    item_AddRef,
++    item_Release,
++    /* IInspectable methods */
++    item_GetIids,
++    item_GetRuntimeClassName,
++    item_GetTrustLevel,
++    /* IGraphicsCaptureItem methods */
++    item_get_DisplayName,
++    item_get_Size,
++    item_add_Closed,
++    item_remove_Closed,
++};
++
++IWineCompositionVisualCapture *item_visual( IGraphicsCaptureItem *iface )
++{
++    if (!iface || iface->lpVtbl != &item_vtbl) return NULL;
++    return impl_from_IGraphicsCaptureItem( iface )->visual;
++}
++
++/*** the statics ***/
++
++struct item_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IGraphicsCaptureItemStatics IGraphicsCaptureItemStatics_iface;
++    IGraphicsCaptureItemStatics2 IGraphicsCaptureItemStatics2_iface;
++    LONG ref;
++};
++
++static inline struct item_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct item_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct item_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IGraphicsCaptureItemStatics ))
++        *out = &impl->IGraphicsCaptureItemStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IGraphicsCaptureItemStatics2 ))
++        *out = &impl->IGraphicsCaptureItemStatics2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    struct item_statics *impl = impl_from_IActivationFactory( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    struct item_statics *impl = impl_from_IActivationFactory( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++/* items are made by the statics only */
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( item_statics, IGraphicsCaptureItemStatics, struct item_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI item_statics_CreateFromVisual( IGraphicsCaptureItemStatics *iface, IVisual *visual,
++                                                     IGraphicsCaptureItem **result )
++{
++    IWineCompositionVisualCapture *capture;
++    struct item *item;
++
++    TRACE( "iface %p, visual %p, result %p.\n", iface, visual, result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!visual) return E_INVALIDARG;
++    if (FAILED(IVisual_QueryInterface( visual, &IID_IWineCompositionVisualCapture, (void **)&capture )))
++    {
++        WARN( "visual %p is not one of Wine's composition.\n", visual );
++        return E_INVALIDARG;
++    }
++
++    if (!(item = calloc( 1, sizeof(*item) )))
++    {
++        IWineCompositionVisualCapture_Release( capture );
++        return E_OUTOFMEMORY;
++    }
++    item->IGraphicsCaptureItem_iface.lpVtbl = &item_vtbl;
++    item->ref = 1;
++    item->visual = capture;
++    InitializeCriticalSectionEx( &item->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    item->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": item.cs");
++    list_init( &item->closed_handlers );
++
++    TRACE( "created item %p.\n", item );
++    *result = &item->IGraphicsCaptureItem_iface;
++    return S_OK;
++}
++
++static const struct IGraphicsCaptureItemStaticsVtbl item_statics_vtbl =
++{
++    item_statics_QueryInterface,
++    item_statics_AddRef,
++    item_statics_Release,
++    /* IInspectable methods */
++    item_statics_GetIids,
++    item_statics_GetRuntimeClassName,
++    item_statics_GetTrustLevel,
++    /* IGraphicsCaptureItemStatics methods */
++    item_statics_CreateFromVisual,
++};
++
++DEFINE_IINSPECTABLE( item_statics2, IGraphicsCaptureItemStatics2, struct item_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI item_statics2_TryCreateFromWindowId( IGraphicsCaptureItemStatics2 *iface, WindowId window_id,
++                                                           IGraphicsCaptureItem **result )
++{
++    FIXME( "iface %p, window_id %#I64x, result %p: windows cannot be captured.\n", iface, window_id.Value, result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI item_statics2_TryCreateFromDisplayId( IGraphicsCaptureItemStatics2 *iface, DisplayId display_id,
++                                                            IGraphicsCaptureItem **result )
++{
++    FIXME( "iface %p, display_id %#I64x, result %p: displays cannot be captured.\n", iface, display_id.Value, result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IGraphicsCaptureItemStatics2Vtbl item_statics2_vtbl =
++{
++    item_statics2_QueryInterface,
++    item_statics2_AddRef,
++    item_statics2_Release,
++    /* IInspectable methods */
++    item_statics2_GetIids,
++    item_statics2_GetRuntimeClassName,
++    item_statics2_GetTrustLevel,
++    /* IGraphicsCaptureItemStatics2 methods */
++    item_statics2_TryCreateFromWindowId,
++    item_statics2_TryCreateFromDisplayId,
++};
++
++static struct item_statics item_statics =
++{
++    {&factory_vtbl},
++    {&item_statics_vtbl},
++    {&item_statics2_vtbl},
++    1,
++};
++
++IActivationFactory *item_factory = &item_statics.IActivationFactory_iface;
+diff --git a/dlls/graphicscapture/main.c b/dlls/graphicscapture/main.c
+index 1b749a850d0..716b85270c7 100644
+--- a/dlls/graphicscapture/main.c
++++ b/dlls/graphicscapture/main.c
+@@ -24,6 +24,46 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(capture);
+ 
++HRESULT handlers_add( struct list *list, INT64 *next_token, IUnknown *handler, EventRegistrationToken *token )
++{
++    struct handler *entry;
++
++    if (!handler || !token) return E_INVALIDARG;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    entry->token.value = ++*next_token;
++    entry->handler = handler;
++    IUnknown_AddRef( handler );
++    list_add_tail( list, &entry->entry );
++    *token = entry->token;
++    return S_OK;
++}
++
++void handlers_remove( struct list *list, EventRegistrationToken token )
++{
++    struct handler *entry;
++
++    LIST_FOR_EACH_ENTRY( entry, list, struct handler, entry )
++    {
++        if (entry->token.value != token.value) continue;
++        list_remove( &entry->entry );
++        IUnknown_Release( entry->handler );
++        free( entry );
++        return;
++    }
++}
++
++void handlers_clear( struct list *list )
++{
++    struct handler *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( entry, next, list, struct handler, entry )
++    {
++        list_remove( &entry->entry );
++        IUnknown_Release( entry->handler );
++        free( entry );
++    }
++}
++
+ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **factory )
+ {
+     const WCHAR *buffer = WindowsGetStringRawBuffer( classid, NULL );
+@@ -34,6 +74,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession ))
+         IActivationFactory_QueryInterface( session_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem ))
++        IActivationFactory_QueryInterface( item_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool ))
++        IActivationFactory_QueryInterface( frame_pool_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/graphicscapture/private.h b/dlls/graphicscapture/private.h
+index d60c138c873..1af0e1a923c 100644
+--- a/dlls/graphicscapture/private.h
++++ b/dlls/graphicscapture/private.h
+@@ -28,13 +28,50 @@
+ #include "winstring.h"
+ 
+ #include "activation.h"
++#include "roapi.h"
++#include "d3d11.h"
+ 
+ #define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Foundation_Numerics
+ #include "windows.foundation.h"
++#define WIDL_using_Windows_System
++#include "windows.system.h"
++#define WIDL_using_Windows_Graphics
++#define WIDL_using_Windows_Graphics_DirectX
++#define WIDL_using_Windows_Graphics_DirectX_Direct3D11
++#include "windows.graphics.directx.direct3d11.h"
++#include "windows.graphics.directx.direct3d11.interop.h"
++#define WIDL_using_Windows_UI
++#define WIDL_using_Windows_UI_Composition
++#include "windows.ui.composition.h"
+ #define WIDL_using_Windows_Graphics_Capture
+ #include "windows.graphics.capture.h"
+ 
++#include "wine/list.h"
++#include "wine/winecomposition.h"
++
+ extern IActivationFactory *session_factory;
++extern IActivationFactory *item_factory;
++extern IActivationFactory *frame_pool_factory;
++
++/* the visual an item captures, or NULL for an item not of ours */
++extern IWineCompositionVisualCapture *item_visual( IGraphicsCaptureItem *item );
++/* starts drawing what the item shows into the pool's buffers; releasing what comes back stops it */
++extern HRESULT frame_pool_start( IDirect3D11CaptureFramePool *pool, IGraphicsCaptureItem *item, IUnknown **capture );
++extern HRESULT session_create( IDirect3D11CaptureFramePool *pool, IGraphicsCaptureItem *item,
++                               IGraphicsCaptureSession **out );
++
++/* event handlers, by token */
++struct handler
++{
++    struct list entry;
++    EventRegistrationToken token;
++    IUnknown *handler;
++};
++
++extern HRESULT handlers_add( struct list *list, INT64 *next_token, IUnknown *handler, EventRegistrationToken *token );
++extern void handlers_remove( struct list *list, EventRegistrationToken token );
++extern void handlers_clear( struct list *list );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/graphicscapture/session.c b/dlls/graphicscapture/session.c
+index 12269e55de1..2614aad063d 100644
+--- a/dlls/graphicscapture/session.c
++++ b/dlls/graphicscapture/session.c
+@@ -22,21 +22,21 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(capture);
+ 
+-struct session
++struct session_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+     IGraphicsCaptureSessionStatics IGraphicsCaptureSessionStatics_iface;
+     LONG ref;
+ };
+ 
+-static inline struct session *impl_from_IActivationFactory( IActivationFactory *iface )
++static inline struct session_statics *impl_from_IActivationFactory( IActivationFactory *iface )
+ {
+-    return CONTAINING_RECORD( iface, struct session, IActivationFactory_iface );
++    return CONTAINING_RECORD( iface, struct session_statics, IActivationFactory_iface );
+ }
+ 
+ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+ {
+-    struct session *impl = impl_from_IActivationFactory( iface );
++    struct session_statics *impl = impl_from_IActivationFactory( iface );
+ 
+     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+ 
+@@ -64,7 +64,7 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+ 
+ static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
+ {
+-    struct session *impl = impl_from_IActivationFactory( iface );
++    struct session_statics *impl = impl_from_IActivationFactory( iface );
+     ULONG ref = InterlockedIncrement( &impl->ref );
+     TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
+     return ref;
+@@ -72,7 +72,7 @@ static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
+ 
+ static ULONG WINAPI factory_Release( IActivationFactory *iface )
+ {
+-    struct session *impl = impl_from_IActivationFactory( iface );
++    struct session_statics *impl = impl_from_IActivationFactory( iface );
+     ULONG ref = InterlockedDecrement( &impl->ref );
+     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+     return ref;
+@@ -115,7 +115,7 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+     factory_ActivateInstance,
+ };
+ 
+-DEFINE_IINSPECTABLE( session_statics, IGraphicsCaptureSessionStatics, struct session, IActivationFactory_iface )
++DEFINE_IINSPECTABLE( session_statics, IGraphicsCaptureSessionStatics, struct session_statics, IActivationFactory_iface )
+ 
+ static HRESULT WINAPI session_statics_IsSupported( IGraphicsCaptureSessionStatics *iface, boolean *result )
+ {
+@@ -138,7 +138,7 @@ static const struct IGraphicsCaptureSessionStaticsVtbl session_statics_vtbl =
+     session_statics_IsSupported,
+ };
+ 
+-static struct session session_statics =
++static struct session_statics session_statics =
+ {
+     {&factory_vtbl},
+     {&session_statics_vtbl},
+@@ -146,3 +146,277 @@ static struct session session_statics =
+ };
+ 
+ IActivationFactory *session_factory = &session_statics.IActivationFactory_iface;
++
++/*
++ * A session draws what its item shows into its pool's buffers from
++ * StartCapture on, until it is closed.  Only visuals are items here, and
++ * neither the cursor nor a border is drawn into a visual's frames, whatever
++ * the properties say.
++ */
++struct session
++{
++    IGraphicsCaptureSession IGraphicsCaptureSession_iface;
++    IGraphicsCaptureSession2 IGraphicsCaptureSession2_iface;
++    IGraphicsCaptureSession3 IGraphicsCaptureSession3_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++    CRITICAL_SECTION cs;
++    IDirect3D11CaptureFramePool *pool;
++    IGraphicsCaptureItem *item;
++    IUnknown *capture;          /* while capturing */
++    BOOL closed;
++    boolean cursor_capture;
++    boolean border_required;
++};
++
++static inline struct session *impl_from_IGraphicsCaptureSession( IGraphicsCaptureSession *iface )
++{
++    return CONTAINING_RECORD( iface, struct session, IGraphicsCaptureSession_iface );
++}
++
++static HRESULT WINAPI session_QueryInterface( IGraphicsCaptureSession *iface, REFIID iid, void **out )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IGraphicsCaptureSession ))
++        *out = &session->IGraphicsCaptureSession_iface;
++    else if (IsEqualGUID( iid, &IID_IGraphicsCaptureSession2 ))
++        *out = &session->IGraphicsCaptureSession2_iface;
++    else if (IsEqualGUID( iid, &IID_IGraphicsCaptureSession3 ))
++        *out = &session->IGraphicsCaptureSession3_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &session->IClosable_iface;
++    else
++    {
++        WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI session_AddRef( IGraphicsCaptureSession *iface )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession( iface );
++    ULONG ref = InterlockedIncrement( &session->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI session_Release( IGraphicsCaptureSession *iface )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession( iface );
++    ULONG ref = InterlockedDecrement( &session->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (session->capture) IUnknown_Release( session->capture );
++        IGraphicsCaptureItem_Release( session->item );
++        IDirect3D11CaptureFramePool_Release( session->pool );
++        session->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &session->cs );
++        free( session );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI session_GetIids( IGraphicsCaptureSession *iface, ULONG *iid_count, IID **iids )
++{
++    TRACE( "iface %p, iid_count %p, iids %p.\n", iface, iid_count, iids );
++
++    if (!(*iids = CoTaskMemAlloc( 4 * sizeof(**iids) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = IID_IGraphicsCaptureSession;
++    (*iids)[1] = IID_IGraphicsCaptureSession2;
++    (*iids)[2] = IID_IGraphicsCaptureSession3;
++    (*iids)[3] = IID_IClosable;
++    *iid_count = 4;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_GetRuntimeClassName( IGraphicsCaptureSession *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Graphics.Capture.GraphicsCaptureSession";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI session_GetTrustLevel( IGraphicsCaptureSession *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_StartCapture( IGraphicsCaptureSession *iface )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession( iface );
++    IUnknown *capture;
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &session->cs );
++    if (session->closed) hr = RO_E_CLOSED;
++    else if (session->capture) hr = S_OK;
++    else if (SUCCEEDED(hr = frame_pool_start( session->pool, session->item, &capture )))
++        session->capture = capture;
++    LeaveCriticalSection( &session->cs );
++    return hr;
++}
++
++static const struct IGraphicsCaptureSessionVtbl session_vtbl =
++{
++    session_QueryInterface,
++    session_AddRef,
++    session_Release,
++    /* IInspectable methods */
++    session_GetIids,
++    session_GetRuntimeClassName,
++    session_GetTrustLevel,
++    /* IGraphicsCaptureSession methods */
++    session_StartCapture,
++};
++
++DEFINE_IINSPECTABLE( session2, IGraphicsCaptureSession2, struct session, IGraphicsCaptureSession_iface )
++
++static HRESULT WINAPI session2_get_IsCursorCaptureEnabled( IGraphicsCaptureSession2 *iface, boolean *value )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession2( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = session->cursor_capture;
++    return S_OK;
++}
++
++static HRESULT WINAPI session2_put_IsCursorCaptureEnabled( IGraphicsCaptureSession2 *iface, boolean value )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession2( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++
++    session->cursor_capture = value;
++    return S_OK;
++}
++
++static const struct IGraphicsCaptureSession2Vtbl session2_vtbl =
++{
++    session2_QueryInterface,
++    session2_AddRef,
++    session2_Release,
++    /* IInspectable methods */
++    session2_GetIids,
++    session2_GetRuntimeClassName,
++    session2_GetTrustLevel,
++    /* IGraphicsCaptureSession2 methods */
++    session2_get_IsCursorCaptureEnabled,
++    session2_put_IsCursorCaptureEnabled,
++};
++
++DEFINE_IINSPECTABLE( session3, IGraphicsCaptureSession3, struct session, IGraphicsCaptureSession_iface )
++
++static HRESULT WINAPI session3_get_IsBorderRequired( IGraphicsCaptureSession3 *iface, boolean *value )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession3( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = session->border_required;
++    return S_OK;
++}
++
++static HRESULT WINAPI session3_put_IsBorderRequired( IGraphicsCaptureSession3 *iface, boolean value )
++{
++    struct session *session = impl_from_IGraphicsCaptureSession3( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++
++    session->border_required = value;
++    return S_OK;
++}
++
++static const struct IGraphicsCaptureSession3Vtbl session3_vtbl =
++{
++    session3_QueryInterface,
++    session3_AddRef,
++    session3_Release,
++    /* IInspectable methods */
++    session3_GetIids,
++    session3_GetRuntimeClassName,
++    session3_GetTrustLevel,
++    /* IGraphicsCaptureSession3 methods */
++    session3_get_IsBorderRequired,
++    session3_put_IsBorderRequired,
++};
++
++DEFINE_IINSPECTABLE( session_closable, IClosable, struct session, IGraphicsCaptureSession_iface )
++
++static HRESULT WINAPI session_closable_Close( IClosable *iface )
++{
++    struct session *session = impl_from_IClosable( iface );
++    IUnknown *capture;
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &session->cs );
++    session->closed = TRUE;
++    capture = session->capture;
++    session->capture = NULL;
++    LeaveCriticalSection( &session->cs );
++    /* not with the session's lock held: this takes the composition's */
++    if (capture) IUnknown_Release( capture );
++    return S_OK;
++}
++
++static const struct IClosableVtbl session_closable_vtbl =
++{
++    session_closable_QueryInterface,
++    session_closable_AddRef,
++    session_closable_Release,
++    /* IInspectable methods */
++    session_closable_GetIids,
++    session_closable_GetRuntimeClassName,
++    session_closable_GetTrustLevel,
++    /* IClosable methods */
++    session_closable_Close,
++};
++
++HRESULT session_create( IDirect3D11CaptureFramePool *pool, IGraphicsCaptureItem *item, IGraphicsCaptureSession **out )
++{
++    struct session *session;
++
++    if (!item_visual( item ))
++    {
++        WARN( "item %p is not one of ours.\n", item );
++        return E_INVALIDARG;
++    }
++    if (!(session = calloc( 1, sizeof(*session) ))) return E_OUTOFMEMORY;
++    session->IGraphicsCaptureSession_iface.lpVtbl = &session_vtbl;
++    session->IGraphicsCaptureSession2_iface.lpVtbl = &session2_vtbl;
++    session->IGraphicsCaptureSession3_iface.lpVtbl = &session3_vtbl;
++    session->IClosable_iface.lpVtbl = &session_closable_vtbl;
++    session->ref = 1;
++    InitializeCriticalSectionEx( &session->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    session->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": session.cs");
++    session->pool = pool;
++    IDirect3D11CaptureFramePool_AddRef( pool );
++    session->item = item;
++    IGraphicsCaptureItem_AddRef( item );
++    session->cursor_capture = TRUE;
++    session->border_required = TRUE;
++
++    TRACE( "created session %p.\n", session );
++    *out = &session->IGraphicsCaptureSession_iface;
++    return S_OK;
++}
+diff --git a/dlls/graphicscapture/tests/Makefile.in b/dlls/graphicscapture/tests/Makefile.in
+index 6a1f7d80143..4303956a34a 100644
+--- a/dlls/graphicscapture/tests/Makefile.in
++++ b/dlls/graphicscapture/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL = graphicscapture.dll
+-IMPORTS = combase
++IMPORTS = combase d3d11 user32
+ 
+ SOURCES = \
+ 	graphicscapture.c
+diff --git a/dlls/graphicscapture/tests/graphicscapture.c b/dlls/graphicscapture/tests/graphicscapture.c
+index caac271763b..4cfc87f9eb1 100644
+--- a/dlls/graphicscapture/tests/graphicscapture.c
++++ b/dlls/graphicscapture/tests/graphicscapture.c
+@@ -21,14 +21,28 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winuser.h"
+ #include "winstring.h"
+ 
+ #include "roapi.h"
++#include "d3d11.h"
+ 
+ #define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Foundation_Numerics
+ #include "windows.foundation.h"
++#define WIDL_using_Windows_System
++#include "windows.system.h"
++#define WIDL_using_Windows_Graphics
++#define WIDL_using_Windows_Graphics_DirectX
++#define WIDL_using_Windows_Graphics_DirectX_Direct3D11
++#include "windows.graphics.directx.direct3d11.h"
++#include "windows.graphics.directx.direct3d11.interop.h"
++#define WIDL_using_Windows_UI
++#define WIDL_using_Windows_UI_Composition
++#include "windows.ui.composition.h"
+ #define WIDL_using_Windows_Graphics_Capture
+ #include "windows.graphics.capture.h"
++#include "dispatcherqueue.h"
+ 
+ #include "wine/test.h"
+ 
+@@ -84,6 +98,355 @@ static void test_GraphicsCaptureSessionStatics(void)
+     ok( ref == 0, "got ref %ld.\n", ref );
+ }
+ 
++/*** capturing a composition visual ***/
++
++struct arrived
++{
++    ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable_iface;
++    HANDLE event;
++    LONG count;
++};
++
++static HRESULT WINAPI arrived_QueryInterface( ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable *iface,
++                                              REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI arrived_AddRef( ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI arrived_Release( ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI arrived_Invoke( ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable *iface,
++                                      IDirect3D11CaptureFramePool *sender, IInspectable *args )
++{
++    struct arrived *arrived = CONTAINING_RECORD( iface, struct arrived,
++            ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable_iface );
++
++    ok( !!sender, "got no sender.\n" );
++    ok( !args, "got args %p.\n", args );
++    InterlockedIncrement( &arrived->count );
++    SetEvent( arrived->event );
++    return S_OK;
++}
++
++static const ITypedEventHandler_Direct3D11CaptureFramePool_IInspectableVtbl arrived_vtbl =
++{
++    arrived_QueryInterface,
++    arrived_AddRef,
++    arrived_Release,
++    arrived_Invoke,
++};
++
++/* the composition draws on this thread, through its dispatcher queue */
++static DWORD wait_arrived( struct arrived *arrived, DWORD ms )
++{
++    DWORD end = GetTickCount() + ms, ret;
++    MSG msg;
++
++    for (;;)
++    {
++        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
++        ret = MsgWaitForMultipleObjects( 1, &arrived->event, FALSE, 10, QS_ALLINPUT );
++        if (ret == WAIT_OBJECT_0 || (int)(end - GetTickCount()) <= 0) return ret;
++    }
++}
++
++static HSTRING hstring( const WCHAR *s )
++{
++    HSTRING str = NULL;
++    WindowsCreateString( s, wcslen( s ), &str );
++    return str;
++}
++
++static ISpriteVisual *create_sprite( ICompositor *compositor, float width, float height, float x, float y,
++                                     Color colour, ICompositionColorBrush **out )
++{
++    Vector2 size = {width, height};
++    Vector3 offset = {x, y, 0.0f};
++    ICompositionColorBrush *brush;
++    ICompositionBrush *base;
++    ISpriteVisual *sprite;
++    IVisual *visual;
++
++    ICompositor_CreateSpriteVisual( compositor, &sprite );
++    ISpriteVisual_QueryInterface( sprite, &IID_IVisual, (void **)&visual );
++    IVisual_put_Size( visual, size );
++    IVisual_put_Offset( visual, offset );
++    IVisual_Release( visual );
++    ICompositor_CreateColorBrushWithColor( compositor, colour, &brush );
++    ICompositionColorBrush_QueryInterface( brush, &IID_ICompositionBrush, (void **)&base );
++    ISpriteVisual_put_Brush( sprite, base );
++    ICompositionBrush_Release( base );
++    if (out) *out = brush;
++    else ICompositionColorBrush_Release( brush );
++    return sprite;
++}
++
++#define check_frame( pool, device, colour, child ) check_frame_( __LINE__, pool, device, colour, child )
++static void check_frame_( unsigned int line, IDirect3D11CaptureFramePool *pool, ID3D11Device *device,
++                          DWORD colour, DWORD child )
++{
++    IDirect3DDxgiInterfaceAccess *access;
++    Direct3DSurfaceDescription desc;
++    ID3D11DeviceContext *immediate;
++    IDirect3D11CaptureFrame *frame;
++    D3D11_TEXTURE2D_DESC tex_desc;
++    ID3D11Texture2D *texture, *staging;
++    D3D11_MAPPED_SUBRESOURCE map;
++    IDirect3DSurface *surface;
++    SizeInt32 size;
++    IClosable *closable;
++    HRESULT hr;
++
++    frame = NULL;
++    hr = IDirect3D11CaptureFramePool_TryGetNextFrame( pool, &frame );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    ok_(__FILE__, line)( !!frame, "got no frame.\n" );
++    if (!frame) return;
++    hr = IDirect3D11CaptureFrame_get_ContentSize( frame, &size );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    ok_(__FILE__, line)( size.Width == 64 && size.Height == 32, "got size %dx%d.\n", size.Width, size.Height );
++    hr = IDirect3D11CaptureFrame_get_Surface( frame, &surface );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDirect3DSurface_get_Description( surface, &desc );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    ok_(__FILE__, line)( desc.Width == 64 && desc.Height == 32, "got size %dx%d.\n", desc.Width, desc.Height );
++    ok_(__FILE__, line)( desc.Format == DirectXPixelFormat_B8G8R8A8UIntNormalized, "got format %u.\n", desc.Format );
++    hr = IDirect3DSurface_QueryInterface( surface, &IID_IDirect3DDxgiInterfaceAccess, (void **)&access );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDirect3DDxgiInterfaceAccess_GetInterface( access, &IID_ID3D11Texture2D, (void **)&texture );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    IDirect3DDxgiInterfaceAccess_Release( access );
++    IDirect3DSurface_Release( surface );
++
++    ID3D11Texture2D_GetDesc( texture, &tex_desc );
++    tex_desc.Usage = D3D11_USAGE_STAGING;
++    tex_desc.BindFlags = 0;
++    tex_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    tex_desc.MiscFlags = 0;
++    hr = ID3D11Device_CreateTexture2D( device, &tex_desc, NULL, &staging );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    ID3D11Device_GetImmediateContext( device, &immediate );
++    ID3D11DeviceContext_CopyResource( immediate, (ID3D11Resource *)staging, (ID3D11Resource *)texture );
++    hr = ID3D11DeviceContext_Map( immediate, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    if (hr == S_OK)
++    {
++        DWORD *row = (DWORD *)((BYTE *)map.pData + map.RowPitch);
++        ok_(__FILE__, line)( row[1] == colour, "got %08lx at (1,1).\n", row[1] );
++        row = (DWORD *)((BYTE *)map.pData + map.RowPitch * 12);
++        ok_(__FILE__, line)( row[12] == child, "got %08lx at (12,12).\n", row[12] );
++        ok_(__FILE__, line)( row[40] == colour, "got %08lx at (40,12).\n", row[40] );
++        ID3D11DeviceContext_Unmap( immediate, (ID3D11Resource *)staging, 0 );
++    }
++    ID3D11DeviceContext_Release( immediate );
++    ID3D11Texture2D_Release( staging );
++    ID3D11Texture2D_Release( texture );
++
++    hr = IDirect3D11CaptureFrame_QueryInterface( frame, &IID_IClosable, (void **)&closable );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IClosable_Close( closable );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    IClosable_Release( closable );
++    IDirect3D11CaptureFrame_Release( frame );
++}
++
++static void test_capture_visual(void)
++{
++    static const Color red = {255, 255, 0, 0}, green = {255, 0, 255, 0}, blue = {255, 0, 0, 255};
++    struct DispatcherQueueOptions options = {sizeof(options), DQTYPE_THREAD_CURRENT, DQTAT_COM_NONE};
++    struct arrived arrived = {{&arrived_vtbl}};
++    HRESULT (WINAPI *create_queue)(struct DispatcherQueueOptions, IDispatcherQueueController **);
++    HRESULT (WINAPI *create_device)(IDXGIDevice *, IInspectable **);
++    IDirect3D11CaptureFramePoolStatics2 *pool_statics;
++    IDispatcherQueueController *controller = NULL;
++    IDirect3D11CaptureFramePool *pool = NULL;
++    IGraphicsCaptureSession *session = NULL;
++    IGraphicsCaptureItemStatics *item_statics;
++    IDirect3DDxgiInterfaceAccess *access;
++    IGraphicsCaptureItem *item = NULL;
++    ICompositionColorBrush *brush;
++    IDirect3DDevice *device = NULL;
++    IDirect3D11CaptureFrame *frame;
++    IVisualCollection *children;
++    IContainerVisual *container;
++    ICompositor *compositor;
++    ISpriteVisual *root, *child;
++    IInspectable *inspectable;
++    EventRegistrationToken token;
++    IVisual *visual, *child_visual;
++    IDXGIDevice *dxgi, *back;
++    ID3D11Device *d3d;
++    IClosable *closable;
++    SizeInt32 size;
++    HSTRING str;
++    HRESULT hr;
++
++    create_queue = (void *)GetProcAddress( LoadLibraryW( L"coremessaging.dll" ), "CreateDispatcherQueueController" );
++    create_device = (void *)GetProcAddress( LoadLibraryW( L"d3d11.dll" ), "CreateDirect3D11DeviceFromDXGIDevice" );
++    if (!create_queue || !create_device)
++    {
++        win_skip( "no dispatcher queues or Direct3D devices for WinRT.\n" );
++        return;
++    }
++    hr = create_queue( options, &controller );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    str = hstring( L"Windows.UI.Composition.Compositor" );
++    hr = RoActivateInstance( str, &inspectable );
++    WindowsDeleteString( str );
++    ok( hr == S_OK || broken( hr == REGDB_E_CLASSNOTREG ), "got hr %#lx.\n", hr );
++    if (FAILED(hr)) goto done;
++    IInspectable_QueryInterface( inspectable, &IID_ICompositor, (void **)&compositor );
++    IInspectable_Release( inspectable );
++
++    str = hstring( L"Windows.Graphics.Capture.GraphicsCaptureItem" );
++    hr = RoGetActivationFactory( str, &IID_IGraphicsCaptureItemStatics, (void **)&item_statics );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr))
++    {
++        ICompositor_Release( compositor );
++        goto done;
++    }
++    str = hstring( L"Windows.Graphics.Capture.Direct3D11CaptureFramePool" );
++    hr = RoGetActivationFactory( str, &IID_IDirect3D11CaptureFramePoolStatics2, (void **)&pool_statics );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr))
++    {
++        IGraphicsCaptureItemStatics_Release( item_statics );
++        ICompositor_Release( compositor );
++        goto done;
++    }
++
++    hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
++                            D3D11_SDK_VERSION, &d3d, NULL, NULL );
++    if (FAILED(hr))
++        hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_WARP, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
++                                D3D11_SDK_VERSION, &d3d, NULL, NULL );
++    if (FAILED(hr))
++    {
++        skip( "no Direct3D 11 device, hr %#lx.\n", hr );
++        IGraphicsCaptureItemStatics_Release( item_statics );
++        IDirect3D11CaptureFramePoolStatics2_Release( pool_statics );
++        ICompositor_Release( compositor );
++        goto done;
++    }
++    ID3D11Device_QueryInterface( d3d, &IID_IDXGIDevice, (void **)&dxgi );
++    hr = create_device( dxgi, &inspectable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IInspectable_QueryInterface( inspectable, &IID_IDirect3DDevice, (void **)&device );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_interface( inspectable, &IID_IClosable );
++    hr = IInspectable_QueryInterface( inspectable, &IID_IDirect3DDxgiInterfaceAccess, (void **)&access );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDirect3DDxgiInterfaceAccess_GetInterface( access, &IID_IDXGIDevice, (void **)&back );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( back == dxgi, "got another device.\n" );
++    IDXGIDevice_Release( back );
++    IDirect3DDxgiInterfaceAccess_Release( access );
++    IInspectable_Release( inspectable );
++
++    /* red, with a green square in it */
++    root = create_sprite( compositor, 64.0f, 32.0f, 0.0f, 0.0f, red, &brush );
++    child = create_sprite( compositor, 16.0f, 16.0f, 8.0f, 8.0f, green, NULL );
++    ISpriteVisual_QueryInterface( root, &IID_IVisual, (void **)&visual );
++    ISpriteVisual_QueryInterface( child, &IID_IVisual, (void **)&child_visual );
++    ISpriteVisual_QueryInterface( root, &IID_IContainerVisual, (void **)&container );
++    IContainerVisual_get_Children( container, &children );
++    IVisualCollection_InsertAtTop( children, child_visual );
++
++    hr = IGraphicsCaptureItemStatics_CreateFromVisual( item_statics, visual, &item );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (!item) goto release;
++    check_interface( item, &IID_IGraphicsCaptureItem );
++    check_interface( item, &IID_IAgileObject );
++    hr = IGraphicsCaptureItem_get_Size( item, &size );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( size.Width == 64 && size.Height == 32, "got size %dx%d.\n", size.Width, size.Height );
++
++    hr = IDirect3D11CaptureFramePoolStatics2_CreateFreeThreaded( pool_statics, device,
++            DirectXPixelFormat_B8G8R8A8UIntNormalized, 1, size, &pool );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    check_interface( pool, &IID_IClosable );
++    arrived.event = CreateEventW( NULL, FALSE, FALSE, NULL );
++    hr = IDirect3D11CaptureFramePool_add_FrameArrived( pool,
++            &arrived.ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable_iface, &token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDirect3D11CaptureFramePool_CreateCaptureSession( pool, item, &session );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++    /* nothing is drawn before the capture starts */
++    frame = (void *)0xdeadbeef;
++    hr = IDirect3D11CaptureFramePool_TryGetNextFrame( pool, &frame );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( !frame, "got frame %p.\n", frame );
++
++    hr = IGraphicsCaptureSession_StartCapture( session );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( wait_arrived( &arrived, 5000 ) == WAIT_OBJECT_0, "no frame arrived.\n" );
++    check_frame( pool, d3d, 0xffff0000, 0xff00ff00 );
++    /* the only buffer was taken, and nothing changed since */
++    frame = (void *)0xdeadbeef;
++    hr = IDirect3D11CaptureFramePool_TryGetNextFrame( pool, &frame );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( !frame, "got frame %p.\n", frame );
++
++    /* a change brings a frame, with no commit asked for */
++    hr = ICompositionColorBrush_put_Color( brush, blue );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( wait_arrived( &arrived, 5000 ) == WAIT_OBJECT_0, "no frame arrived.\n" );
++    check_frame( pool, d3d, 0xff0000ff, 0xff00ff00 );
++
++    hr = IDirect3D11CaptureFramePool_remove_FrameArrived( pool, token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IGraphicsCaptureSession_QueryInterface( session, &IID_IClosable, (void **)&closable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IClosable_Close( closable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IClosable_Release( closable );
++    hr = IDirect3D11CaptureFramePool_QueryInterface( pool, &IID_IClosable, (void **)&closable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IClosable_Close( closable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IClosable_Release( closable );
++    CloseHandle( arrived.event );
++
++    IGraphicsCaptureSession_Release( session );
++    IDirect3D11CaptureFramePool_Release( pool );
++    IGraphicsCaptureItem_Release( item );
++release:
++    ICompositionColorBrush_Release( brush );
++    IVisualCollection_Release( children );
++    IContainerVisual_Release( container );
++    IVisual_Release( child_visual );
++    IVisual_Release( visual );
++    ISpriteVisual_Release( child );
++    ISpriteVisual_Release( root );
++    IDirect3DDevice_Release( device );
++    IDXGIDevice_Release( dxgi );
++    ID3D11Device_Release( d3d );
++    IGraphicsCaptureItemStatics_Release( item_statics );
++    IDirect3D11CaptureFramePoolStatics2_Release( pool_statics );
++    ICompositor_Release( compositor );
++done:
++    if (controller) IDispatcherQueueController_Release( controller );
++}
++
+ START_TEST(graphicscapture)
+ {
+     HRESULT hr;
+@@ -92,6 +455,7 @@ START_TEST(graphicscapture)
+     ok( hr == S_OK, "RoInitialize failed, hr %#lx\n", hr );
+ 
+     test_GraphicsCaptureSessionStatics();
++    test_capture_visual();
+ 
+     RoUninitialize();
+ }

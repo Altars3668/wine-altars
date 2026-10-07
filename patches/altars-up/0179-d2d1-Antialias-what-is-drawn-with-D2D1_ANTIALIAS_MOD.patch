@@ -1,0 +1,1061 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 21:44:33 -0400
+Subject: [PATCH] d2d1: Antialias what is drawn with
+ D2D1_ANTIALIAS_MODE_PER_PRIMITIVE.
+
+SetAntialiasMode() was recorded and nothing more: every fill and stroke,
+and every clip, was aliased, which in Office leaves every shape, chart line
+and gradient-filled word with stepped edges.  Windows covers a pixel by as
+much of it as the primitive covers (tools/d2daaprobe in wine-altars, build
+29671): 0.75 of it for an edge at x + 0.25, 178/255 for a clip edge at
+x + 0.3, and a line a pixel wide at an angle smeared over its row.
+
+Each primitive is now drawn first into a mask of what it covers over the
+pixels its bounds, or widened bounds, and the clip reach: R8, with 8
+samples, or as many as the device has; the mask, kept by the context and
+grown as needed, is cleared over them with ClearView().  The edges of
+triangles are covered by the samples; those the pixel shader decides --
+curves, curved strokes and round joins -- cover as much of the pixel as is
+within them, the distance to the edge in pixels being the implicit
+function over its gradient, rather than clipping at the pixel's centre.
+The mask keeps the most any part covers, so the parts of one primitive do
+not add up where they overlap.  Then a rectangle over those pixels is drawn
+with the brush, times the mean of the mask's samples.  A rectangle along
+the edges of pixels is drawn as before.
+
+An axis-aligned clip pushed antialiased keeps as much of each pixel as it
+covers, worked out in the pixel shader, edge by edge from whichever clip
+the edge of the intersection comes from.  Clearing keeps to the pixels
+whose centres the clip keeps, as before.
+
+A rectangle and a clip antialiased now match Windows exactly; an edge of a
+triangle is within an eighth of a pixel, curves within a few percent.  The
+new test passes on Windows, in a desktop session on the GPU, and with the
+GL and Vulkan renderers.
+
+Per-sample shading was tried first and dropped: the renderers do not agree
+with each other or with Windows on where a per-sample shader's inputs and
+SV_Position are (tools/d3d11sampleprobe in wine-altars).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 69802d1f7ce8c79b1567b82c2f8a0e2421d3f859)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 3c0f29e222d..604e6a19a23 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -62,11 +62,15 @@ struct d2d_settings
+ };
+ extern struct d2d_settings d2d_settings;
+ 
++/* Axis-aligned clips, each the intersection of those before; "edges" says which of an intersection's left, top,
++ * right and bottom edges (bits 0 to 3) come from a clip pushed antialiased. */
+ struct d2d_clip_stack
+ {
+     D2D1_RECT_F *stack;
+     size_t size;
+     size_t count;
++    unsigned char *edges;
++    size_t edges_size;
+ };
+ 
+ struct d2d_error_state
+@@ -130,12 +134,26 @@ struct d2d_brush_cb
+     } u;
+ };
+ 
++/* How a draw counts what a shape covers: drawn straight to the target, where the shaders' tests keep a pixel's
++ * centre; into a multisampled mask of what an antialiased primitive covers; or through such a mask. */
++enum d2d_coverage
++{
++    D2D_COVERAGE_SHAPE,
++    D2D_COVERAGE_MASK,
++    D2D_COVERAGE_COVER,
++};
++
+ struct d2d_ps_cb
+ {
+     BOOL outline;
+     BOOL is_arc;
+     BOOL round_joins;
+-    BOOL pad;
++    enum d2d_coverage coverage;
++    int mask_offset[2];
++    unsigned int sample_count;
++    /* the edges of the clip that are antialiased, and where the clip is */
++    unsigned int clip_edges;
++    D2D1_RECT_F clip;
+     struct d2d_brush_cb colour_brush;
+     struct d2d_brush_cb opacity_brush;
+ };
+@@ -240,6 +258,18 @@ struct d2d_device_context
+     struct d2d_shape_resources shape_resources[D2D_SHAPE_TYPE_COUNT];
+     ID3D11Buffer *vs_cb;
+     ID3D11PixelShader *ps;
++    /* What an antialiased primitive covers is drawn here first, made when first wanted and grown as needed,
++     * with a blend state that keeps the most any part covers; "sample_count" is 0 until looked up, and 1 where
++     * multisampling is not to be had. */
++    struct
++    {
++        ID3D11Texture2D *texture;
++        ID3D11RenderTargetView *rtv;
++        ID3D11ShaderResourceView *srv;
++        ID3D11BlendState *bs;
++        D2D1_SIZE_U size;
++        unsigned int sample_count;
++    } coverage;
+     ID3D11Buffer *ps_cb;
+     ID3D11Buffer *ib;
+     unsigned int vb_stride;
+@@ -829,6 +859,7 @@ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *
+ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+         D2D1_FILL_MODE fill_mode, ID2D1Geometry **src_geometries, unsigned int geometry_count);
+ struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface);
++BOOL d2d_geometry_get_rectangle(const struct d2d_geometry *geometry, D2D1_RECT_F *rect);
+ 
+ struct d2d_geometry_realization
+ {
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 39e57a4caf8..939af2a5812 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -82,8 +82,14 @@ static BOOL d2d_clip_stack_init(struct d2d_clip_stack *stack)
+ {
+     if (!(stack->stack = malloc(INITIAL_CLIP_STACK_SIZE * sizeof(*stack->stack))))
+         return FALSE;
++    if (!(stack->edges = malloc(INITIAL_CLIP_STACK_SIZE * sizeof(*stack->edges))))
++    {
++        free(stack->stack);
++        return FALSE;
++    }
+ 
+     stack->size = INITIAL_CLIP_STACK_SIZE;
++    stack->edges_size = INITIAL_CLIP_STACK_SIZE;
+     stack->count = 0;
+ 
+     return TRUE;
+@@ -91,19 +97,37 @@ static BOOL d2d_clip_stack_init(struct d2d_clip_stack *stack)
+ 
+ static void d2d_clip_stack_cleanup(struct d2d_clip_stack *stack)
+ {
++    free(stack->edges);
+     free(stack->stack);
+ }
+ 
+-static BOOL d2d_clip_stack_push(struct d2d_clip_stack *stack, const D2D1_RECT_F *rect)
++/* Each edge of the intersection is the one of the clip it comes from, antialiased or not as that clip is. */
++static BOOL d2d_clip_stack_push(struct d2d_clip_stack *stack, const D2D1_RECT_F *rect, BOOL antialias)
+ {
++    unsigned char edges = antialias ? 0xf : 0;
++    const D2D1_RECT_F *prev;
+     D2D1_RECT_F r;
+ 
+-    if (!d2d_array_reserve((void **)&stack->stack, &stack->size, stack->count + 1, sizeof(*stack->stack)))
++    if (!d2d_array_reserve((void **)&stack->stack, &stack->size, stack->count + 1, sizeof(*stack->stack))
++            || !d2d_array_reserve((void **)&stack->edges, &stack->edges_size, stack->count + 1,
++            sizeof(*stack->edges)))
+         return FALSE;
+ 
+     r = *rect;
+     if (stack->count)
+-        d2d_rect_intersect(&r, &stack->stack[stack->count - 1]);
++    {
++        prev = &stack->stack[stack->count - 1];
++        if (prev->left >= r.left)
++            edges = (edges & ~0x1) | (stack->edges[stack->count - 1] & 0x1);
++        if (prev->top >= r.top)
++            edges = (edges & ~0x2) | (stack->edges[stack->count - 1] & 0x2);
++        if (prev->right <= r.right)
++            edges = (edges & ~0x4) | (stack->edges[stack->count - 1] & 0x4);
++        if (prev->bottom <= r.bottom)
++            edges = (edges & ~0x8) | (stack->edges[stack->count - 1] & 0x8);
++        d2d_rect_intersect(&r, prev);
++    }
++    stack->edges[stack->count] = edges;
+     stack->stack[stack->count++] = r;
+ 
+     return TRUE;
+@@ -116,10 +140,58 @@ static void d2d_clip_stack_pop(struct d2d_clip_stack *stack)
+     --stack->count;
+ }
+ 
++/* An antialiased primitive is drawn into a multisampled mask of what it covers, then as a rectangle through the
++ * mask; "bounds" are the pixels of the target the mask stands for. */
++struct d2d_coverage_pass
++{
++    enum d2d_coverage coverage;
++    RECT bounds;
++};
++
++static void d2d_device_context_release_coverage(struct d2d_device_context *context)
++{
++    if (context->coverage.srv)
++        ID3D11ShaderResourceView_Release(context->coverage.srv);
++    if (context->coverage.rtv)
++        ID3D11RenderTargetView_Release(context->coverage.rtv);
++    if (context->coverage.texture)
++        ID3D11Texture2D_Release(context->coverage.texture);
++    context->coverage.srv = NULL;
++    context->coverage.rtv = NULL;
++    context->coverage.texture = NULL;
++    context->coverage.size.width = context->coverage.size.height = 0;
++}
++
++/* The pixels drawing reaches: those whose centres the clip keeps, and, unless "centres" says otherwise, those an
++ * antialiased edge of it crosses; else the whole target. */
++static void d2d_device_context_get_scissor(const struct d2d_device_context *context, RECT *rect, BOOL centres)
++{
++    const D2D1_RECT_F *clip_rect;
++    unsigned char edges;
++
++    if (context->clip_stack.count)
++    {
++        clip_rect = &context->clip_stack.stack[context->clip_stack.count - 1];
++        edges = centres ? 0 : context->clip_stack.edges[context->clip_stack.count - 1];
++        rect->left = edges & 0x1 ? floorf(clip_rect->left) : ceilf(clip_rect->left - 0.5f);
++        rect->top = edges & 0x2 ? floorf(clip_rect->top) : ceilf(clip_rect->top - 0.5f);
++        rect->right = edges & 0x4 ? ceilf(clip_rect->right) : ceilf(clip_rect->right - 0.5f);
++        rect->bottom = edges & 0x8 ? ceilf(clip_rect->bottom) : ceilf(clip_rect->bottom - 0.5f);
++    }
++    else
++    {
++        rect->left = 0;
++        rect->top = 0;
++        rect->right = context->pixel_size.width;
++        rect->bottom = context->pixel_size.height;
++    }
++}
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
+-        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush, const struct d2d_coverage_pass *pass)
+ {
++    static ID3D11ShaderResourceView * const no_view;
+     struct d2d_shape_resources *shape_resources = &render_target->shape_resources[shape_type];
+     ID3DDeviceContextState *prev_state;
+     ID3D11Device1 *device = render_target->d3d_device;
+@@ -151,46 +223,55 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     ID3D11DeviceContext1_VSSetShader(context, shape_resources->vs, NULL, 0);
+     ID3D11DeviceContext1_PSSetConstantBuffers(context, 0, 1, &ps_cb);
+     ID3D11DeviceContext1_PSSetShader(context, render_target->ps, NULL, 0);
+-    ID3D11DeviceContext1_RSSetViewports(context, 1, &vp);
+-    if (render_target->clip_stack.count)
+-    {
+-        const D2D1_RECT_F *clip_rect;
+-
+-        clip_rect = &render_target->clip_stack.stack[render_target->clip_stack.count - 1];
+-        scissor_rect.left = ceilf(clip_rect->left - 0.5f);
+-        scissor_rect.top = ceilf(clip_rect->top - 0.5f);
+-        scissor_rect.right = ceilf(clip_rect->right - 0.5f);
+-        scissor_rect.bottom = ceilf(clip_rect->bottom - 0.5f);
+-    }
+-    else
+-    {
+-        scissor_rect.left = 0.0f;
+-        scissor_rect.top = 0.0f;
+-        scissor_rect.right = render_target->pixel_size.width;
+-        scissor_rect.bottom = render_target->pixel_size.height;
+-    }
+-    ID3D11DeviceContext1_RSSetScissorRects(context, 1, &scissor_rect);
++    /* Clearing, with no brush to blend, keeps to the pixels whose centres the clip keeps. */
++    d2d_device_context_get_scissor(render_target, &scissor_rect, !brush);
+     ID3D11DeviceContext1_RSSetState(context, render_target->rs);
+-    ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv, NULL);
+-    if (brush)
+-    {
+-        ID3D11BlendState *blend_state = render_target->drawing_state.primitiveBlend == D2D1_PRIMITIVE_BLEND_ADD
+-                ? render_target->bs_add : render_target->bs;
+-        ID3D11DeviceContext1_OMSetBlendState(context, blend_state, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+-        d2d_brush_bind_resources(brush, render_target, 0);
++    if (pass && pass->coverage == D2D_COVERAGE_MASK)
++    {
++        /* The mask's pixels are the target's from the corner of the bounds on, and each keeps the most any part
++         * of the shape covers of it. */
++        vp.TopLeftX = -pass->bounds.left;
++        vp.TopLeftY = -pass->bounds.top;
++        scissor_rect.left = max(scissor_rect.left, pass->bounds.left) - pass->bounds.left;
++        scissor_rect.top = max(scissor_rect.top, pass->bounds.top) - pass->bounds.top;
++        scissor_rect.right = min(scissor_rect.right, pass->bounds.right) - pass->bounds.left;
++        scissor_rect.bottom = min(scissor_rect.bottom, pass->bounds.bottom) - pass->bounds.top;
++        ID3D11DeviceContext1_RSSetViewports(context, 1, &vp);
++        ID3D11DeviceContext1_RSSetScissorRects(context, 1, &scissor_rect);
++        ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->coverage.rtv, NULL);
++        ID3D11DeviceContext1_OMSetBlendState(context, render_target->coverage.bs, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+     }
+     else
+     {
+-        ID3D11DeviceContext1_OMSetBlendState(context, NULL, NULL, D3D11_DEFAULT_SAMPLE_MASK);
++        ID3D11DeviceContext1_RSSetViewports(context, 1, &vp);
++        ID3D11DeviceContext1_RSSetScissorRects(context, 1, &scissor_rect);
++        ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv, NULL);
++        if (pass && pass->coverage == D2D_COVERAGE_COVER)
++            ID3D11DeviceContext1_PSSetShaderResources(context, 4, 1, &render_target->coverage.srv);
++        if (brush)
++        {
++            ID3D11BlendState *blend_state = render_target->drawing_state.primitiveBlend == D2D1_PRIMITIVE_BLEND_ADD
++                    ? render_target->bs_add : render_target->bs;
++            ID3D11DeviceContext1_OMSetBlendState(context, blend_state, NULL, D3D11_DEFAULT_SAMPLE_MASK);
++            d2d_brush_bind_resources(brush, render_target, 0);
++        }
++        else
++        {
++            ID3D11DeviceContext1_OMSetBlendState(context, NULL, NULL, D3D11_DEFAULT_SAMPLE_MASK);
++        }
++        if (opacity_brush)
++            d2d_brush_bind_resources(opacity_brush, render_target, 1);
+     }
+-    if (opacity_brush)
+-        d2d_brush_bind_resources(opacity_brush, render_target, 1);
+ 
+     if (ib)
+         ID3D11DeviceContext1_DrawIndexed(context, index_count, 0, 0);
+     else
+         ID3D11DeviceContext1_Draw(context, index_count, 0);
+ 
++    /* The mask is drawn into again as a target. */
++    if (pass && pass->coverage == D2D_COVERAGE_COVER)
++        ID3D11DeviceContext1_PSSetShaderResources(context, 4, 1, &no_view);
++
+     ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
+     ID3D11DeviceContext1_Release(context);
+     ID3DDeviceContextState_Release(prev_state);
+@@ -337,6 +418,9 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+         ID3D11Buffer_Release(context->ib);
+         ID3D11Buffer_Release(context->ps_cb);
+         ID3D11PixelShader_Release(context->ps);
++        d2d_device_context_release_coverage(context);
++        if (context->coverage.bs)
++            ID3D11BlendState_Release(context->coverage.bs);
+         ID3D11Buffer_Release(context->vs_cb);
+         for (i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
+         {
+@@ -834,7 +918,8 @@ static void STDMETHODCALLTYPE d2d_device_context_FillEllipse(ID2D1DeviceContext6
+ }
+ 
+ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
+-        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc, BOOL round_joins)
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc, BOOL round_joins,
++        const struct d2d_coverage_pass *pass)
+ {
+     D3D11_MAPPED_SUBRESOURCE map_desc;
+     ID3D11DeviceContext *d3d_context;
+@@ -855,7 +940,16 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+     cb_data->outline = outline;
+     cb_data->is_arc = is_arc;
+     cb_data->round_joins = round_joins;
+-    cb_data->pad = 0;
++    cb_data->coverage = pass ? pass->coverage : D2D_COVERAGE_SHAPE;
++    cb_data->mask_offset[0] = pass ? pass->bounds.left : 0;
++    cb_data->mask_offset[1] = pass ? pass->bounds.top : 0;
++    cb_data->sample_count = context->coverage.sample_count;
++    cb_data->clip_edges = 0;
++    if (context->clip_stack.count)
++    {
++        cb_data->clip_edges = context->clip_stack.edges[context->clip_stack.count - 1];
++        cb_data->clip = context->clip_stack.stack[context->clip_stack.count - 1];
++    }
+     if (!d2d_brush_fill_cb(brush, &cb_data->colour_brush))
+         WARN("Failed to initialize colour brush buffer.\n");
+     if (!d2d_brush_fill_cb(opacity_brush, &cb_data->opacity_brush))
+@@ -922,9 +1016,207 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     return S_OK;
+ }
+ 
+-static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
++/* The transform from the world to the target's pixels. */
++static void d2d_device_context_get_device_transform(const struct d2d_device_context *context,
++        D2D1_MATRIX_3X2_F *m)
++{
++    const D2D1_MATRIX_3X2_F *w = &context->drawing_state.transform;
++    float scale_x = context->desc.dpiX / 96.0f, scale_y = context->desc.dpiY / 96.0f;
++
++    m->_11 = w->_11 * scale_x;
++    m->_21 = w->_21 * scale_x;
++    m->_31 = w->_31 * scale_x;
++    m->_12 = w->_12 * scale_y;
++    m->_22 = w->_22 * scale_y;
++    m->_32 = w->_32 * scale_y;
++}
++
++/* A mask of at least "width" by "height" pixels, with as many samples as the device allows, up to eight. */
++static BOOL d2d_device_context_get_coverage(struct d2d_device_context *context, unsigned int width,
++        unsigned int height)
++{
++    static const unsigned int sample_counts[] = {8, 4, 2};
++    D3D11_TEXTURE2D_DESC desc;
++    unsigned int i;
++    UINT levels;
++    HRESULT hr;
++
++    if (!context->coverage.sample_count)
++    {
++        context->coverage.sample_count = 1;
++        for (i = 0; i < ARRAY_SIZE(sample_counts); ++i)
++        {
++            if (SUCCEEDED(ID3D11Device1_CheckMultisampleQualityLevels(context->d3d_device, DXGI_FORMAT_R8_UNORM,
++                    sample_counts[i], &levels)) && levels)
++            {
++                context->coverage.sample_count = sample_counts[i];
++                break;
++            }
++        }
++        TRACE("Antialiasing with %u samples a pixel.\n", context->coverage.sample_count);
++    }
++    if (context->coverage.sample_count < 2)
++        return FALSE;
++    if (!context->coverage.bs)
++    {
++        D3D11_BLEND_DESC blend_desc;
++
++        memset(&blend_desc, 0, sizeof(blend_desc));
++        blend_desc.RenderTarget[0].BlendEnable = TRUE;
++        blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++        blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
++        blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_MAX;
++        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++        blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
++        blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_MAX;
++        blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++        if (FAILED(hr = ID3D11Device1_CreateBlendState(context->d3d_device, &blend_desc, &context->coverage.bs)))
++        {
++            ERR("Failed to create the coverage blend state, hr %#lx; not antialiasing.\n", hr);
++            context->coverage.sample_count = 1;
++            return FALSE;
++        }
++    }
++    if (context->coverage.texture && context->coverage.size.width >= width && context->coverage.size.height >= height)
++        return TRUE;
++
++    width = (max(width, context->coverage.size.width) + 255) & ~255u;
++    height = (max(height, context->coverage.size.height) + 255) & ~255u;
++    if (width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
++        return FALSE;
++    d2d_device_context_release_coverage(context);
++
++    desc.Width = width;
++    desc.Height = height;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Format = DXGI_FORMAT_R8_UNORM;
++    desc.SampleDesc.Count = context->coverage.sample_count;
++    desc.SampleDesc.Quality = 0;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    desc.CPUAccessFlags = 0;
++    desc.MiscFlags = 0;
++    if (FAILED(hr = ID3D11Device1_CreateTexture2D(context->d3d_device, &desc, NULL, &context->coverage.texture))
++            || FAILED(hr = ID3D11Device1_CreateRenderTargetView(context->d3d_device,
++            (ID3D11Resource *)context->coverage.texture, NULL, &context->coverage.rtv))
++            || FAILED(hr = ID3D11Device1_CreateShaderResourceView(context->d3d_device,
++            (ID3D11Resource *)context->coverage.texture, NULL, &context->coverage.srv)))
++    {
++        ERR("Failed to create a %ux%u coverage mask, hr %#lx; not antialiasing.\n", width, height, hr);
++        d2d_device_context_release_coverage(context);
++        context->coverage.sample_count = 1;
++        return FALSE;
++    }
++    context->coverage.size.width = width;
++    context->coverage.size.height = height;
++    return TRUE;
++}
++
++/* Whether the geometry, filled, or stroked "stroke_width" wide in "style", is drawn antialiased through a mask
++ * of what it covers; if so, the mask is cleared over the pixels it may. */
++static BOOL d2d_device_context_begin_coverage(struct d2d_device_context *context,
++        const struct d2d_geometry *geometry, BOOL stroke, float stroke_width, const struct d2d_stroke_style *style,
++        struct d2d_coverage_pass *pass)
++{
++    static const float transparent[4];
++    ID3D11DeviceContext1 *d3d_context;
++    D2D1_RECT_F bounds, rect;
++    D2D1_MATRIX_3X2_F m;
++    RECT scissor, clear;
++    HRESULT hr;
++
++    if (context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
++            || context->target.type != D2D_TARGET_BITMAP)
++        return FALSE;
++    d2d_device_context_get_device_transform(context, &m);
++    if (m._11 * m._22 - m._12 * m._21 == 0.0f)
++        return FALSE;
++    if (stroke)
++        hr = ID2D1Geometry_GetWidenedBounds((ID2D1Geometry *)&geometry->ID2D1Geometry_iface, stroke_width,
++                style ? (ID2D1StrokeStyle *)&style->ID2D1StrokeStyle1_iface : NULL, &m,
++                D2D1_DEFAULT_FLATTENING_TOLERANCE, &bounds);
++    else
++        hr = ID2D1Geometry_GetBounds((ID2D1Geometry *)&geometry->ID2D1Geometry_iface, &m, &bounds);
++    if (FAILED(hr) || !(bounds.left <= bounds.right && bounds.top <= bounds.bottom))
++        return FALSE;
++
++    if (stroke)
++    {
++        /* what is drawn may be a little off what is worked out */
++        bounds.left -= 1.0f;
++        bounds.top -= 1.0f;
++        bounds.right += 1.0f;
++        bounds.bottom += 1.0f;
++    }
++    else if (d2d_geometry_get_rectangle(geometry, &rect) && !m._12 && !m._21
++            && bounds.left == floorf(bounds.left) && bounds.top == floorf(bounds.top)
++            && bounds.right == floorf(bounds.right) && bounds.bottom == floorf(bounds.bottom))
++    {
++        /* A rectangle along the edges of pixels covers them whole or not at all. */
++        return FALSE;
++    }
++
++    d2d_device_context_get_scissor(context, &scissor, FALSE);
++    scissor.left = max(scissor.left, 0);
++    scissor.top = max(scissor.top, 0);
++    scissor.right = min(scissor.right, (LONG)context->pixel_size.width);
++    scissor.bottom = min(scissor.bottom, (LONG)context->pixel_size.height);
++    pass->bounds.left = floorf(max(bounds.left, (float)scissor.left));
++    pass->bounds.top = floorf(max(bounds.top, (float)scissor.top));
++    pass->bounds.right = ceilf(min(bounds.right, (float)scissor.right));
++    pass->bounds.bottom = ceilf(min(bounds.bottom, (float)scissor.bottom));
++    if (pass->bounds.left >= pass->bounds.right || pass->bounds.top >= pass->bounds.bottom)
++        return FALSE;
++    if (!d2d_device_context_get_coverage(context, pass->bounds.right - pass->bounds.left,
++            pass->bounds.bottom - pass->bounds.top))
++        return FALSE;
++
++    pass->coverage = D2D_COVERAGE_MASK;
++    clear.left = 0;
++    clear.top = 0;
++    clear.right = pass->bounds.right - pass->bounds.left;
++    clear.bottom = pass->bounds.bottom - pass->bounds.top;
++    if (context->cs)
++        EnterCriticalSection(context->cs);
++    ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
++    ID3D11DeviceContext1_ClearView(d3d_context, (ID3D11View *)context->coverage.rtv, transparent, &clear, 1);
++    ID3D11DeviceContext1_Release(d3d_context);
++    if (context->cs)
++        LeaveCriticalSection(context->cs);
++    return TRUE;
++}
++
++/* The primitive drawn as the rectangle of its mask, each pixel as much of the brush as the mask covers of it. */
++static void d2d_device_context_cover(struct d2d_device_context *context, const struct d2d_coverage_pass *mask,
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++{
++    struct d2d_coverage_pass pass = *mask;
++    D2D1_MATRIX_3X2_F m, to_world, quad;
++
++    pass.coverage = D2D_COVERAGE_COVER;
++    d2d_device_context_get_device_transform(context, &m);
++    if (!d2d_matrix_invert(&to_world, &m))
++        return;
++    /* The unit quad's corners at ±1 go to the corners of the mask's pixels, and from there to the world. */
++    quad._11 = (pass.bounds.right - pass.bounds.left) / 2.0f;
++    quad._12 = 0.0f;
++    quad._21 = 0.0f;
++    quad._22 = (pass.bounds.bottom - pass.bounds.top) / 2.0f;
++    quad._31 = (pass.bounds.left + pass.bounds.right) / 2.0f;
++    quad._32 = (pass.bounds.top + pass.bounds.bottom) / 2.0f;
++    d2d_matrix_multiply(&quad, &to_world);
++
++    if (FAILED(d2d_device_context_update_vs_cb(context, &quad, 0.0f, 0.0f, FALSE))
++            || FAILED(d2d_device_context_update_ps_cb(context, brush, opacity_brush, FALSE, FALSE, FALSE, &pass)))
++        return;
++    d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, context->ib, 6, context->vb, context->vb_stride,
++            brush, opacity_brush, &pass);
++}
++
++static void d2d_device_context_draw_geometry_pass(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
+-        const struct d2d_stroke_style *style)
++        const struct d2d_stroke_style *style, const struct d2d_coverage_pass *pass)
+ {
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
+@@ -960,7 +1252,7 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+         return;
+     }
+ 
+-    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, FALSE, round_joins)))
++    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, FALSE, round_joins, pass)))
+     {
+         WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -997,7 +1289,7 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+         }
+ 
+         d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * geometry->outline.face_count, vb,
+-                sizeof(*geometry->outline.vertices), brush, NULL);
++                sizeof(*geometry->outline.vertices), brush, NULL, pass);
+ 
+         ID3D11Buffer_Release(vb);
+         ID3D11Buffer_Release(ib);
+@@ -1005,7 +1297,8 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+ 
+     if (geometry->outline.bezier_face_count)
+     {
+-        if (round_joins && FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, FALSE, FALSE)))
++        if (round_joins && FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL,
++                TRUE, FALSE, FALSE, pass)))
+         {
+             WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
+             return;
+@@ -1034,7 +1327,7 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+ 
+         d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib,
+                 3 * geometry->outline.bezier_face_count, vb,
+-                sizeof(*geometry->outline.beziers), brush, NULL);
++                sizeof(*geometry->outline.beziers), brush, NULL, pass);
+ 
+         ID3D11Buffer_Release(vb);
+         ID3D11Buffer_Release(ib);
+@@ -1063,16 +1356,32 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+             return;
+         }
+ 
+-        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE, FALSE)))
++        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE, FALSE, pass)))
+             d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
+                     3 * geometry->outline.arc_face_count, vb,
+-                    sizeof(*geometry->outline.arcs), brush, NULL);
++                    sizeof(*geometry->outline.arcs), brush, NULL, pass);
+ 
+         ID3D11Buffer_Release(vb);
+         ID3D11Buffer_Release(ib);
+     }
+ }
+ 
++
++static void d2d_device_context_draw_geometry(struct d2d_device_context *context,
++        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
++        const struct d2d_stroke_style *style)
++{
++    struct d2d_coverage_pass pass;
++
++    if (d2d_device_context_begin_coverage(context, geometry, TRUE, stroke_width, style, &pass))
++    {
++        d2d_device_context_draw_geometry_pass(context, geometry, brush, stroke_width, style, &pass);
++        d2d_device_context_cover(context, &pass, brush, NULL);
++        return;
++    }
++    d2d_device_context_draw_geometry_pass(context, geometry, brush, stroke_width, style, NULL);
++}
++
+ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush);
+ 
+@@ -1158,8 +1467,9 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
+     d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width, stroke_style_impl);
+ }
+ 
+-static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+-        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++static void d2d_device_context_fill_geometry_pass(struct d2d_device_context *render_target,
++        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush,
++        const struct d2d_coverage_pass *pass)
+ {
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
+@@ -1179,7 +1489,7 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+         return;
+     }
+ 
+-    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, FALSE, FALSE)))
++    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, FALSE, FALSE, pass)))
+     {
+         WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -1209,7 +1519,7 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+         }
+ 
+         d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
+-                sizeof(*geometry->fill.vertices), brush, opacity_brush);
++                sizeof(*geometry->fill.vertices), brush, opacity_brush, pass);
+ 
+         ID3D11Buffer_Release(vb);
+         ID3D11Buffer_Release(ib);
+@@ -1228,7 +1538,7 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+         }
+ 
+         d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.bezier_vertex_count, vb,
+-                sizeof(*geometry->fill.bezier_vertices), brush, opacity_brush);
++                sizeof(*geometry->fill.bezier_vertices), brush, opacity_brush, pass);
+ 
+         ID3D11Buffer_Release(vb);
+     }
+@@ -1245,14 +1555,28 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+             return;
+         }
+ 
+-        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE, FALSE)))
++        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE, FALSE, pass)))
+             d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
+-                    sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
++                    sizeof(*geometry->fill.arc_vertices), brush, opacity_brush, pass);
+ 
+         ID3D11Buffer_Release(vb);
+     }
+ }
+ 
++static void d2d_device_context_fill_geometry(struct d2d_device_context *context,
++        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++{
++    struct d2d_coverage_pass pass;
++
++    if (d2d_device_context_begin_coverage(context, geometry, FALSE, 0.0f, NULL, &pass))
++    {
++        d2d_device_context_fill_geometry_pass(context, geometry, brush, opacity_brush, &pass);
++        d2d_device_context_cover(context, &pass, brush, opacity_brush);
++        return;
++    }
++    d2d_device_context_fill_geometry_pass(context, geometry, brush, opacity_brush, NULL);
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_FillGeometry(ID2D1DeviceContext6 *iface,
+         ID2D1Geometry *geometry, ID2D1Brush *brush, ID2D1Brush *opacity_brush)
+ {
+@@ -2238,7 +2562,7 @@ static void d2d_device_context_push_layer(struct d2d_device_context *context,
+     if (d2d_rect_is_bounded(&parameters->contentBounds))
+     {
+         d2d_device_context_transform_clip(context, &parameters->contentBounds, &clip);
+-        state->clipped = d2d_clip_stack_push(&context->clip_stack, &clip);
++        state->clipped = d2d_clip_stack_push(&context->clip_stack, &clip, FALSE);
+     }
+ }
+ 
+@@ -2390,11 +2714,9 @@ static void STDMETHODCALLTYPE d2d_device_context_PushAxisAlignedClip(ID2D1Device
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_push_clip(context->target.command_list, clip_rect, antialias_mode);
+ 
+-    if (antialias_mode != D2D1_ANTIALIAS_MODE_ALIASED)
+-        FIXME("Ignoring antialias_mode %#x.\n", antialias_mode);
+-
+     d2d_device_context_transform_clip(context, clip_rect, &transformed_rect);
+-    if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect))
++    if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect,
++            antialias_mode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE))
+         WARN("Failed to push clip rect.\n");
+ }
+ 
+@@ -2500,7 +2822,7 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
+     ID3D11DeviceContext_Release(d3d_context);
+ 
+     d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, context->ib, 6,
+-            context->vb, context->vb_stride, NULL, NULL);
++            context->vb, context->vb_stride, NULL, NULL, NULL);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_BeginDraw(ID2D1DeviceContext6 *iface)
+@@ -5015,9 +5337,19 @@ static const char shape_ps_code[] =
+     "#define GRADIENT_CONVERSION_TO_LINEAR  1\n"
+     "#define GRADIENT_CONVERSION_TO_SRGB    2\n"
+     "\n"
++    "#define COVERAGE_SHAPE      0\n"
++    "#define COVERAGE_MASK       1\n"
++    "#define COVERAGE_COVER      2\n"
++    "\n"
++
+     "bool outline;\n"
+     "bool is_arc;\n"
+     "bool round_joins;\n"
++    "uint coverage;\n"
++    "int2 mask_offset;\n"
++    "uint sample_count;\n"
++    "uint clip_edges;\n"
++    "float4 clip;\n"
+     "struct brush\n"
+     "{\n"
+     "    uint type;\n"
+@@ -5028,12 +5360,14 @@ static const char shape_ps_code[] =
+     "SamplerState s0, s1;\n"
+     "Texture2D t0, t1;\n"
+     "Buffer<float4> b0, b1;\n"
++    "Texture2DMS<float> mask;\n"
+     "\n"
+     "struct input\n"
+     "{\n"
+     "    float2 p : WORLD_POSITION;\n"
+     "    float4 b : BEZIER;\n"
+     "    nointerpolation float2x2 stroke_transform : STROKE_TRANSFORM;\n"
++    "    float4 position : SV_POSITION;\n"
+     "};\n"
+     "\n"
+     "/* The colour at \"position\" in [0, 1] of stops sorted by position: the first stop's before it, the last one's\n"
+@@ -5245,20 +5579,59 @@ static const char shape_ps_code[] =
+     "    return float4(0.0, 0.0, 0.0, brush.opacity);\n"
+     "}\n"
+     "\n"
++    "/* A shape is drawn straight to the target, keeping the pixels whose centres the tests here keep; or,\n"
++    " * antialiased, first into a multisampled mask of what it covers -- the samples its triangles cover, as much\n"
++    " * of each pixel as is within the edges decided here -- and then as a rectangle through the mask. */\n"
+     "float4 main(struct input i) : SV_Target\n"
+     "{\n"
+-    "    float4 colour;\n"
++    "    float4 colour = float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
++    "    float covered, alpha = 1.0f, f, g, r;\n"
++    "    uint s;\n"
+     "\n"
+-    "    colour = sample_brush(colour_brush, t0, s0, b0, i.p);\n"
+-    "    if (opacity_brush.type < BRUSH_TYPE_COUNT)\n"
+-    "        colour *= sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
++    "    if (coverage != COVERAGE_MASK)\n"
++    "    {\n"
++    "        colour = sample_brush(colour_brush, t0, s0, b0, i.p);\n"
++    "        if (opacity_brush.type < BRUSH_TYPE_COUNT)\n"
++    "            colour *= sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
++    "    }\n"
+     "\n"
++    "    /* A clip's antialiased edges leave as much of a pixel as the clip covers of it. */\n"
++    "    if (coverage != COVERAGE_MASK && clip_edges)\n"
++    "    {\n"
++    "        float4 edge = float4(clip_edges & 1 ? clip.x : -1.0e30f, clip_edges & 2 ? clip.y : -1.0e30f,\n"
++    "                clip_edges & 4 ? clip.z : 1.0e30f, clip_edges & 8 ? clip.w : 1.0e30f);\n"
++    "\n"
++    "        colour *= saturate(min(i.position.x + 0.5f, edge.z) - max(i.position.x - 0.5f, edge.x))\n"
++    "                * saturate(min(i.position.y + 0.5f, edge.w) - max(i.position.y - 0.5f, edge.y));\n"
++    "    }\n"
++    "\n"
++    "    if (coverage == COVERAGE_COVER)\n"
++    "    {\n"
++    "        covered = 0.0f;\n"
++    "        [loop]\n"
++    "        for (s = 0; s < sample_count; ++s)\n"
++    "            covered += mask.Load(int2(i.position.xy) - mask_offset, s);\n"
++    "        return colour * (covered / sample_count);\n"
++    "    }\n"
++    "\n"
++
+     "    if (outline && round_joins)\n"
+     "    {\n"
+     "        /* A join is drawn as a miter; a round one is the part of it within half\n"
+     "         * a stroke width of the point joined at. The sides of the segments lie\n"
+-    "         * exactly on that circle, so allow for rounding. */\n"
+-    "        clip(1.0001f - dot(i.b.xy, i.b.xy));\n"
++    "         * exactly on that circle, so allow for rounding. Antialiased, the circle's\n"
++    "         * edge fades over the pixel outside it, and the sides, the edges of their\n"
++    "         * triangles, are left to them. */\n"
++    "        if (coverage == COVERAGE_MASK)\n"
++    "        {\n"
++    "            r = length(i.b.xy);\n"
++    "            g = length(float2(ddx(r), ddy(r)));\n"
++    "            alpha = g > 0.0f ? saturate(1.0f + (1.0f - r) / g) : 1.0f;\n"
++    "        }\n"
++    "        else\n"
++    "        {\n"
++    "            clip(1.0001f - dot(i.b.xy, i.b.xy));\n"
++    "        }\n"
+     "    }\n"
+     "    else if (outline)\n"
+     "    {\n"
+@@ -5289,32 +5662,53 @@ static const char shape_ps_code[] =
+     "        if (!is_arc)\n"
+     "        {\n"
+     "            df = 2.0f * uv.x * du - dv;\n"
+-    "\n"
+-    "            clip(dot(df, uv.zw));\n"
+-    "            clip(length(mul(i.stroke_transform, df)) - abs(uv.x * uv.x - uv.y));\n"
++    "            f = uv.x * uv.x - uv.y;\n"
+     "        }\n"
+     "        else\n"
+     "        {\n"
+     "            df = 2.0f * uv.x * du + 2.0f * uv.y * dv;\n"
+-    "\n"
+-    "            clip(dot(df, uv.zw));\n"
+-    "            clip(length(mul(i.stroke_transform, df)) - abs(uv.x * uv.x + uv.y * uv.y - 1.0f));\n"
++    "            f = uv.x * uv.x + uv.y * uv.y - 1.0f;\n"
+     "        }\n"
++    "\n"
++    "        clip(dot(df, uv.zw));\n"
++    "        /* Antialiased, as much of the pixel as is within half a stroke width of\n"
++    "         * the curve, the distance to its edge in pixels being the difference over\n"
++    "         * the gradient. */\n"
++    "        g = length(df);\n"
++    "        if (coverage == COVERAGE_MASK)\n"
++    "            alpha = g > 0.0f ? saturate(0.5f + (length(mul(i.stroke_transform, df)) - abs(f)) / g) : 1.0f;\n"
++    "        else\n"
++    "            clip(length(mul(i.stroke_transform, df)) - abs(f));\n"
+     "    }\n"
+     "    else\n"
+     "    {\n"
++    "        float2 du, dv, df;\n"
++    "\n"
+     "        /* Evaluate the implicit form of the curve in texture space.\n"
+-    "         * \"i.b.z\" determines which side of the curve is shaded. */\n"
++    "         * \"i.b.z\" determines which side of the curve is shaded.\n"
++    "         * Antialiased, as much of the pixel as is on that side, the distance\n"
++    "         * to the curve in pixels being the value over its gradient. */\n"
++    "        du = float2(ddx(i.b.x), ddy(i.b.x));\n"
++    "        dv = float2(ddx(i.b.y), ddy(i.b.y));\n"
+     "        if (!is_arc)\n"
+     "        {\n"
+-    "            clip((i.b.x * i.b.x - i.b.y) * i.b.z);\n"
++    "            f = (i.b.x * i.b.x - i.b.y) * i.b.z;\n"
++    "            df = 2.0f * i.b.x * du - dv;\n"
+     "        }\n"
+     "        else\n"
+     "        {\n"
+-    "            clip((i.b.x * i.b.x + i.b.y * i.b.y - 1.0) * i.b.z);\n"
++    "            f = (i.b.x * i.b.x + i.b.y * i.b.y - 1.0) * i.b.z;\n"
++    "            df = 2.0f * i.b.x * du + 2.0f * i.b.y * dv;\n"
+     "        }\n"
++    "        g = length(df);\n"
++    "        if (coverage == COVERAGE_MASK)\n"
++    "            alpha = g > 0.0f ? saturate(0.5f + f / g) : 1.0f;\n"
++    "        else\n"
++    "            clip(f);\n"
+     "    }\n"
+     "\n"
++    "    if (coverage == COVERAGE_MASK)\n"
++    "        return float4(alpha, alpha, alpha, alpha);\n"
+     "    return colour;\n"
+     "}\n";
+ static const struct shape_info
+@@ -5943,7 +6337,7 @@ HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGI
+     }
+ 
+     if (FAILED(hr = D3DCompile(shape_ps_code, sizeof(shape_ps_code) - 1, "ps", NULL, NULL,
+-            "main", "ps_4_0", 0, 0, &compiled, NULL)))
++            "main", "ps_4_1", 0, 0, &compiled, NULL)))
+     {
+         WARN("Failed to compile the pixel shader, hr %#lx.\n", hr);
+         return hr;
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 2f336ed9eb1..05cd7e6d061 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -6939,6 +6939,15 @@ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *fac
+     return hr;
+ }
+ 
++/* Whether the geometry is a rectangle geometry, and which. */
++BOOL d2d_geometry_get_rectangle(const struct d2d_geometry *geometry, D2D1_RECT_F *rect)
++{
++    if (geometry->ID2D1Geometry_iface.lpVtbl != (const ID2D1GeometryVtbl *)&d2d_rectangle_geometry_vtbl)
++        return FALSE;
++    *rect = geometry->u.rectangle.rect;
++    return TRUE;
++}
++
+ struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface)
+ {
+     if (!iface)
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index 4a4647649e7..c90b18eb421 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -8255,6 +8255,110 @@ static void test_gradient_drawing(BOOL d3d11)
+     release_test_context(&ctx);
+ }
+ 
++/* What an edge covers of a pixel: white is drawn on transparent black, one shape to a cell 64 pixels wide, first
++ * antialiased and then aliased, so alpha is coverage. */
++static void test_antialiasing(BOOL d3d11)
++{
++    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    static const D2D1_ELLIPSE circle = {{32.3f, 32.6f}, 20.2f, 20.2f};
++    static const D2D1_POINT_2F p0 = {4.0f, 10.0f}, p1 = {60.0f, 40.0f};
++    static const D2D1_RECT_F clip = {10.3f, 10.6f, 40.7f, 50.2f};
++    static const D2D1_RECT_F rect = {10.25f, 10.5f, 40.75f, 50.5f};
++    static const D2D1_RECT_F all = {0.0f, 0.0f, 64.0f, 64.0f};
++    ID2D1SolidColorBrush *brush;
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    unsigned int i, x, sum, max;
++    D2D1_MATRIX_3X2_F m;
++    D2D1_COLOR_F colour;
++    BYTE a;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++
++    set_color(&colour, 1.0f, 1.0f, 1.0f, 1.0f);
++    hr = ID2D1RenderTarget_CreateSolidColorBrush(ctx.rt, &colour, NULL, &brush);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    set_color(&colour, 0.0f, 0.0f, 0.0f, 0.0f);
++    ID2D1RenderTarget_Clear(ctx.rt, &colour);
++    for (i = 0; i < 2; ++i)
++    {
++        D2D1_ANTIALIAS_MODE mode = i ? D2D1_ANTIALIAS_MODE_ALIASED : D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
++
++        ID2D1RenderTarget_SetAntialiasMode(ctx.rt, mode);
++        m = identity;
++        m._32 = i * 64.0f;
++
++        ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++        ID2D1RenderTarget_FillRectangle(ctx.rt, &rect, (ID2D1Brush *)brush);
++
++        m._31 = 64.0f;
++        ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++        ID2D1RenderTarget_PushAxisAlignedClip(ctx.rt, &clip, mode);
++        ID2D1RenderTarget_FillRectangle(ctx.rt, &all, (ID2D1Brush *)brush);
++        ID2D1RenderTarget_PopAxisAlignedClip(ctx.rt);
++
++        m._31 = 128.0f;
++        ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++        ID2D1RenderTarget_FillEllipse(ctx.rt, &circle, (ID2D1Brush *)brush);
++
++        m._31 = 192.0f;
++        ID2D1RenderTarget_SetTransform(ctx.rt, &m);
++        ID2D1RenderTarget_DrawLine(ctx.rt, p0, p1, (ID2D1Brush *)brush, 1.0f, NULL);
++    }
++    ID2D1RenderTarget_SetTransform(ctx.rt, &identity);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    get_surface_readback(&ctx, &rb);
++#define alpha(x, y) ((unsigned int)(get_readback_colour(&rb, x, y) >> 24))
++    /* A rectangle and a clip antialiased cover each pixel by as much of it as they cover. */
++    ok(compare_uint(alpha(10, 30), 191, 2), "Got unexpected coverage %u.\n", alpha(10, 30));
++    ok(compare_uint(alpha(40, 30), 191, 2), "Got unexpected coverage %u.\n", alpha(40, 30));
++    ok(compare_uint(alpha(20, 10), 128, 2), "Got unexpected coverage %u.\n", alpha(20, 10));
++    ok(compare_uint(alpha(20, 50), 128, 2), "Got unexpected coverage %u.\n", alpha(20, 50));
++    ok(alpha(20, 30) == 255 && !alpha(9, 30) && !alpha(41, 30), "Got unexpected coverage.\n");
++    ok(compare_uint(alpha(64 + 10, 30), 178, 1), "Got unexpected coverage %u.\n", alpha(64 + 10, 30));
++    ok(compare_uint(alpha(64 + 40, 30), 178, 1), "Got unexpected coverage %u.\n", alpha(64 + 40, 30));
++    ok(compare_uint(alpha(64 + 20, 50), 51, 1), "Got unexpected coverage %u.\n", alpha(64 + 20, 50));
++    ok(compare_uint(alpha(64 + 20, 10), 102, 1), "Got unexpected coverage %u.\n", alpha(64 + 20, 10));
++    ok(alpha(64 + 20, 30) == 255 && !alpha(64 + 9, 30) && !alpha(64 + 41, 30), "Got unexpected coverage.\n");
++    /* A circle's edge covers part of the pixel it crosses. */
++    a = alpha(128 + 12, 32);
++    ok(a >= 200 && a <= 240, "Got unexpected coverage %u.\n", a);
++    ok(alpha(128 + 13, 32) == 255 && !alpha(128 + 11, 32), "Got unexpected coverage.\n");
++    /* A line a pixel wide at an angle covers about 1 / sin(angle) of a row, none of it whole. */
++    for (x = 26, sum = max = 0; x <= 38; ++x)
++    {
++        sum += alpha(192 + x, 25);
++        max = max(max, alpha(192 + x, 25));
++    }
++    ok(compare_uint(sum, 558, 40), "Got unexpected coverage %u.\n", sum);
++    ok(max < 240, "Got unexpected coverage %u.\n", max);
++
++    /* Aliased, a pixel is covered or not by where its centre is. */
++    ok(alpha(10, 64 + 30) == 255 && alpha(40, 64 + 30) == 255, "Got unexpected coverage.\n");
++    ok(alpha(20, 64 + 10) == 255 && !alpha(20, 64 + 50), "Got unexpected coverage.\n");
++    ok(alpha(64 + 10, 64 + 30) == 255 && alpha(64 + 40, 64 + 30) == 255, "Got unexpected coverage.\n");
++    ok(!alpha(64 + 20, 64 + 50) && !alpha(64 + 20, 64 + 10), "Got unexpected coverage.\n");
++    ok(alpha(128 + 12, 64 + 32) == 255 && !alpha(128 + 11, 64 + 32), "Got unexpected coverage.\n");
++    for (x = 26, sum = 0; x <= 38; ++x)
++    {
++        a = alpha(192 + x, 64 + 25);
++        ok(!a || a == 255, "Got unexpected coverage %u at %u.\n", a, x);
++        sum += a;
++    }
++    ok(sum == 510, "Got unexpected coverage %u.\n", sum);
++#undef alpha
++    release_resource_readback(&rb);
++
++    ID2D1SolidColorBrush_Release(brush);
++    release_test_context(&ctx);
++}
++
+ static void test_draw_geometry(BOOL d3d11)
+ {
+     ID2D1TransformedGeometry *transformed_geometry[4];
+@@ -20764,6 +20868,7 @@ START_TEST(d2d1)
+     queue_d3d10_test(test_stroke_style);
+     queue_test(test_gradient);
+     queue_test(test_gradient_drawing);
++    queue_test(test_antialiasing);
+     queue_test(test_draw_geometry);
+     queue_test(test_fill_geometry);
+     queue_test(test_wic_gdi_interop);

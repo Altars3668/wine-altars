@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 19:46:16 -0400
+Subject: [PATCH] ntdll: Run the work of persistent threads on a thread of its
+ own.
+
+Work queued with WT_EXECUTEINPERSISTENTTHREAD, or to an environment
+made persistent, ran on the regular worker threads.  Windows 11 runs it
+all on one thread that never exits, and that waits for it alertably, so
+that APCs queued to it run there; so does Wine now, one such thread for
+each pool (tools/startupgapsprobe misc).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/ntdll/threadpool.c b/dlls/ntdll/threadpool.c
+index 110c9f6ad28..be64660a285 100644
+--- a/dlls/ntdll/threadpool.c
++++ b/dlls/ntdll/threadpool.c
+@@ -115,6 +115,10 @@ struct threadpool
+     int                     num_busy_workers;
+     HANDLE                  compl_port;
+     TP_POOL_STACK_INFORMATION stack_info;
++    /* work for the persistent thread, locked via .cs */
++    struct list             persistent_items;
++    HANDLE                  persistent_thread;
++    HANDLE                  persistent_event;
+ };
+ 
+ enum threadpool_objtype
+@@ -146,6 +150,7 @@ struct threadpool_object
+     PTP_CLEANUP_GROUP_CANCEL_CALLBACK group_cancel_callback;
+     PTP_SIMPLE_CALLBACK     finalization_callback;
+     BOOL                    may_run_long;
++    BOOL                    persistent;
+     HMODULE                 race_dll;
+     TP_CALLBACK_PRIORITY    priority;
+     /* information about the group, locked via .group->cs */
+@@ -371,6 +376,7 @@ static inline struct threadpool_instance *impl_from_TP_CALLBACK_INSTANCE( TP_CAL
+ }
+ 
+ static void CALLBACK threadpool_worker_proc( void *param );
++static void CALLBACK threadpool_persistent_proc( void *param );
+ static void tp_object_submit( struct threadpool_object *object, BOOL signaled );
+ static void tp_object_execute( struct threadpool_object *object, BOOL wait_thread );
+ static void tp_object_prepare_shutdown( struct threadpool_object *object );
+@@ -1222,6 +1228,29 @@ static NTSTATUS tp_new_worker_thread( struct threadpool *pool )
+     return status;
+ }
+ 
++/***********************************************************************
++ *           tp_persistent_thread    (internal)
++ *
++ * Makes sure the thread that runs the pool's persistent work is there: one thread, which never exits while
++ * the pool lives, and waits for its work alertably, so that APCs queued to it run.  Called with the pool's
++ * lock held.
++ */
++static BOOL tp_persistent_thread( struct threadpool *pool )
++{
++    HANDLE thread;
++
++    if (pool->persistent_thread) return TRUE;
++    if (!pool->persistent_event &&
++        NtCreateEvent( &pool->persistent_event, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE ))
++        return FALSE;
++    if (RtlCreateUserThread( GetCurrentProcess(), NULL, FALSE, 0, pool->stack_info.StackReserve,
++                             pool->stack_info.StackCommit, threadpool_persistent_proc, pool, &thread, NULL ))
++        return FALSE;
++    InterlockedIncrement( &pool->refcount );
++    pool->persistent_thread = thread;
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           tp_timerqueue_lock    (internal)
+  *
+@@ -1782,6 +1811,9 @@ static NTSTATUS tp_threadpool_alloc( struct threadpool **out )
+     pool->num_busy_workers        = 0;
+     pool->stack_info.StackReserve = nt->OptionalHeader.SizeOfStackReserve;
+     pool->stack_info.StackCommit  = nt->OptionalHeader.SizeOfStackCommit;
++    list_init( &pool->persistent_items );
++    pool->persistent_thread       = 0;
++    pool->persistent_event        = 0;
+ 
+     TRACE( "allocated threadpool %p\n", pool );
+ 
+@@ -1802,6 +1834,7 @@ static void tp_threadpool_shutdown( struct threadpool *pool )
+ 
+     pool->shutdown = TRUE;
+     RtlWakeAllConditionVariable( &pool->update_event );
++    if (pool->persistent_event) NtSetEvent( pool->persistent_event, NULL );
+ }
+ 
+ /***********************************************************************
+@@ -1822,6 +1855,9 @@ static BOOL tp_threadpool_release( struct threadpool *pool )
+     assert( !pool->objcount );
+     for (i = 0; i < ARRAY_SIZE(pool->pools); ++i)
+         assert( list_empty( &pool->pools[i] ) );
++    assert( list_empty( &pool->persistent_items ) );
++    if (pool->persistent_thread) NtClose( pool->persistent_thread );
++    if (pool->persistent_event) NtClose( pool->persistent_event );
+ 
+     pool->cs.DebugInfo->Spare[0] = 0;
+     RtlDeleteCriticalSection( &pool->cs );
+@@ -1995,6 +2031,7 @@ static void tp_object_initialize( struct threadpool_object *object, struct threa
+     object->group_cancel_callback   = NULL;
+     object->finalization_callback   = NULL;
+     object->may_run_long            = 0;
++    object->persistent              = FALSE;
+     object->race_dll                = NULL;
+     object->priority                = TP_CALLBACK_PRIORITY_NORMAL;
+ 
+@@ -2031,8 +2068,7 @@ static void tp_object_initialize( struct threadpool_object *object, struct threa
+         if (environment->ActivationContext)
+             FIXME( "activation context not supported yet\n" );
+ 
+-        if (environment->u.s.Persistent)
+-            FIXME( "persistent threads not supported yet\n" );
++        object->persistent              = environment->u.s.Persistent != 0;
+     }
+ 
+     if (object->race_dll)
+@@ -2084,6 +2120,19 @@ static void tp_object_submit( struct threadpool_object *object, BOOL signaled )
+ 
+     RtlEnterCriticalSection( &pool->cs );
+ 
++    /* Work for the persistent thread goes to it, which is started the first time. */
++    if (object->persistent && tp_persistent_thread( pool ))
++    {
++        InterlockedIncrement( &object->refcount );
++        if (!object->num_pending_callbacks++)
++            list_add_tail( &pool->persistent_items, &object->pool_entry );
++        if (object->type == TP_OBJECT_TYPE_WAIT && signaled)
++            object->u.wait.signaled++;
++        NtSetEvent( pool->persistent_event, NULL );
++        RtlLeaveCriticalSection( &pool->cs );
++        return;
++    }
++
+     /* Start new worker threads if required. */
+     if (pool->num_busy_workers >= pool->num_workers &&
+         pool->num_workers < pool->max_workers)
+@@ -2491,6 +2540,47 @@ static void CALLBACK threadpool_worker_proc( void *param )
+     RtlExitUserThread( 0 );
+ }
+ 
++/***********************************************************************
++ *           threadpool_persistent_proc    (internal)
++ */
++static void CALLBACK threadpool_persistent_proc( void *param )
++{
++    struct threadpool *pool = param;
++    struct list *ptr;
++
++    TRACE( "starting persistent thread for pool %p\n", pool );
++    set_thread_name(L"wine_threadpool_persistent");
++
++    RtlEnterCriticalSection( &pool->cs );
++    for (;;)
++    {
++        while ((ptr = list_head( &pool->persistent_items )))
++        {
++            struct threadpool_object *object = LIST_ENTRY( ptr, struct threadpool_object, pool_entry );
++            assert( object->num_pending_callbacks > 0 );
++
++            list_remove( &object->pool_entry );
++            if (object->num_pending_callbacks > 1)
++                list_add_tail( &pool->persistent_items, &object->pool_entry );
++
++            tp_object_execute( object, FALSE );
++            tp_object_release( object );
++        }
++
++        if (pool->shutdown)
++            break;
++
++        RtlLeaveCriticalSection( &pool->cs );
++        NtWaitForSingleObject( pool->persistent_event, TRUE, NULL );
++        RtlEnterCriticalSection( &pool->cs );
++    }
++    RtlLeaveCriticalSection( &pool->cs );
++
++    TRACE( "terminating persistent thread for pool %p\n", pool );
++    tp_threadpool_release( pool );
++    RtlExitUserThread( 0 );
++}
++
+ /***********************************************************************
+  *           TpAllocCleanupGroup    (NTDLL.@)
+  */

@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:35:28 -0400
+Subject: [PATCH] msxml3: Wait for a stream that has no data yet as Windows
+ does.
+
+A stream with no data yet answers Read with E_PENDING.  On Windows
+(tools/msxmlmoreprobe in the wine-altars repository, MSXML 3.0 and 6.0,
+synchronous and asynchronous loads alike) the document reads again at
+once, and when the answer is E_PENDING again it reads no more, as a plain
+stream never says when data comes: load() and IPersistStreamInit::Load
+succeed, load() reporting the document loaded, with an empty document
+whose readyState stays READYSTATE_INTERACTIVE and which holds on to the
+stream until it is released, with no parse error.  One E_PENDING among
+the data costs one more read.  Wine took E_PENDING as a failure.
+
+readyState now says READYSTATE_INTERACTIVE for such a document, and
+READYSTATE_COMPLETE for every other, as it did.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index 393512bc63b..13a3c43e570 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -113,6 +113,8 @@ struct domdoc
+     VARIANT_BOOL resolving;
+     HRESULT error;
+     struct parse_error parse_error;
++    LONG ready_state;
++    ISequentialStream *pending_stream; /* a stream that has no data yet, kept as Windows keeps it */
+ 
+     struct domnode *node;
+ 
+@@ -338,6 +340,7 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+ {
+     struct parse_error error;
+     LARGE_INTEGER zero = {{0}};
++    unsigned int pending = 0;
+     struct domnode *node;
+     DWORD read, written;
+     IStream *hstream;
+@@ -345,6 +348,12 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+     BYTE buf[4096];
+     HRESULT hr;
+ 
++    if (doc->pending_stream)
++    {
++        ISequentialStream_Release(doc->pending_stream);
++        doc->pending_stream = NULL;
++    }
++
+     hstream = NULL;
+     hr = CreateStreamOnHGlobal(NULL, TRUE, &hstream);
+     if (FAILED(hr))
+@@ -355,11 +364,34 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+         /* A failing Read need not set the count: a document's stream does not while it is
+          * written to, and Word loads documents from empty ones. */
+         read = 0;
+-        if (FAILED(hr = ISequentialStream_Read(stream, buf, sizeof(buf), &read)))
+-            break;
++        hr = ISequentialStream_Read(stream, buf, sizeof(buf), &read);
++        if (hr == E_PENDING)
++        {
++            /* no data yet: Windows reads again at once, and when there is still none it
++             * waits for data a plain stream never announces, keeping the stream with an
++             * empty document that is still interactive */
++            if (++pending < 2)
++            {
++                hr = S_OK;
++                written = read = 1;
++                continue;
++            }
++            IStream_Release(hstream);
++            domnode_create(NODE_DOCUMENT, NULL, 0, NULL, 0, NULL, &node);
++            node->properties = domdoc_create_properties(doc->node->properties->version);
++            attach_doc_node(doc, node);
++            memset(&error, 0, sizeof(error));
++            domdoc_set_parse_error(doc, &error);
++            ISequentialStream_AddRef((doc->pending_stream = stream));
++            doc->ready_state = READYSTATE_INTERACTIVE;
++            return S_OK;
++        }
++        if (FAILED(hr)) break;
++        pending = 0;
+         hr = IStream_Write(hstream, buf, min(read, sizeof(buf)), &written);
+     } while (SUCCEEDED(hr) && written != 0 && read != 0);
+ 
++    doc->ready_state = READYSTATE_COMPLETE;
+     if (FAILED(hr))
+     {
+         WARN("failed to copy stream, hr %#lx.\n", hr);
+@@ -548,6 +580,7 @@ static ULONG WINAPI domdoc_Release( IXMLDOMDocument3 *iface )
+         release_namespaces(doc);
+         SysFreeString(doc->parse_error.reason);
+         SysFreeString(doc->parse_error.srctext);
++        if (doc->pending_stream) ISequentialStream_Release(doc->pending_stream);
+         free(doc);
+     }
+ 
+@@ -1480,12 +1513,14 @@ static HRESULT WINAPI domdoc_load(IXMLDOMDocument3 *iface, VARIANT source, VARIA
+ 
+ static HRESULT WINAPI domdoc_get_readyState(IXMLDOMDocument3 *iface, LONG *value)
+ {
+-    FIXME("%p, %p.\n", iface, value);
++    domdoc *doc = impl_from_IXMLDOMDocument3(iface);
++
++    TRACE("%p, %p.\n", iface, value);
+ 
+     if (!value)
+         return E_INVALIDARG;
+ 
+-    *value = READYSTATE_COMPLETE;
++    *value = doc->ready_state;
+     return S_OK;
+ }
+ 
+@@ -1579,6 +1614,13 @@ static HRESULT WINAPI domdoc_loadXML(IXMLDOMDocument3 *iface, BSTR data, VARIANT
+ 
+     *result = VARIANT_FALSE;
+ 
++    if (doc->pending_stream)
++    {
++        ISequentialStream_Release(doc->pending_stream);
++        doc->pending_stream = NULL;
++    }
++    doc->ready_state = READYSTATE_COMPLETE;
++
+     if (data && *data)
+     {
+         ISequentialStream *stream;
+@@ -2638,6 +2680,7 @@ HRESULT create_domdoc(struct domnode *node, IUnknown **obj)
+     object->IConnectionPointContainer_iface.lpVtbl = &ConnectionPointContainerVtbl;
+     object->refcount = 1;
+     object->async = VARIANT_TRUE;
++    object->ready_state = READYSTATE_COMPLETE;
+     object->node = domnode_addref(node);
+ 
+     ConnectionPoint_Init(&object->cp_dispatch, object, &IID_IDispatch);
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index a5d63193f43..a2538a514c3 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -19842,13 +19842,23 @@ static void test_new_parser_validation(void)
+     }
+ }
+ 
+-/* a stream that gives some data, then answers Read with a result of its choosing */
++/* a stream that gives some data, then answers Read with a result of its choosing; or, given steps,
++ * that answers each Read with the next step's data or result, up to a step with neither: the end */
++struct read_step
++{
++    const char *data;
++    HRESULT result;
++};
++
+ struct read_stream
+ {
+     IStream IStream_iface;
+     const char *data;
+     HRESULT result;
+     BOOL given;
++    const struct read_step *steps;
++    unsigned int step, reads;
++    LONG refs;
+ };
+ 
+ static HRESULT WINAPI read_stream_QueryInterface(IStream *iface, REFIID riid, void **obj)
+@@ -19857,6 +19867,7 @@ static HRESULT WINAPI read_stream_QueryInterface(IStream *iface, REFIID riid, vo
+             IsEqualGUID(riid, &IID_IStream))
+     {
+         *obj = iface;
++        IStream_AddRef(iface);
+         return S_OK;
+     }
+     *obj = NULL;
+@@ -19865,18 +19876,36 @@ static HRESULT WINAPI read_stream_QueryInterface(IStream *iface, REFIID riid, vo
+ 
+ static ULONG WINAPI read_stream_AddRef(IStream *iface)
+ {
+-    return 2;
++    struct read_stream *stream = CONTAINING_RECORD(iface, struct read_stream, IStream_iface);
++
++    return InterlockedIncrement(&stream->refs);
+ }
+ 
+ static ULONG WINAPI read_stream_Release(IStream *iface)
+ {
+-    return 1;
++    struct read_stream *stream = CONTAINING_RECORD(iface, struct read_stream, IStream_iface);
++
++    return InterlockedDecrement(&stream->refs);
+ }
+ 
+ static HRESULT WINAPI read_stream_Read(IStream *iface, void *buffer, ULONG size, ULONG *read)
+ {
+     struct read_stream *stream = CONTAINING_RECORD(iface, struct read_stream, IStream_iface);
+     ULONG len = stream->data && !stream->given ? strlen(stream->data) : 0;
++    const struct read_step *step;
++
++    stream->reads++;
++    if (stream->steps)
++    {
++        step = &stream->steps[stream->step];
++        if (step->data || step->result) stream->step++;
++        if (FAILED(step->result)) return step->result;
++        len = step->data ? strlen(step->data) : 0;
++        ok(len <= size, "Unexpected size %lu.\n", size);
++        if (len) memcpy(buffer, step->data, len);
++        if (read) *read = len;
++        return step->result;
++    }
+ 
+     if (len && len <= size)
+     {
+@@ -20213,6 +20242,115 @@ static void test_load_failing_stream(void)
+     }
+ }
+ 
++/* A stream with no data yet answers E_PENDING.  Windows reads again at once, and when there is still
++ * none it reads no more, as a plain stream never says when data comes: the load succeeds with an
++ * empty document that stays interactive and holds on to the stream. */
++static void test_load_pending_stream(void)
++{
++    static const char xml[] = "<?xml version=\"1.0\"?><r><a/></r>";
++    static const struct read_step once[] = { { NULL, E_PENDING }, { xml }, { NULL } };
++    static const struct read_step twice[] = { { NULL, E_PENDING }, { NULL, E_PENDING }, { xml }, { NULL } };
++    static const struct read_step five[] =
++    {
++        { NULL, E_PENDING }, { NULL, E_PENDING }, { NULL, E_PENDING }, { NULL, E_PENDING }, { NULL, E_PENDING },
++        { xml }, { NULL },
++    };
++    static const struct read_step middle[] =
++    {
++        { "<?xml version=\"1.0\"?><r>" }, { NULL, E_PENDING }, { "<a/></r>" }, { NULL },
++    };
++    static const struct
++    {
++        const struct read_step *steps;
++        unsigned int reads;
++        BOOL waiting;
++    }
++    tests[] =
++    {
++        { once, 3 },
++        { twice, 2, TRUE },
++        { five, 2, TRUE },
++        { middle, 4 },
++    };
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++    }
++    documents[] =
++    {
++        { &_create(CLSID_DOMDocument30) },
++        { &_create(CLSID_DOMDocument60) },
++    };
++    struct read_stream stream = { { &read_stream_vtbl } };
++    IPersistStreamInit *persist;
++    IXMLDOMParseError *error;
++    unsigned int i, j, async;
++    IXMLDOMDocument2 *doc;
++    IXMLDOMElement *root;
++    VARIANT_BOOL loaded;
++    LONG state, code;
++    HRESULT hr;
++    VARIANT v;
++
++    for (i = 0; i < ARRAY_SIZE(documents); i++)
++    for (j = 0; j < ARRAY_SIZE(tests); j++)
++    for (async = 0; async < 2; async++)
++    {
++        winetest_push_context("%s, %u, async %u", documents[i].name, j, async);
++        doc = _create_object(documents[i].clsid, documents[i].name, &IID_IXMLDOMDocument2, __LINE__);
++        hr = IXMLDOMDocument2_put_async(doc, async ? VARIANT_TRUE : VARIANT_FALSE);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        stream.steps = tests[j].steps;
++        stream.step = stream.reads = 0;
++        stream.refs = 1;
++        V_VT(&v) = VT_UNKNOWN;
++        V_UNKNOWN(&v) = (IUnknown *)&stream.IStream_iface;
++        loaded = VARIANT_FALSE;
++        hr = IXMLDOMDocument2_load(doc, v, &loaded);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(loaded == VARIANT_TRUE, "Unexpected result %d.\n", loaded);
++        ok(stream.reads == tests[j].reads, "Got %u reads.\n", stream.reads);
++        ok(stream.refs == (tests[j].waiting ? 2 : 1), "Got %ld references.\n", stream.refs);
++        state = -1;
++        hr = IXMLDOMDocument2_get_readyState(doc, &state);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(state == (tests[j].waiting ? READYSTATE_INTERACTIVE : READYSTATE_COMPLETE), "Got state %ld.\n", state);
++        root = NULL;
++        hr = IXMLDOMDocument2_get_documentElement(doc, &root);
++        ok(hr == (tests[j].waiting ? S_FALSE : S_OK), "Unexpected hr %#lx.\n", hr);
++        if (root) IXMLDOMElement_Release(root);
++        hr = IXMLDOMDocument2_get_parseError(doc, &error);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        code = -1;
++        IXMLDOMParseError_get_errorCode(error, &code);
++        ok(!code, "Unexpected error code %#lx.\n", code);
++        IXMLDOMParseError_Release(error);
++        IXMLDOMDocument2_Release(doc);
++        ok(stream.refs == 1, "Got %ld references.\n", stream.refs);
++
++        if (!async)
++        {
++            doc = _create_object(documents[i].clsid, documents[i].name, &IID_IXMLDOMDocument2, __LINE__);
++            stream.step = stream.reads = 0;
++            stream.refs = 1;
++            hr = IXMLDOMDocument2_QueryInterface(doc, &IID_IPersistStreamInit, (void **)&persist);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            hr = IPersistStreamInit_Load(persist, &stream.IStream_iface);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ok(stream.reads == tests[j].reads, "Got %u reads.\n", stream.reads);
++            ok(stream.refs == (tests[j].waiting ? 2 : 1), "Got %ld references.\n", stream.refs);
++            state = -1;
++            hr = IXMLDOMDocument2_get_readyState(doc, &state);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ok(state == (tests[j].waiting ? READYSTATE_INTERACTIVE : READYSTATE_COMPLETE), "Got state %ld.\n", state);
++            IPersistStreamInit_Release(persist);
++            IXMLDOMDocument2_Release(doc);
++        }
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(domdoc)
+ {
+     HRESULT hr;
+@@ -20351,6 +20489,7 @@ START_TEST(domdoc)
+     test_load_from_document_stream();
+     test_parse_error_source();
+     test_load_failing_stream();
++    test_load_pending_stream();
+ 
+     if (is_clsid_supported(&CLSID_MXNamespaceManager40, &IID_IMXNamespaceManager))
+     {

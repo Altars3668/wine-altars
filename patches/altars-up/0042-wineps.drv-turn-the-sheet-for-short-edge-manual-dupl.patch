@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 15:12:01 -0400
+Subject: [PATCH] wineps.drv: turn the sheet for short-edge manual duplex.
+
+The two passes sent the same page setup, so asking to bind on the short edge
+printed the backs the same way up as the fronts -- which is what binding on
+the long edge means.  The stack only goes back into the tray turned about its
+long edge, so the short-edge case is the one where the content has to be
+turned instead.
+
+Do it in the page setup, before anything is placed on the sheet: a translate
+to the far corner and a 180 rotate ahead of the transform that was already
+there.  Every coordinate downstream is still the one the application asked
+for, so nothing else in the driver has to know.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 6bc25d155a85096db88d109938a9896c90e51821)
+
+diff --git a/dlls/wineps.drv/printproc.c b/dlls/wineps.drv/printproc.c
+index 4ac67b17f89..426c80e0161 100644
+--- a/dlls/wineps.drv/printproc.c
++++ b/dlls/wineps.drv/printproc.c
+@@ -3028,7 +3028,7 @@ static INPUTSLOT *find_manual_slot(PPD *ppd)
+  * both passes send exactly the same pages, and only the job ticket differs, so
+  * nothing in the rendering path has to know about it. */
+ static BOOL print_pass(struct pp_data *data, WCHAR *doc_name, const char *page_set,
+-                       BOOL manual_feed)
++                       BOOL manual_feed, BOOL upside_down)
+ {
+     DEVMODEW *dm = &data->ctx->Devmode->dmPublic;
+     DWORD saved_source = dm->dmDefaultSource;
+@@ -3046,6 +3046,7 @@ static BOOL print_pass(struct pp_data *data, WCHAR *doc_name, const char *page_s
+         return FALSE;
+ 
+     data->ctx->job.page_set = page_set;
++    data->ctx->job.upside_down = upside_down;
+ 
+     /* The second side goes through the manual feeder.  That is what makes the
+      * printer itself stop and ask for the paper on its own panel, and wait for
+@@ -3193,6 +3194,7 @@ cleanup:
+     ClosePrinter(spool_data);
+     pass_ret = EndDocPrinter(data->hport) && ret;
+     data->ctx->job.page_set = NULL;
++    data->ctx->job.upside_down = FALSE;
+     dm->dmDefaultSource = saved_source;
+     dm->dmFields = saved_fields;
+     return pass_ret;
+@@ -3242,7 +3244,7 @@ BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
+     struct pp_data *data = get_handle_data(pp);
+     DEVMODEW *devmode = NULL;
+     HANDLE spool_data;
+-    BOOL manual_feeder;
++    BOOL manual_feeder, upside_down;
+ 
+     TRACE("%p, %s\n", pp, debugstr_w(doc_name));
+ 
+@@ -3265,13 +3267,19 @@ BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
+     GdiDeleteSpoolFileHandle(spool_data);
+ 
+     if (!manual_duplex_wanted(data))
+-        return print_pass(data, doc_name, NULL, FALSE);
++        return print_pass(data, doc_name, NULL, FALSE, FALSE);
+ 
+     manual_feeder = find_manual_slot(data->ctx->pi->ppd) != NULL;
+-    TRACE("manual duplex: odd pages first, second side %s\n",
+-          manual_feeder ? "through the manual feeder" : "after a prompt");
+-
+-    if (!print_pass(data, doc_name, "odd", FALSE))
++    /* The stack comes out of the bin printed side down and goes back in turned
++     * over about its long edge, so the backs already line up for binding on
++     * that edge.  Binding on the short one is the case that needs the content
++     * turned instead. */
++    upside_down = data->ctx->Devmode->dmPublic.dmDuplex == DMDUP_HORIZONTAL;
++    TRACE("manual duplex: odd pages first, second side %s%s\n",
++          manual_feeder ? "through the manual feeder" : "after a prompt",
++          upside_down ? ", turned for short-edge binding" : "");
++
++    if (!print_pass(data, doc_name, "odd", FALSE, FALSE))
+         return FALSE;
+ 
+     /* With a manual feeder both jobs go out together: the printer prints the
+@@ -3284,7 +3292,7 @@ BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
+         return TRUE;   /* the first side did print */
+     }
+ 
+-    return print_pass(data, doc_name, "even", manual_feeder);
++    return print_pass(data, doc_name, "even", manual_feeder, upside_down);
+ }
+ BOOL WINAPI ControlPrintProcessor(HANDLE pp, DWORD cmd)
+ {
+diff --git a/dlls/wineps.drv/ps.c b/dlls/wineps.drv/ps.c
+index 2c555f22256..64e3598f996 100644
+--- a/dlls/wineps.drv/ps.c
++++ b/dlls/wineps.drv/ps.c
+@@ -95,13 +95,14 @@ static const char psendfeature[] =
+ "} stopped cleartomark\n";
+ 
+ static const char psnewpage[] = /* name, number, llx, lly, urx, ury, orientation,
+-                                   xres, yres, xtrans, ytrans, rot */
++                                   xres, yres, turn, xtrans, ytrans, rot */
+ "%%%%Page: %s %d\n"
+ "%%%%PageBoundingBox: %ld %ld %ld %ld\n"
+ "%%%%PageOrientation: %s\n"
+ "%%%%BeginPageSetup\n"
+ "/pgsave save def\n"
+ "72 %d div 72 %d div scale\n"
++"%s"
+ "%d %d translate\n"
+ "1 -1 scale\n"
+ "%d rotate\n"
+@@ -566,11 +567,26 @@ static void get_bounding_box( print_ctx *ctx, RECT *bbox)
+ INT PSDRV_WriteNewPage( print_ctx *ctx )
+ {
+     signed int xtrans, ytrans, rotation;
+-    char buf[256], name[16];
++    char buf[384], name[16], turn[64];
+     RECT bbox;
+ 
+     sprintf(name, "%d", ctx->job.PageNo);
+ 
++    /* Turning the whole sheet over, before anything is placed on it, keeps
++     * short-edge duplex out of the rest of the drawing code: every coordinate
++     * downstream is still the one the application asked for. */
++    turn[0] = 0;
++    if (ctx->job.upside_down)
++    {
++        BOOL landscape = ctx->Devmode->dmPublic.dmOrientation == DMORIENT_LANDSCAPE;
++        /* in the sheet's own orientation, which is the one the page setup
++         * below is written in -- GetDeviceCaps swaps the two for landscape */
++        int sheet_w = GetDeviceCaps(ctx->hdc, landscape ? PHYSICALHEIGHT : PHYSICALWIDTH);
++        int sheet_h = GetDeviceCaps(ctx->hdc, landscape ? PHYSICALWIDTH : PHYSICALHEIGHT);
++
++        sprintf(turn, "%d %d translate\n180 rotate\n", sheet_w, sheet_h);
++    }
++
+     get_bounding_box( ctx, &bbox );
+     UnionRect( &ctx->bbox, &bbox, &ctx->bbox );
+ 
+@@ -597,7 +613,7 @@ INT PSDRV_WriteNewPage( print_ctx *ctx )
+             bbox.left, bbox.top, bbox.right, bbox.bottom,
+             ctx->Devmode->dmPublic.dmOrientation == DMORIENT_LANDSCAPE ? "Landscape" : "Portrait",
+             GetDeviceCaps(ctx->hdc, ASPECTX), GetDeviceCaps(ctx->hdc, ASPECTY),
+-            xtrans, ytrans, rotation);
++            turn, xtrans, ytrans, rotation);
+ 
+     if( write_spool( ctx, buf, strlen(buf) ) != strlen(buf) ) {
+         WARN("WriteSpool error\n");
+diff --git a/dlls/wineps.drv/psdrv.h b/dlls/wineps.drv/psdrv.h
+index b3df1633d3b..81afc4e41af 100644
+--- a/dlls/wineps.drv/psdrv.h
++++ b/dlls/wineps.drv/psdrv.h
+@@ -341,6 +341,11 @@ typedef struct {
+      * selecting, so both passes send the same pages and only the ticket
+      * differs. */
+     const char          *page_set;
++    /* Set on the pass that prints the backs of the sheets when the two sides
++     * are to be bound on the short edge.  The stack can only go back into the
++     * tray turned about its long edge, so the content is what has to be turned
++     * for the short one. */
++    BOOL                upside_down;
+ } JOB;
+ 
+ typedef struct

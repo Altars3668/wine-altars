@@ -1,0 +1,1443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 21:44:04 -0400
+Subject: [PATCH] appxdeploymentclient: answer the package queries instead of
+ returning E_NOTIMPL.
+
+Office's Click-to-Run LASTRUN step integrates its MSIX add-ons.  It asks the
+PackageManager whether Microsoft.WritingAssistant and Microsoft.Outlook.UriHandler
+are installed, builds a Uri to OPushUtil.msix, tries to activate
+Windows.Management.Deployment.StagePackageOptions, and when that class is not
+registered falls back to IPackageManager6::ProvisionPackageForAllUsersAsync.
+
+Every one of those failed here, and the last one killed the process:
+
+  fixme:appx:package_manager_FindPackagesByPackageFamilyName ... stub
+  err:combase:RoGetActivationFactory Failed to find library for
+      L"Windows.Management.Deployment.StagePackageOptions"
+  fixme:appx:package_manager_QueryInterface {0847e909-...} not implemented
+  wine: Unhandled page fault on read access to 0000000000000000
+        at address 000000014075707C
+
+  14075706b: call [rip+0x8774f]      ; QueryInterface, returns E_NOINTERFACE
+  140757071: mov rcx,[rbp+0x28]      ; the [out] it never wrote, still NULL
+  14075707c: mov rax,[rcx]           ; fault
+  140757086: mov rax,[rax+0x30]      ; slot 6: ProvisionPackageForAllUsersAsync
+
+C2R is not being careless in a way Windows would punish: on Windows the QI
+succeeds, the call returns an operation, and the operation reports whether the
+deployment worked.  The stubs here break that contract -- they return E_NOTIMPL
+and leave the [out] parameter exactly as the caller left it -- so the caller
+dereferences a pointer nobody wrote.  The scenario then stays EXECUTING and the
+install never finishes.
+
+So answer the questions rather than declining them.  Wine has no AppX package
+store: no package is registered, and none can be deployed.  Both of those have
+a truthful WinRT answer.
+
+  - FindPackages* hand back an empty IIterable<Package>.  Zero packages match,
+    because zero packages exist.
+  - FindPackageBy*FullName report S_OK with a NULL package, which is what a
+    lookup that finds nothing returns.
+  - every *Async returns an operation that has already reached
+    AsyncStatus_Error, with ERROR_NOT_SUPPORTED in IAsyncInfo::ErrorCode and a
+    DeploymentResult carrying the same code and an ErrorText saying no package
+    was deployed.  GetResults still yields that result, the way Microsoft's own
+    deployment samples read the reason for a failure.  A caller learns the
+    deployment did not happen however it chooses to look.
+  - the remaining stubs at least NULL their [out] parameters, so the next
+    caller that skips the HRESULT finds a NULL rather than whatever was on its
+    stack.
+
+IPackageManager6 is implemented alongside, from the SDK IDL: uuid
+0847e909-53cd-4e4f-832e-57d180f6e447, six methods, and the
+AddPackageByAppInstallerOptions enum and PackageVolume runtime class its
+signatures need.
+
+appxprobe walks the same path C2R does and now reports QI IPackageManager6 0x0,
+an empty but walkable package collection, status Error with code 0x80070032, the
+completed handler invoked exactly once, and a DeploymentResult with a matching
+ExtendedErrorCode.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 984dba990b1537779e3608389c98e6dfa47f3c37)
+
+diff --git a/dlls/appxdeploymentclient/Makefile.in b/dlls/appxdeploymentclient/Makefile.in
+index 315f501d9cd..f07553b9c1b 100644
+--- a/dlls/appxdeploymentclient/Makefile.in
++++ b/dlls/appxdeploymentclient/Makefile.in
+@@ -3,5 +3,6 @@ IMPORTS = combase
+ 
+ SOURCES = \
+ 	classes.idl \
++	deployment.c \
+ 	main.c \
+ 	package.c
+diff --git a/dlls/appxdeploymentclient/deployment.c b/dlls/appxdeploymentclient/deployment.c
+new file mode 100644
+index 00000000000..f300dbfa92a
+--- /dev/null
++++ b/dlls/appxdeploymentclient/deployment.c
+@@ -0,0 +1,773 @@
++/* WinRT Windows.Management.Deployment deployment results
++ *
++ * Copyright (C) 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(appx);
++
++/* Wine has no AppX package store, so a deployment cannot be carried out and no
++ * package is ever registered.  Returning E_NOTIMPL from the PackageManager
++ * methods does not say that: it leaves the [out] operation untouched, and a
++ * caller that follows the documented contract -- inspect the operation, then
++ * read the DeploymentResult off it -- dereferences a pointer that was never
++ * written.  So report the failure the way Windows reports a deployment that
++ * failed: an operation that reaches Error, with the reason both in
++ * IAsyncInfo::ErrorCode and in the DeploymentResult handed back by GetResults. */
++#define DEPLOYMENT_NOT_SUPPORTED HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED )
++
++static const WCHAR deployment_error_text[] =
++    L"Windows.Management.Deployment is not implemented: no package was deployed.";
++
++struct deployment_result
++{
++    IDeploymentResult IDeploymentResult_iface;
++    LONG ref;
++
++    HRESULT extended_error;
++};
++
++static inline struct deployment_result *impl_from_IDeploymentResult( IDeploymentResult *iface )
++{
++    return CONTAINING_RECORD( iface, struct deployment_result, IDeploymentResult_iface );
++}
++
++static HRESULT WINAPI deployment_result_QueryInterface( IDeploymentResult *iface, REFIID iid, void **out )
++{
++    struct deployment_result *impl = impl_from_IDeploymentResult( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDeploymentResult ))
++    {
++        *out = &impl->IDeploymentResult_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI deployment_result_AddRef( IDeploymentResult *iface )
++{
++    struct deployment_result *impl = impl_from_IDeploymentResult( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI deployment_result_Release( IDeploymentResult *iface )
++{
++    struct deployment_result *impl = impl_from_IDeploymentResult( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI deployment_result_GetIids( IDeploymentResult *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI deployment_result_GetRuntimeClassName( IDeploymentResult *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Management_Deployment_DeploymentResult,
++                                ARRAY_SIZE(RuntimeClass_Windows_Management_Deployment_DeploymentResult) - 1,
++                                class_name );
++}
++
++static HRESULT WINAPI deployment_result_GetTrustLevel( IDeploymentResult *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI deployment_result_get_ErrorText( IDeploymentResult *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    return WindowsCreateString( deployment_error_text, ARRAY_SIZE(deployment_error_text) - 1, value );
++}
++
++static HRESULT WINAPI deployment_result_get_ActivityId( IDeploymentResult *iface, GUID *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    /* No deployment ran, so there is no activity to correlate against. */
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
++}
++
++static HRESULT WINAPI deployment_result_get_ExtendedErrorCode( IDeploymentResult *iface, HRESULT *value )
++{
++    struct deployment_result *impl = impl_from_IDeploymentResult( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = impl->extended_error;
++    return S_OK;
++}
++
++static const struct IDeploymentResultVtbl deployment_result_vtbl =
++{
++    deployment_result_QueryInterface,
++    deployment_result_AddRef,
++    deployment_result_Release,
++    /* IInspectable methods */
++    deployment_result_GetIids,
++    deployment_result_GetRuntimeClassName,
++    deployment_result_GetTrustLevel,
++    /* IDeploymentResult methods */
++    deployment_result_get_ErrorText,
++    deployment_result_get_ActivityId,
++    deployment_result_get_ExtendedErrorCode,
++};
++
++static HRESULT deployment_result_create( HRESULT extended_error, IDeploymentResult **out )
++{
++    struct deployment_result *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++
++    impl->IDeploymentResult_iface.lpVtbl = &deployment_result_vtbl;
++    impl->ref = 1;
++    impl->extended_error = extended_error;
++
++    *out = &impl->IDeploymentResult_iface;
++    return S_OK;
++}
++
++struct deployment_operation
++{
++    IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress IAsyncOperationWithProgress_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++
++    CRITICAL_SECTION cs;
++    IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress *completed;
++    IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress *progress;
++    IDeploymentResult *result;
++    HRESULT hr;
++    BOOL closed;
++};
++
++static inline struct deployment_operation *impl_from_IAsyncOperationWithProgress(
++        IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface )
++{
++    return CONTAINING_RECORD( iface, struct deployment_operation, IAsyncOperationWithProgress_iface );
++}
++
++static HRESULT WINAPI async_QueryInterface( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                            REFIID iid, void **out )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress ))
++    {
++        *out = &impl->IAsyncOperationWithProgress_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        *out = &impl->IAsyncInfo_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI async_AddRef( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI async_Release( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (impl->completed)
++            IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_Release( impl->completed );
++        if (impl->progress)
++            IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_Release( impl->progress );
++        if (impl->result) IDeploymentResult_Release( impl->result );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI async_GetIids( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                     ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_GetRuntimeClassName( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                                 HSTRING *class_name )
++{
++    static const WCHAR name[] =
++        L"Windows.Foundation.IAsyncOperationWithProgress`2<Windows.Management.Deployment.DeploymentResult, "
++        L"Windows.Management.Deployment.DeploymentProgress>";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI async_GetTrustLevel( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                           TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_put_Progress( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                          IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress *handler )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->closed)
++    {
++        LeaveCriticalSection( &impl->cs );
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    if (impl->progress)
++        IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_Release( impl->progress );
++    if ((impl->progress = handler))
++        IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_AddRef( impl->progress );
++    LeaveCriticalSection( &impl->cs );
++
++    /* The operation failed before it could report any progress, so the handler
++     * is recorded for get_Progress and never invoked. */
++    return S_OK;
++}
++
++static HRESULT WINAPI async_get_Progress( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                          IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress **handler )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (!handler) return E_POINTER;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->closed)
++    {
++        LeaveCriticalSection( &impl->cs );
++        *handler = NULL;
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    if ((*handler = impl->progress))
++        IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_AddRef( *handler );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_put_Completed( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                           IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress *handler )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->closed)
++    {
++        LeaveCriticalSection( &impl->cs );
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    if (impl->completed)
++    {
++        LeaveCriticalSection( &impl->cs );
++        return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    }
++    if ((impl->completed = handler))
++        IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_AddRef( impl->completed );
++    LeaveCriticalSection( &impl->cs );
++
++    /* The operation is already in its terminal state, so the handler has to run
++     * now: nothing else will ever call it. */
++    if (handler)
++        IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_Invoke( handler, iface,
++                                                                                               Error );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_get_Completed( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                           IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress **handler )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (!handler) return E_POINTER;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->closed)
++    {
++        LeaveCriticalSection( &impl->cs );
++        *handler = NULL;
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    if ((*handler = impl->completed))
++        IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_AddRef( *handler );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_GetResults( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                        IDeploymentResult **results )
++{
++    struct deployment_operation *impl = impl_from_IAsyncOperationWithProgress( iface );
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    if (!results) return E_POINTER;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->closed)
++    {
++        LeaveCriticalSection( &impl->cs );
++        *results = NULL;
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    /* A deployment that failed still has a result to describe why it failed,
++     * and that is where callers are told to look for the reason. */
++    if ((*results = impl->result)) IDeploymentResult_AddRef( *results );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static const struct IAsyncOperationWithProgress_DeploymentResult_DeploymentProgressVtbl async_vtbl =
++{
++    async_QueryInterface,
++    async_AddRef,
++    async_Release,
++    /* IInspectable methods */
++    async_GetIids,
++    async_GetRuntimeClassName,
++    async_GetTrustLevel,
++    /* IAsyncOperationWithProgress<DeploymentResult *, DeploymentProgress> methods */
++    async_put_Progress,
++    async_get_Progress,
++    async_put_Completed,
++    async_get_Completed,
++    async_GetResults,
++};
++
++DEFINE_IINSPECTABLE( async_info, IAsyncInfo, struct deployment_operation, IAsyncOperationWithProgress_iface )
++
++static HRESULT WINAPI async_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    struct deployment_operation *impl = impl_from_IAsyncInfo( iface );
++
++    TRACE( "iface %p, id %p.\n", iface, id );
++
++    if (!id) return E_POINTER;
++    if (impl->closed) return E_ILLEGAL_METHOD_CALL;
++    *id = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    struct deployment_operation *impl = impl_from_IAsyncInfo( iface );
++
++    TRACE( "iface %p, status %p.\n", iface, status );
++
++    if (!status) return E_POINTER;
++    if (impl->closed) return E_ILLEGAL_METHOD_CALL;
++    *status = Error;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
++{
++    struct deployment_operation *impl = impl_from_IAsyncInfo( iface );
++
++    TRACE( "iface %p, error_code %p.\n", iface, error_code );
++
++    if (!error_code) return E_POINTER;
++    if (impl->closed) return E_ILLEGAL_METHOD_CALL;
++    *error_code = impl->hr;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_Cancel( IAsyncInfo *iface )
++{
++    struct deployment_operation *impl = impl_from_IAsyncInfo( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    /* Already in a terminal state: there is nothing left to cancel. */
++    if (impl->closed) return E_ILLEGAL_METHOD_CALL;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_Close( IAsyncInfo *iface )
++{
++    struct deployment_operation *impl = impl_from_IAsyncInfo( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &impl->cs );
++    impl->closed = TRUE;
++    if (impl->result)
++    {
++        IDeploymentResult_Release( impl->result );
++        impl->result = NULL;
++    }
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl async_info_vtbl =
++{
++    async_info_QueryInterface,
++    async_info_AddRef,
++    async_info_Release,
++    /* IInspectable methods */
++    async_info_GetIids,
++    async_info_GetRuntimeClassName,
++    async_info_GetTrustLevel,
++    /* IAsyncInfo methods */
++    async_info_get_Id,
++    async_info_get_Status,
++    async_info_get_ErrorCode,
++    async_info_Cancel,
++    async_info_Close,
++};
++
++/* Hand back an operation that has already failed, carrying the reason.  Every
++ * PackageManager method that returns an operation returns this one: Wine cannot
++ * deploy a package, and this is how a deployment that did not happen is
++ * reported. */
++HRESULT deployment_not_supported( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    struct deployment_operation *impl;
++    HRESULT hr;
++
++    if (!operation) return E_POINTER;
++    *operation = NULL;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    if (FAILED(hr = deployment_result_create( DEPLOYMENT_NOT_SUPPORTED, &impl->result )))
++    {
++        free( impl );
++        return hr;
++    }
++
++    impl->IAsyncOperationWithProgress_iface.lpVtbl = &async_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_info_vtbl;
++    impl->ref = 1;
++    impl->hr = DEPLOYMENT_NOT_SUPPORTED;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)( __FILE__ ": deployment_operation.cs" );
++
++    *operation = &impl->IAsyncOperationWithProgress_iface;
++    return S_OK;
++}
++
++/* An iterator over nothing.  No AppX package is ever registered in a Wine
++ * prefix, so every package query has the same, truthful answer: none. */
++struct package_iterator
++{
++    IIterator_Package IIterator_Package_iface;
++    LONG ref;
++};
++
++static inline struct package_iterator *impl_from_IIterator_Package( IIterator_Package *iface )
++{
++    return CONTAINING_RECORD( iface, struct package_iterator, IIterator_Package_iface );
++}
++
++static HRESULT WINAPI package_iterator_QueryInterface( IIterator_Package *iface, REFIID iid, void **out )
++{
++    struct package_iterator *impl = impl_from_IIterator_Package( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IIterator_Package ))
++    {
++        *out = &impl->IIterator_Package_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI package_iterator_AddRef( IIterator_Package *iface )
++{
++    struct package_iterator *impl = impl_from_IIterator_Package( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI package_iterator_Release( IIterator_Package *iface )
++{
++    struct package_iterator *impl = impl_from_IIterator_Package( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI package_iterator_GetIids( IIterator_Package *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI package_iterator_GetRuntimeClassName( IIterator_Package *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Foundation.Collections.IIterator`1<Windows.ApplicationModel.Package>";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI package_iterator_GetTrustLevel( IIterator_Package *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_iterator_get_Current( IIterator_Package *iface, IPackage **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return E_BOUNDS;
++}
++
++static HRESULT WINAPI package_iterator_get_HasCurrent( IIterator_Package *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_iterator_MoveNext( IIterator_Package *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_iterator_GetMany( IIterator_Package *iface, UINT32 items_size,
++                                                IPackage **items, UINT32 *count )
++{
++    TRACE( "iface %p, items_size %u, items %p, count %p.\n", iface, items_size, items, count );
++
++    if (!count) return E_POINTER;
++    *count = 0;
++    return S_OK;
++}
++
++static const struct IIterator_PackageVtbl package_iterator_vtbl =
++{
++    package_iterator_QueryInterface,
++    package_iterator_AddRef,
++    package_iterator_Release,
++    /* IInspectable methods */
++    package_iterator_GetIids,
++    package_iterator_GetRuntimeClassName,
++    package_iterator_GetTrustLevel,
++    /* IIterator<Package *> methods */
++    package_iterator_get_Current,
++    package_iterator_get_HasCurrent,
++    package_iterator_MoveNext,
++    package_iterator_GetMany,
++};
++
++struct package_iterable
++{
++    IIterable_Package IIterable_Package_iface;
++    LONG ref;
++};
++
++static inline struct package_iterable *impl_from_IIterable_Package( IIterable_Package *iface )
++{
++    return CONTAINING_RECORD( iface, struct package_iterable, IIterable_Package_iface );
++}
++
++static HRESULT WINAPI package_iterable_QueryInterface( IIterable_Package *iface, REFIID iid, void **out )
++{
++    struct package_iterable *impl = impl_from_IIterable_Package( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IIterable_Package ))
++    {
++        *out = &impl->IIterable_Package_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI package_iterable_AddRef( IIterable_Package *iface )
++{
++    struct package_iterable *impl = impl_from_IIterable_Package( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI package_iterable_Release( IIterable_Package *iface )
++{
++    struct package_iterable *impl = impl_from_IIterable_Package( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI package_iterable_GetIids( IIterable_Package *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI package_iterable_GetRuntimeClassName( IIterable_Package *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Foundation.Collections.IIterable`1<Windows.ApplicationModel.Package>";
++
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI package_iterable_GetTrustLevel( IIterable_Package *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI package_iterable_First( IIterable_Package *iface, IIterator_Package **value )
++{
++    struct package_iterator *impl;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) )))
++    {
++        *value = NULL;
++        return E_OUTOFMEMORY;
++    }
++
++    impl->IIterator_Package_iface.lpVtbl = &package_iterator_vtbl;
++    impl->ref = 1;
++
++    *value = &impl->IIterator_Package_iface;
++    return S_OK;
++}
++
++static const struct IIterable_PackageVtbl package_iterable_vtbl =
++{
++    package_iterable_QueryInterface,
++    package_iterable_AddRef,
++    package_iterable_Release,
++    /* IInspectable methods */
++    package_iterable_GetIids,
++    package_iterable_GetRuntimeClassName,
++    package_iterable_GetTrustLevel,
++    /* IIterable<Package *> methods */
++    package_iterable_First,
++};
++
++HRESULT empty_package_iterable_create( IIterable_Package **packages )
++{
++    struct package_iterable *impl;
++
++    if (!packages) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) )))
++    {
++        *packages = NULL;
++        return E_OUTOFMEMORY;
++    }
++
++    impl->IIterable_Package_iface.lpVtbl = &package_iterable_vtbl;
++    impl->ref = 1;
++
++    *packages = &impl->IIterable_Package_iface;
++    return S_OK;
++}
+diff --git a/dlls/appxdeploymentclient/package.c b/dlls/appxdeploymentclient/package.c
+index 50dcb0f928a..2d995ee5cb6 100644
+--- a/dlls/appxdeploymentclient/package.c
++++ b/dlls/appxdeploymentclient/package.c
+@@ -26,6 +26,7 @@ struct package_manager
+ {
+     IPackageManager IPackageManager_iface;
+     IPackageManager2 IPackageManager2_iface;
++    IPackageManager6 IPackageManager6_iface;
+     LONG ref;
+ };
+ 
+@@ -57,6 +58,13 @@ static HRESULT WINAPI package_manager_QueryInterface( IPackageManager *iface, RE
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IPackageManager6 ))
++    {
++        *out = &impl->IPackageManager6_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -84,86 +92,91 @@ static ULONG WINAPI package_manager_Release( IPackageManager *iface )
+ static HRESULT WINAPI package_manager_GetIids( IPackageManager *iface, ULONG *iid_count, IID **iids )
+ {
+     FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    *iids = NULL;
+     return E_NOTIMPL;
+ }
+ 
+ static HRESULT WINAPI package_manager_GetRuntimeClassName( IPackageManager *iface, HSTRING *class_name )
+ {
+-    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Management_Deployment_PackageManager,
++                                ARRAY_SIZE(RuntimeClass_Windows_Management_Deployment_PackageManager) - 1,
++                                class_name );
+ }
+ 
+ static HRESULT WINAPI package_manager_GetTrustLevel( IPackageManager *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI package_manager_AddPackageAsync( IPackageManager *iface, IUriRuntimeClass *uri,
+     IIterable_Uri *dependencies, DeploymentOptions options, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, uri %p, dependencies %p, options %d, operation %p stub!\n", iface, uri, dependencies, options, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, operation %p.\n", iface, uri, dependencies, options, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager_UpdatePackageAsync( IPackageManager *iface, IUriRuntimeClass *uri, IIterable_Uri *dependencies,
+     DeploymentOptions options, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, uri %p, dependencies %p, options %d, operation %p stub!\n", iface, uri, dependencies, options, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, operation %p.\n", iface, uri, dependencies, options, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager_RemovePackageAsync( IPackageManager *iface, HSTRING name,
+     IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring(name), operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, operation %p.\n", iface, debugstr_hstring(name), operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager_StagePackageAsync( IPackageManager *iface, IUriRuntimeClass *uri, IIterable_Uri *dependencies,
+     IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, uri %p, dependencies %p, operation %p stub!\n", iface, uri, dependencies, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, uri %p, dependencies %p, operation %p.\n", iface, uri, dependencies, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager_RegisterPackageAsync( IPackageManager *iface, IUriRuntimeClass *uri, IIterable_Uri *dependencies,
+     DeploymentOptions options, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, uri %p, dependencies %p, options %d, operation %p stub!\n", iface, uri, dependencies, options, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, operation %p.\n", iface, uri, dependencies, options, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackages( IPackageManager *iface, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, packages %p stub!\n", iface, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, packages %p.\n", iface, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackagesByUserSecurityId( IPackageManager *iface, HSTRING sid, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, sid %s, packages %p stub!\n", iface, debugstr_hstring(sid), packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, packages %p.\n", iface, debugstr_hstring(sid), packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackagesByNamePublisher( IPackageManager *iface, HSTRING name, HSTRING publisher, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, name %s, publisher %s, packages %p stub!\n", iface, debugstr_hstring(name), debugstr_hstring(publisher), packages );
++    TRACE( "iface %p, name %s, publisher %s, packages %p.\n", iface, debugstr_hstring(name), debugstr_hstring(publisher), packages );
+ 
+     if (!name || !publisher) return E_INVALIDARG;
+-    return E_NOTIMPL;
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackagesByUserSecurityIdNamePublisher( IPackageManager *iface, HSTRING sid,
+     HSTRING name, HSTRING publisher, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, sid %s, name %s, publisher %s, packages %p stub!\n", iface, debugstr_hstring(sid), debugstr_hstring(name), debugstr_hstring(publisher), packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, name %s, publisher %s, packages %p.\n", iface, debugstr_hstring(sid), debugstr_hstring(name), debugstr_hstring(publisher), packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindUsers( IPackageManager *iface, HSTRING name, IIterable_PackageUserInformation **users )
+ {
+     FIXME( "iface %p, name %s, users %p stub!\n", iface, debugstr_hstring(name), users );
++    *users = NULL;
+     return E_NOTIMPL;
+ }
+ 
+@@ -175,35 +188,37 @@ static HRESULT WINAPI package_manager_SetPackageState( IPackageManager *iface, H
+ 
+ static HRESULT WINAPI package_manager_FindPackageByPackageFullName( IPackageManager *iface, HSTRING name, IPackage **package )
+ {
+-    FIXME( "iface %p, name %s, package %p stub!\n", iface, debugstr_hstring(name), package );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, package %p.\n", iface, debugstr_hstring(name), package );
++    *package = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI package_manager_CleanupPackageForUserAsync( IPackageManager *iface, HSTRING name, HSTRING sid,
+     IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, name %s, sid %s, operation %p stub!\n", iface, debugstr_hstring(name), debugstr_hstring(sid), operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, sid %s, operation %p.\n", iface, debugstr_hstring(name), debugstr_hstring(sid), operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackagesByPackageFamilyName( IPackageManager *iface, HSTRING family_name,
+     IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, family_name %s, packages %p stub!\n", iface, debugstr_hstring(family_name), packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, family_name %s, packages %p.\n", iface, debugstr_hstring(family_name), packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackagesByUserSecurityIdPackageFamilyName( IPackageManager *iface, HSTRING sid,
+     HSTRING family_name, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, sid %s, family_name %s, packages %p stub!\n", iface, debugstr_hstring(sid), debugstr_hstring(family_name), packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, family_name %s, packages %p.\n", iface, debugstr_hstring(sid), debugstr_hstring(family_name), packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager_FindPackageByUserSecurityIdPackageFullName( IPackageManager *iface, HSTRING sid, HSTRING name, IPackage **package )
+ {
+-    FIXME( "iface %p, sid %s, name %s, package %p stub!\n", iface, debugstr_hstring(sid), debugstr_hstring(name), package );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, name %s, package %p.\n", iface, debugstr_hstring(sid), debugstr_hstring(name), package );
++    *package = NULL;
++    return S_OK;
+ }
+ 
+ static const struct IPackageManagerVtbl package_manager_vtbl =
+@@ -239,70 +254,70 @@ DEFINE_IINSPECTABLE( package_manager2, IPackageManager2, struct package_manager,
+ static HRESULT WINAPI package_manager2_RemovePackageWithOptionsAsync( IPackageManager2 *iface, HSTRING name, RemovalOptions options,
+     IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, name %s, options %d, operation %p stub!\n", iface, debugstr_hstring(name), options, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, options %d, operation %p.\n", iface, debugstr_hstring(name), options, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager2_StagePackageWithOptionsAsync( IPackageManager2 *iface, IUriRuntimeClass *uri, IIterable_Uri *dependencies,
+     DeploymentOptions options, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, uri %p, dependencies %p, options %d, operation %p stub!\n", iface, uri, dependencies, options, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, operation %p.\n", iface, uri, dependencies, options, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager2_RegisterPackageByFullNameAsync( IPackageManager2 *iface, HSTRING name, IIterable_HSTRING *dependencies,
+     DeploymentOptions options, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, name %s, dependencies %p, options %d, operation %p stub!\n", iface, debugstr_hstring(name), dependencies, options, operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, dependencies %p, options %d, operation %p.\n", iface, debugstr_hstring(name), dependencies, options, operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static HRESULT WINAPI package_manager2_FindPackagesWithPackageTypes( IPackageManager2 *iface, PackageTypes types, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, types %d, packages %p stub!\n", iface, types, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, types %d, packages %p.\n", iface, types, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager2_FindPackagesByUserSecurityIdWithPackageTypes( IPackageManager2 *iface, HSTRING sid,
+     PackageTypes types, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, sid %s, types %d, packages %p stub!\n", iface, debugstr_hstring(sid), types, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, types %d, packages %p.\n", iface, debugstr_hstring(sid), types, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager2_FindPackagesByNamePublisherWithPackageTypes( IPackageManager2 *iface, HSTRING name, HSTRING publisher,
+     PackageTypes types, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, name %s, publisher %s, types %d, packages %p stub!\n", iface, debugstr_hstring(name), debugstr_hstring(publisher), types, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, publisher %s, types %d, packages %p.\n", iface, debugstr_hstring(name), debugstr_hstring(publisher), types, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager2_FindPackagesByUserSecurityIdNamePublisherWithPackageTypes( IPackageManager2 *iface, HSTRING sid, HSTRING name,
+     HSTRING publisher, PackageTypes types, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, sid %s, name %s, publisher %s, types %d, packages %p stub!\n", iface, debugstr_hstring(sid), debugstr_hstring(name), debugstr_hstring(publisher), types, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, name %s, publisher %s, types %d, packages %p.\n", iface, debugstr_hstring(sid), debugstr_hstring(name), debugstr_hstring(publisher), types, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager2_FindPackagesByPackageFamilyNameWithPackageTypes( IPackageManager2 *iface, HSTRING family_name, PackageTypes types,
+    IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, family_name %s, types %d, packages %p stub!\n", iface, debugstr_hstring(family_name), types, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, family_name %s, types %d, packages %p.\n", iface, debugstr_hstring(family_name), types, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager2_FindPackagesByUserSecurityIdPackageFamilyNameWithPackageTypes( IPackageManager2 *iface, HSTRING sid, HSTRING family_name,
+     PackageTypes types, IIterable_Package **packages )
+ {
+-    FIXME( "iface %p, sid %s, family_name %s, types %d, packages %p stub!\n", iface, debugstr_hstring(sid), debugstr_hstring(family_name), types, packages );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, sid %s, family_name %s, types %d, packages %p.\n", iface, debugstr_hstring(sid), debugstr_hstring(family_name), types, packages );
++    return empty_package_iterable_create( packages );
+ }
+ 
+ static HRESULT WINAPI package_manager2_StageUserDataAsync( IPackageManager2 *iface, HSTRING name,
+     IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring(name), operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, name %s, operation %p.\n", iface, debugstr_hstring(name), operation );
++    return deployment_not_supported( operation );
+ }
+ 
+ static const struct IPackageManager2Vtbl package_manager2_vtbl =
+@@ -327,6 +342,79 @@ static const struct IPackageManager2Vtbl package_manager2_vtbl =
+     package_manager2_StageUserDataAsync,
+ };
+ 
++DEFINE_IINSPECTABLE( package_manager6, IPackageManager6, struct package_manager, IPackageManager_iface );
++
++static HRESULT WINAPI package_manager6_ProvisionPackageForAllUsersAsync( IPackageManager6 *iface, HSTRING family_name,
++    IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    TRACE( "iface %p, family_name %s, operation %p.\n", iface, debugstr_hstring(family_name), operation );
++    return deployment_not_supported( operation );
++}
++
++static HRESULT WINAPI package_manager6_AddPackageByAppInstallerFileAsync( IPackageManager6 *iface, IUriRuntimeClass *uri,
++    AddPackageByAppInstallerOptions options, IPackageVolume *target_volume, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    TRACE( "iface %p, uri %p, options %d, target_volume %p, operation %p.\n", iface, uri, options, target_volume, operation );
++    return deployment_not_supported( operation );
++}
++
++static HRESULT WINAPI package_manager6_RequestAddPackageByAppInstallerFileAsync( IPackageManager6 *iface, IUriRuntimeClass *uri,
++    AddPackageByAppInstallerOptions options, IPackageVolume *target_volume, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    TRACE( "iface %p, uri %p, options %d, target_volume %p, operation %p.\n", iface, uri, options, target_volume, operation );
++    return deployment_not_supported( operation );
++}
++
++static HRESULT WINAPI package_manager6_AddPackageToVolumeAndRelatedSetAsync( IPackageManager6 *iface, IUriRuntimeClass *uri,
++    IIterable_Uri *dependencies, DeploymentOptions options, IPackageVolume *target_volume,
++    IIterable_HSTRING *optional_package_family_names, IIterable_Uri *package_uris_to_install,
++    IIterable_Uri *related_package_uris, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, target_volume %p, optional_package_family_names %p, "
++           "package_uris_to_install %p, related_package_uris %p, operation %p.\n", iface, uri, dependencies, options,
++           target_volume, optional_package_family_names, package_uris_to_install, related_package_uris, operation );
++    return deployment_not_supported( operation );
++}
++
++static HRESULT WINAPI package_manager6_StagePackageToVolumeAndRelatedSetAsync( IPackageManager6 *iface, IUriRuntimeClass *uri,
++    IIterable_Uri *dependencies, DeploymentOptions options, IPackageVolume *target_volume,
++    IIterable_HSTRING *optional_package_family_names, IIterable_Uri *package_uris_to_install,
++    IIterable_Uri *related_package_uris, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, target_volume %p, optional_package_family_names %p, "
++           "package_uris_to_install %p, related_package_uris %p, operation %p.\n", iface, uri, dependencies, options,
++           target_volume, optional_package_family_names, package_uris_to_install, related_package_uris, operation );
++    return deployment_not_supported( operation );
++}
++
++static HRESULT WINAPI package_manager6_RequestAddPackageAsync( IPackageManager6 *iface, IUriRuntimeClass *uri,
++    IIterable_Uri *dependencies, DeploymentOptions options, IPackageVolume *target_volume,
++    IIterable_HSTRING *optional_package_family_names, IIterable_Uri *related_package_uris, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
++{
++    TRACE( "iface %p, uri %p, dependencies %p, options %d, target_volume %p, optional_package_family_names %p, "
++           "related_package_uris %p, operation %p.\n", iface, uri, dependencies, options, target_volume,
++           optional_package_family_names, related_package_uris, operation );
++    return deployment_not_supported( operation );
++}
++
++static const struct IPackageManager6Vtbl package_manager6_vtbl =
++{
++    package_manager6_QueryInterface,
++    package_manager6_AddRef,
++    package_manager6_Release,
++    /* IInspectable methods */
++    package_manager6_GetIids,
++    package_manager6_GetRuntimeClassName,
++    package_manager6_GetTrustLevel,
++    /* IPackageManager6 methods */
++    package_manager6_ProvisionPackageForAllUsersAsync,
++    package_manager6_AddPackageByAppInstallerFileAsync,
++    package_manager6_RequestAddPackageByAppInstallerFileAsync,
++    package_manager6_AddPackageToVolumeAndRelatedSetAsync,
++    package_manager6_StagePackageToVolumeAndRelatedSetAsync,
++    package_manager6_RequestAddPackageAsync,
++};
++
+ struct package_manager_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -346,6 +434,7 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+ 
+     if (IsEqualGUID( iid, &IID_IUnknown ) ||
+         IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
+         IsEqualGUID( iid, &IID_IActivationFactory ))
+     {
+         *out = &impl->IActivationFactory_iface;
+@@ -382,14 +471,17 @@ static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_cou
+ 
+ static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
+ {
+-    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Management_Deployment_PackageManager,
++                                ARRAY_SIZE(RuntimeClass_Windows_Management_Deployment_PackageManager) - 1,
++                                class_name );
+ }
+ 
+ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+@@ -406,6 +498,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
+ 
+     impl->IPackageManager_iface.lpVtbl = &package_manager_vtbl;
+     impl->IPackageManager2_iface.lpVtbl = &package_manager2_vtbl;
++    impl->IPackageManager6_iface.lpVtbl = &package_manager6_vtbl;
+     impl->ref = 1;
+ 
+     *instance = (IInspectable *)&impl->IPackageManager_iface;
+diff --git a/dlls/appxdeploymentclient/private.h b/dlls/appxdeploymentclient/private.h
+index cc35ab9d7ec..159c7a55ffb 100644
+--- a/dlls/appxdeploymentclient/private.h
++++ b/dlls/appxdeploymentclient/private.h
+@@ -38,6 +38,9 @@
+ 
+ extern IActivationFactory *package_manager_factory;
+ 
++extern HRESULT deployment_not_supported( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation );
++extern HRESULT empty_package_iterable_create( IIterable_Package **packages );
++
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+     {                                                                                              \
+diff --git a/include/windows.management.deployment.idl b/include/windows.management.deployment.idl
+index 9691b228c2b..891f8d7a43c 100644
+--- a/include/windows.management.deployment.idl
++++ b/include/windows.management.deployment.idl
+@@ -25,6 +25,7 @@ import "windows.applicationmodel.idl";
+ 
+ namespace Windows.Management.Deployment {
+ 
++    typedef enum AddPackageByAppInstallerOptions AddPackageByAppInstallerOptions;
+     typedef enum DeploymentOptions DeploymentOptions;
+     typedef enum DeploymentProgressState DeploymentProgressState;
+     typedef enum PackageInstallState PackageInstallState;
+@@ -37,16 +38,21 @@ namespace Windows.Management.Deployment {
+     interface IDeploymentResult;
+     interface IPackageManager;
+     interface IPackageManager2;
++    interface IPackageManager6;
+     interface IPackageUserInformation;
++    interface IPackageVolume;
+ 
+     runtimeclass DeploymentResult;
+     runtimeclass PackageManager;
+     runtimeclass PackageUserInformation;
++    runtimeclass PackageVolume;
+ 
+     declare {
+         interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *>;
+         interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Uri *>;
+         interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Package *>;
++        interface Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Package *>;
+         interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.Package *>;
+         interface Windows.Foundation.Collections.IIterable<Windows.Management.Deployment.PackageUserInformation *>;
+         interface Windows.Foundation.Collections.IIterator<Windows.Management.Deployment.PackageUserInformation *>;
+@@ -55,6 +61,18 @@ namespace Windows.Management.Deployment {
+         interface Windows.Foundation.AsyncOperationWithProgressCompletedHandler<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress>;
+     }
+ 
++    [contract(Windows.Foundation.UniversalApiContract, 5.0)]
++    [flags]
++    enum AddPackageByAppInstallerOptions
++    {
++        None                     = 0x0,
++        InstallAllResources      = 0x20,
++        ForceTargetAppShutdown   = 0x40,
++        RequiredContentGroupOnly = 0x100,
++        [contract(Windows.Foundation.UniversalApiContract, 8.0)]
++        LimitToExistingPackages  = 0x200,
++    };
++
+     [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+     [flags]
+     enum DeploymentOptions
+@@ -227,6 +245,46 @@ namespace Windows.Management.Deployment {
+         HRESULT StageUserDataAsync([in] HSTRING name, [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.Management.Deployment.PackageManager),
++        uuid(0847e909-53cd-4e4f-832e-57d180f6e447)
++    ]
++    interface IPackageManager6 : IInspectable
++    {
++        HRESULT ProvisionPackageForAllUsersAsync([in] HSTRING family_name, [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
++        HRESULT AddPackageByAppInstallerFileAsync([in] Windows.Foundation.Uri *app_installer_file_uri,
++                                                  [in] Windows.Management.Deployment.AddPackageByAppInstallerOptions options,
++                                                  [in] Windows.Management.Deployment.PackageVolume *target_volume,
++                                                  [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
++        HRESULT RequestAddPackageByAppInstallerFileAsync([in] Windows.Foundation.Uri *app_installer_file_uri,
++                                                         [in] Windows.Management.Deployment.AddPackageByAppInstallerOptions options,
++                                                         [in] Windows.Management.Deployment.PackageVolume *target_volume,
++                                                         [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
++        [overload("AddPackageAsync")]
++        HRESULT AddPackageToVolumeAndRelatedSetAsync([in] Windows.Foundation.Uri *uri, [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *dependencies,
++                                                     [in] Windows.Management.Deployment.DeploymentOptions options,
++                                                     [in] Windows.Management.Deployment.PackageVolume *target_volume,
++                                                     [in] Windows.Foundation.Collections.IIterable<HSTRING> *optional_package_family_names,
++                                                     [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *package_uris_to_install,
++                                                     [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *related_package_uris,
++                                                     [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
++        [overload("StagePackageAsync")]
++        HRESULT StagePackageToVolumeAndRelatedSetAsync([in] Windows.Foundation.Uri *uri, [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *dependencies,
++                                                       [in] Windows.Management.Deployment.DeploymentOptions options,
++                                                       [in] Windows.Management.Deployment.PackageVolume *target_volume,
++                                                       [in] Windows.Foundation.Collections.IIterable<HSTRING> *optional_package_family_names,
++                                                       [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *package_uris_to_install,
++                                                       [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *related_package_uris,
++                                                       [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
++        HRESULT RequestAddPackageAsync([in] Windows.Foundation.Uri *uri, [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *dependencies,
++                                       [in] Windows.Management.Deployment.DeploymentOptions options,
++                                       [in] Windows.Management.Deployment.PackageVolume *target_volume,
++                                       [in] Windows.Foundation.Collections.IIterable<HSTRING> *optional_package_family_names,
++                                       [in] Windows.Foundation.Collections.IIterable<Windows.Foundation.Uri *> *related_package_uris,
++                                       [out, retval] Windows.Foundation.IAsyncOperationWithProgress<Windows.Management.Deployment.DeploymentResult *, Windows.Management.Deployment.DeploymentProgress> **operation);
++    }
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         exclusiveto(Windows.Management.Deployment.PackageUserInformation),
+@@ -238,6 +296,54 @@ namespace Windows.Management.Deployment {
+         [propget] HRESULT InstallState([out, retval] Windows.Management.Deployment.PackageInstallState *value);
+     }
+ 
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Management.Deployment.PackageVolume),
++        uuid(cf2672c3-1a40-4450-9739-2ace2e898853)
++    ]
++    interface IPackageVolume : IInspectable
++    {
++        [propget] HRESULT IsOffline([out, retval] boolean *value);
++        [propget] HRESULT IsSystemVolume([out, retval] boolean *value);
++        [propget] HRESULT MountPoint([out, retval] HSTRING *value);
++        [propget] HRESULT Name([out, retval] HSTRING *value);
++        [propget] HRESULT PackageStorePath([out, retval] HSTRING *value);
++        [propget] HRESULT SupportsHardLinks([out, retval] boolean *value);
++        [overload("FindPackages")]
++        HRESULT FindPackages([out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackages")]
++        HRESULT FindPackagesByNamePublisher([in] HSTRING name, [in] HSTRING publisher, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackages")]
++        HRESULT FindPackagesByPackageFamilyName([in] HSTRING family_name, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesWithPackageTypes")]
++        HRESULT FindPackagesWithPackageTypes([in] Windows.Management.Deployment.PackageTypes types, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesWithPackageTypes")]
++        HRESULT FindPackagesByNamePublisherWithPackagesTypes([in] Windows.Management.Deployment.PackageTypes types, [in] HSTRING name,
++                                                             [in] HSTRING publisher, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesWithPackageTypes")]
++        HRESULT FindPackagesByPackageFamilyNameWithPackageTypes([in] Windows.Management.Deployment.PackageTypes types, [in] HSTRING family_name,
++                                                                [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackage")]
++        HRESULT FindPackageByPackageFullName([in] HSTRING full_name, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesForUser")]
++        HRESULT FindPackagesByUserSecurityId([in] HSTRING sid, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesForUser")]
++        HRESULT FindPackagesByUserSecurityIdNamePublisher([in] HSTRING sid, [in] HSTRING name, [in] HSTRING publisher,
++                                                          [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesForUser")]
++        HRESULT FindPackagesByUserSecurityIdPackageFamilyName([in] HSTRING sid, [in] HSTRING family_name, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesForUserWithPackageTypes")]
++        HRESULT FindPackagesByUserSecurityIdWithPackageTypes([in] HSTRING sid, [in] Windows.Management.Deployment.PackageTypes types,
++                                                             [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesForUserWithPackageTypes")]
++        HRESULT FindPackagesByUserSecurityIdNamePublisherWithPackageTypes([in] HSTRING sid, [in] Windows.Management.Deployment.PackageTypes types,
++                                                                          [in] HSTRING name, [in] HSTRING publisher, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++        [overload("FindPackagesForUserWithPackageTypes")]
++        HRESULT FindPackagesByUserSecurityIdPackageFamilyNameWithPackagesTypes([in] HSTRING sid, [in] Windows.Management.Deployment.PackageTypes types,
++                                                                               [in] HSTRING family_name, [out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.Package *> **packages);
++    }
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         marshaling_behavior(agile)
+@@ -261,7 +367,7 @@ namespace Windows.Management.Deployment {
+         /* [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Management.Deployment.IPackageManager3; */
+         /* [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.Management.Deployment.IPackageManager4; */
+         /* [contract(Windows.Foundation.UniversalApiContract, 4.0)] interface Windows.Management.Deployment.IPackageManager5; */
+-        /* [contract(Windows.Foundation.UniversalApiContract, 5.0)] interface Windows.Management.Deployment.IPackageManager6; */
++        [contract(Windows.Foundation.UniversalApiContract, 5.0)] interface Windows.Management.Deployment.IPackageManager6;
+         /* [contract(Windows.Foundation.UniversalApiContract, 6.0)] interface Windows.Management.Deployment.IPackageManager7; */
+         /* [contract(Windows.Foundation.UniversalApiContract, 7.0)] interface Windows.Management.Deployment.IPackageManager8; */
+         /* [contract(Windows.Foundation.UniversalApiContract, 10.0)] interface Windows.Management.Deployment.IPackageManager9; */
+@@ -276,4 +382,13 @@ namespace Windows.Management.Deployment {
+         [default] interface Windows.Management.Deployment.IPackageUserInformation;
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile)
++    ]
++    runtimeclass PackageVolume
++    {
++        [default] interface Windows.Management.Deployment.IPackageVolume;
++        /* [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.Management.Deployment.IPackageVolume2; */
++    }
+ }

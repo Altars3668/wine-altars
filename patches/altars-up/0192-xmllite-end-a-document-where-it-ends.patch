@@ -1,0 +1,554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 00:22:41 -0400
+Subject: [PATCH] xmllite: end a document where it ends.
+
+A document that ended with elements still open had its last node read
+again on every call, an element one level deeper each time, so a caller
+reading to the end never got there. Answer MX_E_INPUTEND there, as
+Windows does, and keep answering it. Text the document ends in is the
+whole node, and a comment, section or instruction it ends in, or a name
+it cuts off, is the error Windows gives for each.
+
+The markup that ends a comment, section or instruction could lie across
+two of the chunks read from the stream, and then was not seen at all.
+While the declaration was read, reading more converted again what had
+been converted already: a UTF-16 document got the start twice, and a
+UTF-8 one that was nothing but its declaration failed an assertion.
+
+A document without a root element, or with a second one, is
+WC_E_ROOTELEMENT; an XML declaration anywhere but at the start is
+WC_E_TEXTXMLDECL; and a document with no byte order mark and no '<' to
+tell its encoding by is UTF-8, however short.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8b58e3c5b347ad9967f0564fb3f925c55d7c7149)
+
+diff --git a/dlls/xmllite/reader.c b/dlls/xmllite/reader.c
+index b276ba1b37f..b9fba03bcbe 100644
+--- a/dlls/xmllite/reader.c
++++ b/dlls/xmllite/reader.c
+@@ -906,7 +906,6 @@ static HRESULT readerinput_detectencoding(xmlreaderinput *readerinput, xml_encod
+     {
+         HRESULT hr = readerinput_growraw(readerinput);
+         if (FAILED(hr)) return hr;
+-        if (buffer->written < 3) return MX_E_INPUTEND;
+     }
+ 
+     ptrW = (WCHAR *)buffer->data;
+@@ -931,6 +930,9 @@ static HRESULT readerinput_detectencoding(xmlreaderinput *readerinput, xml_encod
+         buffer->cur += sizeof(utf16lebom);
+         *enc = XmlEncoding_UTF16;
+     }
++    /* and what a document without a mark or a declaration is in */
++    else
++        *enc = XmlEncoding_UTF8;
+ 
+     return S_OK;
+ }
+@@ -1117,30 +1119,26 @@ static int readerinput_convert(xmlreaderinput *readerinput, const char *src, int
+     return ret;
+ }
+ 
+-/* note that raw buffer content is kept */
+-static void readerinput_switchencoding(xmlreaderinput *readerinput, xml_encoding enc)
++/* Converts all that the raw buffer holds, from where the data begins, in place of what was
++   converted before: until the declaration has been read the raw data is kept, since the
++   encoding it names may have to convert it again. */
++static void readerinput_convert_all(xmlreaderinput *readerinput)
+ {
+     encoded_buffer *src = &readerinput->buffer->encoded;
+     encoded_buffer *dest = &readerinput->buffer->utf16;
+     int len, dest_len;
+-    UINT cp = ~0u;
+-    HRESULT hr;
+     WCHAR *ptr;
+ 
+-    hr = get_code_page(enc, &cp);
+-    if (FAILED(hr)) return;
+-
+-    readerinput->buffer->code_page = cp;
+     len = readerinput_get_convlen(readerinput);
+-
+-    TRACE("switching to cp %d\n", cp);
++    dest->written = 0;
++    dest->prev_cr = FALSE;
+ 
+     /* just copy in this case */
+-    if (enc == XmlEncoding_UTF16)
++    if (readerinput->buffer->code_page == 1200)
+     {
+         readerinput_grow(readerinput, len);
+         memcpy(dest->data, src->data + src->cur, len);
+-        dest->written += len;
++        dest->written = len;
+     }
+     else
+     {
+@@ -1149,12 +1147,23 @@ static void readerinput_switchencoding(xmlreaderinput *readerinput, xml_encoding
+         ptr = (WCHAR*)dest->data;
+         readerinput_convert(readerinput, src->data + src->cur, len, ptr, dest_len);
+         ptr[dest_len] = 0;
+-        dest->written += dest_len*sizeof(WCHAR);
++        dest->written = dest_len*sizeof(WCHAR);
+     }
+ 
+     fixup_buffer_cr(dest, 0);
+ }
+ 
++static void readerinput_switchencoding(xmlreaderinput *readerinput, xml_encoding enc)
++{
++    UINT cp = ~0u;
++
++    if (FAILED(get_code_page(enc, &cp))) return;
++
++    TRACE("switching to cp %d\n", cp);
++    readerinput->buffer->code_page = cp;
++    readerinput_convert_all(readerinput);
++}
++
+ /* shrinks parsed data a buffer begins with */
+ static void reader_shrink(xmlreader *reader)
+ {
+@@ -1186,6 +1195,13 @@ static HRESULT reader_more(xmlreader *reader)
+     if (FAILED(hr = readerinput_growraw(readerinput)))
+         return hr;
+ 
++    /* what was read before is still there and was converted already; do it again whole */
++    if (reader->instate == XmlReadInState_Initial)
++    {
++        readerinput_convert_all(readerinput);
++        return hr;
++    }
++
+     len = readerinput_get_convlen(readerinput);
+     prev_len = dest->written / sizeof(WCHAR);
+ 
+@@ -1685,39 +1701,36 @@ static HRESULT reader_parse_comment(xmlreader *reader)
+         reader_set_strvalue(reader, StringValue_Value, NULL);
+     }
+ 
+-    /* will exit when there's no more data, it won't attempt to
+-       read more from stream */
++    /* will exit when there's no more data now; the end of the markup may be in what comes next */
+     while (*ptr)
+     {
+-        if (ptr[0] == '-')
++        if (ptr[0] == '-' && !reader_cmp(reader, L"--"))
+         {
+-            if (ptr[1] == '-')
++            if (!reader_cmp(reader, L"-->"))
+             {
+-                if (ptr[2] == '>')
+-                {
+-                    strval value;
++                strval value;
+ 
+-                    reader_init_strvalue(start, reader_get_cur(reader)-start, &value);
+-                    TRACE("%s\n", debug_strval(reader, &value));
++                reader_init_strvalue(start, reader_get_cur(reader)-start, &value);
++                TRACE("%s\n", debug_strval(reader, &value));
+ 
+-                    /* skip rest of markup '->' */
+-                    reader_skipn(reader, 3);
++                /* skip rest of markup '->' */
++                reader_skipn(reader, 3);
+ 
+-                    reader_set_strvalue(reader, StringValue_Value, &value);
+-                    reader->resume[XmlReadResume_Body] = 0;
+-                    reader->resumestate = XmlReadResumeState_Initial;
+-                    return S_OK;
+-                }
+-                else
+-                    return WC_E_COMMENT;
++                reader_set_strvalue(reader, StringValue_Value, &value);
++                reader->resume[XmlReadResume_Body] = 0;
++                reader->resumestate = XmlReadResumeState_Initial;
++                return S_OK;
+             }
++            else
++                return WC_E_COMMENT;
+         }
+ 
+         reader_skipn(reader, 1);
+-        ptr++;
++        ptr = reader_get_ptr(reader);
+     }
+ 
+-    return S_OK;
++    /* the document ends in the comment */
++    return is_reader_pending(reader) ? S_OK : WC_E_COMMENT;
+ }
+ 
+ /* [13] PubidChar ::= #x20 | #xD | #xA | [a-zA-Z0-9] | [-'()+,./:=?;!*#@$_%] */
+@@ -1841,7 +1854,6 @@ static HRESULT reader_parse_name(xmlreader *reader, strval *name)
+ /* [17] PITarget ::= Name - (('X' | 'x') ('M' | 'm') ('L' | 'l')) */
+ static HRESULT reader_parse_pitarget(xmlreader *reader, strval *target)
+ {
+-    static const strval xmlval = { (WCHAR *)L"xml", 3 };
+     strval name;
+     WCHAR *ptr;
+     HRESULT hr;
+@@ -1850,9 +1862,10 @@ static HRESULT reader_parse_pitarget(xmlreader *reader, strval *target)
+     hr = reader_parse_name(reader, &name);
+     if (FAILED(hr)) return is_reader_pending(reader) ? E_PENDING : WC_E_PI;
+ 
+-    /* now that we got name check for illegal content */
+-    if (strval_eq(reader, &name, &xmlval))
+-        return WC_E_LEADINGXML;
++    /* now that we got name check for illegal content: in any case, it is a declaration somewhere
++       other than at the start */
++    if (name.len == 3 && !wcsnicmp(reader_get_strptr(reader, &name), L"xml", 3))
++        return WC_E_TEXTXMLDECL;
+ 
+     /* PITarget can't be a qualified name */
+     ptr = reader_get_strptr(reader, &name);
+@@ -1898,7 +1911,7 @@ static HRESULT reader_parse_pi(xmlreader *reader)
+     {
+         if (ptr[0] == '?')
+         {
+-            if (ptr[1] == '>')
++            if (!reader_cmp(reader, L"?>"))
+             {
+                 UINT cur = reader_get_cur(reader);
+                 strval value;
+@@ -1928,7 +1941,8 @@ static HRESULT reader_parse_pi(xmlreader *reader)
+         ptr = reader_get_ptr(reader);
+     }
+ 
+-    return S_OK;
++    /* the document ends in the instruction */
++    return is_reader_pending(reader) ? S_OK : WC_E_PI;
+ }
+ 
+ /* This one is used to parse significant whitespace nodes, like in Misc production */
+@@ -2192,6 +2206,8 @@ static HRESULT reader_parse_local(xmlreader *reader, strval *local, BOOL check_f
+     else
+          reader->resume[XmlReadResume_Local] = 0;
+ 
++    if (!*ptr) return NC_E_QNAMECHARACTER;
++
+     reader_init_strvalue(start, reader_get_cur(reader)-start, local);
+ 
+     return S_OK;
+@@ -2217,6 +2233,7 @@ static HRESULT reader_parse_qname(xmlreader *reader, strval *prefix, strval *loc
+         ptr = reader_get_ptr(reader);
+         start = reader_get_cur(reader);
+         reader->resume[XmlReadResume_Name] = start;
++        if (!*ptr) return is_reader_pending(reader) ? E_PENDING : MX_E_INPUTEND;
+         if (!is_ncnamechar(*ptr)) return NC_E_QNAMECHARACTER;
+     }
+ 
+@@ -2239,6 +2256,8 @@ static HRESULT reader_parse_qname(xmlreader *reader, strval *prefix, strval *loc
+         }
+ 
+         if (is_reader_pending(reader)) return E_PENDING;
++        /* a name ends in something, not in the end of the document */
++        if (!*ptr) return NC_E_QNAMECHARACTER;
+ 
+         /* got a qualified name */
+         if (*ptr == ':')
+@@ -2648,7 +2667,7 @@ static HRESULT reader_parse_cdata(xmlreader *reader)
+ 
+     while (*ptr)
+     {
+-        if (*ptr == ']' && *(ptr+1) == ']' && *(ptr+2) == '>')
++        if (*ptr == ']' && !reader_cmp(reader, L"]]>"))
+         {
+             strval value;
+ 
+@@ -2670,7 +2689,8 @@ static HRESULT reader_parse_cdata(xmlreader *reader)
+         }
+     }
+ 
+-    return S_OK;
++    /* the document ends in the section */
++    return is_reader_pending(reader) ? S_OK : WC_E_CDSECT;
+ }
+ 
+ /* [14] CharData ::= [^<&]* - ([^<&]* ']]>' [^<&]*) */
+@@ -2702,7 +2722,7 @@ static HRESULT reader_parse_chardata(xmlreader *reader)
+     while (*ptr)
+     {
+         /* CDATA closing sequence ']]>' is not allowed */
+-        if (ptr[0] == ']' && ptr[1] == ']' && ptr[2] == '>')
++        if (ptr[0] == ']' && !reader_cmp(reader, L"]]>"))
+             return WC_E_CDSECTEND;
+ 
+         /* Found next markup part */
+@@ -2731,6 +2751,18 @@ static HRESULT reader_parse_chardata(xmlreader *reader)
+         ptr = reader_get_ptr(reader);
+     }
+ 
++    /* the document ends in the text, so this is all of it; the next read finds the end */
++    if (!is_reader_pending(reader))
++    {
++        strval value;
++
++        reader->empty_element.position = position;
++        reader_init_strvalue(start, reader_get_cur(reader)-start, &value);
++        reader_set_strvalue(reader, StringValue_Value, &value);
++        reader->resume[XmlReadResume_Body] = 0;
++        reader->resumestate = XmlReadResumeState_Initial;
++    }
++
+     return S_OK;
+ }
+ 
+@@ -2757,6 +2789,10 @@ static HRESULT reader_parse_content(xmlreader *reader)
+ 
+     reader_shrink(reader);
+ 
++    /* the document ended with elements still open */
++    if (!*reader_get_ptr(reader))
++        return is_reader_pending(reader) ? E_PENDING : MX_E_INPUTEND;
++
+     /* handle end tag here, it indicates end of content as well */
+     if (!reader_cmp(reader, L"</"))
+         return reader_parse_endtag(reader);
+@@ -2818,6 +2854,8 @@ static HRESULT reader_parse_nextnode(xmlreader *reader)
+                 xml_encoding enc;
+ 
+                 hr = readerinput_growraw(reader->input);
++                /* nothing at all, so no root element */
++                if (hr == MX_E_INPUTEND) return WC_E_ROOTELEMENT;
+                 if (FAILED(hr)) return hr;
+ 
+                 reader->position.line_number = 1;
+@@ -2874,7 +2912,11 @@ static HRESULT reader_parse_nextnode(xmlreader *reader)
+                 return hr;
+             break;
+         case XmlReadInState_Element:
+-            return reader_parse_element(reader);
++            hr = reader_parse_element(reader);
++            if (hr != S_FALSE) return hr;
++            if (is_reader_pending(reader)) return E_PENDING;
++            /* no root element, or something else where it should be */
++            return *reader_get_ptr(reader) ? WC_E_SYNTAX : WC_E_ROOTELEMENT;
+         case XmlReadInState_Content:
+             return reader_parse_content(reader);
+         case XmlReadInState_MiscEnd:
+@@ -2884,7 +2926,11 @@ static HRESULT reader_parse_nextnode(xmlreader *reader)
+             if (*reader_get_ptr(reader))
+             {
+                 WARN("found garbage in the end of XML\n");
+-                return WC_E_SYNTAX;
++                if (reader_cmp(reader, L"<")) return WC_E_SYNTAX;
++                /* markup, but the document had its element: an end tag without a start, or another one */
++                if (!reader_cmp(reader, L"</")) return NC_E_QNAMECHARACTER;
++                if (!reader_get_ptr(reader)[1]) return is_reader_pending(reader) ? E_PENDING : MX_E_INPUTEND;
++                return WC_E_ROOTELEMENT;
+             }
+ 
+             reader->instate = XmlReadInState_Eof;
+diff --git a/dlls/xmllite/tests/reader.c b/dlls/xmllite/tests/reader.c
+index 46b19eae883..5a22c77db5e 100644
+--- a/dlls/xmllite/tests/reader.c
++++ b/dlls/xmllite/tests/reader.c
+@@ -803,16 +803,13 @@ if (0)
+ 
+     nodetype = XmlNodeType_Element;
+     hr = IXmlReader_Read(reader, &nodetype);
+-    todo_wine
+     ok(FAILED(hr), "Unexpected hr %#lx.\n", hr);
+     ok(nodetype == XmlNodeType_None, "Unexpected node type %d\n", nodetype);
+ 
+-    todo_wine
+     TEST_READER_STATE(reader, XmlReadState_Error);
+ 
+     nodetype = XmlNodeType_Element;
+     hr = IXmlReader_Read(reader, &nodetype);
+-    todo_wine
+     ok(FAILED(hr), "Unexpected hr %#lx.\n", hr);
+     ok(nodetype == XmlNodeType_None, "Unexpected node type %d\n", nodetype);
+ 
+@@ -2976,6 +2973,182 @@ static void test_utf16_chunks(void)
+     free(xml);
+ }
+ 
++/* Where a document ends: the nodes before the end, then what Read says there, again on every later call. */
++static void test_document_end(void)
++{
++    static const struct
++    {
++        const char *xml;
++        XmlNodeType types[5];
++        HRESULT hr;
++        const WCHAR *text;
++    }
++    tests[] =
++    {
++        { "<a><b>", { XmlNodeType_Element, XmlNodeType_Element }, MX_E_INPUTEND },
++        { "<a><b/>", { XmlNodeType_Element, XmlNodeType_Element }, MX_E_INPUTEND },
++        { "<a>text", { XmlNodeType_Element, XmlNodeType_Text }, MX_E_INPUTEND, L"text" },
++        { "<a><b></b>", { XmlNodeType_Element, XmlNodeType_Element, XmlNodeType_EndElement }, MX_E_INPUTEND },
++        { "<a>&amp;", { XmlNodeType_Element, XmlNodeType_Text }, MX_E_INPUTEND, L"&" },
++        { "<a>t<", { XmlNodeType_Element, XmlNodeType_Text }, MX_E_INPUTEND, L"t" },
++        { "<a><!-- c -->", { XmlNodeType_Element, XmlNodeType_Comment }, MX_E_INPUTEND },
++        { "<?xml version=\"1.0\"?><a>", { XmlNodeType_XmlDeclaration, XmlNodeType_Element }, MX_E_INPUTEND },
++        { "<a><b x=\"1\"", { XmlNodeType_Element }, MX_E_INPUTEND },
++        { "<a/><", { XmlNodeType_Element }, MX_E_INPUTEND },
++        { "<a", { XmlNodeType_None }, NC_E_QNAMECHARACTER },
++        { "<a></b", { XmlNodeType_Element }, NC_E_QNAMECHARACTER },
++        { "<a></a", { XmlNodeType_Element }, NC_E_QNAMECHARACTER },
++        { "<a><![CDATA[x", { XmlNodeType_Element }, WC_E_CDSECT },
++        { "<a><!-- c", { XmlNodeType_Element }, WC_E_COMMENT },
++        { "<a><?p x", { XmlNodeType_Element }, WC_E_PI },
++        { "", { XmlNodeType_None }, WC_E_ROOTELEMENT },
++        { " ", { XmlNodeType_Whitespace }, WC_E_ROOTELEMENT },
++        { "<?xml version=\"1.0\"?>", { XmlNodeType_XmlDeclaration }, WC_E_ROOTELEMENT },
++        { "<!-- c -->", { XmlNodeType_Comment }, WC_E_ROOTELEMENT },
++        { "<a></a><b/>", { XmlNodeType_Element, XmlNodeType_EndElement }, WC_E_ROOTELEMENT },
++        { "<a></a><![CDATA[x]]>", { XmlNodeType_Element, XmlNodeType_EndElement }, WC_E_ROOTELEMENT },
++        { "<a></a></b>", { XmlNodeType_Element, XmlNodeType_EndElement }, NC_E_QNAMECHARACTER },
++        { "<a></a>trailing", { XmlNodeType_Element, XmlNodeType_EndElement }, WC_E_SYNTAX },
++        { "x<a/>", { XmlNodeType_None }, WC_E_SYNTAX },
++        { "<a/><?xml version=\"1.0\"?>", { XmlNodeType_Element }, WC_E_TEXTXMLDECL },
++        { "<a><?xml version=\"1.0\"?></a>", { XmlNodeType_Element }, WC_E_TEXTXMLDECL },
++        { "<!-- c --><?xml version=\"1.0\"?><a/>", { XmlNodeType_Comment }, WC_E_TEXTXMLDECL },
++        { "<a><?XML x?></a>", { XmlNodeType_Element }, WC_E_TEXTXMLDECL },
++        { "<a/>", { XmlNodeType_Element }, S_FALSE },
++        { "<a></a><!-- c --><?p?> ", { XmlNodeType_Element, XmlNodeType_EndElement, XmlNodeType_Comment,
++                XmlNodeType_ProcessingInstruction, XmlNodeType_Whitespace }, S_FALSE },
++    };
++    unsigned int i, j, n, len;
++    const WCHAR *value;
++    IXmlReader *reader;
++    XmlNodeType type;
++    IStream *stream;
++    WCHAR *wide;
++    HRESULT hr;
++
++    hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        for (j = 0; j < 2; ++j)
++        {
++            /* without a byte order mark, UTF-16 is told by the '<' the document starts with */
++            if (j && tests[i].xml[0] != '<') continue;
++            winetest_push_context("%s %s", j ? "UTF-16" : "UTF-8", debugstr_a(tests[i].xml));
++
++            len = strlen(tests[i].xml);
++            if (j)
++            {
++                wide = malloc((len + 1) * sizeof(WCHAR));
++                MultiByteToWideChar(CP_UTF8, 0, tests[i].xml, len + 1, wide, len + 1);
++                stream = create_stream_on_data(wide, len * sizeof(WCHAR));
++                free(wide);
++            }
++            else stream = create_stream_on_data(tests[i].xml, len);
++
++            hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++            for (n = 0; n < ARRAY_SIZE(tests[i].types) && tests[i].types[n] != XmlNodeType_None; ++n)
++            {
++                type = XmlNodeType_None;
++                hr = IXmlReader_Read(reader, &type);
++                ok(hr == S_OK, "Node %u: unexpected hr %#lx.\n", n, hr);
++                ok(type == tests[i].types[n], "Node %u: got type %d, expected %d.\n", n, type, tests[i].types[n]);
++                if (type == XmlNodeType_Text)
++                {
++                    hr = IXmlReader_GetValue(reader, &value, NULL);
++                    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                    ok(!wcscmp(value, tests[i].text), "Got text %s.\n", debugstr_w(value));
++                }
++            }
++            /* the end, and the same end again */
++            for (n = 0; n < 2; ++n)
++            {
++                type = XmlNodeType_Element;
++                hr = IXmlReader_Read(reader, &type);
++                ok(hr == tests[i].hr, "Got hr %#lx, expected %#lx.\n", hr, tests[i].hr);
++                ok(type == XmlNodeType_None, "Got type %d.\n", type);
++            }
++
++            IXmlReader_SetInput(reader, NULL);
++            IStream_Release(stream);
++            winetest_pop_context();
++        }
++    }
++
++    IXmlReader_Release(reader);
++}
++
++/* The markup that ends a comment, a section or an instruction can lie across two of the chunks read from the
++ * stream: the characters before the boundary do not end it by themselves. */
++static void test_markup_end_chunk_boundary(void)
++{
++    static const struct
++    {
++        const char *start, *end;
++        XmlNodeType type;
++    }
++    tests[] =
++    {
++        { "<a><!--", "--></a>", XmlNodeType_Comment },
++        { "<a><![CDATA[", "]]></a>", XmlNodeType_CDATA },
++        { "<a><?p ", "?></a>", XmlNodeType_ProcessingInstruction },
++    };
++    /* what the first read asks for, and so how far the first chunk goes */
++    const unsigned int chunk = 8188;
++    unsigned int i, j, k, size, filler, len;
++    const WCHAR *value;
++    IXmlReader *reader;
++    XmlNodeType type;
++    IStream *stream;
++    HRESULT hr;
++    char *xml;
++
++    hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        /* the first character of the end markup is the last of the chunk, and then the one before it */
++        for (j = 0; j < 2; ++j)
++        {
++            winetest_push_context("%s %u", debugstr_a(tests[i].start), j);
++
++            filler = chunk - 1 - j - strlen(tests[i].start);
++            size = strlen(tests[i].start) + filler + strlen(tests[i].end);
++            xml = malloc(size);
++            strcpy(xml, tests[i].start);
++            memset(xml + strlen(tests[i].start), 'x', filler);
++            memcpy(xml + strlen(tests[i].start) + filler, tests[i].end, strlen(tests[i].end));
++
++            stream = create_stream_on_data(xml, size);
++            hr = IXmlReader_SetInput(reader, (IUnknown *)stream);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++            k = 0;
++            while ((hr = IXmlReader_Read(reader, &type)) == S_OK)
++            {
++                if (type != tests[i].type) continue;
++                hr = IXmlReader_GetValue(reader, &value, &len);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                ok(len == filler, "Got %u characters, expected %u.\n", len, filler);
++                k++;
++            }
++            ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
++            ok(k == 1, "Got %u nodes.\n", k);
++
++            IXmlReader_SetInput(reader, NULL);
++            IStream_Release(stream);
++            free(xml);
++            winetest_pop_context();
++        }
++    }
++
++    IXmlReader_Release(reader);
++}
++
+ START_TEST(reader)
+ {
+     test_reader_create();
+@@ -3007,4 +3180,6 @@ START_TEST(reader)
+     test_attribute_by_name();
+     test_multibyte_chunk_boundary();
+     test_utf16_chunks();
++    test_document_end();
++    test_markup_end_chunk_boundary();
+ }

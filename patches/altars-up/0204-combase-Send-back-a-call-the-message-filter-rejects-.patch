@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:09:46 -0400
+Subject: [PATCH] combase: Send back a call the message filter rejects, and
+ make it again as the caller's filter says.
+
+A call the called apartment's filter answers with SERVERCALL_RETRYLATER was
+made all the same.  As Windows does it, the call now goes back unmade, and a
+single-threaded apartment that has a filter asks its RetryRejectedCall whether
+to give up (-1, RPC_E_CALL_REJECTED), make it again at once (under 100) or
+after that many milliseconds; one without a filter gets RPC_E_CALL_REJECTED,
+and the multithreaded apartment RPC_E_SERVERCALL_RETRYLATER.  The same holds
+for SERVERCALL_REJECTED, the caller's filter being told which answer it got.
+HandleInComingCall is told the calling thread when that is a single-threaded
+apartment and 0 otherwise, instead of the called process, and
+RetryRejectedCall the called apartment's thread.
+
+Word's filter answers an in-place Excel worksheet's SetBorderSpace with
+SERVERCALL_RETRYLATER while it lays out; Wine ran it inside that layout.
+
+Measured on Windows 11 in and across processes (tools/comprobe/retrylater.c).
+A request the RPC runtime sent is no longer leaked when a fault comes back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 728920b216cfc2eebef6f1437c69f3a8c5381f6e)
+
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+index 10b88aca4b1..87066ea5cbd 100644
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -96,6 +96,7 @@ typedef struct
+     RPC_BINDING_HANDLE     bind; /* handle to the remote server */
+     OXID                   oxid; /* apartment in which the channel is valid */
+     DWORD                  server_pid; /* id of server process */
++    DWORD                  server_tid; /* thread of the server's apartment, 0 for a multithreaded one */
+     HANDLE                 event; /* cached event handle */
+     IID                    iid; /* IID of the proxy this belongs to */
+ } ClientRpcChannelBuffer;
+@@ -1163,6 +1164,7 @@ static void ClientRpcChannelBuffer_ReleaseEventHandle(ClientRpcChannelBuffer *Th
+ 
+ static HRESULT WINAPI ClientRpcChannelBuffer_GetBuffer(LPRPCCHANNELBUFFER iface, RPCOLEMESSAGE* olemsg, REFIID riid)
+ {
++    struct apartment *caller = com_get_current_apt();
+     ClientRpcChannelBuffer *This = (ClientRpcChannelBuffer *)iface;
+     RPC_MESSAGE *msg = (RPC_MESSAGE *)olemsg;
+     RPC_CLIENT_INTERFACE *cif;
+@@ -1279,7 +1281,9 @@ static HRESULT WINAPI ClientRpcChannelBuffer_GetBuffer(LPRPCCHANNELBUFFER iface,
+         orpcthis->version.MinorVersion = COM_MINOR_VERSION;
+         orpcthis->flags = message_state->channel_hook_info.dwServerPid ? ORPCF_LOCAL : ORPCF_NULL;
+         if (msg->RpcFlags & RPCFLG_INPUT_SYNCHRONOUS) orpcthis->flags |= ORPCF_INPUT_SYNC;
+-        orpcthis->reserved1 = 0;
++        /* the calling thread, when it is a single-threaded apartment, which is what the called apartment's message
++         * filter is told the call comes from (Windows passes it in a local ORPCTHIS of its own) */
++        orpcthis->reserved1 = caller && !caller->multi_threaded ? caller->tid : 0;
+         orpcthis->cid = message_state->channel_hook_info.uCausality;
+ 
+         /* NDR representation of orpcthis->extensions */
+@@ -1358,6 +1362,33 @@ static inline HRESULT ClientRpcChannelBuffer_IsCorrectApartment(ClientRpcChannel
+     return S_OK;
+ }
+ 
++/* What becomes of a call the called apartment's message filter rejected, or asked to be made again later: a
++ * single-threaded apartment with a filter of its own asks it whether to make it again, and when (-1 gives up;
++ * under 100, at once; otherwise after that many milliseconds, taking calls and messages meanwhile); one without a
++ * filter gives up, and so does the multithreaded apartment, which alone tells which answer the call got. */
++static BOOL retry_rejected_call(struct apartment *apt, DWORD callee, HRESULT *rejected, DWORD start, HANDLE event)
++{
++    DWORD type = *rejected == RPC_E_SERVERCALL_RETRYLATER ? SERVERCALL_RETRYLATER : SERVERCALL_REJECTED;
++    DWORD delay, index;
++
++    if (!apt->multi_threaded)
++    {
++        *rejected = RPC_E_CALL_REJECTED;
++        if (apt->filter)
++        {
++            delay = IMessageFilter_RetryRejectedCall(apt->filter, UlongToHandle(callee), GetTickCount() - start, type);
++            TRACE("IMessageFilter_RetryRejectedCall returned %ld\n", delay);
++            if (delay != ~0u)
++            {
++                if (delay >= 100) CoWaitForMultipleHandles(0, delay, 1, &event, &index);
++                return TRUE;
++            }
++        }
++    }
++    WARN("thread %#lx rejected the call (%lu), which fails with %#lx\n", callee, type, *rejected);
++    return FALSE;
++}
++
+ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER iface, RPCOLEMESSAGE *olemsg, ULONG *pstatus)
+ {
+     ClientRpcChannelBuffer *This = (ClientRpcChannelBuffer *)iface;
+@@ -1369,9 +1400,12 @@ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER ifac
+     ORPCTHAT orpcthat;
+     ORPC_EXTENT_ARRAY orpc_ext_array;
+     WIRE_ORPC_EXTENT *first_wire_orpc_extent = NULL;
+-    HRESULT hrFault = S_OK;
++    HRESULT hrFault = S_OK, rejected;
+     struct apartment *apt = apartment_get_current_or_mta();
+     struct tlsdata *tlsdata;
++    ULONG request_length;
++    void *request;
++    DWORD start;
+ 
+     TRACE("%p, iMethod %ld\n", olemsg, olemsg->iMethod);
+ 
+@@ -1413,67 +1447,102 @@ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER ifac
+      * from DllMain */
+ 
+     message_state->params.msg = olemsg;
+-    if (message_state->params.bypass_rpcrt)
++    request = msg->Buffer;
++    request_length = msg->BufferLength;
++    start = GetTickCount();
++    for (;;)
+     {
+-        TRACE("Calling apartment thread %#lx...\n", message_state->target_tid);
++        if (message_state->params.bypass_rpcrt)
++        {
++            TRACE("Calling apartment thread %#lx...\n", message_state->target_tid);
+ 
+-        msg->ProcNum &= ~RPC_FLAGS_VALID_BIT;
++            msg->ProcNum &= ~RPC_FLAGS_VALID_BIT;
+ 
+-        /* an input-synchronous call is sent, so that the thread takes it while it waits in a message it sent */
+-        if (olemsg->rpcFlags & RPCFLG_INPUT_SYNCHRONOUS)
+-            SendMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0, (LPARAM)&message_state->params);
+-        else if (!PostMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0,
+-                               (LPARAM)&message_state->params))
+-        {
+-            ERR("PostMessage failed with error %lu\n", GetLastError());
++            /* an input-synchronous call is sent, so that the thread takes it while it waits in a message it sent */
++            if (olemsg->rpcFlags & RPCFLG_INPUT_SYNCHRONOUS)
++                SendMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0, (LPARAM)&message_state->params);
++            else if (!PostMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0,
++                                   (LPARAM)&message_state->params))
++            {
++                ERR("PostMessage failed with error %lu\n", GetLastError());
+ 
+-            /* Note: message_state->params.iface doesn't have a reference and
+-             * so doesn't need to be released */
++                /* Note: message_state->params.iface doesn't have a reference and
++                 * so doesn't need to be released */
+ 
+-            hr = HRESULT_FROM_WIN32(GetLastError());
++                hr = HRESULT_FROM_WIN32(GetLastError());
++            }
+         }
+-    }
+-    else
+-    {
+-        /* we use a separate thread here because we need to be able to
+-         * pump the message loop in the application thread: if we do not,
+-         * any windows created by this thread will hang and RPCs that try
+-         * and re-enter this STA from an incoming server thread will
+-         * deadlock. InstallShield is an example of that.
+-         */
+-        if (!QueueUserWorkItem(rpc_sendreceive_thread, &message_state->params, WT_EXECUTEDEFAULT))
++        else
+         {
+-            ERR("QueueUserWorkItem failed with error %lu\n", GetLastError());
+-            hr = E_UNEXPECTED;
++            /* we use a separate thread here because we need to be able to
++             * pump the message loop in the application thread: if we do not,
++             * any windows created by this thread will hang and RPCs that try
++             * and re-enter this STA from an incoming server thread will
++             * deadlock. InstallShield is an example of that.
++             */
++            if (!QueueUserWorkItem(rpc_sendreceive_thread, &message_state->params, WT_EXECUTEDEFAULT))
++            {
++                ERR("QueueUserWorkItem failed with error %lu\n", GetLastError());
++                hr = E_UNEXPECTED;
++            }
++            else
++                hr = S_OK;
+         }
+-        else
+-            hr = S_OK;
+-    }
+ 
+-    if (hr == S_OK)
+-    {
+-        if (WaitForSingleObject(message_state->params.handle, 0))
++        tlsdata->pending_call_count_client++;
++        if (hr == S_OK)
++        {
++            if (WaitForSingleObject(message_state->params.handle, 0))
++                hr = CoWaitForMultipleHandles(0, INFINITE, 1, &message_state->params.handle, &index);
++        }
++
++        /* for WM shortcut, faults are returned in params->hr */
++        if (hr == S_OK)
++            hrFault = message_state->params.hr;
++
++        status = message_state->params.status;
++
++        TRACE("RPC call status: %#lx\n", status);
++        if (status != RPC_S_OK)
++            hr = HRESULT_FROM_WIN32(status);
++
++        rejected = hr == S_OK ? hrFault : hr;
++        if ((rejected != RPC_E_CALL_REJECTED && rejected != RPC_E_SERVERCALL_RETRYLATER) ||
++            !retry_rejected_call(apt, message_state->params.bypass_rpcrt ? message_state->target_tid : This->server_tid,
++                                 &rejected, start, message_state->params.handle))
+         {
+-            tlsdata->pending_call_count_client++;
+-            hr = CoWaitForMultipleHandles(0, INFINITE, 1, &message_state->params.handle, &index);
+             tlsdata->pending_call_count_client--;
++            break;
++        }
++        tlsdata->pending_call_count_client--;
++
++        TRACE("making the rejected call again\n");
++        /* the request, which a call made by the RPC runtime keeps when a fault comes back, goes again */
++        if (!message_state->params.bypass_rpcrt)
++        {
++            I_RpcFree(msg->Buffer);
++            msg->Buffer = request;
++            msg->BufferLength = request_length;
+         }
++        message_state->params.hr = S_OK;
++        message_state->params.status = RPC_S_OK;
++        hr = hrFault = S_OK;
+     }
+     ClientRpcChannelBuffer_ReleaseEventHandle(This, message_state->params.handle);
+ 
+-    /* for WM shortcut, faults are returned in params->hr */
+-    if (hr == S_OK)
+-        hrFault = message_state->params.hr;
++    if (rejected == RPC_E_CALL_REJECTED || rejected == RPC_E_SERVERCALL_RETRYLATER)
++    {
++        if (hr == S_OK) hrFault = rejected;
++        else hr = rejected;
++    }
+ 
+-    status = message_state->params.status;
++    /* the RPC runtime frees the request only when the call succeeds */
++    if (!message_state->params.bypass_rpcrt && status != RPC_S_OK && msg->Buffer != request)
++        I_RpcFree(request);
+ 
+     orpcthat.flags = ORPCF_NULL;
+     orpcthat.extensions = NULL;
+ 
+-    TRACE("RPC call status: %#lx\n", status);
+-    if (status != RPC_S_OK)
+-        hr = HRESULT_FROM_WIN32(status);
+-
+     TRACE("hrFault = %#lx\n", hrFault);
+ 
+     /* FIXME: this condition should be
+@@ -1700,6 +1769,8 @@ HRESULT rpc_create_clientchannel(const OXID *oxid, const IPID *ipid,
+     This->bind = bind;
+     This->oxid = apartment_getoxid(apt);
+     This->server_pid = oxid_info->dwPid;
++    /* an apartment's OXID holds its process and, for a single-threaded one, its thread (apartment_construct) */
++    This->server_tid = (DWORD)*oxid != 0xcafe ? (DWORD)*oxid : 0;
+     This->event = NULL;
+     This->iid = *iid;
+ 
+@@ -1947,25 +2018,23 @@ void rpc_execute_call(struct dispatch_params *params)
+         else
+             calltype = CALLTYPE_TOPLEVEL_CALLPENDING;
+ 
++        /* the caller is its thread when it is a single-threaded apartment, and 0 otherwise */
+         handlecall = IMessageFilter_HandleInComingCall(apt->filter,
+                                                        calltype,
+-                                                       UlongToHandle(GetCurrentProcessId()),
++                                                       UlongToHandle(orpcthis.reserved1),
+                                                        0 /* FIXME */,
+                                                        &interface_info);
+         TRACE("IMessageFilter_HandleInComingCall returned %ld\n", handlecall);
++        /* a call rejected, or to be made again later, goes back to the caller unmade, whose apartment decides
++         * whether to make it again (ClientRpcChannelBuffer_SendReceive) */
+         switch (handlecall)
+         {
+         case SERVERCALL_REJECTED:
+             params->hr = RPC_E_CALL_REJECTED;
+             goto exit_reset_state;
+         case SERVERCALL_RETRYLATER:
+-#if 0 /* FIXME: handle retries on the client side before enabling this code */
+-            params->hr = RPC_E_RETRY;
++            params->hr = RPC_E_SERVERCALL_RETRYLATER;
+             goto exit_reset_state;
+-#else
+-            FIXME("retry call later not implemented\n");
+-            break;
+-#endif
+         case SERVERCALL_ISHANDLED:
+         default:
+             break;
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index 7b10b538752..0317611b8b7 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -3153,6 +3153,159 @@ static void test_message_filter_calls(void)
+     ok_no_locks();
+ }
+ 
++/* a filter that answers the first incoming call as it is told, and the calls it made that were rejected with the
++ * delays it is given */
++static DWORD filter_answer, filter_caller, filter_callee, filter_reject_type, filter_retry_tick;
++static LONG filter_delays[2], filter_delay_count, filter_incoming, filter_retries;
++
++static DWORD WINAPI AnsweringFilter_HandleInComingCall(IMessageFilter *iface, DWORD type, HTASK caller, DWORD tick,
++                                                       INTERFACEINFO *info)
++{
++    filter_caller = HandleToUlong(caller);
++    return filter_incoming++ ? SERVERCALL_ISHANDLED : filter_answer;
++}
++
++static DWORD WINAPI AnsweringFilter_RetryRejectedCall(IMessageFilter *iface, HTASK callee, DWORD tick, DWORD type)
++{
++    LONG i = filter_retries++;
++
++    filter_callee = HandleToUlong(callee);
++    filter_reject_type = type;
++    filter_retry_tick = tick;
++    return i < filter_delay_count ? filter_delays[i] : -1;
++}
++
++static const IMessageFilterVtbl AnsweringFilter_Vtbl =
++{
++    MessageFilter_QueryInterface,
++    MessageFilter_AddRef,
++    MessageFilter_Release,
++    AnsweringFilter_HandleInComingCall,
++    AnsweringFilter_RetryRejectedCall,
++    RecordingFilter_MessagePending
++};
++
++static IMessageFilter AnsweringFilter = { &AnsweringFilter_Vtbl };
++
++static const struct
++{
++    DWORD apartment;
++    BOOL filter;
++    DWORD answer;
++    LONG delay;
++    HRESULT hr;
++    LONG incoming, retries;
++}
++rejected_tests[] =
++{
++    { COINIT_APARTMENTTHREADED, TRUE, SERVERCALL_RETRYLATER, 0, E_NOINTERFACE, 2, 1 },
++    { COINIT_APARTMENTTHREADED, TRUE, SERVERCALL_RETRYLATER, 99, E_NOINTERFACE, 2, 1 },
++    { COINIT_APARTMENTTHREADED, TRUE, SERVERCALL_RETRYLATER, 150, E_NOINTERFACE, 2, 1 },
++    { COINIT_APARTMENTTHREADED, TRUE, SERVERCALL_RETRYLATER, -1, RPC_E_CALL_REJECTED, 1, 1 },
++    { COINIT_APARTMENTTHREADED, TRUE, SERVERCALL_REJECTED, 0, E_NOINTERFACE, 2, 1 },
++    { COINIT_APARTMENTTHREADED, TRUE, SERVERCALL_REJECTED, -1, RPC_E_CALL_REJECTED, 1, 1 },
++    { COINIT_APARTMENTTHREADED, FALSE, SERVERCALL_RETRYLATER, 0, RPC_E_CALL_REJECTED, 1, 0 },
++    { COINIT_APARTMENTTHREADED, FALSE, SERVERCALL_REJECTED, 0, RPC_E_CALL_REJECTED, 1, 0 },
++    { COINIT_MULTITHREADED, FALSE, SERVERCALL_RETRYLATER, 0, RPC_E_SERVERCALL_RETRYLATER, 1, 0 },
++    { COINIT_MULTITHREADED, FALSE, SERVERCALL_REJECTED, 0, RPC_E_CALL_REJECTED, 1, 0 },
++};
++
++struct rejected_client_params
++{
++    IStream *streams[ARRAY_SIZE(rejected_tests)];
++    DWORD main_tid;
++    HANDLE done;
++};
++
++static DWORD CALLBACK rejected_client_thread(void *arg)
++{
++    struct rejected_client_params *params = arg;
++    IMessageFilter *prev_filter;
++    IClassFactory *cf;
++    DWORD start, elapsed;
++    unsigned int i;
++    IUnknown *unk;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(rejected_tests); i++)
++    {
++        winetest_push_context("%u", i);
++        CoInitializeEx(NULL, rejected_tests[i].apartment);
++        if (rejected_tests[i].filter)
++        {
++            hr = CoRegisterMessageFilter(&AnsweringFilter, &prev_filter);
++            ok_ole_success(hr, CoRegisterMessageFilter);
++        }
++        hr = CoGetInterfaceAndReleaseStream(params->streams[i], &IID_IClassFactory, (void **)&cf);
++        ok_ole_success(hr, CoGetInterfaceAndReleaseStream);
++
++        filter_answer = rejected_tests[i].answer;
++        filter_delays[0] = rejected_tests[i].delay;
++        filter_delay_count = 1;
++        filter_incoming = filter_retries = 0;
++        filter_caller = filter_callee = 0xdeadbeef;
++        start = GetTickCount();
++        hr = IClassFactory_CreateInstance(cf, NULL, &IID_IOleWindow, (void **)&unk);
++        elapsed = GetTickCount() - start;
++        ok(hr == rejected_tests[i].hr, "got %#lx.\n", hr);
++        ok(filter_incoming == rejected_tests[i].incoming, "got %ld incoming calls.\n", filter_incoming);
++        ok(filter_retries == rejected_tests[i].retries, "got %ld retries.\n", filter_retries);
++        /* the called apartment is told the calling thread when it is a single-threaded apartment */
++        ok(filter_caller == (rejected_tests[i].apartment == COINIT_MULTITHREADED ? 0 : GetCurrentThreadId()),
++           "got caller %#lx.\n", filter_caller);
++        if (filter_retries)
++        {
++            ok(filter_callee == params->main_tid, "got callee %#lx.\n", filter_callee);
++            ok(filter_reject_type == rejected_tests[i].answer, "got type %lu.\n", filter_reject_type);
++            ok(filter_retry_tick < 1000, "got tick count %lu.\n", filter_retry_tick);
++        }
++        if (rejected_tests[i].delay >= 100 && rejected_tests[i].hr == E_NOINTERFACE)
++            ok(elapsed >= 100, "retried after %lu ms.\n", elapsed);
++
++        IClassFactory_Release(cf);
++        if (rejected_tests[i].filter) CoRegisterMessageFilter(prev_filter, NULL);
++        CoUninitialize();
++        winetest_pop_context();
++    }
++    SetEvent(params->done);
++    return 0;
++}
++
++/* A call the called apartment's message filter rejects, or asks to be made again later, goes back unmade; the
++ * calling apartment's own filter, when it is a single-threaded apartment that has one, decides whether and when
++ * to make it again. */
++static void test_rejected_calls(void)
++{
++    struct rejected_client_params params;
++    IMessageFilter *prev_filter;
++    HANDLE thread;
++    unsigned int i;
++    DWORD index;
++    HRESULT hr;
++
++    cLocks = 0;
++
++    hr = CoRegisterMessageFilter(&AnsweringFilter, &prev_filter);
++    ok_ole_success(hr, CoRegisterMessageFilter);
++    for (i = 0; i < ARRAY_SIZE(rejected_tests); i++)
++    {
++        hr = CoMarshalInterThreadInterfaceInStream(&IID_IClassFactory, (IUnknown *)&Test_ClassFactory,
++                                                   &params.streams[i]);
++        ok_ole_success(hr, CoMarshalInterThreadInterfaceInStream);
++    }
++    params.main_tid = GetCurrentThreadId();
++    params.done = CreateEventA(NULL, TRUE, FALSE, NULL);
++    thread = CreateThread(NULL, 0, rejected_client_thread, &params, 0, NULL);
++    hr = CoWaitForMultipleHandles(0, 30000, 1, &params.done, &index);
++    ok(hr == S_OK, "got %#lx.\n", hr);
++    ok(!WaitForSingleObject(thread, 10000), "wait failed.\n");
++    CloseHandle(thread);
++    CloseHandle(params.done);
++    hr = CoRegisterMessageFilter(prev_filter, NULL);
++    ok_ole_success(hr, CoRegisterMessageFilter);
++    ok_no_locks();
++}
++
+ /* test failure case of trying to unmarshal from bad stream */
+ static void test_bad_marshal_stream(void)
+ {
+@@ -5276,6 +5429,7 @@ START_TEST(marshal)
+     test_proxy_used_in_wrong_thread();
+     test_message_filter();
+     test_message_filter_calls();
++    test_rejected_calls();
+     test_bad_marshal_stream();
+     test_proxy_interfaces();
+     test_stubbuffer(&IID_IClassFactory);

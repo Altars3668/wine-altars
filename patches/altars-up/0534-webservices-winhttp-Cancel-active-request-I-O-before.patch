@@ -1,0 +1,608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 03:38:48 -0400
+Subject: [PATCH] webservices, winhttp: Cancel active request I/O before
+ waiting for call locks.
+
+Implement proxy abort and faulted channel states. Interrupt the active
+HTTP request before acquiring locks held by blocking calls. Match native
+synchronous cancellation errors and reset/close behaviour.
+
+Add the WinHTTP request closing hook, protect netconn publication and
+release, and only interrupt active I/O so idle or upgraded WebSocket
+connections remain usable. Native loopback probes and full HTTP,
+notification, proxy and channel regressions verify both paths.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/webservices/channel.c b/dlls/webservices/channel.c
+index 73b109565c1..25d4896282b 100644
+--- a/dlls/webservices/channel.c
++++ b/dlls/webservices/channel.c
+@@ -198,6 +198,7 @@ enum session_state
+ struct channel
+ {
+     ULONG                   magic;
++    LONG                    aborted;
+     CRITICAL_SECTION        cs;
+     WS_CHANNEL_TYPE         type;
+     WS_CHANNEL_BINDING      binding;
+@@ -322,16 +323,26 @@ HRESULT WINAPI WsAbortChannel( WS_CHANNEL *handle, WS_ERROR *error )
+     struct channel *channel = (struct channel *)handle;
+ 
+     TRACE( "%p %p\n", handle, error );
++    if (!channel || channel->magic != CHANNEL_MAGIC) return E_INVALIDARG;
+ 
+-    EnterCriticalSection( &channel->cs );
+-
+-    if (channel->magic != CHANNEL_MAGIC)
++    /* 阻塞 I/O 持有 channel->cs，必须先中断传输，再等待该锁。 */
++    InterlockedExchange( &channel->aborted, TRUE );
++    if (channel->binding == WS_HTTP_CHANNEL_BINDING)
+     {
+-        LeaveCriticalSection( &channel->cs );
+-        return E_INVALIDARG;
++        HINTERNET request = InterlockedExchangePointer( (void **)&channel->u.http.request, NULL );
++        if (request) WinHttpCloseHandle( request );
+     }
++    else if (channel->binding == WS_TCP_CHANNEL_BINDING)
++        shutdown( channel->u.tcp.socket, SD_BOTH );
++    else if (channel->binding == WS_UDP_CHANNEL_BINDING)
++        shutdown( channel->u.udp.socket, SD_BOTH );
+ 
++    EnterCriticalSection( &channel->cs );
+     abort_channel( channel );
++    if (channel->state != WS_CHANNEL_STATE_CREATED && channel->state != WS_CHANNEL_STATE_CLOSED)
++        channel->state = WS_CHANNEL_STATE_FAULTED;
++    else
++        InterlockedExchange( &channel->aborted, FALSE );
+ 
+     LeaveCriticalSection( &channel->cs );
+     return S_OK;
+@@ -340,6 +351,7 @@ HRESULT WINAPI WsAbortChannel( WS_CHANNEL *handle, WS_ERROR *error )
+ static void reset_channel( struct channel *channel )
+ {
+     channel->state         = WS_CHANNEL_STATE_CREATED;
++    InterlockedExchange( &channel->aborted, FALSE );
+     channel->session_state = SESSION_STATE_UNINITIALIZED;
+     clear_addr( &channel->addr );
+     init_dict( &channel->dict_send, channel->dict_size );
+@@ -351,8 +363,7 @@ static void reset_channel( struct channel *channel )
+     switch (channel->binding)
+     {
+     case WS_HTTP_CHANNEL_BINDING:
+-        WinHttpCloseHandle( channel->u.http.request );
+-        channel->u.http.request = NULL;
++        WinHttpCloseHandle( InterlockedExchangePointer( (void **)&channel->u.http.request, NULL ));
+         WinHttpCloseHandle( channel->u.http.connect );
+         channel->u.http.connect = NULL;
+         WinHttpCloseHandle( channel->u.http.session );
+@@ -1780,14 +1791,22 @@ static HRESULT send_message_bytes( struct channel *channel, WS_MESSAGE *msg )
+     switch (channel->binding)
+     {
+     case WS_HTTP_CHANNEL_BINDING:
+-        if (channel->u.http.request)
++    {
++        HINTERNET request, previous;
++
++        previous = InterlockedExchangePointer( (void **)&channel->u.http.request, NULL );
++        if (previous) WinHttpCloseHandle( previous );
++        if ((hr = open_http_request( channel, &request )) != S_OK) return hr;
++        InterlockedExchangePointer( (void **)&channel->u.http.request, request );
++        if (channel->aborted)
+         {
+-            WinHttpCloseHandle( channel->u.http.request );
+-            channel->u.http.request = NULL;
++            request = InterlockedExchangePointer( (void **)&channel->u.http.request, NULL );
++            if (request) WinHttpCloseHandle( request );
++            return WS_E_OPERATION_ABORTED;
+         }
+-        if ((hr = open_http_request( channel, &channel->u.http.request )) != S_OK) return hr;
+-        if ((hr = message_insert_http_headers( msg, channel->u.http.request, channel->encoding )) != S_OK) return hr;
+-        return send_message_http( channel->u.http.request, buf.bytes, buf.length );
++        if ((hr = message_insert_http_headers( msg, request, channel->encoding )) != S_OK) return hr;
++        return send_message_http( request, buf.bytes, buf.length );
++    }
+ 
+     case WS_TCP_CHANNEL_BINDING:
+         if (channel->type & WS_CHANNEL_TYPE_SESSION)
+@@ -1837,6 +1856,7 @@ HRESULT channel_send_message( WS_CHANNEL *handle, WS_MESSAGE *msg )
+     }
+ 
+     hr = send_message_bytes( channel, msg );
++    if (channel->aborted) hr = WS_E_OPERATION_ABORTED;
+     if (hr != S_OK) channel->state = WS_CHANNEL_STATE_FAULTED;
+ 
+     LeaveCriticalSection( &channel->cs );
+@@ -2554,6 +2574,7 @@ HRESULT channel_receive_message( WS_CHANNEL *handle, WS_MESSAGE *msg )
+     }
+ 
+     if ((hr = receive_message_bytes( channel, msg )) == S_OK) hr = init_reader( channel );
++    if (channel->aborted) hr = WS_E_OPERATION_ABORTED;
+     if (hr != S_OK) channel->state = WS_CHANNEL_STATE_FAULTED;
+ 
+     LeaveCriticalSection( &channel->cs );
+diff --git a/dlls/webservices/proxy.c b/dlls/webservices/proxy.c
+index cefb7decc54..a33802eb4a4 100644
+--- a/dlls/webservices/proxy.c
++++ b/dlls/webservices/proxy.c
+@@ -453,8 +453,21 @@ HRESULT WINAPI WsCloseServiceProxy( WS_SERVICE_PROXY *handle, const WS_ASYNC_CON
+  */
+ HRESULT WINAPI WsAbortServiceProxy( WS_SERVICE_PROXY *handle, WS_ERROR *error )
+ {
+-    FIXME( "%p %p\n", handle, error );
+-    return E_NOTIMPL;
++    struct proxy *proxy = (struct proxy *)handle;
++    HRESULT hr;
++
++    TRACE( "%p %p\n", handle, error );
++    if (!proxy || proxy->magic != PROXY_MAGIC) return E_INVALIDARG;
++
++    /* WsCall 持有 proxy->cs；先中断它的 channel 才能等到锁。 */
++    hr = WsAbortChannel( proxy->channel, error );
++    EnterCriticalSection( &proxy->cs );
++    if (hr == S_OK && proxy->state != WS_SERVICE_PROXY_STATE_CREATED &&
++        proxy->state != WS_SERVICE_PROXY_STATE_CLOSED)
++        proxy->state = WS_SERVICE_PROXY_STATE_FAULTED;
++
++    LeaveCriticalSection( &proxy->cs );
++    return hr;
+ }
+ 
+ static HRESULT set_send_context( WS_MESSAGE *msg, const WS_CALL_PROPERTY *props, ULONG count )
+diff --git a/dlls/webservices/tests/channel.c b/dlls/webservices/tests/channel.c
+index c64027fb86d..84e88cb12b7 100644
+--- a/dlls/webservices/tests/channel.c
++++ b/dlls/webservices/tests/channel.c
+@@ -239,6 +239,50 @@ static void test_WsResetChannel(void)
+     WsFreeChannel( channel );
+ }
+ 
++static void test_WsAbortChannel(void)
++{
++    WS_ENDPOINT_ADDRESS address = {0};
++    WS_CHANNEL_STATE state;
++    WS_CHANNEL *channel;
++    HRESULT hr;
++    unsigned int mode, repeat;
++
++    address.url.chars = (WCHAR *)L"http://127.0.0.1:9/";
++    address.url.length = lstrlenW( address.url.chars );
++    for (mode = 0; mode < 3; mode++)
++    {
++        hr = WsCreateChannel( WS_CHANNEL_TYPE_REQUEST, WS_HTTP_CHANNEL_BINDING, NULL, 0, NULL, &channel, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        if (hr != S_OK) continue;
++        if (mode)
++        {
++            hr = WsOpenChannel( channel, &address, NULL, NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++        }
++        if (mode == 2)
++        {
++            hr = WsCloseChannel( channel, NULL, NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++        }
++        for (repeat = 0; repeat < 2; repeat++)
++        {
++            hr = WsAbortChannel( channel, NULL );
++            ok( hr == S_OK, "mode %u got %#lx\n", mode, hr );
++            state = 0xdeadbeef;
++            hr = WsGetChannelProperty( channel, WS_CHANNEL_PROPERTY_STATE, &state, sizeof(state), NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( state == (mode == 0 ? WS_CHANNEL_STATE_CREATED :
++                           mode == 1 ? WS_CHANNEL_STATE_FAULTED : WS_CHANNEL_STATE_CLOSED),
++                "mode %u got %u\n", mode, state );
++        }
++        hr = WsCloseChannel( channel, NULL, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        hr = WsResetChannel( channel, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        WsFreeChannel( channel );
++    }
++}
++
+ static void test_WsCreateListener(void)
+ {
+     HRESULT hr;
+@@ -1533,7 +1577,7 @@ done:
+ 
+ START_TEST(channel)
+ {
+-    BOOL firewall_enabled = is_firewall_enabled();
++    BOOL firewall_enabled;
+     struct listener_info info;
+     HANDLE thread;
+     HRESULT hr;
+@@ -1559,6 +1603,16 @@ START_TEST(channel)
+         { WS_TCP_CHANNEL_BINDING, WS_CHANNEL_TYPE_DUPLEX_SESSION, NULL, client_duplex_session_dict, listener_socket_proc, 4096 },
+     };
+ 
++    char **argv;
++    int argc = winetest_get_mainargs( &argv );
++
++    if (argc > 2 && !strcmp( argv[2], "abort" ))
++    {
++        test_WsAbortChannel();
++        return;
++    }
++    test_WsAbortChannel();
++    firewall_enabled = is_firewall_enabled();
+     if (firewall_enabled)
+     {
+         if (!is_process_elevated())
+diff --git a/dlls/webservices/tests/proxy.c b/dlls/webservices/tests/proxy.c
+index fd9c9797442..4764f9473c3 100644
+--- a/dlls/webservices/tests/proxy.c
++++ b/dlls/webservices/tests/proxy.c
+@@ -231,6 +231,51 @@ static void test_WsResetServiceProxy(void)
+     WsFreeServiceProxy( proxy );
+ }
+ 
++static void test_WsAbortServiceProxy(void)
++{
++    WS_ENDPOINT_ADDRESS address = {0};
++    WS_SERVICE_PROXY_STATE state;
++    WS_SERVICE_PROXY *proxy;
++    HRESULT hr;
++    unsigned int mode, repeat;
++
++    address.url.chars = (WCHAR *)L"http://127.0.0.1:9/";
++    address.url.length = lstrlenW( address.url.chars );
++    for (mode = 0; mode < 3; mode++)
++    {
++        hr = WsCreateServiceProxy( WS_CHANNEL_TYPE_REQUEST, WS_HTTP_CHANNEL_BINDING, NULL,
++                                   NULL, 0, NULL, 0, &proxy, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        if (hr != S_OK) continue;
++        if (mode)
++        {
++            hr = WsOpenServiceProxy( proxy, &address, NULL, NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++        }
++        if (mode == 2)
++        {
++            hr = WsCloseServiceProxy( proxy, NULL, NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++        }
++        for (repeat = 0; repeat < 2; repeat++)
++        {
++            hr = WsAbortServiceProxy( proxy, NULL );
++            ok( hr == S_OK, "mode %u got %#lx\n", mode, hr );
++            state = 0xdeadbeef;
++            hr = WsGetServiceProxyProperty( proxy, WS_PROXY_PROPERTY_STATE, &state, sizeof(state), NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( state == (mode == 0 ? WS_SERVICE_PROXY_STATE_CREATED :
++                           mode == 1 ? WS_SERVICE_PROXY_STATE_FAULTED : WS_SERVICE_PROXY_STATE_CLOSED),
++                "mode %u got %u\n", mode, state );
++        }
++        hr = WsCloseServiceProxy( proxy, NULL, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        hr = WsResetServiceProxy( proxy, NULL );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        WsFreeServiceProxy( proxy );
++    }
++}
++
+ static HRESULT create_channel( int port, WS_CHANNEL **ret )
+ {
+     WS_CHANNEL_PROPERTY prop[2];
+@@ -1218,7 +1263,17 @@ START_TEST(proxy)
+     struct server_info info;
+     HANDLE thread;
+     DWORD ret;
++    int argc;
++    char **argv;
++
++    argc = winetest_get_mainargs( &argv );
++    if (argc > 2 && !strcmp( argv[2], "abort" ))
++    {
++        test_WsAbortServiceProxy();
++        return;
++    }
+ 
++    test_WsAbortServiceProxy();
+     test_WsCreateServiceProxy();
+     test_WsCreateServiceProxyFromTemplate();
+     test_WsOpenServiceProxy();
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+index 1691d05a9d5..a3c641390cb 100644
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -2012,6 +2012,25 @@ static int get_receive_response_timeout( struct request *request )
+     return request->receive_response_timeout;
+ }
+ 
++static void set_request_netconn( struct request *request, struct netconn *netconn )
++{
++    AcquireSRWLockExclusive( &request->netconn_lock );
++    request->netconn = netconn;
++    if (request->handle_closed && netconn) netconn_cancel_io( netconn );
++    ReleaseSRWLockExclusive( &request->netconn_lock );
++}
++
++static struct netconn *detach_request_netconn( struct request *request )
++{
++    struct netconn *netconn;
++
++    AcquireSRWLockExclusive( &request->netconn_lock );
++    netconn = request->netconn;
++    request->netconn = NULL;
++    ReleaseSRWLockExclusive( &request->netconn_lock );
++    return netconn;
++}
++
+ static DWORD open_connection( struct request *request )
+ {
+     BOOL is_secure = request->hdr.flags & WINHTTP_FLAG_SECURE;
+@@ -2129,7 +2148,7 @@ static DWORD open_connection( struct request *request )
+         netconn_set_timeout( netconn, TRUE, request->send_timeout );
+         netconn_set_timeout( netconn, FALSE, get_receive_response_timeout( request ));
+ 
+-        request->netconn = netconn;
++        set_request_netconn( request, netconn );
+ 
+         if (is_secure)
+         {
+@@ -2137,7 +2156,7 @@ static DWORD open_connection( struct request *request )
+             {
+                 if ((ret = secure_proxy_connect( request )))
+                 {
+-                    request->netconn = NULL;
++                    set_request_netconn( request, NULL );
+                     free( addressW );
+                     netconn_release( netconn );
+                     return ret;
+@@ -2151,7 +2170,7 @@ static DWORD open_connection( struct request *request )
+                 (ret = netconn_secure_connect( netconn, connect->hostname, request->security_flags,
+                                                &request->cred_handle, request->check_revocation )))
+             {
+-                request->netconn = NULL;
++                set_request_netconn( request, NULL );
+                 free( addressW );
+                 netconn_release( netconn );
+                 return ret;
+@@ -2166,11 +2185,12 @@ static DWORD open_connection( struct request *request )
+ 
+         netconn_set_timeout( netconn, TRUE, request->send_timeout );
+         netconn_set_timeout( netconn, FALSE, get_receive_response_timeout( request ));
+-        request->netconn = netconn;
++        set_request_netconn( request, netconn );
+     }
+ 
+     if (netconn->secure && !(request->server_cert = netconn_get_certificate( netconn )))
+     {
++        set_request_netconn( request, NULL );
+         free( addressW );
+         netconn_release( netconn );
+         return ERROR_WINHTTP_SECURE_FAILURE;
+@@ -2179,15 +2199,14 @@ static DWORD open_connection( struct request *request )
+ done:
+     reset_data_stream( request );
+     free( addressW );
+-    return ERROR_SUCCESS;
++    return request->handle_closed ? ERROR_WINHTTP_OPERATION_CANCELLED : ERROR_SUCCESS;
+ }
+ 
+ void close_connection( struct request *request )
+ {
+-    if (!request->netconn) return;
++    struct netconn *netconn = detach_request_netconn( request );
+ 
+-    netconn_release( request->netconn );
+-    request->netconn = NULL;
++    if (netconn) netconn_release( netconn );
+ }
+ 
+ static DWORD add_host_header( struct request *request, DWORD modifier )
+@@ -2227,6 +2246,7 @@ static void clear_response_headers( struct request *request )
+ 
+ static void finished_reading( struct request *request )
+ {
++    struct netconn *netconn;
+     BOOL close = FALSE, close_request_headers = FALSE;
+     WCHAR connection[20];
+     DWORD size = sizeof(connection), size2 = size;
+@@ -2249,14 +2269,14 @@ static void finished_reading( struct request *request )
+         if (!wcsicmp( connection, L"close" )) close_request_headers = TRUE;
+     }
+ 
+-    if (close || close_request_headers)
++    netconn = detach_request_netconn( request );
++    if (close || close_request_headers || request->handle_closed)
+     {
+         if (close_request_headers) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CLOSING_CONNECTION, 0, 0 );
+-        netconn_release( request->netconn );
++        netconn_release( netconn );
+         if (close_request_headers) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CONNECTION_CLOSED, 0, 0 );
+     }
+-    else cache_connection( request->netconn );
+-    request->netconn = NULL;
++    else cache_connection( netconn );
+ }
+ 
+ enum escape_flags
+@@ -2448,8 +2468,23 @@ static DWORD add_websocket_key_header( struct request *request )
+     return ERROR_SUCCESS;
+ }
+ 
++static DWORD send_request_impl( struct request *request, const WCHAR *headers, DWORD headers_len, void *optional,
++                                DWORD optional_len, DWORD total_len, DWORD_PTR context, BOOL async );
++
+ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD headers_len, void *optional,
+                            DWORD optional_len, DWORD total_len, DWORD_PTR context, BOOL async )
++{
++    DWORD ret;
++
++    InterlockedIncrement( &request->io_in_progress );
++    ret = request->handle_closed ? ERROR_WINHTTP_OPERATION_CANCELLED :
++        send_request_impl( request, headers, headers_len, optional, optional_len, total_len, context, async );
++    InterlockedDecrement( &request->io_in_progress );
++    return ret;
++}
++
++static DWORD send_request_impl( struct request *request, const WCHAR *headers, DWORD headers_len, void *optional,
++                                DWORD optional_len, DWORD total_len, DWORD_PTR context, BOOL async )
+ {
+     struct connect *connect = request->connect;
+     struct session *session = connect->session;
+@@ -2564,6 +2599,7 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+     send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_REQUEST_SENT, &len, sizeof(len) );
+ 
+ end:
++    if (request->handle_closed) ret = ERROR_WINHTTP_OPERATION_CANCELLED;
+     if (async)
+     {
+         if (!ret) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, NULL, 0 );
+@@ -3142,8 +3178,7 @@ static DWORD handle_redirect( struct request *request, DWORD status )
+                 goto end;
+             }
+ 
+-            netconn_release( request->netconn );
+-            request->netconn = NULL;
++            close_connection( request );
+             request->content_length = request->content_read = 0;
+             reset_data_stream( request );
+         }
+@@ -3225,12 +3260,25 @@ static DWORD queue_receive_response( struct request *request )
+     return ret;
+ }
+ 
++static DWORD receive_response_impl( struct request *request );
++
+ static DWORD receive_response( struct request *request )
++{
++    DWORD ret;
++
++    InterlockedIncrement( &request->io_in_progress );
++    ret = request->handle_closed ? ERROR_WINHTTP_OPERATION_CANCELLED : receive_response_impl( request );
++    InterlockedDecrement( &request->io_in_progress );
++    return ret;
++}
++
++static DWORD receive_response_impl( struct request *request )
+ {
+     BOOL async = request->connect->hdr.flags & WINHTTP_FLAG_ASYNC;
+     DWORD ret, size, query, status;
+ 
+     TRACE( "request state %d\n", request->state );
++    if (request->handle_closed) return ERROR_WINHTTP_OPERATION_CANCELLED;
+ 
+     switch (request->state)
+     {
+@@ -3306,6 +3354,7 @@ static DWORD receive_response( struct request *request )
+     return async ? queue_receive_response( request ) : receive_response( request );
+ 
+ done:
++    if (request->handle_closed) ret = ERROR_WINHTTP_OPERATION_CANCELLED;
+     if (!ret)
+     {
+         request->state = REQUEST_STATE_RESPONSE_RECEIVED;
+@@ -3374,7 +3423,19 @@ static BOOL skip_async_queue( struct request *request, BOOL *wont_block, DWORD t
+     return request->hdr.recursion_count <= RECURSION_LIMIT && *wont_block;
+ }
+ 
++static DWORD query_data_available_impl( struct request *request, DWORD *available, BOOL async );
++
+ static DWORD query_data_available( struct request *request, DWORD *available, BOOL async )
++{
++    DWORD ret;
++
++    InterlockedIncrement( &request->io_in_progress );
++    ret = request->handle_closed ? ERROR_WINHTTP_OPERATION_CANCELLED : query_data_available_impl( request, available, async );
++    InterlockedDecrement( &request->io_in_progress );
++    return ret;
++}
++
++static DWORD query_data_available_impl( struct request *request, DWORD *available, BOOL async )
+ {
+     DWORD ret = ERROR_SUCCESS, count = 0;
+ 
+@@ -3383,6 +3444,7 @@ static DWORD query_data_available( struct request *request, DWORD *available, BO
+     ret = query_data_stream( request, &count );
+ 
+ done:
++    if (request->handle_closed) ret = ERROR_WINHTTP_OPERATION_CANCELLED;
+     TRACE( "%lu bytes available\n", count );
+     if (async)
+     {
+@@ -3498,7 +3560,19 @@ BOOL WINAPI WinHttpQueryDataAvailable( HINTERNET hrequest, LPDWORD available )
+     return !ret || ret == ERROR_IO_PENDING;
+ }
+ 
++static DWORD read_data_impl( struct request *request, char *buffer, DWORD size, DWORD *read, BOOL async );
++
+ static DWORD read_data( struct request *request, char *buffer, DWORD size, DWORD *read, BOOL async )
++{
++    DWORD ret;
++
++    InterlockedIncrement( &request->io_in_progress );
++    ret = request->handle_closed ? ERROR_WINHTTP_OPERATION_CANCELLED : read_data_impl( request, buffer, size, read, async );
++    InterlockedDecrement( &request->io_in_progress );
++    return ret;
++}
++
++static DWORD read_data_impl( struct request *request, char *buffer, DWORD size, DWORD *read, BOOL async )
+ {
+     DWORD bytes_read = 0, count, ret = ERROR_SUCCESS;
+ 
+@@ -3510,6 +3584,7 @@ static DWORD read_data( struct request *request, char *buffer, DWORD size, DWORD
+     }
+ 
+     TRACE( "%lu bytes read\n", bytes_read );
++    if (request->handle_closed) ret = ERROR_WINHTTP_OPERATION_CANCELLED;
+     if (end_of_data_stream( request )) finished_reading( request );
+     if (async)
+     {
+diff --git a/dlls/winhttp/session.c b/dlls/winhttp/session.c
+index 6cb01f69010..f0937cfd1f6 100644
+--- a/dlls/winhttp/session.c
++++ b/dlls/winhttp/session.c
+@@ -1451,9 +1451,20 @@ static BOOL request_set_option( struct object_header *hdr, DWORD option, void *b
+     }
+ }
+ 
++static void request_handle_closing( struct object_header *hdr )
++{
++    struct request *request = (struct request *)hdr;
++
++    InterlockedExchange( &request->handle_closed, TRUE );
++    AcquireSRWLockExclusive( &request->netconn_lock );
++    if (request->netconn && request->io_in_progress) netconn_cancel_io( request->netconn );
++    ReleaseSRWLockExclusive( &request->netconn_lock );
++    cancel_queue( &request->queue );
++}
++
+ static const struct object_vtbl request_vtbl =
+ {
+-    NULL,
++    request_handle_closing,
+     request_destroy,
+     request_query_option,
+     request_set_option
+diff --git a/dlls/winhttp/winhttp_private.h b/dlls/winhttp/winhttp_private.h
+index 05f993a70d8..82b794cb9a7 100644
+--- a/dlls/winhttp/winhttp_private.h
++++ b/dlls/winhttp/winhttp_private.h
+@@ -227,6 +227,9 @@ struct request
+     void *optional;
+     DWORD optional_len;
+     struct netconn *netconn;
++    SRWLOCK netconn_lock;
++    LONG handle_closed;
++    LONG io_in_progress;
+     DWORD security_flags;
+     BOOL check_revocation;
+     const CERT_CONTEXT *server_cert;
+diff --git a/include/webservices.h b/include/webservices.h
+index 0cf25b922ee..7d97668c046 100644
+--- a/include/webservices.h
++++ b/include/webservices.h
+@@ -1698,6 +1698,7 @@ enum
+     WS_MATCH_URL_NO_QUERY                 = 0x100
+ };
+ 
++HRESULT WINAPI WsAbortChannel(WS_CHANNEL*, WS_ERROR*);
+ HRESULT WINAPI WsAbortServiceProxy(WS_SERVICE_PROXY*, WS_ERROR*);
+ HRESULT WINAPI WsAcceptChannel(WS_LISTENER*, WS_CHANNEL*, const WS_ASYNC_CONTEXT*, WS_ERROR*);
+ HRESULT WINAPI WsAddCustomHeader(WS_MESSAGE*, const WS_ELEMENT_DESCRIPTION*, WS_WRITE_OPTION,

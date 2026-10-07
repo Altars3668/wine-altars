@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 16:46:40 -0400
+Subject: [PATCH] d2d1: draw round, bevel and miter-or-bevel line joins
+
+Every join was drawn as a miter.  Joins are still built as miters, and
+are now cut back in the shaders: the outline vertex shader brings the tip
+of a join, and the inner point opposite it, back to the bevel line when
+the miter is longer than the limit (always, for a bevel), and for round
+joins hands the pixel shader the offset from the point joined at, which
+drops what lies further than half a stroke width from it.  The sides of a
+segment lie on that circle, and the outer edges of a miter touch it where
+they leave the sides, so what is left of the miter is the round join.
+
+A point the path goes straight on through made a "join" reaching 25 units
+along the next segment, past its end if it was shorter; nothing is joined
+there now.
+
+A miter longer than the limit is still drawn in full, where D2D cuts it
+off, and a join where the path turns right back still reaches the same 25
+units past the point for bevels.  The tests follow from the geometry and
+were not run on Windows; each pixel checked lies wholly on one side of
+every edge, so antialiasing does not change it.  d2d1: 18627 tests, 0 failures, on GL and Vulkan.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 89a0f91bf6d4c070c02b0df1d7388c92821925bc)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 9248ac4207b..c371c7d42ce 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -120,7 +120,8 @@ struct d2d_ps_cb
+ {
+     BOOL outline;
+     BOOL is_arc;
+-    BOOL pad[2];
++    BOOL round_joins;
++    BOOL pad;
+     struct d2d_brush_cb colour_brush;
+     struct d2d_brush_cb opacity_brush;
+ };
+@@ -139,6 +140,8 @@ struct d2d_vs_cb
+     } transform_geometry;
+     struct d2d_vec4 transform_rtx;
+     struct d2d_vec4 transform_rty;
++    /* x: the miter limit past which a join is bevelled, 0 for none; y: non-zero for round joins. */
++    struct d2d_vec4 join;
+ };
+ 
+ struct d2d_device_context_ops
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 30351e1c692..113889fe525 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -825,7 +825,7 @@ static void STDMETHODCALLTYPE d2d_device_context_FillEllipse(ID2D1DeviceContext6
+ }
+ 
+ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
+-        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc)
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc, BOOL round_joins)
+ {
+     D3D11_MAPPED_SUBRESOURCE map_desc;
+     ID3D11DeviceContext *d3d_context;
+@@ -845,8 +845,8 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+     cb_data = map_desc.pData;
+     cb_data->outline = outline;
+     cb_data->is_arc = is_arc;
+-    cb_data->pad[0] = 0;
+-    cb_data->pad[1] = 0;
++    cb_data->round_joins = round_joins;
++    cb_data->pad = 0;
+     if (!d2d_brush_fill_cb(brush, &cb_data->colour_brush))
+         WARN("Failed to initialize colour brush buffer.\n");
+     if (!d2d_brush_fill_cb(opacity_brush, &cb_data->opacity_brush))
+@@ -859,7 +859,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+ }
+ 
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit, BOOL round_joins)
+ {
+     D3D11_MAPPED_SUBRESOURCE map_desc;
+     ID3D11DeviceContext *d3d_context;
+@@ -902,6 +902,11 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     cb_data->transform_rty.z = w->_32 * tmp_y;
+     cb_data->transform_rty.w = -2.0f / context->pixel_size.height;
+ 
++    cb_data->join.x = miter_limit;
++    cb_data->join.y = round_joins ? 1.0f : 0.0f;
++    cb_data->join.z = 0.0f;
++    cb_data->join.w = 0.0f;
++
+     ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->vs_cb, 0);
+     ID3D11DeviceContext_Release(d3d_context);
+ 
+@@ -909,20 +914,44 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+ }
+ 
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+-        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
++        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
++        const struct d2d_stroke_style *style)
+ {
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
++    BOOL round_joins = FALSE;
++    float miter_limit = 0.0f;
+     ID3D11Buffer *ib, *vb;
+     HRESULT hr;
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
++    /* Joins are drawn as miters and cut back in the shaders: to a bevel past the miter limit, or to the circle
++     * around the point they join at. A miter join longer than the limit is drawn in full. */
++    if (style)
++    {
++        switch (style->desc.lineJoin)
++        {
++            case D2D1_LINE_JOIN_BEVEL:
++                miter_limit = 1.0f;
++                break;
++            case D2D1_LINE_JOIN_ROUND:
++                round_joins = TRUE;
++                break;
++            case D2D1_LINE_JOIN_MITER_OR_BEVEL:
++                miter_limit = max(style->desc.miterLimit, 1.0f);
++                break;
++            default:
++                break;
++        }
++    }
++
++    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width,
++            miter_limit, round_joins)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+     }
+ 
+-    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, FALSE)))
++    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, FALSE, round_joins)))
+     {
+         WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -967,6 +996,12 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+ 
+     if (geometry->outline.bezier_face_count)
+     {
++        if (round_joins && FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, FALSE, FALSE)))
++        {
++            WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
++            return;
++        }
++
+         buffer_desc.ByteWidth = geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces);
+         buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+         buffer_data.pSysMem = geometry->outline.bezier_faces;
+@@ -1019,7 +1054,7 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+             return;
+         }
+ 
+-        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
++        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE, FALSE)))
+             d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
+                     3 * geometry->outline.arc_face_count, vb,
+                     sizeof(*geometry->outline.arcs), brush, NULL);
+@@ -1053,7 +1088,7 @@ static void d2d_device_context_draw_styled_geometry(struct d2d_device_context *c
+     if (stroke)
+     {
+         d2d_device_context_draw_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)stroke),
+-                brush, stroke_width);
++                brush, stroke_width, style);
+         ID2D1PathGeometry_Release(stroke);
+     }
+     if (caps)
+@@ -1103,8 +1138,6 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
+         else if (desc->transformType == D2D1_STROKE_TRANSFORM_TYPE_HAIRLINE && scale > 0.0f)
+             stroke_width = 96.0f / context->desc.dpiX / scale;
+ 
+-        if (desc->lineJoin != D2D1_LINE_JOIN_MITER && desc->lineJoin != D2D1_LINE_JOIN_MITER_OR_BEVEL)
+-            FIXME("Line join %#x is drawn as a miter.\n", desc->lineJoin);
+         if (stroke_style_impl->dash_count || desc->startCap != D2D1_CAP_STYLE_FLAT
+                 || desc->endCap != D2D1_CAP_STYLE_FLAT || desc->dashCap != D2D1_CAP_STYLE_FLAT)
+         {
+@@ -1113,7 +1146,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
+         }
+     }
+ 
+-    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width);
++    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width, stroke_style_impl);
+ }
+ 
+ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+@@ -1131,13 +1164,13 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+     buffer_data.SysMemPitch = 0;
+     buffer_data.SysMemSlicePitch = 0;
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
++    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f, 0.0f, FALSE)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+     }
+ 
+-    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, FALSE)))
++    if (FAILED(hr = d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, FALSE, FALSE)))
+     {
+         WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -1203,7 +1236,7 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+             return;
+         }
+ 
+-        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
++        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE, FALSE)))
+             d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
+                     sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
+ 
+@@ -2425,6 +2458,10 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
+     vs_cb_data->transform_rty.y = 1.0f;
+     vs_cb_data->transform_rty.z = 1.0f;
+     vs_cb_data->transform_rty.w = -1.0f;
++    vs_cb_data->join.x = 0.0f;
++    vs_cb_data->join.y = 0.0f;
++    vs_cb_data->join.z = 0.0f;
++    vs_cb_data->join.w = 0.0f;
+ 
+     ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->vs_cb, 0);
+ 
+@@ -4686,6 +4723,7 @@ static const char shape_vs_code_outline[] =
+     "float stroke_width;\n"
+     "float4 transform_rtx;\n"
+     "float4 transform_rty;\n"
++    "float2 join;\n"
+     "\n"
+     "struct output\n"
+     "{\n"
+@@ -4722,7 +4760,16 @@ static const char shape_vs_code_outline[] =
+     "    l = -dot(v_p, q_next) / (1.0f + dot(q_prev, q_next));\n"
+     "    q_i = l * q_prev + v_p;\n"
+     "\n"
+-    "    o.b = float4(0.0, 0.0, 0.0, 0.0);\n"
++    "    /* A join longer than the miter limit is bevelled: its tip, and the inner\n"
++    "     * point opposite, come back along the bisector to where it crosses the\n"
++    "     * line between the ends of the two sides, at sin²(½θ) the length of the\n"
++    "     * miter. The sides of a segment are never longer than 1. */\n"
++    "    if (join.x > 0.0f && dot(q_i, q_i) > join.x * join.x)\n"
++    "        q_i /= dot(q_i, q_i);\n"
++    "\n"
++    "    /* For round joins, the offset from the point joined at, in half stroke\n"
++    "     * widths; what lies further than one of them from it is cut away. */\n"
++    "    o.b = join.y ? float4(q_i, 0.0f, 0.0f) : float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+     "\n"
+     "    o.p = mul(float3(position, 1.0f), transform_geometry) + stroke_width * 0.5f * q_i;\n"
+     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"
+@@ -4931,6 +4978,7 @@ static const char shape_ps_code[] =
+     "\n"
+     "bool outline;\n"
+     "bool is_arc;\n"
++    "bool round_joins;\n"
+     "struct brush\n"
+     "{\n"
+     "    uint type;\n"
+@@ -5068,7 +5116,14 @@ static const char shape_ps_code[] =
+     "    if (opacity_brush.type < BRUSH_TYPE_COUNT)\n"
+     "        colour *= sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
+     "\n"
+-    "    if (outline)\n"
++    "    if (outline && round_joins)\n"
++    "    {\n"
++    "        /* A join is drawn as a miter; a round one is the part of it within half\n"
++    "         * a stroke width of the point joined at. The sides of the segments lie\n"
++    "         * exactly on that circle, so allow for rounding. */\n"
++    "        clip(1.0001f - dot(i.b.xy, i.b.xy));\n"
++    "    }\n"
++    "    else if (outline)\n"
+     "    {\n"
+     "        float2 du, dv, df;\n"
+     "        float4 uv;\n"
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index b6903d01024..964e406230e 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2947,6 +2947,9 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
+     f = &geometry->outline.faces[geometry->outline.face_count];
+ 
+     ccw = d2d_point_ccw(&origin, prev, next);
++    /* Straight on, the two segments meet flush and there is nothing to join. */
++    if (ccw == 0.0f && d2d_point_dot(prev, next) < 0.0f)
++        return TRUE;
+     if (ccw == 0.0f)
+     {
+         d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index 71a04f6c578..9896aa5cad4 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -17551,6 +17551,112 @@ static void test_stroke_styles(BOOL d3d11)
+     release_test_context(&ctx);
+ }
+ 
++static ID2D1PathGeometry *create_polyline(ID2D1Factory *factory, const D2D1_POINT_2F *points,
++        unsigned int count)
++{
++    ID2D1GeometrySink *sink;
++    ID2D1PathGeometry *path;
++    HRESULT hr;
++
++    hr = ID2D1Factory_CreatePathGeometry(factory, &path);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1PathGeometry_Open(path, &sink);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1GeometrySink_BeginFigure(sink, points[0], D2D1_FIGURE_BEGIN_HOLLOW);
++    ID2D1GeometrySink_AddLines(sink, points + 1, count - 1);
++    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
++    hr = ID2D1GeometrySink_Close(sink);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1GeometrySink_Release(sink);
++
++    return path;
++}
++
++static void test_stroke_joins(BOOL d3d11)
++{
++    /* A right angle at (40, 10), ten wide: the miter fills the square up to (45, 5), a bevel stops at the line
++     * x - y = 35 between the corners of the two sides, a round join at the circle of five around (40, 10). */
++    static const D2D1_POINT_2F corner[] = {{10.0f, 10.0f}, {40.0f, 10.0f}, {40.0f, 40.0f}};
++    static const D2D1_POINT_2F straight[] = {{10.0f, 60.0f}, {30.0f, 60.0f}, {50.0f, 60.0f}};
++    static const struct
++    {
++        D2D1_LINE_JOIN join;
++        float miter_limit;
++        DWORD tip, edge, inside;
++    }
++    tests[] =
++    {
++        {D2D1_LINE_JOIN_MITER,          10.0f, 0xffff0000, 0xffff0000, 0xffff0000},
++        {D2D1_LINE_JOIN_BEVEL,          10.0f, 0xffffffff, 0xffffffff, 0xffff0000},
++        {D2D1_LINE_JOIN_ROUND,          10.0f, 0xffffffff, 0xffff0000, 0xffff0000},
++        /* the miter of a right angle is √2 half widths long */
++        {D2D1_LINE_JOIN_MITER_OR_BEVEL,  2.0f, 0xffff0000, 0xffff0000, 0xffff0000},
++        {D2D1_LINE_JOIN_MITER_OR_BEVEL,  1.0f, 0xffffffff, 0xffffffff, 0xffff0000},
++    };
++    D2D1_STROKE_STYLE_PROPERTIES1 desc;
++    ID2D1PathGeometry *path, *line;
++    struct d2d1_test_context ctx;
++    ID2D1SolidColorBrush *brush;
++    D2D1_COLOR_F red, white;
++    ID2D1StrokeStyle1 *style;
++    unsigned int i;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++    if (!ctx.factory1)
++    {
++        win_skip("ID2D1Factory1 is not supported.\n");
++        release_test_context(&ctx);
++        return;
++    }
++
++    set_color(&red, 1.0f, 0.0f, 0.0f, 1.0f);
++    set_color(&white, 1.0f, 1.0f, 1.0f, 1.0f);
++    hr = ID2D1DeviceContext_CreateSolidColorBrush(ctx.context, &red, NULL, &brush);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    path = create_polyline((ID2D1Factory *)ctx.factory1, corner, ARRAY_SIZE(corner));
++    line = create_polyline((ID2D1Factory *)ctx.factory1, straight, ARRAY_SIZE(straight));
++
++    memset(&desc, 0, sizeof(desc));
++    desc.dashStyle = D2D1_DASH_STYLE_SOLID;
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        winetest_push_context("Test %u", i);
++
++        desc.lineJoin = tests[i].join;
++        desc.miterLimit = tests[i].miter_limit;
++        hr = ID2D1Factory1_CreateStrokeStyle(ctx.factory1, &desc, NULL, 0, &style);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ID2D1DeviceContext_BeginDraw(ctx.context);
++        ID2D1DeviceContext_Clear(ctx.context, &white);
++        ID2D1DeviceContext_DrawGeometry(ctx.context, (ID2D1Geometry *)path, (ID2D1Brush *)brush, 10.0f,
++                (ID2D1StrokeStyle *)style);
++        ID2D1DeviceContext_DrawGeometry(ctx.context, (ID2D1Geometry *)line, (ID2D1Brush *)brush, 4.0f,
++                (ID2D1StrokeStyle *)style);
++        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++        check_effect_pixel(&ctx, 44, 5, tests[i].tip, 0);
++        check_effect_pixel(&ctx, 42, 6, tests[i].edge, 0);
++        check_effect_pixel(&ctx, 41, 8, tests[i].inside, 0);
++        /* the sides themselves */
++        check_effect_pixel(&ctx, 25, 6, 0xffff0000, 0);
++        check_effect_pixel(&ctx, 44, 25, 0xffff0000, 0);
++        /* going straight on through a point joins nothing, and stops at the end */
++        check_effect_pixel(&ctx, 48, 60, 0xffff0000, 0);
++        check_effect_pixel(&ctx, 52, 60, 0xffffffff, 0);
++
++        ID2D1StrokeStyle1_Release(style);
++        winetest_pop_context();
++    }
++
++    ID2D1PathGeometry_Release(line);
++    ID2D1PathGeometry_Release(path);
++    ID2D1SolidColorBrush_Release(brush);
++    release_test_context(&ctx);
++}
++
+ static void test_get_effect_properties(BOOL d3d11)
+ {
+     ID2D1Properties *properties, *properties2;
+@@ -19262,6 +19368,7 @@ START_TEST(d2d1)
+     queue_test(test_effect_rendering);
+     queue_test(test_path_geometry_arcs);
+     queue_test(test_stroke_styles);
++    queue_test(test_stroke_joins);
+     queue_test(test_layer_rendering);
+         queue_d3d10_test(test_get_effect_properties);
+         queue_test(test_effect_vertex_buffer);
+@@ -19362,6 +19469,7 @@ START_TEST(d2d1)
+     queue_test(test_effect_rendering);
+     queue_test(test_path_geometry_arcs);
+     queue_test(test_stroke_styles);
++    queue_test(test_stroke_joins);
+     queue_test(test_layer_rendering);
+     queue_d3d10_test(test_get_effect_properties);
+     queue_test(test_effect_vertex_buffer);

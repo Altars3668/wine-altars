@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:35:16 -0400
+Subject: [PATCH] win32u: Tell per-monitor aware windows when their monitor's
+ DPI changes.
+
+Windows sends WM_DPICHANGED to a per-monitor aware top-level window whose monitor's DPI changes,
+with a rectangle that keeps its size at the new DPI: the same one when it is maximized, scaled from
+its top left corner otherwise; the children of a per-monitor v2 window get
+WM_DPICHANGED_BEFOREPARENT before it, from the bottom up, and WM_DPICHANGED_AFTERPARENT after it,
+from the top down.  Wine never sent any of them, so a program kept the layout of the DPI it
+started with.
+
+Note each such window's DPI before the display cache is updated, and once the server has given the
+windows their new DPI, tell those whose DPI changed.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 0bdc65a655d..22283a2cc57 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -4867,11 +4867,14 @@ struct display_snapshot
+     /* the same, in system DPI, which is how windows are placed against them */
+     RECT placed_monitor[16];
+     RECT placed_work[16];
++    /* and each monitor's effective DPI */
++    struct ratio dpi[16];
+ };
+ 
+ static void get_display_snapshot( struct display_snapshot *snapshot )
+ {
+     struct monitor *monitor;
++    struct ratio x, y;
+ 
+     memset( snapshot, 0, sizeof(*snapshot) );
+     if (!lock_display_devices( FALSE )) return;
+@@ -4887,22 +4890,105 @@ static void get_display_snapshot( struct display_snapshot *snapshot )
+         monitor_get_info( monitor, &info, (struct ratio){ system_dpi, 1 } );
+         snapshot->placed_monitor[snapshot->count] = info.rcMonitor;
+         snapshot->placed_work[snapshot->count] = info.rcWork;
++        snapshot->dpi[snapshot->count] = monitor_get_dpi( monitor, MDT_EFFECTIVE_DPI, &x, &y );
+         snapshot->count++;
+     }
+ 
+     unlock_display_devices();
+ }
+ 
++struct window_dpi
++{
++    HWND hwnd;
++    struct ratio dpi;
++};
++
++/* the per-monitor aware top-level windows and their DPI, before the monitors change */
++static struct window_dpi *get_window_dpis(void)
++{
++    struct window_dpi *dpis;
++    struct ratio raw_dpi;
++    UINT i, count = 0;
++    HWND *list;
++
++    if (!(list = list_window_children( get_desktop_window() ))) return NULL;
++    for (i = 0; list[i]; i++) ;
++    if ((dpis = malloc( (i + 1) * sizeof(*dpis) )))
++    {
++        for (i = 0; list[i]; i++)
++        {
++            if (!NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( list[i] ) )) continue;
++            dpis[count].hwnd = list[i];
++            dpis[count].dpi = get_win_monitor_dpi( list[i], &raw_dpi );
++            if (dpis[count].dpi.num) count++;
++        }
++        dpis[count].hwnd = 0;
++    }
++    free( list );
++    return dpis;
++}
++
++/* tell the children of a per-monitor v2 window: before their parent from the bottom up,
++ * after it from the top down */
++static void send_dpi_changed_to_children( HWND parent, UINT msg )
++{
++    HWND *list;
++    UINT i;
++
++    if (!(list = list_window_children( parent ))) return;
++    for (i = 0; list[i]; i++)
++    {
++        if (msg == WM_DPICHANGED_BEFOREPARENT) send_dpi_changed_to_children( list[i], msg );
++        send_message_timeout( list[i], msg, 0, 0, SMTO_ABORTIFHUNG, 2000, FALSE );
++        if (msg == WM_DPICHANGED_AFTERPARENT) send_dpi_changed_to_children( list[i], msg );
++    }
++    free( list );
++}
++
++/* Windows tells a per-monitor aware window when the DPI of the monitor it is on changes -- the user
++ * picked another scale, or the host's desktop did -- once the window has the new DPI, and suggests
++ * where it would keep its size at the new DPI: the same rectangle when maximized, scaled from its top
++ * left corner otherwise.  A per-monitor v2 window's children hear about it as well. */
++static void notify_dpi_changes( const struct window_dpi *dpis )
++{
++    struct ratio old_dpi, new_dpi, raw_dpi;
++    BOOL v2;
++    RECT rect;
++
++    for (; dpis && dpis->hwnd; dpis++)
++    {
++        old_dpi = dpis->dpi;
++        new_dpi = get_win_monitor_dpi( dpis->hwnd, &raw_dpi );
++        if (!new_dpi.num || (UINT)new_dpi.num * old_dpi.den == (UINT)old_dpi.num * new_dpi.den) continue;
++        if (!get_window_rect( dpis->hwnd, &rect, no_dpi )) continue;
++
++        if (!(get_window_long( dpis->hwnd, GWL_STYLE ) & WS_MAXIMIZE))
++        {
++            rect.right = rect.left + muldiv( rect.right - rect.left, new_dpi.num * old_dpi.den, old_dpi.num * new_dpi.den );
++            rect.bottom = rect.top + muldiv( rect.bottom - rect.top, new_dpi.num * old_dpi.den, old_dpi.num * new_dpi.den );
++        }
++        v2 = NTUSER_DPI_CONTEXT_GET_VERSION( get_window_dpi_awareness_context( dpis->hwnd ) ) >= 2;
++        TRACE( "%p: dpi %u/%u -> %u/%u, suggesting %s%s\n", dpis->hwnd, old_dpi.num, old_dpi.den, new_dpi.num,
++               new_dpi.den, wine_dbgstr_rect( &rect ), v2 ? ", per-monitor v2" : "" );
++
++        if (v2) send_dpi_changed_to_children( dpis->hwnd, WM_DPICHANGED_BEFOREPARENT );
++        send_message_timeout( dpis->hwnd, WM_DPICHANGED, MAKEWPARAM( new_dpi.num / new_dpi.den, new_dpi.num / new_dpi.den ),
++                              (LPARAM)&rect, SMTO_ABORTIFHUNG, 2000, FALSE );
++        if (v2) send_dpi_changed_to_children( dpis->hwnd, WM_DPICHANGED_AFTERPARENT );
++    }
++}
++
+ static void display_mode_changed( BOOL broadcast )
+ {
+     DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
+     struct display_snapshot before, after;
++    struct window_dpi *dpis = get_window_dpis();
+ 
+     get_display_snapshot( &before );
+     if (!update_display_cache( TRUE ))
+     {
+         ERR( "Failed to update display cache after mode change.\n" );
+-        return;
++        goto done;
+     }
+     get_display_snapshot( &after );
+ 
+@@ -4914,13 +5000,13 @@ static void display_mode_changed( BOOL broadcast )
+     if (!broadcast && !memcmp( &before, &after, sizeof(before) ))
+     {
+         TRACE( "display configuration unchanged.\n" );
+-        return;
++        goto done;
+     }
+ 
+     if (!get_primary_source_mode( &current_mode ))
+     {
+         ERR( "Failed to get primary source current display settings.\n" );
+-        return;
++        goto done;
+     }
+ 
+     invalidate_work_area();
+@@ -4969,6 +5055,10 @@ static void display_mode_changed( BOOL broadcast )
+     }
+ 
+     fit_windows_to_display( before.placed_monitor, before.placed_work, before.count );
++    if (memcmp( before.dpi, after.dpi, sizeof(before.dpi) )) notify_dpi_changes( dpis );
++
++done:
++    free( dpis );
+ }
+ 
+ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmode,

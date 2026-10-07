@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 01:03:37 -0400
+Subject: [PATCH] combase: Call into a context's apartment from outside it, and
+ let the context answer for IMarshal.
+
+C++/WinRT resumes every co_await through the context it captured: the
+awaited operation completes on some thread pool thread, and the rest of
+the coroutine is handed to IContextCallback::ContextCallback on the
+awaiting thread's context.  Office's AugLoop is one such caller.
+
+Upstream has since implemented ContextCallback through the apartment's
+IRundown, as Windows does, and shared the context token between MTA
+threads.  These tests, which pass on Windows, check it against what
+Windows does, and two things it did not:
+
+- Into the MTA from an STA, the call answered RPC_E_DISCONNECTED and the
+  callback never ran, as nothing had yet called into the MTA from
+  outside to make it reachable.  The context's apartment now is made
+  reachable first, and the callback runs on a thread that enters the
+  MTA, as on Windows.
+- The context answers for IMarshal, being the same object in every
+  apartment; here through the free-threaded marshaler.
+
+What else the tests check upstream already does:
+
+- A context belongs to an apartment, not a thread: every thread of the
+  MTA, a thread in no apartment while the MTA exists included, gets the
+  same object, and each STA its own.  It lives as long as its apartment,
+  and a reference held past the apartment is left with a context that
+  answers RPC_E_DISCONNECTED.
+- ContextCallback accepts any interface and method, and returns what
+  the callback returns.  In its own apartment the callback runs at once
+  on the calling thread; into an STA it runs on the STA's thread.  A
+  caller that is an STA serves incoming calls while it waits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 5dda9e5c798..a62dbbadd93 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -2427,6 +2427,7 @@ static struct thread_context
+     LONG ref;
+     LONG reported_ref;
+     OXID oxid;
++    IUnknown *marshal;
+ } *mta_context;
+ 
+ static inline struct thread_context *impl_from_IComThreadingInfo(IComThreadingInfo *iface)
+@@ -2463,6 +2464,20 @@ static HRESULT WINAPI thread_context_info_QueryInterface(IComThreadingInfo *ifac
+     {
+         *obj = &context->IObjContext_iface;
+     }
++    else if (IsEqualIID(riid, &IID_IMarshal))
++    {
++        IUnknown *marshal;
++
++        /* a context is the same object in every apartment */
++        if (!context->marshal)
++        {
++            if (FAILED(CoCreateFreeThreadedMarshaler((IUnknown *)&context->IComThreadingInfo_iface, &marshal)))
++                return E_NOINTERFACE;
++            if (InterlockedCompareExchangePointer((void **)&context->marshal, marshal, NULL))
++                IUnknown_Release(marshal);
++        }
++        return IUnknown_QueryInterface(context->marshal, riid, obj);
++    }
+ 
+     if (*obj)
+     {
+@@ -2496,6 +2511,7 @@ static void context_token_release(IObjContext *iface)
+         if (context == mta_context) mta_context = NULL;
+         LeaveCriticalSection(&context_cs);
+ 
++        if (context->marshal) IUnknown_Release(context->marshal);
+         free(context);
+     }
+ }
+@@ -2600,7 +2616,7 @@ static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *
+     struct thread_context *context = impl_from_IContextCallback(iface);
+     IObjContext *current_context;
+     XAptCallback apt_callback;
+-    struct apartment *apt;
++    struct apartment *apt, *target;
+     STDOBJREF stdobjref;
+     OXID_INFO oxid_info;
+     IRundown *rundown;
+@@ -2655,6 +2671,13 @@ static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *
+         return hr;
+     }
+ 
++    /* the context's apartment answers from outside even if nothing ever called into it before */
++    if ((target = apartment_findfromoxid(context->oxid)))
++    {
++        rpc_start_remoting(target);
++        apartment_release(target);
++    }
++
+     hr = rpc_resolve_oxid(context->oxid, &oxid_info);
+     if (SUCCEEDED(hr))
+     {
+diff --git a/dlls/ole32/tests/compobj.c b/dlls/ole32/tests/compobj.c
+index b4e12b38fe1..3a51dbd0c04 100644
+--- a/dlls/ole32/tests/compobj.c
++++ b/dlls/ole32/tests/compobj.c
+@@ -2258,6 +2258,233 @@ static void test_CoGetObjectContext(void)
+     CoUninitialize();
+ }
+ 
++struct context_call_info
++{
++    DWORD thread;
++    APTTYPE type;
++    APTTYPEQUALIFIER qualifier;
++    ULONG_PTR token;
++    int count;
++};
++
++static HRESULT CALLBACK context_callback(ComCallData *data)
++{
++    struct context_call_info *info = data->pUserDefined;
++
++    ok(data->dwDispid == 7 && data->dwReserved == 9, "got %lu, %lu\n", data->dwDispid, data->dwReserved);
++    info->thread = GetCurrentThreadId();
++    CoGetApartmentType(&info->type, &info->qualifier);
++    CoGetContextToken(&info->token);
++    info->count++;
++    return 0x80001234;
++}
++
++static HRESULT call_in_context(IContextCallback *context, struct context_call_info *info, REFIID iid, int method)
++{
++    ComCallData data = {7, 9, info};
++
++    memset(info, 0, sizeof(*info));
++    return IContextCallback_ContextCallback(context, context_callback, &data, iid, method, NULL);
++}
++
++static IContextCallback *main_context, *mta_context, *sta2_context;
++static ULONG_PTR main_token, mta_token;
++static DWORD mta_tid, sta2_tid;
++static HANDLE mta_ready, mta_go, mta_exit, sta2_ready, sta2_exit, calls_done;
++
++static void pump_until(HANDLE event)
++{
++    MSG msg;
++
++    while (MsgWaitForMultipleObjects(1, &event, FALSE, 5000, QS_ALLINPUT) == WAIT_OBJECT_0 + 1)
++        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
++}
++
++static DWORD CALLBACK context_mta_thread(void *arg)
++{
++    struct context_call_info info;
++    IContextCallback *context;
++    ULONG_PTR token;
++    HRESULT hr;
++
++    CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    CoGetContextToken(&mta_token);
++    hr = CoGetObjectContext(&IID_IContextCallback, (void **)&mta_context);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    SetEvent(mta_ready);
++
++    WaitForSingleObject(mta_go, INFINITE);
++
++    /* into the main STA, which is pumping */
++    hr = call_in_context(main_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.thread == GetThreadId(arg), "ran on %#lx\n", info.thread);
++    ok(info.type == APTTYPE_MAINSTA, "got %d\n", info.type);
++    ok(info.token == main_token, "wrong context\n");
++
++    /* its own */
++    hr = call_in_context(mta_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.thread == GetCurrentThreadId(), "ran on %#lx\n", info.thread);
++    ok(info.type == APTTYPE_MTA && info.qualifier == APTTYPEQUALIFIER_NONE, "got %d, %d\n", info.type, info.qualifier);
++
++    SetEvent(calls_done);
++    WaitForSingleObject(mta_exit, INFINITE);
++
++    CoGetContextToken(&token);
++    ok(token == mta_token, "the MTA's context changed\n");
++    hr = CoGetObjectContext(&IID_IContextCallback, (void **)&context);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(context == mta_context, "got another context\n");
++    IContextCallback_Release(context);
++    CoUninitialize();
++    return 0;
++}
++
++/* in no apartment while the MTA exists, as a thread pool thread is */
++static DWORD CALLBACK context_implicit_thread(void *arg)
++{
++    struct context_call_info info;
++    IContextCallback *context;
++    ULONG_PTR token = 0;
++    HRESULT hr;
++
++    hr = CoGetContextToken(&token);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(token == mta_token, "not the MTA's context\n");
++    hr = CoGetObjectContext(&IID_IContextCallback, (void **)&context);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(context == mta_context, "not the MTA's context\n");
++    IContextCallback_Release(context);
++
++    hr = call_in_context(mta_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.thread == GetCurrentThreadId(), "ran on %#lx\n", info.thread);
++    ok(info.type == APTTYPE_MTA && info.qualifier == APTTYPEQUALIFIER_IMPLICIT_MTA, "got %d, %d\n", info.type, info.qualifier);
++
++    hr = call_in_context(main_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.thread == GetThreadId(arg), "ran on %#lx\n", info.thread);
++    ok(info.type == APTTYPE_MAINSTA, "got %d\n", info.type);
++
++    SetEvent(calls_done);
++    return 0;
++}
++
++static DWORD CALLBACK context_sta2_thread(void *arg)
++{
++    struct context_call_info info;
++    HRESULT hr;
++
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    hr = CoGetObjectContext(&IID_IContextCallback, (void **)&sta2_context);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(sta2_context != main_context, "an STA shares the main STA's context\n");
++
++    /* from one STA into another */
++    hr = call_in_context(main_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.thread == GetThreadId(arg), "ran on %#lx\n", info.thread);
++
++    SetEvent(sta2_ready);
++    pump_until(sta2_exit);
++    CoUninitialize();
++    return 0;
++}
++
++/* ContextCallback runs the callback in the context's apartment, wherever the caller is. */
++static void test_ContextCallback(void)
++{
++    static const IID *iids[] = {&IID_ICallbackWithNoReentrancyToApplicationSTA, &IID_IUnknown, &IID_IDispatch, &IID_IWineTest};
++    struct context_call_info info;
++    IContextCallback *context;
++    HANDLE thread, main_thread;
++    IUnknown *unk;
++    HRESULT hr;
++    int i;
++
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &main_thread, 0, FALSE,
++                    DUPLICATE_SAME_ACCESS);
++    CoGetContextToken(&main_token);
++    hr = CoGetObjectContext(&IID_IContextCallback, (void **)&main_context);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = CoGetObjectContext(&IID_IContextCallback, (void **)&context);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(context == main_context, "got another context\n");
++    IContextCallback_Release(context);
++
++    /* a context is the same object in every apartment */
++    hr = IContextCallback_QueryInterface(main_context, &IID_IMarshal, (void **)&unk);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    if (hr == S_OK) IUnknown_Release(unk);
++
++    /* in its own apartment the callback runs there and then, whatever the interface and method named */
++    for (i = 0; i < ARRAY_SIZE(iids); i++)
++    {
++        hr = call_in_context(main_context, &info, iids[i], i ? 0 : 5);
++        ok(hr == 0x80001234, "%d: got %#lx\n", i, hr);
++        ok(info.count == 1 && info.thread == GetCurrentThreadId(), "%d: ran %d times on %#lx\n", i, info.count, info.thread);
++        ok(info.type == APTTYPE_MAINSTA, "%d: got %d\n", i, info.type);
++    }
++
++    mta_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
++    mta_go = CreateEventW(NULL, FALSE, FALSE, NULL);
++    mta_exit = CreateEventW(NULL, FALSE, FALSE, NULL);
++    sta2_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
++    sta2_exit = CreateEventW(NULL, FALSE, FALSE, NULL);
++    calls_done = CreateEventW(NULL, FALSE, FALSE, NULL);
++
++    thread = CreateThread(NULL, 0, context_mta_thread, main_thread, 0, &mta_tid);
++    WaitForSingleObject(mta_ready, INFINITE);
++
++    /* from an STA, the MTA's context is entered on a thread of the MTA */
++    hr = call_in_context(mta_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.count == 1, "ran %d times\n", info.count);
++    ok(info.thread != GetCurrentThreadId() && info.thread != mta_tid, "ran on %#lx\n", info.thread);
++    ok(info.type == APTTYPE_MTA && info.qualifier == APTTYPEQUALIFIER_NONE, "got %d, %d\n", info.type, info.qualifier);
++    ok(info.token == mta_token, "wrong context\n");
++
++    SetEvent(mta_go);
++    pump_until(calls_done);
++
++    CloseHandle(CreateThread(NULL, 0, context_implicit_thread, main_thread, 0, NULL));
++    pump_until(calls_done);
++
++    /* an STA's context is entered on its thread */
++    thread = CreateThread(NULL, 0, context_sta2_thread, main_thread, 0, &sta2_tid);
++    pump_until(sta2_ready);
++    hr = call_in_context(sta2_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == 0x80001234, "got %#lx\n", hr);
++    ok(info.thread == sta2_tid, "ran on %#lx\n", info.thread);
++    ok(info.type == APTTYPE_STA, "got %d\n", info.type);
++
++    /* and once the apartment is gone, not at all */
++    SetEvent(sta2_exit);
++    WaitForSingleObject(thread, INFINITE);
++    CloseHandle(thread);
++    hr = call_in_context(sta2_context, &info, &IID_ICallbackWithNoReentrancyToApplicationSTA, 5);
++    ok(hr == RPC_E_DISCONNECTED, "got %#lx\n", hr);
++    ok(!info.count, "ran %d times\n", info.count);
++    IContextCallback_Release(sta2_context);
++
++    SetEvent(mta_exit);
++    thread = OpenThread(SYNCHRONIZE, FALSE, mta_tid);
++    WaitForSingleObject(thread, INFINITE);
++    CloseHandle(thread);
++    IContextCallback_Release(mta_context);
++    IContextCallback_Release(main_context);
++    CloseHandle(mta_ready);
++    CloseHandle(mta_go);
++    CloseHandle(mta_exit);
++    CloseHandle(sta2_ready);
++    CloseHandle(sta2_exit);
++    CloseHandle(calls_done);
++    CloseHandle(main_thread);
++    CoUninitialize();
++}
++
+ typedef struct {
+     IUnknown IUnknown_iface;
+     LONG refs;
+@@ -4712,6 +4939,7 @@ START_TEST(compobj)
+     test_registered_object_thread_affinity();
+     test_CoFreeUnusedLibraries();
+     test_CoGetObjectContext();
++    test_ContextCallback();
+     test_CoGetCallContext();
+     test_CoGetContextToken();
+     test_TreatAsClass();

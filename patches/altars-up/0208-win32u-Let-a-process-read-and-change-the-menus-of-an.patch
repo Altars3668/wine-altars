@@ -1,0 +1,917 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 08:53:36 -0400
+Subject: [PATCH] win32u: Let a process read and change the menus of another,
+ through the thread owning them.
+
+A menu is a USER object that any process on the desktop reads and
+changes, and OLE's in-place activation relies on it: the server makes the
+shared menu and asks the container to put its groups in it.  Here a menu
+lives in the memory of its process, and every call on one of another
+process failed.  Word, activating an Excel worksheet in place, found
+Excel's shared menu was no menu (IsMenu), Excel gave the menu up, and
+Word kept its own ribbon.
+
+A call on a menu of another process now goes, packed as it is with the
+text it sets or reads, to the thread that owns the menu as an internal
+message, which makes the call and sends back its result and error: menu
+and item information, item count, state, id, submenu and default item,
+inserting, setting, removing and deleting items, checking, enabling,
+default and help id, and destroying the menu.  A popup of another process
+goes into a menu as it is, a window takes a menu of another process as
+its menu, and calls that meet one of those in a submenu make them once
+the menu is let go of, since no message can be sent while holding one.
+
+What another process may do, and what becomes of its popup when it
+exits, follows Windows as measured with tools/menuprobe in the outer
+tree; the new test checks it.  The owning thread has to take the messages
+sent to it, as for the calls on windows of other threads.  With this Word
+swaps its ribbon for Excel's while the worksheet is active in place.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 423911260daea3b11cb032867059b1d5db46cf94)
+
+diff --git a/dlls/user32/tests/menu.c b/dlls/user32/tests/menu.c
+index 6862f13c6b1..22af03c0248 100644
+--- a/dlls/user32/tests/menu.c
++++ b/dlls/user32/tests/menu.c
+@@ -21,6 +21,7 @@
+ 
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
+ 
+@@ -4230,8 +4231,177 @@ if (0) /* FIXME: uncomment once Wine is fixed */ {
+     DeleteObject(hbmp);
+ }
+ 
++/* wait as a thread with windows does, taking the messages sent to it meanwhile */
++static DWORD wait_for_object_pumping( HANDLE handle, DWORD timeout )
++{
++    DWORD start = GetTickCount(), elapsed, ret;
++    MSG msg;
++
++    for (;;)
++    {
++        if ((elapsed = GetTickCount() - start) >= timeout) return WAIT_TIMEOUT;
++        ret = MsgWaitForMultipleObjects( 1, &handle, FALSE, timeout - elapsed, QS_ALLINPUT );
++        if (ret != WAIT_OBJECT_0 + 1) return ret;
++        while (PeekMessageA( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageA( &msg );
++    }
++}
++
++/* another process reads and changes a menu as its own, and destroys one */
++static void test_menu_other_process_child( char **argv )
++{
++    HMENU menu = (HMENU)(ULONG_PTR)strtoull( argv[3], NULL, 16 );
++    HMENU popup = (HMENU)(ULONG_PTR)strtoull( argv[4], NULL, 16 );
++    HMENU doomed = (HMENU)(ULONG_PTR)strtoull( argv[5], NULL, 16 );
++    HANDLE done, go;
++    MENUITEMINFOW info;
++    WCHAR text[32];
++    MENUINFO mi;
++    HMENU mine;
++    int ret;
++
++    done = OpenEventA( EVENT_MODIFY_STATE, FALSE, "menu_other_process_done" );
++    go = OpenEventA( SYNCHRONIZE, FALSE, "menu_other_process_go" );
++
++    ok( IsMenu( menu ), "not a menu\n" );
++    memset( &mi, 0, sizeof(mi) );
++    mi.cbSize = sizeof(mi);
++    mi.fMask = MIM_MENUDATA | MIM_HELPID;
++    ret = GetMenuInfo( menu, &mi );
++    ok( ret, "GetMenuInfo failed, error %lu\n", GetLastError() );
++    ok( mi.dwMenuData == 0x1234, "got data %#Ix\n", mi.dwMenuData );
++    ok( mi.dwContextHelpID == 77, "got help id %lu\n", mi.dwContextHelpID );
++    ret = GetMenuItemCount( menu );
++    ok( ret == 2, "got %d items\n", ret );
++    memset( text, 0xcc, sizeof(text) );
++    ret = GetMenuStringW( menu, 101, text, 4, MF_BYCOMMAND );
++    ok( ret == 3 && !wcscmp( text, L"&Fi" ), "got %d %s\n", ret, debugstr_w(text) );
++    ok( text[4] == 0xcccc, "wrote past the text\n" );
++    ret = GetMenuState( menu, 1, MF_BYPOSITION );
++    ok( ret == 0x110, "got state %#x\n", ret );
++    ok( GetMenuItemID( menu, 0 ) == 101, "got id %u\n", GetMenuItemID( menu, 0 ) );
++    ok( GetSubMenu( menu, 1 ) == popup, "got submenu %p\n", GetSubMenu( menu, 1 ) );
++
++    mi.fMask = MIM_MENUDATA;
++    mi.dwMenuData = 0x5678;
++    ret = SetMenuInfo( menu, &mi );
++    ok( ret, "SetMenuInfo failed, error %lu\n", GetLastError() );
++    ret = InsertMenuW( menu, 0, MF_BYPOSITION | MF_STRING, 301, L"Child item" );
++    ok( ret, "InsertMenu failed, error %lu\n", GetLastError() );
++    mine = CreatePopupMenu();
++    AppendMenuW( mine, MF_STRING, 401, L"Child sub item" );
++    memset( &info, 0, sizeof(info) );
++    info.cbSize = sizeof(info);
++    info.fMask = MIIM_STRING | MIIM_SUBMENU | MIIM_ID | MIIM_DATA;
++    info.wID = 402;
++    info.hSubMenu = mine;
++    info.dwItemData = 0xc0de;
++    info.dwTypeData = (WCHAR *)L"Child popup";
++    ret = InsertMenuItemW( menu, -1, TRUE, &info );
++    ok( ret, "InsertMenuItem failed, error %lu\n", GetLastError() );
++    ret = ModifyMenuW( menu, 101, MF_BYCOMMAND | MF_STRING, 102, L"First, modified" );
++    ok( ret, "ModifyMenu failed, error %lu\n", GetLastError() );
++    ret = CheckMenuItem( menu, 102, MF_BYCOMMAND | MF_CHECKED );
++    ok( ret == MF_UNCHECKED, "got %#x\n", ret );
++    ret = AppendMenuW( popup, MF_STRING, 202, L"Sub item from the child" );
++    ok( ret, "AppendMenu failed, error %lu\n", GetLastError() );
++    ret = DeleteMenu( menu, 103, MF_BYCOMMAND );
++    ok( !ret, "DeleteMenu of an item it does not have succeeded\n" );
++    ret = DestroyMenu( doomed );
++    ok( ret, "DestroyMenu failed, error %lu\n", GetLastError() );
++    ok( !IsMenu( doomed ), "the menu is still there\n" );
++
++    SetEvent( done );
++    wait_for_object_pumping( go, 10000 );
++}
++
++static void test_menu_other_process(void)
++{
++    char cmdline[MAX_PATH * 2], **argv;
++    HMENU menu, popup, doomed, sub;
++    PROCESS_INFORMATION pi;
++    STARTUPINFOA si = { sizeof(si) };
++    MENUITEMINFOW info;
++    HANDLE done, go;
++    WCHAR text[32];
++    MENUINFO mi;
++    MSG msg;
++    int ret;
++
++    winetest_get_mainargs( &argv );
++    PeekMessageA( &msg, NULL, 0, 0, PM_NOREMOVE );
++
++    menu = CreateMenu();
++    AppendMenuW( menu, MF_STRING, 101, L"&First" );
++    popup = CreatePopupMenu();
++    AppendMenuW( popup, MF_STRING, 201, L"Sub item" );
++    AppendMenuW( menu, MF_POPUP, (UINT_PTR)popup, L"&Popup" );
++    memset( &mi, 0, sizeof(mi) );
++    mi.cbSize = sizeof(mi);
++    mi.fMask = MIM_MENUDATA | MIM_HELPID;
++    mi.dwMenuData = 0x1234;
++    mi.dwContextHelpID = 77;
++    SetMenuInfo( menu, &mi );
++    doomed = CreatePopupMenu();
++
++    done = CreateEventA( NULL, TRUE, FALSE, "menu_other_process_done" );
++    go = CreateEventA( NULL, TRUE, FALSE, "menu_other_process_go" );
++    sprintf( cmdline, "\"%s\" menu other_process %Ix %Ix %Ix", argv[0], (ULONG_PTR)menu, (ULONG_PTR)popup,
++             (ULONG_PTR)doomed );
++    ret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi );
++    ok( ret, "CreateProcess failed, error %lu\n", GetLastError() );
++    ret = wait_for_object_pumping( done, 20000 );
++    ok( !ret, "the other process never got through, %d\n", ret );
++
++    memset( &mi, 0, sizeof(mi) );
++    mi.cbSize = sizeof(mi);
++    mi.fMask = MIM_MENUDATA;
++    GetMenuInfo( menu, &mi );
++    ok( mi.dwMenuData == 0x5678, "got data %#Ix\n", mi.dwMenuData );
++    ret = GetMenuItemCount( menu );
++    ok( ret == 4, "got %d items\n", ret );
++    ret = GetMenuStringW( menu, 0, text, ARRAY_SIZE(text), MF_BYPOSITION );
++    ok( ret == 10 && !wcscmp( text, L"Child item" ), "got %d %s\n", ret, debugstr_w(text) );
++    ret = GetMenuState( menu, 102, MF_BYCOMMAND );
++    ok( ret == MF_CHECKED, "got state %#x\n", ret );
++    memset( &info, 0, sizeof(info) );
++    info.cbSize = sizeof(info);
++    info.fMask = MIIM_SUBMENU | MIIM_ID | MIIM_DATA;
++    ret = GetMenuItemInfoW( menu, 3, TRUE, &info );
++    ok( ret, "GetMenuItemInfo failed, error %lu\n", GetLastError() );
++    ok( info.wID == 402, "got id %u\n", info.wID );
++    ok( info.dwItemData == 0xc0de, "got data %#Ix\n", info.dwItemData );
++    sub = info.hSubMenu;
++    ok( IsMenu( sub ), "the other process's popup is not a menu\n" );
++    ret = GetMenuStringW( sub, 0, text, ARRAY_SIZE(text), MF_BYPOSITION );
++    ok( ret == 14 && !wcscmp( text, L"Child sub item" ), "got %d %s\n", ret, debugstr_w(text) );
++    ret = GetMenuItemCount( popup );
++    ok( ret == 2, "got %d items in the popup\n", ret );
++    ok( !IsMenu( doomed ), "the destroyed menu is still there\n" );
++
++    SetEvent( go );
++    wait_for_object_pumping( pi.hProcess, 20000 );
++    wait_child_process( &pi );
++    /* the other process's popup went with it */
++    ok( !IsMenu( sub ), "the other process's popup is still there\n" );
++    ret = GetMenuItemCount( menu );
++    ok( ret == 4, "got %d items\n", ret );
++
++    DestroyMenu( menu );
++    CloseHandle( done );
++    CloseHandle( go );
++}
++
+ START_TEST(menu)
+ {
++    char **argv;
++    int argc = winetest_get_mainargs( &argv );
++
++    if (argc > 5 && !strcmp( argv[2], "other_process" ))
++    {
++        test_menu_other_process_child( argv );
++        return;
++    }
++
+     register_menu_check_class();
+ 
+     test_menu_add_string();
+@@ -4262,4 +4432,5 @@ START_TEST(menu)
+     test_menu_circref();
+     test_emptypopup();
+     test_AppendMenu();
++    test_menu_other_process();
+ }
+diff --git a/dlls/win32u/menu.c b/dlls/win32u/menu.c
+index a8227d22707..f56a59b57f0 100644
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -313,7 +313,7 @@ static struct menu *grab_menu_ptr( HMENU handle )
+ 
+     if (menu == OBJ_OTHER_PROCESS)
+     {
+-        WARN( "other process menu %p\n", handle );
++        TRACE( "other process menu %p\n", handle );
+         return NULL;
+     }
+ 
+@@ -344,18 +344,193 @@ static struct menu *unsafe_menu_ptr( HMENU handle )
+     return menu;
+ }
+ 
+-/* see IsMenu */
++/* see IsMenu; a menu of another process is a menu too */
+ BOOL is_menu( HMENU handle )
+ {
+-    struct menu *menu;
+-    BOOL is_menu;
++    void *ptr = get_user_handle_ptr( handle, NTUSER_OBJ_MENU );
+ 
+-    menu = grab_menu_ptr( handle );
+-    is_menu = menu != NULL;
+-    release_menu_ptr( menu );
++    if (ptr && ptr != OBJ_OTHER_PROCESS) release_user_handle_ptr( ptr );
++    if (!ptr) RtlSetLastWin32Error( ERROR_INVALID_MENU_HANDLE );
++    return ptr != NULL;
++}
++
++/* Menus are USER objects that any process on the desktop reads and changes, as OLE's in-place activation has a
++ * container and its object's server do with the menu they share, but here a menu lives in the memory of the process
++ * that made it: a call on a menu of another process is made by the thread that owns the menu (WM_WINE_MENU_CALL).
++ * No such call is made while holding a menu, which is to hold the USER lock. */
++static BOOL is_other_process_menu( HMENU handle )
++{
++    void *ptr = get_user_handle_ptr( handle, NTUSER_OBJ_MENU );
++
++    if (ptr == OBJ_OTHER_PROCESS) return TRUE;
++    if (ptr) release_user_handle_ptr( ptr );
++    return FALSE;
++}
++
++static struct menu_call *alloc_menu_call( enum menu_call_func func, HMENU handle, UINT text_size )
++{
++    struct menu_call *call;
++
++    if (!(call = calloc( 1, sizeof(*call) + text_size )))
++    {
++        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
++        return NULL;
++    }
++    call->func = func;
++    call->menu = HandleToUlong( handle );
++    call->text_size = text_size;
++    return call;
++}
++
++/* have the thread owning a menu of another process make a call on it, and take up the error it left */
++static BOOL call_other_process_menu( struct menu_call *call, LRESULT *result )
++{
++    HMENU handle = UlongToHandle( call->menu );
++    DWORD_PTR res = 0;
++    DWORD pid, tid;
++
++    if (!get_user_handle_owner( handle, NTUSER_OBJ_MENU, &pid, &tid ))
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_MENU_HANDLE );
++        return FALSE;
++    }
++    TRACE( "menu %p: call %u by thread %04x of process %04x\n", handle, call->func, tid, pid );
++    if (!send_internal_message_timeout( pid, tid, WM_WINE_MENU_CALL, 0, (LPARAM)call, SMTO_NORMAL, 0, &res ))
++    {
++        WARN( "menu %p: its thread %04x does not answer\n", handle, tid );
++        RtlSetLastWin32Error( ERROR_INVALID_MENU_HANDLE );
++        return FALSE;
++    }
++    if (call->error) RtlSetLastWin32Error( call->error );
++    *result = res;
++    return TRUE;
++}
++
++/* a call on a menu of another process that has nothing to send and nothing to bring back but its result */
++static LRESULT call_other_process_menu_args( enum menu_call_func func, HMENU handle, UINT pos, UINT flags,
++                                             UINT arg, LRESULT failed )
++{
++    struct menu_call *call;
++    LRESULT ret;
++
++    if (!(call = alloc_menu_call( func, handle, 0 ))) return failed;
++    call->pos   = pos;
++    call->flags = flags;
++    call->arg   = arg;
++    if (!call_other_process_menu( call, &ret )) ret = failed;
++    free( call );
++    return ret;
++}
++
++static void menu_info_to_call( struct menu_call *call, const MENUINFO *info )
++{
++    call->info_mask       = info->fMask;
++    call->info_style      = info->dwStyle;
++    call->info_max_height = info->cyMax;
++    call->info_background = (ULONG_PTR)info->hbrBack;
++    call->info_help_id    = info->dwContextHelpID;
++    call->info_data       = info->dwMenuData;
++}
++
++static void menu_info_from_call( MENUINFO *info, const struct menu_call *call )
++{
++    info->cbSize          = sizeof(*info);
++    info->fMask           = call->info_mask;
++    info->dwStyle         = call->info_style;
++    info->cyMax           = call->info_max_height;
++    info->hbrBack         = (HBRUSH)(ULONG_PTR)call->info_background;
++    info->dwContextHelpID = call->info_help_id;
++    info->dwMenuData      = call->info_data;
++}
++
++/* get or set the menu information of a menu of another process */
++static BOOL call_other_process_menu_info( enum menu_call_func func, HMENU handle, MENUINFO *info )
++{
++    struct menu_call *call;
++    LRESULT ret;
++
++    if (!(call = alloc_menu_call( func, handle, 0 ))) return FALSE;
++    menu_info_to_call( call, info );
++    if (!call_other_process_menu( call, &ret )) ret = FALSE;
++    else if (ret && func == MENU_CALL_GET_INFO) menu_info_from_call( info, call );
++    free( call );
++    return ret;
++}
++
++static void menu_item_to_call( struct menu_call *call, const MENUITEMINFOW *info )
++{
++    call->item_mask       = info->fMask;
++    call->item_type       = info->fType;
++    call->item_state      = info->fState;
++    call->item_id         = info->wID;
++    call->item_submenu    = HandleToUlong( info->hSubMenu );
++    call->item_checked    = (ULONG_PTR)info->hbmpChecked;
++    call->item_unchecked  = (ULONG_PTR)info->hbmpUnchecked;
++    call->item_data       = info->dwItemData;
++    call->item_type_value = (ULONG_PTR)info->dwTypeData;
++    call->item_cch        = info->cch;
++    call->item_bitmap     = (ULONG_PTR)info->hbmpItem;
++}
++
++static void menu_item_from_call( MENUITEMINFOW *info, const struct menu_call *call )
++{
++    info->cbSize        = sizeof(*info);
++    info->fMask         = call->item_mask;
++    info->fType         = call->item_type;
++    info->fState        = call->item_state;
++    info->wID           = call->item_id;
++    info->hSubMenu      = UlongToHandle( call->item_submenu );
++    info->hbmpChecked   = (HBITMAP)(ULONG_PTR)call->item_checked;
++    info->hbmpUnchecked = (HBITMAP)(ULONG_PTR)call->item_unchecked;
++    info->dwItemData    = call->item_data;
++    info->cch           = call->item_cch;
++    info->hbmpItem      = (HBITMAP)(ULONG_PTR)call->item_bitmap;
++}
++
++/* NtUserThunkedMenuItemInfo on a menu of another process: an item's text goes along to be set or inserted, and the
++ * caller's buffer goes and comes back to be read into, so that what the owner does not write stays as it was */
++static UINT call_other_process_menu_item_info( HMENU handle, UINT pos, UINT flags, UINT method,
++                                               MENUITEMINFOW *info )
++{
++    BOOL get = method == NtUserGetMenuItemInfoA || method == NtUserGetMenuItemInfoW;
++    BOOL set = method == NtUserInsertMenuItem || method == NtUserSetMenuItemInfo;
++    UINT failed = (method == NtUserGetMenuItemID || method == NtUserGetMenuState ||
++                   method == NtUserGetMenuDefaultItem) ? -1 : 0;
++    struct menu_call *call;
++    UINT text_size = 0;
++    LRESULT ret;
++
++    if ((get || set) && (!info || info->cbSize != sizeof(*info)))
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (get && (info->fMask & (MIIM_TYPE | MIIM_STRING)) && info->dwTypeData && info->cch)
++        text_size = info->cch * (method == NtUserGetMenuItemInfoA ? sizeof(char) : sizeof(WCHAR));
++    else if (set && (info->fMask & MIIM_STRING) && info->dwTypeData)
++        text_size = (wcslen( info->dwTypeData ) + 1) * sizeof(WCHAR);
+ 
+-    if (!is_menu) RtlSetLastWin32Error( ERROR_INVALID_MENU_HANDLE );
+-    return is_menu;
++    if (!(call = alloc_menu_call( MENU_CALL_ITEM_INFO, handle, text_size ))) return failed;
++    call->pos    = pos;
++    call->flags  = flags;
++    call->method = method;
++    if (info) menu_item_to_call( call, info );
++    if (text_size) memcpy( call + 1, info->dwTypeData, text_size );
++
++    if (!call_other_process_menu( call, &ret )) ret = failed;
++    else if (get)
++    {
++        WCHAR *buffer = info->dwTypeData;
++
++        menu_item_from_call( info, call );
++        if (call->item_type_data == MENU_TYPE_DATA_VALUE)
++            info->dwTypeData = (WCHAR *)(ULONG_PTR)call->item_type_value;
++        else
++            info->dwTypeData = buffer;
++        if (text_size) memcpy( buffer, call + 1, text_size );
++    }
++    free( call );
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -648,7 +823,7 @@ BOOL WINAPI NtUserDestroyMenu( HMENU handle )
+     TRACE( "(%p)\n", handle );
+ 
+     if (!(menu = free_user_handle( handle, NTUSER_OBJ_MENU ))) return FALSE;
+-    if (menu == OBJ_OTHER_PROCESS) return FALSE;
++    if (menu == OBJ_OTHER_PROCESS) return call_other_process_menu_args( MENU_CALL_DESTROY, handle, 0, 0, 0, FALSE );
+ 
+     /* DestroyMenu should not destroy system menu popup owner */
+     if ((menu->wFlags & (MF_POPUP | MF_SYSMENU)) == MF_POPUP && menu->hWnd)
+@@ -697,7 +872,7 @@ BOOL set_window_menu( HWND hwnd, HMENU handle )
+     if (get_capture() == hwnd)
+         set_capture_window( 0, GUI_INMENUMODE, NULL );  /* release the capture */
+ 
+-    if (handle)
++    if (handle && !is_other_process_menu( handle ))
+     {
+         struct menu *menu;
+ 
+@@ -734,6 +909,8 @@ DWORD WINAPI NtUserCheckMenuItem( HMENU handle, UINT id, UINT flags )
+     DWORD ret;
+     UINT pos;
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_CHECK, handle, id, flags, 0, -1 );
+     if (!(menu = find_menu_item(handle, id, flags, &pos)))
+         return -1;
+     item = &menu->items[pos];
+@@ -756,6 +933,9 @@ BOOL WINAPI NtUserEnableMenuItem( HMENU handle, UINT id, UINT flags )
+ 
+     TRACE( "(%p, %04x, %04x)\n", handle, id, flags );
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_ENABLE, handle, id, flags, 0, ~0u );
++
+     /* Get the Popupmenu to access the owner menu */
+     if (!(menu = find_menu_item( handle, id, flags, &pos )))
+         return ~0u;
+@@ -858,8 +1038,12 @@ BOOL WINAPI NtUserGetMenuItemRect( HWND hwnd, HMENU handle, UINT item, RECT *rec
+ 
+ static BOOL set_menu_info( HMENU handle, const MENUINFO *info )
+ {
++    HMENU *submenus = NULL;
+     struct menu *menu;
++    UINT i, count = 0;
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_info( MENU_CALL_SET_INFO, handle, (MENUINFO *)info );
+     if (!(menu = grab_menu_ptr( handle ))) return FALSE;
+ 
+     if (info->fMask & MIM_BACKGROUND) menu->hbrBack = info->hbrBack;
+@@ -868,16 +1052,16 @@ static BOOL set_menu_info( HMENU handle, const MENUINFO *info )
+     if (info->fMask & MIM_MENUDATA)   menu->dwMenuData = info->dwMenuData;
+     if (info->fMask & MIM_STYLE)      menu->dwStyle = info->dwStyle;
+ 
+-    if (info->fMask & MIM_APPLYTOSUBMENUS)
++    /* the submenus are set once the menu is let go of, as some may be of another process */
++    if ((info->fMask & MIM_APPLYTOSUBMENUS) && (submenus = malloc( menu->nItems * sizeof(*submenus) )))
+     {
+-        int i;
+-        struct menu_item *item = menu->items;
+-        for (i = menu->nItems; i; i--, item++)
+-            if (item->fType & MF_POPUP)
+-                set_menu_info( item->hSubMenu, info);
++        for (i = 0; i < menu->nItems; i++)
++            if (menu->items[i].fType & MF_POPUP) submenus[count++] = menu->items[i].hSubMenu;
+     }
+ 
+     release_menu_ptr( menu );
++    for (i = 0; i < count; i++) set_menu_info( submenus[i], info );
++    free( submenus );
+     return TRUE;
+ }
+ 
+@@ -916,6 +1100,8 @@ BOOL get_menu_info( HMENU handle, MENUINFO *info )
+ 
+     TRACE( "(%p %p)\n", handle, info );
+ 
++    if (info && info->cbSize == sizeof(MENUINFO) && is_other_process_menu( handle ))
++        return call_other_process_menu_info( MENU_CALL_GET_INFO, handle, info );
+     if (!info || info->cbSize != sizeof(MENUINFO) || !(menu = grab_menu_ptr( handle )))
+     {
+         RtlSetLastWin32Error( ERROR_INVALID_PARAMETER);
+@@ -994,7 +1180,10 @@ static BOOL set_menu_item_info( struct menu_item *menu, const MENUITEMINFOW *inf
+     if (info->fMask & MIIM_SUBMENU)
+     {
+         menu->hSubMenu = info->hSubMenu;
+-        if (menu->hSubMenu)
++        /* one of another process goes in as it is: what is in it is not ours to look at from here */
++        if (menu->hSubMenu && is_other_process_menu( menu->hSubMenu ))
++            menu->fType |= MF_POPUP;
++        else if (menu->hSubMenu)
+         {
+             struct menu *submenu = grab_menu_ptr( menu->hSubMenu );
+             if (!submenu)
+@@ -1051,17 +1240,15 @@ UINT get_menu_state( HMENU handle, UINT item_id, UINT flags )
+     TRACE( "  item: %s\n", debugstr_menuitem( item ));
+     if (item->fType & MF_POPUP)
+     {
+-        struct menu *submenu = grab_menu_ptr( item->hSubMenu );
+-        if (submenu)
+-            state = (submenu->nItems << 8) | ((item->fState | item->fType) & 0xff);
+-        else
+-            state = -1;
+-        release_menu_ptr( submenu );
+-    }
+-    else
+-    {
+-        state = item->fType | item->fState;
++        HMENU submenu = item->hSubMenu;
++        INT count;
++
++        state = (item->fState | item->fType) & 0xff;
++        release_menu_ptr( menu );
++        if ((count = get_menu_item_count( submenu )) < 0) return -1;
++        return (count << 8) | state;
+     }
++    state = item->fType | item->fState;
+     release_menu_ptr(menu);
+     return state;
+ }
+@@ -1265,20 +1452,24 @@ static UINT get_menu_default_item( HMENU handle, UINT bypos, UINT flags )
+     /* default: don't return disabled items */
+     if (item && (!(GMDI_USEDISABLED & flags)) && (item->fState & MFS_DISABLED)) item = NULL;
+ 
++    if (!item) i = -1;
++    else if (!bypos) i = item->wID;
++
+     /* search submenu when needed */
+     if (item && (item->fType & MF_POPUP) && (flags & GMDI_GOINTOPOPUPS))
+     {
+-        UINT ret = get_menu_default_item( item->hSubMenu, bypos, flags );
+-        if (ret != -1)
+-        {
+-            release_menu_ptr( menu );
+-            return ret;
+-        }
++        HMENU submenu = item->hSubMenu;
++        UINT ret;
++
++        release_menu_ptr( menu );
++        if (is_other_process_menu( submenu ))
++            ret = call_other_process_menu_item_info( submenu, bypos, flags, NtUserGetMenuDefaultItem, NULL );
++        else
++            ret = get_menu_default_item( submenu, bypos, flags );
+         /* when item not found in submenu, return the popup item */
++        return ret != -1 ? ret : i;
+     }
+ 
+-    if (!item) i = -1;
+-    else if (!bypos) i = item->wID;
+     release_menu_ptr( menu );
+     return i;
+ }
+@@ -1293,6 +1484,9 @@ UINT WINAPI NtUserThunkedMenuItemInfo( HMENU handle, UINT pos, UINT flags, UINT
+     UINT i;
+     BOOL ret;
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_item_info( handle, pos, flags, method, info );
++
+     switch (method)
+     {
+     case NtUserCheckMenuRadioItem:
+@@ -1371,6 +1565,8 @@ INT get_menu_item_count( HMENU handle )
+     struct menu *menu;
+     INT count;
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_ITEM_COUNT, handle, 0, 0, 0, -1 );
+     if (!(menu = grab_menu_ptr( handle ))) return -1;
+     count = menu->nItems;
+     release_menu_ptr(menu);
+@@ -1389,6 +1585,8 @@ BOOL WINAPI NtUserRemoveMenu( HMENU handle, UINT id, UINT flags )
+ 
+     TRACE( "(menu=%p id=%#x flags=%04x)\n", handle, id, flags );
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_REMOVE, handle, id, flags, 0, FALSE );
+     if (!(menu = find_menu_item( handle, id, flags, &pos )))
+         return FALSE;
+ 
+@@ -1424,16 +1622,20 @@ BOOL WINAPI NtUserRemoveMenu( HMENU handle, UINT id, UINT flags )
+ BOOL WINAPI NtUserDeleteMenu( HMENU handle, UINT id, UINT flags )
+ {
+     struct menu *menu;
++    HMENU owner, submenu;
+     UINT pos;
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_DELETE, handle, id, flags, 0, FALSE );
+     if (!(menu = find_menu_item( handle, id, flags, &pos )))
+         return FALSE;
+ 
+-    if (menu->items[pos].fType & MF_POPUP)
+-        NtUserDestroyMenu( menu->items[pos].hSubMenu );
+-
+-    NtUserRemoveMenu( menu->handle, pos, flags | MF_BYPOSITION );
++    owner = menu->handle;
++    submenu = menu->items[pos].fType & MF_POPUP ? menu->items[pos].hSubMenu : 0;
++    NtUserRemoveMenu( owner, pos, flags | MF_BYPOSITION );
+     release_menu_ptr( menu );
++    /* once the menu is let go of, as the popup may be of another process */
++    if (submenu) NtUserDestroyMenu( submenu );
+     return TRUE;
+ }
+ 
+@@ -1446,6 +1648,8 @@ BOOL WINAPI NtUserSetMenuContextHelpId( HMENU handle, DWORD id )
+ 
+     TRACE( "(%p 0x%08x)\n", handle, id );
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_SET_HELP_ID, handle, 0, 0, id, FALSE );
+     if (!(menu = grab_menu_ptr( handle ))) return FALSE;
+     menu->dwContextHelpID = id;
+     release_menu_ptr( menu );
+@@ -1671,6 +1875,8 @@ BOOL WINAPI NtUserSetMenuDefaultItem( HMENU handle, UINT item, UINT bypos )
+ 
+     TRACE( "(%p,%d,%d)\n", handle, item, bypos );
+ 
++    if (is_other_process_menu( handle ))
++        return call_other_process_menu_args( MENU_CALL_SET_DEFAULT, handle, item, bypos, 0, FALSE );
+     if (!(menu = grab_menu_ptr( handle ))) return FALSE;
+ 
+     /* reset all default-item flags */
+@@ -4773,3 +4979,72 @@ BOOL WINAPI NtUserEndMenu(void)
+     }
+     return exit_menu;
+ }
++
++/* a call that a thread of another process asked for on a menu of this one (WM_WINE_MENU_CALL), made as that thread
++ * would have made it, the error it leaves going back with the result */
++LRESULT handle_menu_call( struct menu_call *call )
++{
++    HMENU handle = UlongToHandle( call->menu );
++    DWORD error = RtlGetLastWin32Error();
++    MENUITEMINFOW item;
++    MENUINFO info;
++    LRESULT ret = 0;
++
++    TRACE( "menu %p: call %u\n", handle, call->func );
++
++    RtlSetLastWin32Error( 0 );
++    switch (call->func)
++    {
++    case MENU_CALL_GET_INFO:
++        menu_info_from_call( &info, call );
++        if ((ret = get_menu_info( handle, &info ))) menu_info_to_call( call, &info );
++        break;
++    case MENU_CALL_SET_INFO:
++        menu_info_from_call( &info, call );
++        if (!(ret = set_menu_info( handle, &info ))) RtlSetLastWin32Error( ERROR_INVALID_MENU_HANDLE );
++        break;
++    case MENU_CALL_ITEM_COUNT:
++        ret = get_menu_item_count( handle );
++        break;
++    case MENU_CALL_ITEM_INFO:
++    {
++        WCHAR *text = call->text_size ? (WCHAR *)(call + 1) : NULL;
++
++        menu_item_from_call( &item, call );
++        item.dwTypeData = text;
++        if (text && (call->method == NtUserInsertMenuItem || call->method == NtUserSetMenuItemInfo))
++            text[call->text_size / sizeof(WCHAR) - 1] = 0;
++        ret = NtUserThunkedMenuItemInfo( handle, call->pos, call->flags, call->method, &item, NULL );
++        menu_item_to_call( call, &item );
++        call->item_type_data = item.dwTypeData == text ? MENU_TYPE_DATA_UNCHANGED : MENU_TYPE_DATA_VALUE;
++        break;
++    }
++    case MENU_CALL_REMOVE:
++        ret = NtUserRemoveMenu( handle, call->pos, call->flags );
++        break;
++    case MENU_CALL_DELETE:
++        ret = NtUserDeleteMenu( handle, call->pos, call->flags );
++        break;
++    case MENU_CALL_DESTROY:
++        ret = NtUserDestroyMenu( handle );
++        break;
++    case MENU_CALL_CHECK:
++        ret = NtUserCheckMenuItem( handle, call->pos, call->flags );
++        break;
++    case MENU_CALL_ENABLE:
++        ret = NtUserEnableMenuItem( handle, call->pos, call->flags );
++        break;
++    case MENU_CALL_SET_DEFAULT:
++        ret = NtUserSetMenuDefaultItem( handle, call->pos, call->flags );
++        break;
++    case MENU_CALL_SET_HELP_ID:
++        ret = NtUserSetMenuContextHelpId( handle, call->arg );
++        break;
++    default:
++        FIXME( "unknown menu call %u\n", call->func );
++        break;
++    }
++    call->error = RtlGetLastWin32Error();
++    RtlSetLastWin32Error( error );
++    return ret;
++}
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 1bd4efbaa8d..d0102616498 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -918,6 +918,13 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
+         memcpy( &ps->hook, &h_extra, sizeof(h_extra) );
+         break;
+     }
++    case WM_WINE_MENU_CALL:
++    {
++        const struct menu_call *call = *buffer;
++        if (size < sizeof(*call) || size - sizeof(*call) < call->text_size) return FALSE;
++        minsize = sizeof(*call);
++        break;
++    }
+     case CB_GETCOMBOBOXINFO:
+     {
+         COMBOBOXINFO cbi = { sizeof(COMBOBOXINFO) };
+@@ -1287,6 +1294,12 @@ static size_t pack_message( HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
+         push_data( data, (LPVOID)h_extra->lparam, sizeof(MSLLHOOKSTRUCT) );
+         return 0;
+     }
++    case WM_WINE_MENU_CALL:
++    {
++        const struct menu_call *call = (const struct menu_call *)lparam;
++        push_data( data, call, sizeof(*call) + call->text_size );
++        return sizeof(*call) + call->text_size;
++    }
+     case WM_NCPAINT:
+         if (wparam <= 1) return 0;
+         FIXME( "WM_NCPAINT hdc packing not supported yet\n" );
+@@ -1482,6 +1495,12 @@ static void pack_reply( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+     case WM_ASKCBFORMATNAME:
+         push_data( data, (WCHAR *)lparam, (lstrlenW((WCHAR *)lparam) + 1) * sizeof(WCHAR) );
+         break;
++    case WM_WINE_MENU_CALL:
++    {
++        const struct menu_call *call = (const struct menu_call *)lparam;
++        push_data( data, call, sizeof(*call) + call->text_size );
++        break;
++    }
+     }
+ }
+ 
+@@ -1641,6 +1660,14 @@ static void unpack_reply( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+             /* don't allow changing class and title pointers */
+         }
+         break;
++    case WM_WINE_MENU_CALL:
++    {
++        struct menu_call *call = (struct menu_call *)lparam;
++        size_t max = sizeof(*call) + call->text_size;
++
++        if (size >= sizeof(*call)) memcpy( call, buffer, min( max, size ));
++        break;
++    }
+     default:
+         ERR( "should not happen: unexpected message %x\n", message );
+         break;
+@@ -2277,6 +2304,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     case WM_WINE_INVALIDATEDCE:
+         invalidate_child_dces( hwnd );
+         return 0;
++    case WM_WINE_MENU_CALL:
++        return handle_menu_call( (struct menu_call *)lparam );
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index e540f92ddf3..465fb59d030 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -221,10 +221,69 @@ extern void release_opengl_drawables( struct list *drawables );
+ /* vulkan.c */
+ extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_instance_extensions *extensions );
+ 
++/* menu.c */
++
++/* what a call on a menu of another process does (WM_WINE_MENU_CALL) */
++enum menu_call_func
++{
++    MENU_CALL_GET_INFO,
++    MENU_CALL_SET_INFO,
++    MENU_CALL_ITEM_COUNT,
++    MENU_CALL_ITEM_INFO,
++    MENU_CALL_REMOVE,
++    MENU_CALL_DELETE,
++    MENU_CALL_DESTROY,
++    MENU_CALL_CHECK,
++    MENU_CALL_ENABLE,
++    MENU_CALL_SET_DEFAULT,
++    MENU_CALL_SET_HELP_ID,
++};
++
++/* a call on a menu of another process, which the thread owning the menu makes for the caller; laid out the same in
++ * every process, with its 64-bit fields 8-byte aligned whatever the alignment rules, it goes between processes as it
++ * is, followed by text_size bytes of an item's text */
++struct menu_call
++{
++    UINT      func;            /* enum menu_call_func */
++    UINT      menu;            /* the menu */
++    UINT      pos;             /* item id or position */
++    UINT      flags;           /* MF_BYPOSITION and the like */
++    UINT      method;          /* NtUserThunkedMenuItemInfo method */
++    UINT      arg;             /* context help id */
++    UINT      error;           /* the error of a call that failed */
++    UINT      text_size;       /* bytes of text that follow: to set or insert, or room for what is read */
++    UINT      item_mask;       /* MENUITEMINFOW */
++    UINT      item_type;
++    UINT      item_state;
++    UINT      item_id;
++    UINT      item_submenu;
++    UINT      item_cch;
++    UINT      item_type_data;  /* how the call left dwTypeData: MENU_TYPE_DATA_* below */
++    UINT      info_mask;       /* MENUINFO */
++    ULONGLONG item_checked;
++    ULONGLONG item_unchecked;
++    ULONGLONG item_data;
++    ULONGLONG item_type_value; /* dwTypeData that is not the text */
++    ULONGLONG item_bitmap;
++    UINT      info_style;
++    UINT      info_max_height;
++    UINT      info_help_id;
++    UINT      padding;
++    ULONGLONG info_background;
++    ULONGLONG info_data;
++};
++
++#define MENU_TYPE_DATA_UNCHANGED 0  /* dwTypeData left as the caller had it */
++#define MENU_TYPE_DATA_TEXT      1  /* the text that follows */
++#define MENU_TYPE_DATA_VALUE     2  /* item_type_value */
++
++extern LRESULT handle_menu_call( struct menu_call *call );
++
+ /* window.c */
+ HANDLE alloc_user_handle( void *ptr, unsigned short type );
+ void *free_user_handle( HANDLE handle, unsigned short type );
+ void *get_user_handle_ptr( HANDLE handle, unsigned short type );
++BOOL get_user_handle_owner( HANDLE handle, unsigned short type, DWORD *pid, DWORD *tid );
+ void release_user_handle_ptr( void *ptr );
+ void *next_thread_user_object( UINT tid, HANDLE *handle, unsigned short type );
+ UINT win_set_flags( HWND hwnd, UINT set_mask, UINT clear_mask );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 0a7325f0d45..a99f3b37cea 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -187,6 +187,17 @@ struct obj_locator get_window_class_locator( HWND hwnd )
+     return locator;
+ }
+ 
++/* the process and the thread that own a user handle */
++BOOL get_user_handle_owner( HANDLE handle, unsigned short type, DWORD *pid, DWORD *tid )
++{
++    struct user_entry entry;
++
++    if (!get_user_entry( handle, type, &entry, &handle )) return FALSE;
++    *pid = entry.pid;
++    *tid = entry.tid;
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           get_window_wndproc_handle
+  */
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 7bf0e3fc71f..0d99eebc04f 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -644,6 +644,7 @@ enum wine_internal_message
+     WM_WINE_SETPIXELFORMAT,
+     WM_WINE_DISPLAYMODECHANGED,
+     WM_WINE_INVALIDATEDCE,
++    WM_WINE_MENU_CALL,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,

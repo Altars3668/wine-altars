@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:40:18 -0400
+Subject: [PATCH] combase: Track default process security and report local
+ proxy blankets.
+
+Match the measured initialization order, parameter errors and local
+proxy settings. Standard marshaling fixes the implicit process defaults,
+and a later CoInitializeSecurity returns RPC_E_TOO_LATE.
+
+This covers Office's default authentication/NULL descriptor path;
+custom authentication services and descriptor enforcement remain
+explicitly unsupported rather than being claimed as implemented.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 5b2b0b0495e..19fe8c2085b 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -50,6 +50,28 @@ static LONG com_lockcount;
+ 
+ static LONG com_server_process_refcount;
+ 
++static CRITICAL_SECTION security_cs;
++static CRITICAL_SECTION_DEBUG security_cs_debug =
++{
++    0, 0, &security_cs,
++    { &security_cs_debug.ProcessLocksList, &security_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": security_cs") }
++};
++static CRITICAL_SECTION security_cs = { &security_cs_debug, -1, 0, 0, 0, 0 };
++static BOOL security_initialized;
++static struct security_settings security_settings =
++{
++    RPC_C_AUTHN_LEVEL_CONNECT, RPC_C_IMP_LEVEL_IDENTIFY, EOAC_NONE,
++};
++
++void com_get_security_settings(struct security_settings *settings)
++{
++    EnterCriticalSection(&security_cs);
++    security_initialized = TRUE;
++    if (settings) *settings = security_settings;
++    LeaveCriticalSection(&security_cs);
++}
++
+ struct comclassredirect_data
+ {
+     ULONG size;
+@@ -1167,10 +1189,47 @@ HRESULT WINAPI CoInitializeSecurity(PSECURITY_DESCRIPTOR sd, LONG cAuthSvc,
+         SOLE_AUTHENTICATION_SERVICE *asAuthSvc, void *reserved1, DWORD authn_level,
+         DWORD imp_level, void *reserved2, DWORD capabilities, void *reserved3)
+ {
+-    FIXME("%p, %ld, %p, %p, %ld, %ld, %p, %ld, %p stub\n", sd, cAuthSvc, asAuthSvc, reserved1, authn_level,
++    const DWORD valid_capabilities = EOAC_MUTUAL_AUTH | EOAC_SECURE_REFS | EOAC_ACCESS_CONTROL | EOAC_APPID |
++            EOAC_DYNAMIC | EOAC_STATIC_CLOAKING | EOAC_DYNAMIC_CLOAKING | EOAC_ANY_AUTHORITY | EOAC_MAKE_FULLSIC |
++            EOAC_REQUIRE_FULLSIC | EOAC_AUTO_IMPERSONATE | EOAC_DEFAULT | EOAC_DISABLE_AAA | EOAC_NO_CUSTOM_MARSHAL;
++    DWORD error = GetLastError();
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %ld, %p, %p, %lu, %lu, %p, %#lx, %p.\n", sd, cAuthSvc, asAuthSvc, reserved1, authn_level,
+             imp_level, reserved2, capabilities, reserved3);
+ 
+-    return S_OK;
++    if (!InternalIsProcessInitialized())
++    {
++        SetLastError(ERROR_SUCCESS);
++        return CO_E_NOTINITIALIZED;
++    }
++
++    EnterCriticalSection(&security_cs);
++    if (security_initialized)
++    {
++        hr = RPC_E_TOO_LATE;
++        SetLastError(error);
++    }
++    else if (authn_level > RPC_C_AUTHN_LEVEL_PKT_PRIVACY || imp_level > RPC_C_IMP_LEVEL_DELEGATE ||
++            (capabilities & ~valid_capabilities) ||
++            ((capabilities & EOAC_STATIC_CLOAKING) && (capabilities & EOAC_DYNAMIC_CLOAKING)) ||
++            cAuthSvc < -1 || (cAuthSvc > 0 && !asAuthSvc) || reserved1 || reserved3)
++    {
++        hr = E_INVALIDARG;
++        SetLastError(ERROR_NO_TOKEN);
++    }
++    else
++    {
++        if (sd || cAuthSvc > 0 || reserved2)
++            FIXME("Security descriptor and authentication services are not supported yet.\n");
++        security_settings.authn_level = authn_level ? authn_level : RPC_C_AUTHN_LEVEL_CONNECT;
++        security_settings.imp_level = imp_level ? imp_level : RPC_C_IMP_LEVEL_IDENTIFY;
++        security_settings.capabilities = capabilities;
++        security_initialized = TRUE;
++        SetLastError(ERROR_SUCCESS);
++    }
++    LeaveCriticalSection(&security_cs);
++    return hr;
+ }
+ 
+ /***********************************************************************
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index 5cc09e72dc3..6d53fb33af6 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -271,3 +271,12 @@ HRESULT ipid_get_dispatch_params(const IPID *ipid, struct apartment **stub_apt,
+ HRESULT ipid_get_dest_context(const IPID *ipid, MSHCTX *dest_context, void **dest_context_data);
+ HRESULT start_apartment_remote_unknown(struct apartment *apt);
+ void get_process_secret(GUID *process_secret);
++
++struct security_settings
++{
++    DWORD authn_level;
++    DWORD imp_level;
++    DWORD capabilities;
++};
++
++void com_get_security_settings(struct security_settings *settings);
+diff --git a/dlls/combase/marshal.c b/dlls/combase/marshal.c
+index ba86acf5a55..89e38dba8ba 100644
+--- a/dlls/combase/marshal.c
++++ b/dlls/combase/marshal.c
+@@ -1378,26 +1378,40 @@ static HRESULT WINAPI ProxyCliSec_QueryBlanket(IClientSecurity *iface,
+                                                void **pAuthInfo,
+                                                DWORD *pCapabilities)
+ {
+-    FIXME("(%p, %p, %p, %p, %p, %p, %p, %p): stub\n", pProxy, pAuthnSvc,
++    struct proxy_manager *This = impl_from_IClientSecurity(iface);
++    struct security_settings settings;
++    struct ifproxy *ifproxy;
++    BOOL found = pProxy == (IUnknown *)&This->IMultiQI_iface;
++
++    TRACE("(%p, %p, %p, %p, %p, %p, %p, %p)\n", pProxy, pAuthnSvc,
+           pAuthzSvc, ppServerPrincName, pAuthnLevel, pImpLevel, pAuthInfo,
+           pCapabilities);
+ 
++    EnterCriticalSection(&This->cs);
++    LIST_FOR_EACH_ENTRY(ifproxy, &This->interfaces, struct ifproxy, entry)
++    {
++        if (pProxy == ifproxy->iface) found = TRUE;
++    }
++    LeaveCriticalSection(&This->cs);
++    if (!found) return E_NOINTERFACE;
++
++    com_get_security_settings(&settings);
+     if (pAuthnSvc)
+-        *pAuthnSvc = 0;
++        *pAuthnSvc = RPC_C_AUTHN_WINNT;
+     if (pAuthzSvc)
+         *pAuthzSvc = 0;
+     if (ppServerPrincName)
+         *ppServerPrincName = NULL;
+     if (pAuthnLevel)
+-        *pAuthnLevel = RPC_C_AUTHN_LEVEL_DEFAULT;
++        *pAuthnLevel = This->oxid_info.dwPid == GetCurrentProcessId() ? RPC_C_AUTHN_LEVEL_PKT_PRIVACY : settings.authn_level;
+     if (pImpLevel)
+-        *pImpLevel = RPC_C_IMP_LEVEL_DEFAULT;
++        *pImpLevel = settings.imp_level;
+     if (pAuthInfo)
+         *pAuthInfo = NULL;
+     if (pCapabilities)
+-        *pCapabilities = EOAC_NONE;
++        *pCapabilities = settings.capabilities & (EOAC_MUTUAL_AUTH | EOAC_STATIC_CLOAKING | EOAC_DYNAMIC_CLOAKING);
+ 
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI ProxyCliSec_SetBlanket(IClientSecurity *iface,
+@@ -1551,6 +1565,8 @@ static HRESULT proxy_manager_construct(
+     struct proxy_manager * This = malloc(sizeof(*This));
+     if (!This) return E_OUTOFMEMORY;
+ 
++    com_get_security_settings(NULL);
++
+     This->remoting_mutex = CreateMutexW(NULL, FALSE, NULL);
+     if (!This->remoting_mutex)
+     {
+@@ -2085,6 +2101,8 @@ static HRESULT WINAPI StdMarshalImpl_MarshalInterface(IMarshal *iface, IStream *
+         return CO_E_NOTINITIALIZED;
+     }
+ 
++    com_get_security_settings(NULL);
++
+     /* make sure this apartment can be reached from other threads / processes */
+     rpc_start_remoting(apt);
+ 
+diff --git a/dlls/combase/tests/Makefile.in b/dlls/combase/tests/Makefile.in
+index 21597b38d51..acf84e5540d 100644
+--- a/dlls/combase/tests/Makefile.in
++++ b/dlls/combase/tests/Makefile.in
+@@ -4,6 +4,7 @@ IMPORTS   = combase uuid user32
+ SOURCES = \
+ 	combase.rc \
+ 	roapi.c \
++	security.c \
+ 	string.c \
+ 	wine.combase.test.c \
+ 	wine.combase.test.spec
+diff --git a/dlls/combase/tests/security.c b/dlls/combase/tests/security.c
+new file mode 100644
+index 00000000000..21bcb561714
+--- /dev/null
++++ b/dlls/combase/tests/security.c
+@@ -0,0 +1,243 @@
++/*
++ * COM process security tests
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++#define CONST_VTABLE
++#include "objbase.h"
++#include "wine/test.h"
++
++static LONG factory_refs;
++
++static HRESULT WINAPI factory_QueryInterface(IClassFactory *iface, REFIID iid, void **obj)
++{
++    *obj = NULL;
++    if (!IsEqualIID(iid, &IID_IUnknown) && !IsEqualIID(iid, &IID_IClassFactory)) return E_NOINTERFACE;
++    *obj = iface;
++    IClassFactory_AddRef(iface);
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef(IClassFactory *iface)
++{
++    return InterlockedIncrement(&factory_refs);
++}
++
++static ULONG WINAPI factory_Release(IClassFactory *iface)
++{
++    return InterlockedDecrement(&factory_refs);
++}
++
++static HRESULT WINAPI factory_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID iid, void **obj)
++{
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static HRESULT WINAPI factory_LockServer(IClassFactory *iface, BOOL lock)
++{
++    return S_OK;
++}
++
++static const IClassFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateInstance,
++    factory_LockServer,
++};
++
++static IClassFactory factory = { &factory_vtbl };
++
++struct proxy_params
++{
++    IStream *stream;
++    DWORD imp_level;
++};
++
++static DWORD WINAPI test_proxy(void *arg)
++{
++    struct proxy_params *params = arg;
++    DWORD authn, authz, authn_level, imp_level, capabilities;
++    RPC_AUTH_IDENTITY_HANDLE identity;
++    IClientSecurity *security;
++    IClassFactory *proxy;
++    OLECHAR *principal;
++    void *obj;
++    HRESULT hr;
++
++    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    ok(hr == S_OK, "Got %#lx.\n", hr);
++    if (FAILED(hr)) return 0;
++
++    hr = CoGetInterfaceAndReleaseStream(params->stream, &IID_IClassFactory, (void **)&proxy);
++    params->stream = NULL;
++    ok(hr == S_OK, "Got %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IClassFactory_QueryInterface(proxy, &IID_IClientSecurity, (void **)&security);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        if (SUCCEEDED(hr)) IClientSecurity_Release(security);
++
++        authn = authz = authn_level = imp_level = capabilities = 0xdeadbeef;
++        principal = (void *)0xdeadbeef;
++        identity = (void *)0xdeadbeef;
++        hr = CoQueryProxyBlanket((IUnknown *)proxy, &authn, &authz, &principal,
++                &authn_level, &imp_level, &identity, &capabilities);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        ok(authn == RPC_C_AUTHN_WINNT, "Got authn %lu.\n", authn);
++        ok(authz == RPC_C_AUTHZ_NONE, "Got authz %lu.\n", authz);
++        ok(authn_level == RPC_C_AUTHN_LEVEL_PKT_PRIVACY, "Got authn level %lu.\n", authn_level);
++        ok(imp_level == params->imp_level, "Got imp level %lu, expected %lu.\n", imp_level, params->imp_level);
++        ok(!principal || !*principal, "Got principal %p.\n", principal);
++        ok(!identity, "Got identity %p.\n", identity);
++        ok(capabilities == EOAC_NONE, "Got capabilities %#lx.\n", capabilities);
++        if (SUCCEEDED(hr)) CoTaskMemFree(principal);
++
++        hr = IClassFactory_CreateInstance(proxy, NULL, &IID_IUnknown, &obj);
++        ok(hr == E_NOINTERFACE, "Got %#lx.\n", hr);
++        IClassFactory_Release(proxy);
++    }
++    CoUninitialize();
++    return 0;
++}
++
++static void test_security(const char *name)
++{
++    DWORD authn_level = RPC_C_AUTHN_LEVEL_DEFAULT, imp_level = RPC_C_IMP_LEVEL_IMPERSONATE;
++    DWORD capabilities = EOAC_NONE, index;
++    struct proxy_params params = {0};
++    HANDLE thread;
++    HRESULT hr, expected = S_OK;
++    BOOL before = !strcmp(name, "before"), marshal_first = !strcmp(name, "marshal_first");
++
++    factory_refs = 1;
++    params.imp_level = RPC_C_IMP_LEVEL_IMPERSONATE;
++    if (before)
++    {
++        SetLastError(0xdeadbeef);
++        hr = CoInitializeSecurity(NULL, -1, NULL, NULL, authn_level, imp_level, NULL, capabilities, NULL);
++        ok(hr == CO_E_NOTINITIALIZED, "Got %#lx.\n", hr);
++        ok(!GetLastError(), "Got error %lu.\n", GetLastError());
++        params.imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
++    }
++
++    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    ok(hr == S_OK, "Got %#lx.\n", hr);
++    if (FAILED(hr)) return;
++
++    if (marshal_first)
++    {
++        hr = CoMarshalInterThreadInterfaceInStream(&IID_IClassFactory, (IUnknown *)&factory, &params.stream);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++        expected = RPC_E_TOO_LATE;
++        params.imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
++    }
++    if (!strcmp(name, "bad_authn"))
++    {
++        authn_level = 0x7fffffff;
++        expected = E_INVALIDARG;
++        params.imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
++    }
++    if (!strcmp(name, "bad_capabilities"))
++    {
++        capabilities = 0x80000000;
++        expected = E_INVALIDARG;
++        params.imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
++    }
++    if (!strcmp(name, "explicit"))
++    {
++        authn_level = RPC_C_AUTHN_LEVEL_PKT_PRIVACY;
++        imp_level = params.imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
++    }
++    if (!before)
++    {
++        SetLastError(0xdeadbeef);
++        hr = CoInitializeSecurity(NULL, -1, NULL, NULL, authn_level, imp_level, NULL, capabilities, NULL);
++        ok(hr == expected, "Got %#lx, expected %#lx.\n", hr, expected);
++        ok(GetLastError() == (expected == S_OK ? 0 : expected == E_INVALIDARG ? ERROR_NO_TOKEN : 0xdeadbeef),
++                "Got error %lu.\n", GetLastError());
++    }
++    if (!strcmp(name, "second"))
++    {
++        SetLastError(0xdeadbeef);
++        hr = CoInitializeSecurity(NULL, -1, NULL, NULL, authn_level, imp_level, NULL, capabilities, NULL);
++        ok(hr == RPC_E_TOO_LATE, "Got %#lx.\n", hr);
++        ok(GetLastError() == 0xdeadbeef, "Got error %lu.\n", GetLastError());
++    }
++
++    if (!params.stream)
++    {
++        hr = CoMarshalInterThreadInterfaceInStream(&IID_IClassFactory, (IUnknown *)&factory, &params.stream);
++        ok(hr == S_OK, "Got %#lx.\n", hr);
++    }
++    if (params.stream)
++    {
++        thread = CreateThread(NULL, 0, test_proxy, &params, 0, NULL);
++        ok(!!thread, "Got error %lu.\n", GetLastError());
++        if (thread)
++        {
++            hr = CoWaitForMultipleHandles(0, 10000, 1, &thread, &index);
++            ok(hr == S_OK, "Got %#lx.\n", hr);
++            if (FAILED(hr)) ExitProcess(1);
++            CloseHandle(thread);
++        }
++        if (params.stream)
++        {
++            static const LARGE_INTEGER zero;
++            IStream_Seek(params.stream, zero, STREAM_SEEK_SET, NULL);
++            CoReleaseMarshalData(params.stream);
++            IStream_Release(params.stream);
++        }
++    }
++    ok(factory_refs == 1, "Got refs %ld.\n", factory_refs);
++    CoUninitialize();
++}
++
++START_TEST(security)
++{
++    static const char *const cases[] =
++    {
++        "office", "second", "before", "marshal_first", "bad_authn", "bad_capabilities", "explicit",
++    };
++    STARTUPINFOA startup = {sizeof(startup)};
++    PROCESS_INFORMATION process;
++    char **argv, command[MAX_PATH * 2];
++    unsigned int i;
++    int argc;
++    BOOL ret;
++
++    argc = winetest_get_mainargs(&argv);
++    if (argc == 3)
++    {
++        test_security(argv[2]);
++        return;
++    }
++    for (i = 0; i < ARRAY_SIZE(cases); ++i)
++    {
++        winetest_push_context("%s", cases[i]);
++        sprintf(command, "\"%s\" security %s", argv[0], cases[i]);
++        ret = CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process);
++        ok(ret, "Got error %lu.\n", GetLastError());
++        if (ret)
++        {
++            wait_child_process(&process);
++        }
++        winetest_pop_context();
++    }
++}
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index a0560f401c8..c4dc82f8565 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -4754,13 +4754,13 @@ static void test_client_security(void)
+     ok_ole_success(hr, "IUnknown_QueryInterface IID_IClientSecurity");
+ 
+     hr = IClientSecurity_QueryBlanket(pCliSec, (IUnknown *)pProxy, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+-    todo_wine ok_ole_success(hr, "IClientSecurity_QueryBlanket (all NULLs)");
++    ok_ole_success(hr, "IClientSecurity_QueryBlanket (all NULLs)");
+ 
+     hr = IClientSecurity_QueryBlanket(pCliSec, (IUnknown *)pMarshal, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+-    todo_wine ok(hr == E_NOINTERFACE, "IClientSecurity_QueryBlanket with local interface should have returned E_NOINTERFACE instead of 0x%08lx\n", hr);
++    ok(hr == E_NOINTERFACE, "IClientSecurity_QueryBlanket with local interface should have returned E_NOINTERFACE instead of 0x%08lx\n", hr);
+ 
+     hr = IClientSecurity_QueryBlanket(pCliSec, (IUnknown *)pProxy, &dwAuthnSvc, &dwAuthzSvc, &pServerPrincName, &dwAuthnLevel, &dwImpLevel, &pAuthInfo, &dwCapabilities);
+-    todo_wine ok_ole_success(hr, "IClientSecurity_QueryBlanket");
++    ok_ole_success(hr, "IClientSecurity_QueryBlanket");
+ 
+     hr = IClientSecurity_SetBlanket(pCliSec, (IUnknown *)pProxy, dwAuthnSvc, dwAuthzSvc, pServerPrincName, dwAuthnLevel, RPC_C_IMP_LEVEL_IMPERSONATE, pAuthInfo, dwCapabilities);
+     todo_wine ok_ole_success(hr, "IClientSecurity_SetBlanket");
+@@ -4777,7 +4777,7 @@ static void test_client_security(void)
+     CoTaskMemFree(pServerPrincName);
+ 
+     hr = IClientSecurity_QueryBlanket(pCliSec, pUnknown1, &dwAuthnSvc, &dwAuthzSvc, &pServerPrincName, &dwAuthnLevel, &dwImpLevel, &pAuthInfo, &dwCapabilities);
+-    todo_wine ok_ole_success(hr, "IClientSecurity_QueryBlanket(IUnknown)");
++    ok_ole_success(hr, "IClientSecurity_QueryBlanket(IUnknown)");
+ 
+     CoTaskMemFree(pServerPrincName);
+ 

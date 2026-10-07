@@ -1,0 +1,456 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 06:38:02 -0400
+Subject: [PATCH] win32u, dwmapi: Draw the border of round corners in
+ DWMWA_BORDER_COLOR.
+
+Windows 11 does not only cut the corners of a window that asks for
+DWMWCP_ROUND or DWMWCP_ROUNDSMALL: it draws a border along the rounded
+edge, in the colour the window asks for with DWMWA_BORDER_COLOR, and
+smooths it where it curves.  Office's dropdowns ask for 0x616161 and
+draw a square border of their own, so under Wine their corners looked
+chipped rather than round.
+
+The window surface now carries the frame -- radius, border width and
+colour -- and draws it over what the application drew, at every
+flush.  The corner pixels are sampled 8x8: those less than half inside
+are cut out of the shape, as before, and the border, 1.25 pixels wide
+where it curves, is blended over the rest with the colour inside the
+corner.  That reproduces the corner pixels of Office's font list on
+Windows 11 (build 29671) to within about 0x10 per channel, and drawing
+it twice changes nothing.  The default border, drawn when no colour is
+given, is not drawn, nor is the shadow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/dwmapi/dwmapi_main.c b/dlls/dwmapi/dwmapi_main.c
+index 87d3baaa2ad..20b24c52a9e 100644
+--- a/dlls/dwmapi/dwmapi_main.c
++++ b/dlls/dwmapi/dwmapi_main.c
+@@ -195,9 +195,12 @@ HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD attribute, LPCVOID value,
+     if (kind == ATTRIBUTE_BOOL) data = !!data;
+ 
+     if (!SetPropW(hwnd, attribute_prop(attribute, name), ULongToHandle(data))) return E_HANDLE;
+-    /* the window manager rounds the corners: the window's surface takes that shape */
++    /* the window manager rounds the corners and draws a border along them: the window's surface
++     * takes that shape and that border */
+     if (attribute == DWMWA_WINDOW_CORNER_PREFERENCE)
+         NtUserCallHwndParam(hwnd, data, NtUserCallHwndParam_SetCornerPreference);
++    else if (attribute == DWMWA_BORDER_COLOR)
++        NtUserCallHwndParam(hwnd, data, NtUserCallHwndParam_SetBorderColor);
+     return S_OK;
+ }
+ 
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index e4d1170e625..c2dd2f9e6d0 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -518,6 +518,198 @@ static BOOL clear_surface_shape( struct window_surface *surface )
+     return TRUE;
+ }
+ 
++/* The frame the window manager of Windows 11 gives a window that asks for round corners: it cuts
++ * the corners round and draws a border along the edge, smoothed where it curves.  The corner pixels
++ * are sampled 8 by 8; a pixel less than half inside the rounded edge is cut out of the shape, and
++ * the border, 1.25 times as wide where it curves as where it is straight, is blended over the rest
++ * by how much of each pixel it covers.  What it is blended with is the colour inside the corner, not
++ * the pixel's own: an application often draws a square border of its own along the edge, which
++ * Windows' smoothing lets show through only where the window is, and the window is only partly
++ * there.  This matches the pixels Windows draws, and drawing it twice changes nothing. */
++#define FRAME_SAMPLES 8
++
++static void frame_corner_coverage( UINT radius, UINT border, UINT x, UINT y, UINT *inside, UINT *covered )
++{
++    double r = radius, inner = radius - 1.25 * border, dx, dy, d2;
++    UINT i, j;
++
++    *inside = *covered = 0;
++    for (j = 0; j < FRAME_SAMPLES; j++)
++    {
++        for (i = 0; i < FRAME_SAMPLES; i++)
++        {
++            dx = r - (x + (i + 0.5) / FRAME_SAMPLES);
++            dy = r - (y + (j + 0.5) / FRAME_SAMPLES);
++            d2 = dx * dx + dy * dy;
++            if (d2 > r * r) continue;
++            (*inside)++;
++            if (inner <= 0 || d2 >= inner * inner) (*covered)++;
++        }
++    }
++}
++
++static BOOL frame_pixel_cut( UINT inside )
++{
++    return inside < FRAME_SAMPLES * FRAME_SAMPLES / 2;
++}
++
++/***********************************************************************
++ *           create_frame_region
++ *
++ * The shape of a window of the given size whose corners the window manager rounds.
++ */
++HRGN create_frame_region( int width, int height, UINT radius )
++{
++    UINT x, y, inside, covered;
++    HRGN region, cut;
++
++    if (!(region = NtGdiCreateRectRgn( 0, 0, width, height ))) return 0;
++    radius = min( radius, max( 0, min( width, height ) / 2 ));
++    cut = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++    for (y = 0; y < radius; y++)
++    {
++        for (x = 0; x < radius; x++)
++        {
++            frame_corner_coverage( radius, 1, x, y, &inside, &covered );
++            if (!frame_pixel_cut( inside )) break;
++        }
++        if (!x) break; /* the corners are cut less further from the edge */
++        NtGdiSetRectRgn( cut, 0, y, x, y + 1 );
++        NtGdiCombineRgn( region, region, cut, RGN_DIFF );
++        NtGdiSetRectRgn( cut, width - x, y, width, y + 1 );
++        NtGdiCombineRgn( region, region, cut, RGN_DIFF );
++        NtGdiSetRectRgn( cut, 0, height - 1 - y, x, height - y );
++        NtGdiCombineRgn( region, region, cut, RGN_DIFF );
++        NtGdiSetRectRgn( cut, width - x, height - 1 - y, width, height - y );
++        NtGdiCombineRgn( region, region, cut, RGN_DIFF );
++    }
++    NtGdiDeleteObjectApp( cut );
++    return region;
++}
++
++static UINT32 blend_frame_pixel( UINT32 color, UINT32 pixel, UINT alpha )
++{
++    UINT32 ret = 0;
++    UINT shift;
++
++    for (shift = 0; shift < 32; shift += 8)
++        ret |= ((((color >> shift) & 0xff) * alpha + ((pixel >> shift) & 0xff) * (256 - alpha)) >> 8) << shift;
++    return ret;
++}
++
++/* draw the frame's border into the surface, over what the application drew there */
++static void draw_surface_frame( struct window_surface *surface, const RECT *dirty,
++                                const BITMAPINFO *color_info, void *color_bits )
++{
++    int width = surface->frame_size.cx, height = surface->frame_size.cy, rows = abs( color_info->bmiHeader.biHeight );
++    UINT radius = surface->frame_radius, border = surface->frame_border, stride, corner, alpha;
++    UINT32 color, inside;
++    RECT edges[4], rect, area;
++    int x, y, px, py, i;
++
++    if (color_info->bmiHeader.biBitCount != 32) return;
++    if (color_info->bmiHeader.biCompression == BI_BITFIELDS)
++    {
++        const UINT *masks = (const UINT *)color_info->bmiColors;
++        if (masks[0] != 0xff0000 || masks[1] != 0xff00 || masks[2] != 0xff) return;
++    }
++    else if (color_info->bmiHeader.biCompression != BI_RGB) return;
++    stride = color_info->bmiHeader.biSizeImage / rows;
++    color = 0xff000000 | (GetRValue( surface->frame_color ) << 16) | (GetGValue( surface->frame_color ) << 8) |
++            GetBValue( surface->frame_color );
++
++    /* the dirty area, in the window's coordinates */
++    area = *dirty;
++    OffsetRect( &area, surface->rect.left, surface->rect.top );
++
++#define FRAME_PIXEL( x, y ) ((UINT32 *)((BYTE *)color_bits + (color_info->bmiHeader.biHeight < 0 ? \
++        (y) - surface->rect.top : rows - 1 - ((y) - surface->rect.top)) * stride) + (x) - surface->rect.left)
++
++    /* the straight edges, between the corners */
++    SetRect( &edges[0], radius, 0, width - radius, border );
++    SetRect( &edges[1], radius, height - border, width - radius, height );
++    SetRect( &edges[2], 0, radius, border, height - radius );
++    SetRect( &edges[3], width - border, radius, width, height - radius );
++    for (i = 0; i < ARRAY_SIZE(edges); i++)
++    {
++        if (!intersect_rect( &rect, &edges[i], &area )) continue;
++        for (y = rect.top; y < rect.bottom; y++)
++            for (x = rect.left; x < rect.right; x++) *FRAME_PIXEL( x, y ) = color;
++    }
++
++    /* the corners */
++    for (corner = 0; corner < 4; corner++)
++    {
++        px = corner & 1 ? width - 1 - radius : radius;
++        py = corner & 2 ? height - 1 - radius : radius;
++        if (px < surface->rect.left || px >= surface->rect.right || py < surface->rect.top || py >= surface->rect.bottom)
++            continue;
++        inside = *FRAME_PIXEL( px, py );
++        for (y = 0; y < radius; y++)
++        {
++            py = corner & 2 ? height - 1 - y : y;
++            if (py < area.top || py >= area.bottom) continue;
++            for (x = 0; x < radius; x++)
++            {
++                px = corner & 1 ? width - 1 - x : x;
++                if (px < area.left || px >= area.right) continue;
++                if (!(alpha = surface->frame_pixels[y * radius + x]) || alpha > 256) continue;
++                *FRAME_PIXEL( px, py ) = blend_frame_pixel( color, inside, alpha );
++            }
++        }
++    }
++#undef FRAME_PIXEL
++}
++
++/***********************************************************************
++ *           window_surface_set_frame
++ *
++ * Give the surface of a window of the given size the frame of round corners and a border, or
++ * take it away with radius 0 or color CLR_INVALID.
++ */
++void window_surface_set_frame( struct window_surface *surface, const SIZE *size, UINT radius, UINT border,
++                               COLORREF color )
++{
++    UINT32 *pixels = NULL;
++    UINT x, y, inside, covered;
++    BOOL same;
++
++    if (surface == &dummy_surface) return;
++    radius = min( radius, max( 0, min( size->cx, size->cy ) / 2 ));
++    if (color == CLR_INVALID || !border) radius = 0;
++    if (!radius) color = CLR_INVALID;
++
++    window_surface_lock( surface );
++    same = surface->frame_size.cx == size->cx && surface->frame_size.cy == size->cy && surface->frame_radius == radius &&
++           surface->frame_border == border && surface->frame_color == color;
++    window_surface_unlock( surface );
++    if (same) return;
++
++    /* the corner pixels' coverage, 0 to 256, or more where they are cut */
++    if (radius && (pixels = calloc( radius * radius, sizeof(*pixels) )))
++    {
++        for (y = 0; y < radius; y++)
++        {
++            for (x = 0; x < radius; x++)
++            {
++                frame_corner_coverage( radius, border, x, y, &inside, &covered );
++                pixels[y * radius + x] = frame_pixel_cut( inside ) ? ~0u : covered * 256 / (FRAME_SAMPLES * FRAME_SAMPLES);
++            }
++        }
++    }
++    else radius = 0;
++
++    window_surface_lock( surface );
++    free( surface->frame_pixels );
++    surface->frame_pixels = pixels;
++    surface->frame_size = *size;
++    surface->frame_radius = radius;
++    surface->frame_border = border;
++    surface->frame_color = radius ? color : CLR_INVALID;
++    surface->bounds = surface->rect;
++    window_surface_unlock( surface );
++}
++
+ static BOOL update_surface_shape( struct window_surface *surface, const RECT *rect, const RECT *dirty,
+                                   const BITMAPINFO *color_info, void *color_bits )
+ {
+@@ -563,6 +755,7 @@ struct window_surface *window_surface_create( const struct window_surface_funcs
+     surface->hwnd = hwnd;
+     surface->rect = *rect;
+     surface->color_key = CLR_INVALID;
++    surface->frame_color = CLR_INVALID;
+     surface->alpha_bits = -1;
+     surface->alpha_mask = 0;
+     reset_bounds( &surface->bounds );
+@@ -596,6 +789,7 @@ void window_surface_release( struct window_surface *surface )
+         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
+         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
+         if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
++        free( surface->frame_pixels );
+         surface->funcs->destroy( surface );
+         if (surface != &dummy_surface) free( surface );
+     }
+@@ -634,8 +828,12 @@ void window_surface_flush( struct window_surface *surface )
+ 
+     if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
+     {
+-        BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
+-        void *shape_bits = window_surface_get_shape( surface, shape_info );
++        void *shape_bits;
++        BOOL shape_changed;
++
++        if (surface->frame_radius) draw_surface_frame( surface, &dirty, color_info, color_bits );
++        shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
++        shape_bits = window_surface_get_shape( surface, shape_info );
+ 
+         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
+                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 7a1919bfd74..ee0f25afa4f 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -72,6 +72,7 @@ typedef struct tagWND
+     int                pixel_format;  /* Pixel format set by the graphics driver */
+     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
+     UINT               corner_preference; /* DWMWA_WINDOW_CORNER_PREFERENCE, for the surface shape */
++    COLORREF           border_color;  /* DWMWA_BORDER_COLOR, for the border of round corners */
+ } WND;
+ 
+ /* WND flags values */
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 6c695003b3a..3f23602efb2 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -61,6 +61,9 @@ extern void window_surface_unlock( struct window_surface *surface );
+ extern void window_surface_flush( struct window_surface *surface );
+ extern void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
+ extern void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
++extern void window_surface_set_frame( struct window_surface *surface, const SIZE *size, UINT radius, UINT border,
++                                      COLORREF color );
++extern HRGN create_frame_region( int width, int height, UINT radius );
+ 
+ /* defwnd.c */
+ extern BOOL adjust_window_rect( RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 0133cf39933..2dd991acec5 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2110,17 +2110,14 @@ static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *
+ }
+ 
+ /***********************************************************************
+- *           get_corner_region
++ *           get_corner_radius
+  *
+  * The rounded corners the desktop window manager of Windows 11 gives a window that asks for
+  * them with DWMWA_WINDOW_CORNER_PREFERENCE: 8 pixels, or 4 for the small ones, at 96 dpi.  A
+  * maximized window stays square.
+  */
+-static HRGN get_corner_region( WND *win, UINT dpi )
++static UINT get_corner_radius( WND *win, UINT dpi )
+ {
+-    /* in the surface, whose rect is rounded up, the window is at 0,0 */
+-    int width = win->rects.visible.right - win->rects.visible.left;
+-    int height = win->rects.visible.bottom - win->rects.visible.top;
+     UINT radius;
+ 
+     switch (win->corner_preference)
+@@ -2130,9 +2127,7 @@ static HRGN get_corner_region( WND *win, UINT dpi )
+     default: return 0;
+     }
+     if (win->dwStyle & WS_MAXIMIZE) return 0;
+-    radius = muldiv( radius, dpi, USER_DEFAULT_SCREEN_DPI );
+-    /* the region leaves out the right and bottom edges */
+-    return NtGdiCreateRoundRectRgn( 0, 0, width + 1, height + 1, 2 * radius, 2 * radius );
++    return muldiv( radius, dpi, USER_DEFAULT_SCREEN_DPI );
+ }
+ 
+ /***********************************************************************
+@@ -2140,14 +2135,26 @@ static HRGN get_corner_region( WND *win, UINT dpi )
+  */
+ static void update_surface_region( HWND hwnd )
+ {
+-    UINT dpi = round_dpi( get_dpi_for_window( hwnd ));
++    UINT dpi = round_dpi( get_dpi_for_window( hwnd )), radius;
+     WND *win = get_win_ptr( hwnd );
+     HRGN region, shape = 0, corners;
++    COLORREF border_color;
+     RECT visible;
++    SIZE size;
+ 
+     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+     if (!win->surface) goto done;
+ 
++    /* in the surface, whose rect is rounded up, the window is at 0,0 */
++    size.cx = win->rects.visible.right - win->rects.visible.left;
++    size.cy = win->rects.visible.bottom - win->rects.visible.top;
++    radius = get_corner_radius( win, dpi );
++    /* the window manager draws a border along the edge in the colour asked for with
++     * DWMWA_BORDER_COLOR; the one it draws by default is not drawn */
++    border_color = win->border_color & 0xff000000 ? CLR_INVALID : win->border_color;
++    window_surface_set_frame( win->surface, &size, radius, max( 1, muldiv( 1, dpi, USER_DEFAULT_SCREEN_DPI )),
++                              border_color );
++
+     if (get_window_region( hwnd, FALSE, &shape, &visible )) goto done;
+     if (shape)
+     {
+@@ -2158,7 +2165,7 @@ static void update_surface_region( HWND hwnd )
+     }
+     /* what the window manager rounds off comes on top of the window region; GetWindowRgn
+      * still returns the region the application set */
+-    if ((corners = get_corner_region( win, dpi )))
++    if (radius && (corners = create_frame_region( size.cx, size.cy, radius )))
+     {
+         if (!shape) shape = corners;
+         else
+@@ -2184,6 +2191,25 @@ done:
+     release_win_ptr( win );
+ }
+ 
++/***********************************************************************
++ *           set_border_color
++ *
++ * dwmapi passes on the window's DWMWA_BORDER_COLOR, which the frame of a window with round corners
++ * is drawn in.
++ */
++static BOOL set_border_color( HWND hwnd, COLORREF color )
++{
++    WND *win = get_win_ptr( hwnd );
++    BOOL changed;
++
++    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
++    changed = win->border_color != color;
++    win->border_color = color;
++    release_win_ptr( win );
++    if (changed) update_surface_region( hwnd );
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           set_corner_preference
+  *
+@@ -6267,6 +6293,7 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
+     win->hIconSmall2 = 0;
+     win->hSysMenu    = 0;
+     win->swap_interval = 1;
++    win->border_color = 0xffffffff; /* DWMWA_COLOR_DEFAULT */
+ 
+     win->min_pos.x = win->min_pos.y = -1;
+     win->max_pos.x = win->max_pos.y = -1;
+@@ -6778,6 +6805,9 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
+     case NtUserCallHwndParam_SetCornerPreference:
+         return set_corner_preference( hwnd, param );
+ 
++    case NtUserCallHwndParam_SetBorderColor:
++        return set_border_color( hwnd, param );
++
+     default:
+         FIXME( "invalid code %u\n", code );
+         return 0;
+diff --git a/include/ntuser.h b/include/ntuser.h
+index c1aee52228a..2c171839f1b 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -1429,6 +1429,7 @@ enum
+     NtUserCallHwndParam_GetPrivateData,
+     NtUserCallHwndParam_SetPrivateData,
+     NtUserCallHwndParam_SetCornerPreference,
++    NtUserCallHwndParam_SetBorderColor,
+ };
+ 
+ struct get_window_rects_params
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index a1fb4845b36..b90f77e939b 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -219,7 +219,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 111
++#define WINE_GDI_DRIVER_VERSION 112
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -322,6 +322,11 @@ struct window_surface
+     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
+     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
+     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
++    SIZE                               frame_size;   /* size of the window in the surface */
++    UINT                               frame_radius; /* radius of the corners the window manager rounds, 0 if square */
++    UINT                               frame_border; /* width of the border it draws along the edge, in pixels */
++    COLORREF                           frame_color;  /* colour of that border, CLR_INVALID if there is none */
++    UINT32                            *frame_pixels; /* how much of each corner pixel the border covers */
+     /* driver-specific fields here */
+ };
+ 

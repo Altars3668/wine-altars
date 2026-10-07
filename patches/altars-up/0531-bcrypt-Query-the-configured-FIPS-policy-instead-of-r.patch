@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 03:38:48 -0400
+Subject: [PATCH] bcrypt: Query the configured FIPS policy instead of returning
+ a constant.
+
+Read the current policy and the legacy LSA value, and provide the disabled
+initial policy without overwriting configured values. Test the query in
+an isolated Wine prefix while leaving native system policy untouched.
+
+Native impersonation level probes confirm ImpersonateLoggedOnUser already
+performs real impersonation; replace its stale one-time warning with trace.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/bcrypt/bcrypt_main.c b/dlls/bcrypt/bcrypt_main.c
+index 5e2c631216a..fd0534bcd09 100644
+--- a/dlls/bcrypt/bcrypt_main.c
++++ b/dlls/bcrypt/bcrypt_main.c
+@@ -692,12 +692,39 @@ NTSTATUS WINAPI BCryptCloseAlgorithmProvider( BCRYPT_ALG_HANDLE handle, DWORD fl
+ 
+ NTSTATUS WINAPI BCryptGetFipsAlgorithmMode(BOOLEAN *enabled)
+ {
+-    FIXME("%p - semi-stub\n", enabled);
++    static const WCHAR *paths[] =
++    {
++        L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Lsa\\FipsAlgorithmPolicy",
++        L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Lsa",
++    };
++    static const WCHAR *names[] = { L"Enabled", L"FipsAlgorithmPolicy" };
++    union { KEY_VALUE_PARTIAL_INFORMATION info; BYTE buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD)]; } value;
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING name;
++    HANDLE key;
++    ULONG size, i;
++    NTSTATUS status;
++    DWORD mode;
+ 
+-    if (!enabled)
+-        return STATUS_INVALID_PARAMETER;
++    TRACE( "%p\n", enabled );
++    if (!enabled) return STATUS_INVALID_PARAMETER;
+ 
+     *enabled = FALSE;
++    for (i = 0; i < ARRAY_SIZE(paths); i++)
++    {
++        RtlInitUnicodeString( &name, paths[i] );
++        InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
++        if (NtOpenKey( &key, KEY_QUERY_VALUE, &attr )) continue;
++        RtlInitUnicodeString( &name, names[i] );
++        status = NtQueryValueKey( key, &name, KeyValuePartialInformation, &value, sizeof(value), &size );
++        NtClose( key );
++        if (!status && value.info.Type == REG_DWORD && value.info.DataLength == sizeof(mode))
++        {
++            memcpy( &mode, value.info.Data, sizeof(mode) );
++            *enabled = !!mode;
++            break;
++        }
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+diff --git a/dlls/bcrypt/tests/bcrypt.c b/dlls/bcrypt/tests/bcrypt.c
+index 1b0e2ecc933..ecc7a38f171 100644
+--- a/dlls/bcrypt/tests/bcrypt.c
++++ b/dlls/bcrypt/tests/bcrypt.c
+@@ -107,6 +107,41 @@ static void test_BCryptGetFipsAlgorithmMode(void)
+     ok(ret == STATUS_INVALID_PARAMETER, "Expected STATUS_INVALID_PARAMETER, got %#lx\n", ret);
+ }
+ 
++static void test_fips_policy(void)
++{
++    HKEY key;
++    DWORD saved, size = sizeof(saved), mode;
++    BOOLEAN enabled;
++    NTSTATUS status;
++    LONG ret;
++
++    /* 只在隔离 Wine 前缀修改策略，不改变原生机器的系统安全设置。 */
++    if (strcmp( winetest_platform, "wine" )) return;
++    ret = RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\Lsa\\FipsAlgorithmPolicy",
++                         0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key );
++    ok( !ret, "got %ld\n", ret );
++    if (ret) return;
++    ret = RegQueryValueExW( key, L"Enabled", NULL, NULL, (BYTE *)&saved, &size );
++    ok( !ret && size == sizeof(saved), "got %ld, size %lu\n", ret, size );
++    if (ret || size != sizeof(saved))
++    {
++        RegCloseKey( key );
++        return;
++    }
++    for (mode = 0; mode < 3; mode++)
++    {
++        ret = RegSetValueExW( key, L"Enabled", 0, REG_DWORD, (BYTE *)&mode, sizeof(mode) );
++        ok( !ret, "got %ld\n", ret );
++        enabled = 0xcc;
++        status = BCryptGetFipsAlgorithmMode( &enabled );
++        ok( !status, "got %#lx\n", status );
++        ok( enabled == !!mode, "mode %lu got %u\n", mode, enabled );
++    }
++    ret = RegSetValueExW( key, L"Enabled", 0, REG_DWORD, (BYTE *)&saved, sizeof(saved) );
++    ok( !ret, "restore got %ld\n", ret );
++    RegCloseKey( key );
++}
++
+ static void format_hash(const UCHAR *bytes, ULONG size, char *buf)
+ {
+     ULONG i;
+@@ -5671,6 +5706,7 @@ START_TEST(bcrypt)
+ 
+     test_BCryptGenRandom();
+     test_BCryptGetFipsAlgorithmMode();
++    test_fips_policy();
+     test_hashes();
+     test_BcryptHash();
+     test_BcryptDeriveKeyPBKDF2();
+diff --git a/dlls/kernelbase/security.c b/dlls/kernelbase/security.c
+index f7a72f4d0c1..be085ad876f 100644
+--- a/dlls/kernelbase/security.c
++++ b/dlls/kernelbase/security.c
+@@ -748,13 +748,8 @@ BOOL WINAPI ImpersonateLoggedOnUser( HANDLE token )
+     BOOL ret;
+     HANDLE dup;
+     TOKEN_TYPE type;
+-    static BOOL warn = TRUE;
+ 
+-    if (warn)
+-    {
+-        FIXME( "(%p)\n", token );
+-        warn = FALSE;
+-    }
++    TRACE( "(%p)\n", token );
+     if (!GetTokenInformation( token, TokenType, &type, sizeof(type), &size )) return FALSE;
+ 
+     if (type == TokenPrimary)
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 28ee2ee44b6..0935cc85178 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -605,6 +605,7 @@ HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisable8dot3NameCreation",
+ HKLM,System\CurrentControlSet\Control\Filesystem,"NtfsDisableLastAccessUpdate",0x10003,0x80000002
+ HKLM,System\CurrentControlSet\Control\hivelist,,16
+ HKLM,System\CurrentControlSet\Control\Lsa,"Security Packages",0x10002,kerberos,schannel
++HKLM,System\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy,"Enabled",0x10003,0
+ HKLM,System\CurrentControlSet\Control\Lsa\Kerberos,,16
+ HKLM,System\CurrentControlSet\Control\Lsa\MSV1_0,,16
+ HKLM,System\CurrentControlSet\Control\Nls\Language,"Default",,"0409"

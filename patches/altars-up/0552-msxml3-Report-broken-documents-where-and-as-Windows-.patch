@@ -1,0 +1,581 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:34:31 -0400
+Subject: [PATCH] msxml3: Report broken documents where and as Windows does.
+
+tools/msxmlmoreprobe in the wine-altars repository loaded fourteen broken
+documents into MSXML 3.0 and 6.0 on Windows 11 and printed what
+parseError said about each.  Three of them Wine took as well-formed:
+
+- A reference to an undeclared entity is XML_ENTITY_UNDEFINED
+  (0xc00ce002) when there is no DTD, or one whose declarations were all
+  read: no external subset and no parameter entity references, or a
+  standalone document (the "Entity Declared" well-formedness
+  constraint).  Otherwise it stays a skipped entity.
+- A character text may not hold, a control character other than tab,
+  line feed and carriage return, or U+FFFE or U+FFFF, is
+  XML_E_BADCHARDATA (0xc00ce508).
+- What follows the root element: another element is
+  XML_E_MULTIPLEROOTS (0xc00ce555), anything else other than spaces,
+  comments and processing instructions XML_E_INVALIDATROOTLEVEL.
+
+The input ending inside a start tag is XML_E_UNCLOSEDSTARTTAG
+(0xc00ce55e) at its name, and inside an element an error with no
+position.  Most errors are at the character the parser reached; a
+duplicate attribute at the end of its start tag; a bad version in the
+declaration at its value.  parseError gives the line's text as srcText
+and the error's offset in the text as filepos, for loadXML, load and
+data from a URL, and an empty string loads with XML_E_MISSINGROOT.
+
+What the probe printed is now Windows' for every document but the
+message texts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index e73cd336ce6..a2478bec9ee 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -273,9 +273,67 @@ static HRESULT WINAPI PersistStreamInit_IsDirty(IPersistStreamInit *iface)
+ static void domdoc_set_parse_error(domdoc *doc, struct parse_error *error)
+ {
+     SysFreeString(doc->parse_error.reason);
++    SysFreeString(doc->parse_error.srctext);
+     doc->parse_error = *error;
+ }
+ 
++/* the line an error is on and where in the text it is, from the text parsed */
++static void parse_error_set_source(struct parse_error *error, const WCHAR *text, size_t len)
++{
++    size_t start = 0, end, i;
++    LONG line = 1;
++
++    if (!error->code || error->line <= 0 || !text) return;
++    for (i = 0; i < len && line < error->line; i++)
++    {
++        if (text[i] == '\r' && i + 1 < len && text[i + 1] == '\n') i++;
++        if (text[i] == '\r' || text[i] == '\n')
++        {
++            line++;
++            start = i + 1;
++        }
++    }
++    if (line != error->line) return;
++    for (end = start; end < len && text[end] != '\r' && text[end] != '\n'; end++);
++    error->srctext = SysAllocStringLen(text + start, end - start);
++    error->filepos = start + max(error->linepos, 1) - 1;
++}
++
++/* the same for text in bytes: UTF-16 when it says so or looks so, else UTF-8 */
++static void parse_error_set_source_bytes(struct parse_error *error, const BYTE *data, size_t size)
++{
++    WCHAR *text;
++    int len;
++
++    if (!error->code || error->line <= 0 || !data || !size) return;
++    if (size >= 2 && data[0] == 0xff && data[1] == 0xfe)
++        return parse_error_set_source(error, (const WCHAR *)(data + 2), (size - 2) / sizeof(WCHAR));
++    if (size >= 2 && data[0] && !data[1])
++        return parse_error_set_source(error, (const WCHAR *)data, size / sizeof(WCHAR));
++    if (size >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf)
++    {
++        data += 3;
++        size -= 3;
++    }
++    if (!(len = MultiByteToWideChar(CP_UTF8, 0, (const char *)data, size, NULL, 0))) return;
++    if (!(text = malloc(len * sizeof(WCHAR)))) return;
++    MultiByteToWideChar(CP_UTF8, 0, (const char *)data, size, text, len);
++    parse_error_set_source(error, text, len);
++    free(text);
++}
++
++/* nothing to parse: the parser's error for it, at no position, as on Windows */
++static void domdoc_set_missing_root_error(domdoc *doc)
++{
++    struct parse_error error = { E_SAX_MISSINGROOT };
++    WCHAR msg[1024];
++
++    if (FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_FROM_HMODULE, MSXML_hInstance,
++            E_SAX_MISSINGROOT, 0, msg, ARRAY_SIZE(msg), NULL))
++        error.reason = SysAllocString(msg);
++    domdoc_set_parse_error(doc, &error);
++}
++
+ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+ {
+     struct parse_error error;
+@@ -283,6 +341,7 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+     struct domnode *node;
+     DWORD read, written;
+     IStream *hstream;
++    HGLOBAL global;
+     BYTE buf[4096];
+     HRESULT hr;
+ 
+@@ -310,6 +369,19 @@ static HRESULT domdoc_load_from_stream(domdoc *doc, ISequentialStream *stream)
+ 
+     hr = IStream_Seek(hstream, zero, STREAM_SEEK_SET, NULL);
+     hr = parse_stream((ISequentialStream *)hstream, false, doc->node->properties, &node, &error);
++    if (FAILED(hr) && SUCCEEDED(GetHGlobalFromStream(hstream, &global)))
++    {
++        ULARGE_INTEGER size = {{0}};
++        STATSTG stat;
++        BYTE *data;
++
++        if (SUCCEEDED(IStream_Stat(hstream, &stat, STATFLAG_NONAME))) size = stat.cbSize;
++        if ((data = GlobalLock(global)))
++        {
++            parse_error_set_source_bytes(&error, data, size.LowPart);
++            GlobalUnlock(global);
++        }
++    }
+     domdoc_set_parse_error(doc, &error);
+     IStream_Release(hstream);
+ 
+@@ -475,6 +547,7 @@ static ULONG WINAPI domdoc_Release( IXMLDOMDocument3 *iface )
+ 
+         release_namespaces(doc);
+         SysFreeString(doc->parse_error.reason);
++        SysFreeString(doc->parse_error.srctext);
+         free(doc);
+     }
+ 
+@@ -1206,6 +1279,7 @@ static HRESULT domdoc_onDataAvailable(void *obj, char *ptr, DWORD len)
+ 
+     stream_wrapper_create(ptr, len, &stream);
+     hr = parse_stream(stream, false, doc->node->properties, &node, &error);
++    if (FAILED(hr)) parse_error_set_source_bytes(&error, (const BYTE *)ptr, len);
+     domdoc_set_parse_error(doc, &error);
+     ISequentialStream_Release(stream);
+ 
+@@ -1417,8 +1491,8 @@ static HRESULT WINAPI domdoc_get_parseError(IXMLDOMDocument3 *iface, IXMLDOMPars
+ {
+     domdoc *doc = impl_from_IXMLDOMDocument3(iface);
+     const struct parse_error *error = &doc->parse_error;
+-    BSTR error_string = NULL;
+-    LONG line = 0, linepos = 0;
++    BSTR error_string = NULL, srctext = NULL;
++    LONG line = 0, linepos = 0, filepos = 0;
+     WCHAR message[1024];
+ 
+     TRACE("%p, %p.\n", iface, obj);
+@@ -1430,7 +1504,9 @@ static HRESULT WINAPI domdoc_get_parseError(IXMLDOMDocument3 *iface, IXMLDOMPars
+         {
+             line = error->line;
+             linepos = error->linepos;
++            filepos = error->filepos;
+             if (error->reason) error_string = SysAllocString(error->reason);
++            if (error->srctext) srctext = SysAllocString(error->srctext);
+         }
+         if (!error_string && FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_FROM_HMODULE,
+                 MSXML_hInstance, doc->error, 0, message, ARRAY_SIZE(message), NULL))
+@@ -1439,7 +1515,7 @@ static HRESULT WINAPI domdoc_get_parseError(IXMLDOMDocument3 *iface, IXMLDOMPars
+             error_string = SysAllocString(L"error");
+     }
+ 
+-    *obj = create_parseError(doc->error, NULL, error_string, NULL, line, linepos, 0);
++    *obj = create_parseError(doc->error, NULL, error_string, srctext, line, linepos, filepos);
+     if (!*obj) return E_OUTOFMEMORY;
+     return S_OK;
+ }
+@@ -1515,6 +1591,7 @@ static HRESULT WINAPI domdoc_loadXML(IXMLDOMDocument3 *iface, BSTR data, VARIANT
+         if (SUCCEEDED(hr = stream_wrapper_create(ptr, lstrlenW(ptr) * sizeof(WCHAR), &stream)))
+         {
+             hr = parse_stream(stream, true, doc->node->properties, &node, &error);
++            if (FAILED(hr)) parse_error_set_source(&error, ptr, lstrlenW(ptr));
+             domdoc_set_parse_error(doc, &error);
+             ISequentialStream_Release(stream);
+         }
+@@ -1534,6 +1611,8 @@ static HRESULT WINAPI domdoc_loadXML(IXMLDOMDocument3 *iface, BSTR data, VARIANT
+         domnode_create(NODE_DOCUMENT, NULL, 0, NULL, 0, NULL, &node);
+         node->properties = domdoc_create_properties(doc->node->properties->version);
+         attach_doc_node(doc, node);
++        domdoc_set_missing_root_error(doc);
++        doc->error = E_SAX_MISSINGROOT;
+ 
+         hr = S_FALSE;
+     }
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index ff55f17218a..488aed9a936 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -49,6 +49,7 @@ enum error_codes
+     E_SAX_BADNAMECHAR = 0xc00ce505,
+     E_SAX_BADCHARINSTRING = 0xc00ce506,
+     E_SAX_XMLDECLSYNTAX = 0xc00ce507,
++    E_SAX_BADCHARDATA = 0xc00ce508,
+     E_SAX_MISSINGWHITESPACE = 0xc00ce509,
+     E_SAX_EXPECTINGTAGEND = 0xc00ce50a,
+     E_SAX_BADCHARINDTD = 0xc00ce50b,
+@@ -66,12 +67,14 @@ enum error_codes
+     E_SAX_UNEXPECTEDENDTAG = 0xc00ce552,
+     E_SAX_UNCLOSEDTAG = 0xc00ce553,
+     E_SAX_DUPLICATEATTRIBUTE = 0xc00ce554,
++    E_SAX_MULTIPLEROOTS = 0xc00ce555,
+     E_SAX_INVALIDATROOTLEVEL = 0xc00ce556,
+     E_SAX_BAD_XMLDECL = 0xc00ce557,
+     E_SAX_MISSINGROOT = 0xc00ce558,
+     E_SAX_UNEXPECTED_EOF = 0xc00ce559,
+     E_SAX_INVALID_CDATACLOSINGTAG = 0xc00ce55c,
+     E_SAX_UNCLOSEDPI = 0xc00ce55d,
++    E_SAX_UNCLOSEDSTARTTAG = 0xc00ce55e,
+     E_SAX_UNCLOSEDENDTAG = 0xc00ce55f,
+     E_SAX_UNCLOSEDCDATA = 0xc00ce564,
+     E_SAX_BADDECLNAME = 0xc00ce565,
+@@ -278,6 +281,8 @@ struct parse_error
+     LONG line;
+     LONG linepos;
+     BSTR reason;
++    LONG filepos;               /* where the error is in the text, counting characters from 0 */
++    BSTR srctext;               /* the line it is on */
+ };
+ extern struct domnode *domnode_addref(struct domnode *node);
+ extern void domnode_release(struct domnode *node);
+diff --git a/dlls/msxml3/parseerror.c b/dlls/msxml3/parseerror.c
+index eb97b916823..f25a5472f60 100644
+--- a/dlls/msxml3/parseerror.c
++++ b/dlls/msxml3/parseerror.c
+@@ -242,8 +242,13 @@ static HRESULT WINAPI parseError_get_filepos(
+     LONG *filepos )
+ {
+     parse_error_t *This = impl_from_IXMLDOMParseError2( iface );
+-    FIXME("(%p)->(%p)\n", This, filepos);
+-    return E_NOTIMPL;
++
++    TRACE("%p, %p.\n", This, filepos);
++
++    if (!filepos) return E_INVALIDARG;
++
++    *filepos = This->filepos;
++    return This->code ? S_OK : S_FALSE;
+ }
+ 
+ static HRESULT WINAPI parseError_get_errorXPath(
+diff --git a/dlls/msxml3/saxreader.c b/dlls/msxml3/saxreader.c
+index a8a8e1c754b..9b1017d6e29 100644
+--- a/dlls/msxml3/saxreader.c
++++ b/dlls/msxml3/saxreader.c
+@@ -944,6 +944,10 @@ struct saxlocator
+     } attributes;
+ 
+     struct dtd *dtd;
++    struct text_position value_position; /* of the value of the XML declaration's attribute last read */
++    bool duplicate_attribute;   /* the start tag being read has one twice */
++    bool dtd_external;          /* the DOCTYPE names an external subset */
++    bool dtd_pe_references;     /* the internal subset refers to parameter entities */
+     const WCHAR *limit_name;
+     bool string_input;
+ 
+@@ -1033,6 +1037,15 @@ static void saxreader_set_error(struct saxlocator *locator, HRESULT status)
+         locator->status = status;
+ }
+ 
++/* an error at the character the parser has reached, the position Windows gives most errors */
++static void saxreader_set_error_here(struct saxlocator *locator, HRESULT status)
++{
++    if (locator->status != S_OK) return;
++    locator->line = locator->buffer.position.line;
++    locator->column = locator->buffer.position.column;
++    locator->status = status;
++}
++
+ static struct dtd * saxreader_new_dtd(struct saxlocator *locator)
+ {
+     struct dtd *dtd;
+@@ -3403,7 +3416,14 @@ static void saxreader_parse_versioninfo(struct saxlocator *locator, const struct
+         return saxreader_set_error(locator, E_SAX_UNEXPECTED_ATTRIBUTE);
+ 
+     if (wcscmp(value, L"1.0"))
++    {
++        if (locator->status == S_OK)
++        {
++            locator->line = locator->value_position.line;
++            locator->column = locator->value_position.column;
++        }
+         return saxreader_set_error(locator, E_SAX_INVALID_VERSION);
++    }
+ 
+     SysFreeString(locator->saxreader->xmldecl_version);
+     locator->saxreader->xmldecl_version = saxreader_alloc_string(locator, L"1.0");
+@@ -3714,7 +3734,7 @@ static void saxreader_parse_name_opt(struct saxlocator *locator, bool no_colons,
+ 
+     if (!saxreader_is_letter(ch) && ch != '_')
+     {
+-        saxreader_set_error(locator, E_SAX_BADSTARTNAMECHAR);
++        saxreader_set_error_here(locator, E_SAX_BADSTARTNAMECHAR);
+         return;
+     }
+ 
+@@ -3771,7 +3791,7 @@ static BSTR saxreader_parse_ncname(struct saxlocator *locator)
+     ch = *saxreader_get_ptr(locator);
+     if (!saxreader_is_ncname_startchar(ch))
+     {
+-        saxreader_set_error(locator, E_SAX_BADSTARTNAMECHAR);
++        saxreader_set_error_here(locator, E_SAX_BADSTARTNAMECHAR);
+         return NULL;
+     }
+ 
+@@ -3963,7 +3983,10 @@ static void saxreader_add_attribute(struct saxlocator *locator, struct element *
+         return;
+ 
+     if (saxreader_has_attribute(locator, name->qname))
+-        return saxreader_set_error(locator, E_SAX_DUPLICATEATTRIBUTE);
++    {
++        locator->duplicate_attribute = true;
++        return;
++    }
+ 
+     if (!saxreader_array_reserve(locator, (void **)&locator->attributes.entries, &locator->attributes.capacity,
+             locator->attributes.count + 1, sizeof(*locator->attributes.entries)))
+@@ -4193,7 +4216,7 @@ static BSTR saxreader_parse_attvalue(struct saxlocator *locator)
+ 
+     if (!(quote[0] = saxreader_is_quote(locator)))
+     {
+-        saxreader_set_error(locator, E_SAX_MISSINGQUOTE);
++        saxreader_set_error_here(locator, E_SAX_MISSINGQUOTE);
+         return NULL;
+     }
+     saxreader_skip(locator, 1);
+@@ -4205,9 +4228,9 @@ static BSTR saxreader_parse_attvalue(struct saxlocator *locator)
+         if (saxreader_cmp(locator, quote))
+             break;
+ 
+-        if (saxreader_cmp(locator, L"<"))
++        if (saxreader_peek(locator, L"<", 1))
+         {
+-            saxreader_set_error(locator, E_SAX_BADCHARINSTRING);
++            saxreader_set_error_here(locator, E_SAX_BADCHARINSTRING);
+             break;
+         }
+ 
+@@ -4313,6 +4336,9 @@ static BSTR saxreader_parse_xmldecl_attribute(struct saxlocator *locator, struct
+     if (!saxreader_cmp(locator, L"="))
+         saxreader_set_error(locator, E_SAX_MISSINGEQUALS);
+     saxreader_skipspaces(locator);
++    /* after the quote, where errors in the value are */
++    locator->value_position = locator->buffer.position;
++    locator->value_position.column++;
+     value = saxreader_parse_attvalue(locator);
+ 
+     return value;
+@@ -4414,7 +4440,7 @@ static void saxreader_parse_starttag(struct saxlocator *locator)
+     int max_depth;
+ 
+     if (!saxreader_cmp(locator, L"<"))
+-        return saxreader_set_error(locator, E_SAX_INVALIDATROOTLEVEL);
++        return saxreader_set_error_here(locator, E_SAX_INVALIDATROOTLEVEL);
+ 
+     name_position = locator->buffer.position;
+     saxreader_parse_qname(locator, &name);
+@@ -4450,6 +4476,14 @@ static void saxreader_parse_starttag(struct saxlocator *locator)
+     {
+         saxreader_skipspaces(locator);
+ 
++        if (!*saxreader_get_ptr(locator))
++        {
++            locator->line = name_position.line;
++            locator->column = name_position.column;
++            saxreader_set_error(locator, E_SAX_UNCLOSEDSTARTTAG);
++            break;
++        }
++
+         if (saxreader_cmp(locator, L"/>"))
+         {
+             empty_element = true;
+@@ -4466,6 +4500,12 @@ static void saxreader_parse_starttag(struct saxlocator *locator)
+         saxreader_parse_attribute(locator, element);
+     }
+ 
++    if (locator->duplicate_attribute)
++    {
++        locator->duplicate_attribute = false;
++        saxreader_set_error_here(locator, E_SAX_DUPLICATEATTRIBUTE);
++    }
++
+     /* Append default attributes from DTD. */
+     saxreader_add_default_attributes(locator, element);
+ 
+@@ -4845,6 +4885,16 @@ static void saxreader_parse_reference(struct saxlocator *locator)
+                     else saxlocator_skipped_entity(locator, &position, entity->name);
+                 }
+             }
++            else if (!locator->dtd || (!locator->dtd_external && !locator->dtd_pe_references) ||
++                     (locator->saxreader->xmldecl_standalone &&
++                      !wcscmp(locator->saxreader->xmldecl_standalone, L"yes")))
++            {
++                /* [WFC: Entity Declared]: with no DTD, or one whose declarations were all read,
++                 * a reference to an entity not declared is an error, not a skipped entity */
++                locator->line = position.line;
++                locator->column = position.column;
++                saxreader_set_error(locator, E_SAX_UNDEFINEDREF);
++            }
+             else
+             {
+                 saxlocator_skipped_entity(locator, &position, str);
+@@ -4986,6 +5036,15 @@ static void saxreader_parse_chardata(struct saxlocator *locator)
+             break;
+         }
+ 
++        if ((context.ch < 0x20 && context.ch != '\t' && context.ch != '\n' && context.ch != '\r') ||
++            context.ch == 0xfffe || context.ch == 0xffff)
++        {
++            locator->line = locator->buffer.position.line;
++            locator->column = locator->buffer.position.column;
++            saxreader_set_error(locator, E_SAX_BADCHARDATA);
++            break;
++        }
++
+         if (context.ch == '&' || context.ch == '<')
+         {
+             if (context.buffer.count)
+@@ -5023,7 +5082,9 @@ static void saxreader_parse_chardata(struct saxlocator *locator)
+     }
+ 
+     free(context.buffer.data);
+-    /* the input ran out inside an element */
++    /* the input ran out inside an element: Windows gives that no position */
++    if (locator->status == S_OK)
++        locator->line = locator->column = 0;
+     if (list_empty(&locator->elements))
+         saxreader_set_error(locator, E_SAX_UNEXPECTED_EOF);
+     else
+@@ -6081,6 +6142,7 @@ static void saxreader_parse_pe_reference(struct saxlocator *locator)
+     /* Skip '%' */
+     saxreader_skip(locator, 1);
+     position = locator->buffer.position;
++    locator->dtd_pe_references = true;
+ 
+     saxreader_parse_name(locator, &name);
+     if (!saxreader_cmp(locator, L";"))
+@@ -6162,6 +6224,7 @@ static void saxreader_parse_doctype(struct saxlocator *locator)
+ 
+     saxreader_skipspaces(locator);
+     saxreader_parse_externalid(locator, &sysid, &pubid, false);
++    if (sysid) locator->dtd_external = true;
+ 
+     saxreader_skipspaces(locator);
+     saxreader_shrink(locator);
+@@ -6362,6 +6425,25 @@ static HRESULT saxreader_parse_stream(struct saxreader *reader, ISequentialStrea
+ 
+                 if (locator->state == SAX_PARSER_EPILOG)
+                 {
++                    const WCHAR *ptr = saxreader_get_ptr(locator);
++
++                    if (locator->buffer.utf16.cur * sizeof(WCHAR) < locator->buffer.utf16.written && *ptr)
++                    {
++                        /* another element is a second root; anything else is out of place */
++                        if (ptr[0] == '<' && ptr[1] && !wcschr(L"/!?", ptr[1]))
++                        {
++                            locator->line = locator->buffer.position.line;
++                            locator->column = locator->buffer.position.column + 1;
++                            saxreader_set_error(locator, E_SAX_MULTIPLEROOTS);
++                        }
++                        else
++                        {
++                            locator->line = locator->buffer.position.line;
++                            locator->column = locator->buffer.position.column;
++                            saxreader_set_error(locator, E_SAX_INVALIDATROOTLEVEL);
++                        }
++                        break;
++                    }
+                     locator->state = SAX_PARSER_EOF;
+                     saxlocator_end_document(locator);
+                 }
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index 289a5ae0676..f77e488d80d 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -20093,6 +20093,85 @@ static void test_load_from_document_stream(void)
+     }
+ }
+ 
++/* where a document is broken: the line, the column, the offset of the column in the text, and that
++ * line's text; nothing for what has no place, an empty document or one that ends too soon */
++static void test_parse_error_source(void)
++{
++    static const struct
++    {
++        const char *xml;
++        LONG code, line, linepos, filepos;
++        const WCHAR *src;
++    }
++    tests[] =
++    {
++        { "", 0xc00ce558 /* XML_E_MISSINGROOT */ },
++        { "<a>", 0xc00ce553 /* XML_E_UNCLOSEDTAG */ },
++        { "<a></b>", 0xc00ce56d /* XML_E_ENDTAGMISMATCH */, 1, 6, 5, L"<a></b>" },
++        { "<a>&x;</a>", 0xc00ce002 /* XML_ENTITY_UNDEFINED */, 1, 5, 4, L"<a>&x;</a>" },
++        { "<a b='1' b='2'/>", 0xc00ce554 /* XML_E_DUPLICATEATTRIBUTE */, 1, 17, 16, L"<a b='1' b='2'/>" },
++        { "<a>\x01</a>", 0xc00ce508 /* XML_E_BADCHARDATA */, 1, 4, 3, L"<a>\x01</a>" },
++        { "<?xml version='2.0'?><a/>", 0xc00ce57f /* XML_E_INVALID_VERSION */, 1, 16, 15,
++          L"<?xml version='2.0'?><a/>" },
++        { "<a/><b/>", 0xc00ce555 /* XML_E_MULTIPLEROOTS */, 1, 6, 5, L"<a/><b/>" },
++        { "text", 0xc00ce556 /* XML_E_INVALIDATROOTLEVEL */, 1, 1, 0, L"text" },
++        { "<a", 0xc00ce55e /* XML_E_UNCLOSEDSTARTTAG */, 1, 2, 1, L"<a" },
++        { "<1a/>", 0xc00ce504 /* XML_E_BADSTARTNAMECHAR */, 1, 2, 1, L"<1a/>" },
++        { "<a b='<'/>", 0xc00ce506 /* XML_E_BADCHARINSTRING */, 1, 7, 6, L"<a b='<'/>" },
++        { "<a b=1/>", 0xc00ce502 /* XML_E_MISSINGQUOTE */, 1, 6, 5, L"<a b=1/>" },
++        { "<a>\n  <b>\n</a>", 0xc00ce56d, 3, 3, 12, L"</a>" },
++    };
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++    }
++    documents[] =
++    {
++        { &_create(CLSID_DOMDocument30) },
++        { &_create(CLSID_DOMDocument60) },
++    };
++    LONG code, line, linepos, filepos;
++    IXMLDOMParseError *error;
++    IXMLDOMDocument2 *doc;
++    VARIANT_BOOL loaded;
++    unsigned int i, j;
++    HRESULT hr;
++    BSTR src;
++
++    for (i = 0; i < ARRAY_SIZE(documents); i++)
++    for (j = 0; j < ARRAY_SIZE(tests); j++)
++    {
++        winetest_push_context("%s, %s", documents[i].name, debugstr_a(tests[j].xml));
++        doc = _create_object(documents[i].clsid, documents[i].name, &IID_IXMLDOMDocument2, __LINE__);
++        loaded = VARIANT_TRUE;
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_(tests[j].xml), &loaded);
++        ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++        ok(loaded == VARIANT_FALSE, "Unexpected result %d.\n", loaded);
++        hr = IXMLDOMDocument2_get_parseError(doc, &error);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        code = line = linepos = filepos = -1;
++        src = NULL;
++        IXMLDOMParseError_get_errorCode(error, &code);
++        IXMLDOMParseError_get_line(error, &line);
++        IXMLDOMParseError_get_linepos(error, &linepos);
++        IXMLDOMParseError_get_filepos(error, &filepos);
++        hr = IXMLDOMParseError_get_srcText(error, &src);
++        ok(SUCCEEDED(hr), "Unexpected hr %#lx.\n", hr);
++        ok(code == tests[j].code, "Unexpected error code %#lx.\n", code);
++        ok(line == tests[j].line && linepos == tests[j].linepos && filepos == tests[j].filepos,
++                "Unexpected position %ld:%ld, %ld.\n", line, linepos, filepos);
++        if (tests[j].src)
++            ok(src && !wcscmp(src, tests[j].src), "Unexpected source %s.\n", debugstr_w(src));
++        else
++            ok(!src, "Unexpected source %s.\n", debugstr_w(src));
++        SysFreeString(src);
++        IXMLDOMParseError_Release(error);
++        IXMLDOMDocument2_Release(doc);
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(domdoc)
+ {
+     HRESULT hr;
+@@ -20229,6 +20308,7 @@ START_TEST(domdoc)
+     test_element_setNamedItem();
+     test_document_stream();
+     test_load_from_document_stream();
++    test_parse_error_source();
+ 
+     if (is_clsid_supported(&CLSID_MXNamespaceManager40, &IID_IMXNamespaceManager))
+     {

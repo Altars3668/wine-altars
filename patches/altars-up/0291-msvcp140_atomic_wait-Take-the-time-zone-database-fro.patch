@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 20:18:50 -0400
+Subject: [PATCH] msvcp140_atomic_wait: Take the time zone database from
+ icu.dll, as Windows does.
+
+std::chrono's get_tzdb(), current_zone() and every conversion through
+a time_zone end in these exports, and Microsoft's library answers them
+from icu.dll: the IANA zone names in order, with each link naming the
+zone it stands for, ICU's data version, ICU's default zone, and for a
+zone at an instant its offset, daylight saving amount, the transitions
+around the instant and a short name.  Wine gave the Windows time zones'
+display names instead, none of which a program asks for by name, and
+__std_tzdb_get_sys_info and __std_tzdb_delete_sys_info were stubs, so
+the first conversion aborted the process.  Word asks for the database
+and the current zone at every start.
+
+Now the same comes from icu.dll when there is one.  The byte after the
+name passed to __std_tzdb_get_sys_info selects the offset alone or the
+offset with its range, a zone with no transition on a side reaches to
+DBL_MAX there, and a short name the file system code page cannot hold
+becomes "+HH" or "+HHMM".  The leap seconds come from where Windows
+keeps them, HKLM\SYSTEM\CurrentControlSet\Control\LeapSecondInformation.
+Without icu.dll the names are the Windows ones as before, and a
+conversion fails with the error for a missing library instead of
+aborting.  Run over Wine's icu.dll, tools/tzdbprobe prints the same
+for these functions as Microsoft's msvcp140_atomic_wait.dll from
+Office's installation does: 634 zones and 157 links, the zones'
+offsets, ranges and short names, and the options.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msvcp140_atomic_wait/Makefile.in b/dlls/msvcp140_atomic_wait/Makefile.in
+index 81b21c812c1..53fea566f61 100644
+--- a/dlls/msvcp140_atomic_wait/Makefile.in
++++ b/dlls/msvcp140_atomic_wait/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE  = msvcp140_atomic_wait.dll
+-IMPORTS = kernelbase msvcp140
++IMPORTS = advapi32 kernelbase msvcp140
+ 
+ SOURCES = \
+ 	main.c
+diff --git a/dlls/msvcp140_atomic_wait/main.c b/dlls/msvcp140_atomic_wait/main.c
+index 035d470920f..350352793bf 100644
+--- a/dlls/msvcp140_atomic_wait/main.c
++++ b/dlls/msvcp140_atomic_wait/main.c
+@@ -17,9 +17,15 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdio.h>
++#include <float.h>
++#include <locale.h>
+ #include "stdint.h"
+ #include "windef.h"
+ #include "winbase.h"
++#include "winnls.h"
++#include "winreg.h"
++#include "icu.h"
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ 
+@@ -221,16 +227,197 @@ struct tzdb_leap_second
+     uint16_t reserved;
+ };
+ 
+-struct tzdb_time_zones * __stdcall __std_tzdb_get_time_zones(void)
++struct tzdb_sys_info
++{
++    enum tzdb_error error;
++    double begin;
++    double end;
++    int32_t offset;
++    int32_t save;
++    char *abbrev;
++};
++
++/* what __std_tzdb_get_sys_info finds in the byte after the name */
++enum tzdb_sys_info_type
++{
++    TZDB_SYS_INFO_FULL,
++    TZDB_SYS_INFO_OFFSET_ONLY,
++    TZDB_SYS_INFO_OFFSET_AND_RANGE,
++};
++
++/* The time zone database comes from icu.dll, as on Windows; without it the Windows time zones stand in
++ * for the names, and nothing can be converted. */
++static struct
++{
++    void (__cdecl *ucal_close)(UCalendar *);
++    int32_t (__cdecl *ucal_get)(const UCalendar *, UCalendarDateFields, UErrorCode *);
++    int32_t (__cdecl *ucal_getCanonicalTimeZoneID)(const UChar *, int32_t, UChar *, int32_t, UBool *, UErrorCode *);
++    int32_t (__cdecl *ucal_getDefaultTimeZone)(UChar *, int32_t, UErrorCode *);
++    int32_t (__cdecl *ucal_getTimeZoneDisplayName)(const UCalendar *, UCalendarDisplayNameType, const char *,
++                                                   UChar *, int32_t, UErrorCode *);
++    UBool (__cdecl *ucal_getTimeZoneTransitionDate)(const UCalendar *, UTimeZoneTransitionType, UDate *, UErrorCode *);
++    const char * (__cdecl *ucal_getTZDataVersion)(UErrorCode *);
++    UCalendar * (__cdecl *ucal_open)(const UChar *, int32_t, const char *, UCalendarType, UErrorCode *);
++    UEnumeration * (__cdecl *ucal_openTimeZoneIDEnumeration)(USystemTimeZoneType, const char *, const int32_t *, UErrorCode *);
++    void (__cdecl *ucal_setMillis)(UCalendar *, UDate, UErrorCode *);
++    void (__cdecl *uenum_close)(UEnumeration *);
++    int32_t (__cdecl *uenum_count)(UEnumeration *, UErrorCode *);
++    const UChar * (__cdecl *uenum_unext)(UEnumeration *, int32_t *, UErrorCode *);
++} icu;
++static BOOL have_icu;
++
++#define U_FAILURE(e) ((e) > U_ZERO_ERROR)
++
++static BOOL WINAPI load_icu(INIT_ONCE *once, void *param, void **context)
++{
++    HMODULE module = LoadLibraryExW(L"icu.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++
++    if (!module)
++    {
++        WARN("icu.dll not found\n");
++        return TRUE;
++    }
++#define LOAD(f) if (!(icu.f = (void *)GetProcAddress(module, #f))) goto fail;
++    LOAD(ucal_close)
++    LOAD(ucal_get)
++    LOAD(ucal_getCanonicalTimeZoneID)
++    LOAD(ucal_getDefaultTimeZone)
++    LOAD(ucal_getTimeZoneDisplayName)
++    LOAD(ucal_getTimeZoneTransitionDate)
++    LOAD(ucal_getTZDataVersion)
++    LOAD(ucal_open)
++    LOAD(ucal_openTimeZoneIDEnumeration)
++    LOAD(ucal_setMillis)
++    LOAD(uenum_close)
++    LOAD(uenum_count)
++    LOAD(uenum_unext)
++#undef LOAD
++    have_icu = TRUE;
++    return TRUE;
++
++fail:
++    WARN("icu.dll lacks a function\n");
++    FreeLibrary(module);
++    return TRUE;
++}
++
++static BOOL init_icu(void)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++
++    InitOnceExecuteOnce(&once, load_icu, NULL, NULL);
++    if (!have_icu) SetLastError(ERROR_MOD_NOT_FOUND);
++    return have_icu;
++}
++
++/* the code page the C++ library's file system functions use */
++static UINT narrow_code_page(void)
++{
++    if (___lc_codepage_func() == CP_UTF8) return CP_UTF8;
++    return AreFileApisANSI() ? CP_ACP : CP_OEMCP;
++}
++
++/* NULL when the string does not convert, with GetLastError() telling why */
++static char *narrow_string(const UChar *str, int len)
++{
++    UINT cp = narrow_code_page();
++    DWORD flags = cp == CP_UTF8 ? WC_ERR_INVALID_CHARS : WC_NO_BEST_FIT_CHARS;
++    BOOL used_default = FALSE, *used = cp == CP_UTF8 ? NULL : &used_default;
++    char *ret;
++    int size;
++
++    if (!(size = WideCharToMultiByte(cp, flags, str, len, NULL, 0, NULL, used))) return NULL;
++    if (used_default)
++    {
++        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
++        return NULL;
++    }
++    if (!(ret = malloc(size + 1))) return NULL;
++    WideCharToMultiByte(cp, flags, str, len, ret, size, NULL, NULL);
++    ret[size] = 0;
++    return ret;
++}
++
++static WCHAR *wide_string(const char *str, size_t len)
++{
++    UINT cp = narrow_code_page();
++    WCHAR *ret;
++    int size;
++
++    if (len && !(size = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, str, len, NULL, 0))) return NULL;
++    if (!len) size = 0;
++    if (!(ret = malloc((size + 1) * sizeof(*ret)))) return NULL;
++    if (len) MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, str, len, ret, size);
++    ret[size] = 0;
++    return ret;
++}
++
++/* ICU's time zone names are never long, but ask again with the right size if one is */
++static UChar *icu_string(int32_t (*get)(void *, UChar *, int32_t, UErrorCode *), void *ctx, int32_t *len)
++{
++    UErrorCode err = U_ZERO_ERROR;
++    int32_t size = 32;
++    UChar *buf;
++
++    if (!(buf = malloc(size * sizeof(*buf)))) return NULL;
++    *len = get(ctx, buf, size, &err);
++    if (err == U_BUFFER_OVERFLOW_ERROR && *len > 0)
++    {
++        free(buf);
++        size = *len + 1;
++        if (!(buf = malloc(size * sizeof(*buf)))) return NULL;
++        err = U_ZERO_ERROR;
++        *len = get(ctx, buf, size, &err);
++    }
++    if (U_FAILURE(err) || *len <= 0)
++    {
++        free(buf);
++        return NULL;
++    }
++    return buf;
++}
++
++struct canonical_id_params
++{
++    const UChar *id;
++    int32_t len;
++};
++
++static int32_t get_canonical_id(void *ctx, UChar *buf, int32_t size, UErrorCode *err)
++{
++    struct canonical_id_params *params = ctx;
++    UBool system;
++
++    return icu.ucal_getCanonicalTimeZoneID(params->id, params->len, buf, size, &system, err);
++}
++
++static int32_t get_default_zone(void *ctx, UChar *buf, int32_t size, UErrorCode *err)
++{
++    return icu.ucal_getDefaultTimeZone(buf, size, err);
++}
++
++struct short_name_params
++{
++    UCalendar *cal;
++    BOOL daylight;
++};
++
++static int32_t get_short_name(void *ctx, UChar *buf, int32_t size, UErrorCode *err)
++{
++    struct short_name_params *params = ctx;
++
++    return icu.ucal_getTimeZoneDisplayName(params->cal, params->daylight ? UCAL_SHORT_DST : UCAL_SHORT_STANDARD,
++                                           NULL, buf, size, err);
++}
++
++static struct tzdb_time_zones *windows_time_zones(struct tzdb_time_zones *z)
+ {
+     DYNAMIC_TIME_ZONE_INFORMATION tzd;
+     static char ver[] = "2022g";
+-    struct tzdb_time_zones *z;
+     unsigned int i, j;
+ 
+-    FIXME("returning Windows time zone names.\n");
++    FIXME("no icu.dll, returning Windows time zone names.\n");
+ 
+-    z = calloc(1, sizeof(*z));
+     while (!EnumDynamicTimeZoneInformation(z->count, &tzd))
+         ++z->count;
+ 
+@@ -251,16 +438,78 @@ struct tzdb_time_zones * __stdcall __std_tzdb_get_time_zones(void)
+     return z;
+ }
+ 
++void __stdcall __std_tzdb_delete_time_zones(struct tzdb_time_zones *z);
++
++struct tzdb_time_zones * __stdcall __std_tzdb_get_time_zones(void)
++{
++    UEnumeration *zones = NULL;
++    UErrorCode err = U_ZERO_ERROR;
++    struct tzdb_time_zones *z;
++    unsigned int i;
++
++    TRACE("()\n");
++
++    if (!(z = calloc(1, sizeof(*z)))) return NULL;
++    if (!init_icu()) return windows_time_zones(z);
++
++    z->ver = (char *)icu.ucal_getTZDataVersion(&err);
++    if (!U_FAILURE(err)) zones = icu.ucal_openTimeZoneIDEnumeration(UCAL_ZONE_TYPE_ANY, NULL, NULL, &err);
++    if (!U_FAILURE(err)) z->count = icu.uenum_count(zones, &err);
++    if (U_FAILURE(err)) goto icu_error;
++
++    if (!(z->names = calloc(z->count, sizeof(*z->names))) || !(z->links = calloc(z->count, sizeof(*z->links))))
++        goto nomem;
++
++    for (i = 0; i < z->count; i++)
++    {
++        struct canonical_id_params params;
++        UChar *canonical;
++        int32_t len;
++
++        params.id = icu.uenum_unext(zones, &params.len, &err);
++        if (U_FAILURE(err) || !params.id) goto icu_error;
++        if (!(z->names[i] = narrow_string(params.id, params.len))) goto win_error;
++        /* a link names the zone it stands for */
++        if (!(canonical = icu_string(get_canonical_id, &params, &len))) goto icu_error;
++        if (len != params.len || memcmp(canonical, params.id, len * sizeof(*canonical)))
++        {
++            z->links[i] = narrow_string(canonical, len);
++            if (!z->links[i])
++            {
++                free(canonical);
++                goto win_error;
++            }
++        }
++        free(canonical);
++    }
++    icu.uenum_close(zones);
++    return z;
++
++icu_error:
++    z->error = TZDB_ERROR_ICU;
++    if (zones) icu.uenum_close(zones);
++    return z;
++win_error:
++    z->error = TZDB_ERROR_WIN;
++    icu.uenum_close(zones);
++    return z;
++nomem:
++    icu.uenum_close(zones);
++    __std_tzdb_delete_time_zones(z);
++    return NULL;
++}
++
+ void __stdcall __std_tzdb_delete_time_zones(struct tzdb_time_zones *z)
+ {
+     unsigned int i;
+ 
+     TRACE("(%p)\n", z);
+ 
++    if (!z) return;
+     for (i = 0; i < z->count; ++i)
+     {
+-        free(z->names[i]);
+-        free(z->links[i]);
++        if (z->names) free(z->names[i]);
++        if (z->links) free(z->links[i]);
+     }
+     free(z->names);
+     free(z->links);
+@@ -272,10 +521,24 @@ struct tzdb_current_zone * __stdcall __std_tzdb_get_current_zone(void)
+     DYNAMIC_TIME_ZONE_INFORMATION tzd;
+     struct tzdb_current_zone *c;
+     unsigned int i;
++    int32_t len;
++    UChar *id;
+ 
+-    FIXME("returning Windows time zone name.\n");
++    TRACE("()\n");
+ 
+-    c = calloc(1, sizeof(*c));
++    if (!(c = calloc(1, sizeof(*c)))) return NULL;
++
++    if (init_icu())
++    {
++        if (!(id = icu_string(get_default_zone, NULL, &len)))
++            c->error = TZDB_ERROR_ICU;
++        else if (!(c->name = narrow_string(id, len)))
++            c->error = TZDB_ERROR_WIN;
++        free(id);
++        return c;
++    }
++
++    FIXME("no icu.dll, returning Windows time zone name.\n");
+ 
+     if (GetDynamicTimeZoneInformation(&tzd) == TIME_ZONE_ID_INVALID)
+     {
+@@ -294,16 +557,122 @@ void __stdcall __std_tzdb_delete_current_zone(struct tzdb_current_zone *c)
+ {
+     TRACE("(%p)\n", c);
+ 
++    if (!c) return;
+     free(c->name);
+     free(c);
+ }
+ 
++/* the abbreviation when ICU's short name does not convert: "+05", "-0930" */
++static char *offset_abbrev(int32_t offset)
++{
++    unsigned int minutes = (offset < 0 ? -offset : offset) / 60000;
++    char *ret = malloc(6);
++
++    if (!ret) return NULL;
++    if (minutes % 60) sprintf(ret, "%c%02u%02u", offset < 0 ? '-' : '+', minutes / 60 % 100, minutes % 60);
++    else sprintf(ret, "%c%02u", offset < 0 ? '-' : '+', minutes / 60 % 100);
++    return ret;
++}
++
++struct tzdb_sys_info * __stdcall __std_tzdb_get_sys_info(const char *tz, size_t len, double time)
++{
++    /* the name is followed by what the caller wants, or by its null terminator for everything */
++    enum tzdb_sys_info_type type = tz[len];
++    UErrorCode err = U_ZERO_ERROR;
++    struct short_name_params params;
++    struct tzdb_sys_info *info;
++    UCalendar *cal = NULL;
++    int32_t abbrev_len;
++    UDate transition;
++    UChar *abbrev;
++    WCHAR *name;
++
++    TRACE("(%s %Iu %.17g)\n", debugstr_an(tz, len), len, time);
++
++    if (!(info = calloc(1, sizeof(*info)))) return NULL;
++    if (!init_icu())
++    {
++        info->error = TZDB_ERROR_WIN;
++        return info;
++    }
++    if (!(name = wide_string(tz, len)))
++    {
++        if (GetLastError() == ERROR_NOT_ENOUGH_MEMORY) goto nomem;
++        info->error = TZDB_ERROR_WIN;
++        return info;
++    }
++    cal = icu.ucal_open(name, -1, NULL, UCAL_DEFAULT, &err);
++    free(name);
++    if (!U_FAILURE(err)) icu.ucal_setMillis(cal, time, &err);
++    if (!U_FAILURE(err)) info->save = icu.ucal_get(cal, UCAL_DST_OFFSET, &err);
++    if (!U_FAILURE(err)) info->offset = icu.ucal_get(cal, UCAL_ZONE_OFFSET, &err) + info->save;
++    if (U_FAILURE(err)) goto icu_error;
++    if (type == TZDB_SYS_INFO_OFFSET_ONLY) goto done;
++
++    /* a zone that never changed has its range reach as far as ICU's dates go */
++    info->begin = icu.ucal_getTimeZoneTransitionDate(cal, UCAL_TZ_TRANSITION_PREVIOUS_INCLUSIVE, &transition, &err)
++                  ? transition : -DBL_MAX;
++    if (!U_FAILURE(err))
++        info->end = icu.ucal_getTimeZoneTransitionDate(cal, UCAL_TZ_TRANSITION_NEXT, &transition, &err)
++                    ? transition : DBL_MAX;
++    if (U_FAILURE(err)) goto icu_error;
++    if (type == TZDB_SYS_INFO_OFFSET_AND_RANGE) goto done;
++
++    params.cal = cal;
++    params.daylight = info->save != 0;
++    if (!(abbrev = icu_string(get_short_name, &params, &abbrev_len))) goto icu_error;
++    info->abbrev = narrow_string(abbrev, abbrev_len);
++    free(abbrev);
++    if (!info->abbrev && !(info->abbrev = offset_abbrev(info->offset))) goto nomem;
++
++done:
++    icu.ucal_close(cal);
++    return info;
++icu_error:
++    info->error = TZDB_ERROR_ICU;
++    if (cal) icu.ucal_close(cal);
++    return info;
++nomem:
++    if (cal) icu.ucal_close(cal);
++    free(info);
++    return NULL;
++}
++
++void __stdcall __std_tzdb_delete_sys_info(struct tzdb_sys_info *info)
++{
++    TRACE("(%p)\n", info);
++
++    if (!info) return;
++    free(info->abbrev);
++    free(info);
++}
++
++/* Windows keeps the leap seconds it knows of in the registry, twelve bytes each. */
+ struct tzdb_leap_second * __stdcall __std_tzdb_get_leap_seconds(size_t prev_size, size_t *new_size)
+ {
+-    FIXME("(%#Ix %p) stub\n", prev_size, new_size);
++    struct tzdb_leap_second *ret = NULL;
++    DWORD size = 0;
++    LSTATUS status;
++    HKEY key;
++
++    TRACE("(%#Ix %p)\n", prev_size, new_size);
+ 
+     *new_size = 0;
+-    return NULL;
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\LeapSecondInformation",
++                      0, KEY_READ, &key))
++        return NULL;
++
++    status = RegQueryValueExW(key, L"LeapSeconds", NULL, NULL, NULL, &size);
++    *new_size = size / sizeof(*ret);
++    if ((!status || status == ERROR_MORE_DATA) && *new_size > prev_size)
++    {
++        if (!(ret = malloc(*new_size * sizeof(*ret)))) status = ERROR_NOT_ENOUGH_MEMORY;
++        else if ((status = RegQueryValueExW(key, L"LeapSeconds", NULL, NULL, (BYTE *)ret, &size)))
++            *new_size = 0;
++    }
++    RegCloseKey(key);
++    if (status) SetLastError(status);
++    return ret;
+ }
+ 
+ void __stdcall __std_tzdb_delete_leap_seconds(struct tzdb_leap_second *l)
+diff --git a/dlls/msvcp140_atomic_wait/msvcp140_atomic_wait.spec b/dlls/msvcp140_atomic_wait/msvcp140_atomic_wait.spec
+index 5d23b217b72..8081baf25fc 100644
+--- a/dlls/msvcp140_atomic_wait/msvcp140_atomic_wait.spec
++++ b/dlls/msvcp140_atomic_wait/msvcp140_atomic_wait.spec
+@@ -23,10 +23,10 @@
+ @ stdcall __std_submit_threadpool_work(ptr)
+ @ stdcall __std_tzdb_delete_current_zone(ptr)
+ @ stdcall __std_tzdb_delete_leap_seconds(ptr)
+-@ stub __std_tzdb_delete_sys_info
++@ stdcall __std_tzdb_delete_sys_info(ptr)
+ @ stdcall __std_tzdb_delete_time_zones(ptr)
+ @ stdcall __std_tzdb_get_current_zone()
+ @ stdcall __std_tzdb_get_leap_seconds(ptr ptr)
+-@ stub __std_tzdb_get_sys_info
++@ stdcall __std_tzdb_get_sys_info(ptr long double)
+ @ stdcall __std_tzdb_get_time_zones()
+ @ stdcall __std_wait_for_threadpool_work_callbacks(ptr long)
+diff --git a/dlls/msvcp140_atomic_wait/tests/msvcp140_atomic_wait.c b/dlls/msvcp140_atomic_wait/tests/msvcp140_atomic_wait.c
+index f0e007df699..4c80288b3d1 100644
+--- a/dlls/msvcp140_atomic_wait/tests/msvcp140_atomic_wait.c
++++ b/dlls/msvcp140_atomic_wait/tests/msvcp140_atomic_wait.c
+@@ -51,6 +51,16 @@ struct tzdb_current_zone
+     char *name;
+ };
+ 
++struct tzdb_sys_info
++{
++    enum tzdb_error error;
++    double begin;
++    double end;
++    int32_t offset;
++    int32_t save;
++    char *abbrev;
++};
++
+ struct tzdb_leap_second
+ {
+     uint16_t year;
+@@ -78,6 +88,8 @@ static struct tzdb_time_zones * (__stdcall *p___std_tzdb_get_time_zones)(void);
+ static void (__stdcall *p___std_tzdb_delete_time_zones)(struct tzdb_time_zones *);
+ static struct tzdb_current_zone * (__stdcall *p___std_tzdb_get_current_zone)(void);
+ static void (__stdcall *p___std_tzdb_delete_current_zone)(struct tzdb_current_zone *);
++static struct tzdb_sys_info * (__stdcall *p___std_tzdb_get_sys_info)(const char *, size_t, double);
++static void (__stdcall *p___std_tzdb_delete_sys_info)(struct tzdb_sys_info *);
+ static struct tzdb_leap_second * (__stdcall *p___std_tzdb_get_leap_seconds)(size_t, size_t *);
+ static void (__stdcall *p___std_tzdb_delete_leap_seconds)(struct tzdb_leap_second *);
+ 
+@@ -107,6 +119,8 @@ static HMODULE init(void)
+     SET(p___std_tzdb_delete_time_zones, "__std_tzdb_delete_time_zones");
+     SET(p___std_tzdb_get_current_zone, "__std_tzdb_get_current_zone");
+     SET(p___std_tzdb_delete_current_zone, "__std_tzdb_delete_current_zone");
++    SET(p___std_tzdb_get_sys_info, "__std_tzdb_get_sys_info");
++    SET(p___std_tzdb_delete_sys_info, "__std_tzdb_delete_sys_info");
+     SET(p___std_tzdb_get_leap_seconds, "__std_tzdb_get_leap_seconds");
+     SET(p___std_tzdb_delete_leap_seconds, "__std_tzdb_delete_leap_seconds");
+     return msvcp;
+@@ -370,6 +384,84 @@ static void test___std_acquire_shared_mutex_for_instance(void)
+     p___std_release_shared_mutex_for_instance(NULL);
+ }
+ 
++/* the IANA zones and their links, and what a zone's offset is at an instant */
++static void test_tzdb_zones(struct tzdb_time_zones *z)
++{
++    static const struct
++    {
++        double time;
++        int32_t offset, save;
++        double begin, end;
++    }
++    tests[] =
++    {
++        /* 2026-07-01T12:00Z, in daylight saving time from 2026-03-08T07:00Z to 2026-11-01T06:00Z */
++        {1782907200000.0, -14400000, 3600000, 1772953200000.0, 1793512800000.0},
++        /* 2026-01-15T12:00Z, in standard time from 2025-11-02T06:00Z to 2026-03-08T07:00Z */
++        {1768478400000.0, -18000000, 0, 1762063200000.0, 1772953200000.0},
++        /* the last millisecond of standard time, and the first of daylight saving time */
++        {1772953199999.0, -18000000, 0, 1762063200000.0, 1772953200000.0},
++        {1772953200000.0, -14400000, 3600000, 1772953200000.0, 1793512800000.0},
++    };
++    char name[32] = "America/New_York";
++    struct tzdb_sys_info *info;
++    unsigned int i, zone = ~0u, link = ~0u;
++
++    for (i = 0; i < z->count; ++i)
++    {
++        if (!strcmp(z->names[i], "America/New_York")) zone = i;
++        if (!strcmp(z->names[i], "US/Eastern")) link = i;
++        if (i) ok(strcmp(z->names[i - 1], z->names[i]) < 0, "%s is listed after %s.\n", z->names[i], z->names[i - 1]);
++    }
++    if (zone == ~0u)
++    {
++        skip("no IANA time zones.\n");
++        return;
++    }
++    ok(!z->links[zone], "got link %s.\n", debugstr_a(z->links[zone]));
++    ok(link != ~0u, "US/Eastern not found.\n");
++    if (link != ~0u)
++        ok(z->links[link] && !strcmp(z->links[link], "America/New_York"), "got link %s.\n", debugstr_a(z->links[link]));
++
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        winetest_push_context("%u", i);
++        info = p___std_tzdb_get_sys_info(name, 16, tests[i].time);
++        ok(!!info, "got NULL.\n");
++        ok(!info->error, "got %u.\n", info->error);
++        ok(info->offset == tests[i].offset, "got offset %d.\n", info->offset);
++        ok(info->save == tests[i].save, "got save %d.\n", info->save);
++        ok(info->begin == tests[i].begin, "got begin %.17g.\n", info->begin);
++        ok(info->end == tests[i].end, "got end %.17g.\n", info->end);
++        ok(info->abbrev && info->abbrev[0], "got abbrev %s.\n", debugstr_a(info->abbrev));
++        p___std_tzdb_delete_sys_info(info);
++        winetest_pop_context();
++    }
++
++    /* the byte after the name says what is wanted: the offset only, or the offset and the range */
++    name[16] = 1;
++    info = p___std_tzdb_get_sys_info(name, 16, tests[0].time);
++    ok(!info->error, "got %u.\n", info->error);
++    ok(info->offset == tests[0].offset && info->save == tests[0].save, "got offset %d save %d.\n", info->offset, info->save);
++    ok(!info->begin && !info->end, "got begin %.17g end %.17g.\n", info->begin, info->end);
++    ok(!info->abbrev, "got abbrev %s.\n", debugstr_a(info->abbrev));
++    p___std_tzdb_delete_sys_info(info);
++
++    name[16] = 2;
++    info = p___std_tzdb_get_sys_info(name, 16, tests[0].time);
++    ok(!info->error, "got %u.\n", info->error);
++    ok(info->offset == tests[0].offset && info->save == tests[0].save, "got offset %d save %d.\n", info->offset, info->save);
++    ok(info->begin == tests[0].begin && info->end == tests[0].end, "got begin %.17g end %.17g.\n", info->begin, info->end);
++    ok(!info->abbrev, "got abbrev %s.\n", debugstr_a(info->abbrev));
++    p___std_tzdb_delete_sys_info(info);
++
++    /* a link converts as the zone it names */
++    info = p___std_tzdb_get_sys_info("US/Eastern", 10, tests[1].time);
++    ok(!info->error, "got %u.\n", info->error);
++    ok(info->offset == tests[1].offset && info->end == tests[1].end, "got offset %d end %.17g.\n", info->offset, info->end);
++    p___std_tzdb_delete_sys_info(info);
++}
++
+ static void test___std_tzdb(void)
+ {
+     struct tzdb_current_zone *c;
+@@ -408,6 +500,8 @@ static void test___std_tzdb(void)
+     }
+     ok(i < z->count, "current zone %s not found.\n", c->name);
+ 
++    test_tzdb_zones(z);
++
+     p___std_tzdb_delete_current_zone(c);
+     p___std_tzdb_delete_time_zones(z);
+ 

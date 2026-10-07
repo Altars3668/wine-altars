@@ -1,0 +1,567 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 06:05:58 -0400
+Subject: [PATCH] dxgi: Implement CreateSwapChainForComposition() for Direct3D
+ 11 devices.
+
+Excel's grid animations (tables, pivot tables, sorting, filters, data
+validation, notes) present through a swapchain made for composition and
+shown by a Windows.UI.Composition surface.  With the stub it tried again
+on every frame, over seven hundred times in one sweep, each attempt
+thrown and caught as an exception.
+
+A swapchain for composition is an ordinary one on a hidden window of its
+own, which a thread of dxgi's owns, so that whichever thread releases
+the swapchain its window goes with it.  A present does not go to that
+window: the whole buffer, dirty rectangles already composited into it,
+is copied into a texture of the device, and whoever shows the swapchain
+is called.  The composition reaches that through
+IWineDXGICompositionSwapChain.  An interval waits for as many frames at
+60 Hz since the last present.
+
+GetHwnd() fails for such a swapchain, GetDesc1() keeps its alpha mode,
+and GetFrameStatistics() answers for it, with
+DXGI_ERROR_FRAME_STATISTICS_DISJOINT before the first present:
+Office's AirSpace asks for them right after creating the swapchain, and
+the stub's E_NOTIMPL made it fail fast (Mso20win32client.dll writes to
+address 0 and raises int 0x29), taking Excel down.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
+index f77ae8e7417..363b52af0f1 100644
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -187,6 +187,18 @@ struct d3d11_swapchain
+     LONG in_set_fullscreen_state;
+     BOOL presented_full;
+     struct wined3d_texture *front_copy;
++
++    /* A swapchain for composition presents to the composition that shows it, not to a window: wined3d draws
++     * with a hidden one, and each present copies the whole buffer into a texture the composition draws. */
++    IWineDXGICompositionSwapChain IWineDXGICompositionSwapChain_iface;
++    HWND composition_window;
++    DXGI_ALPHA_MODE alpha_mode;
++    CRITICAL_SECTION composition_cs;
++    IDXGISurface *presented;
++    UINT presented_version;
++    struct composition_listener *listeners;
++    unsigned int listener_count;
++    LARGE_INTEGER last_present;
+ };
+ 
+ HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
+@@ -197,6 +209,8 @@ HRESULT d3d12_swapchain_create(IWineDXGIFactory *factory, ID3D12CommandQueue *qu
+         IDXGISwapChain1 **swapchain);
+ 
+ BOOL dxgi_validate_swapchain_desc(const DXGI_SWAP_CHAIN_DESC1 *desc);
++HRESULT dxgi_create_composition_swapchain(IWineDXGIFactory *factory, IUnknown *device,
++        const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain);
+ BOOL dxgi_validate_swapchain_fullscreen_desc(const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *desc);
+ 
+ /* IDXGISurface/IDXGIResource */
+diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
+index c6bb47fa9dd..060a34588e8 100644
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -390,10 +390,32 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
+         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
+ {
+-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
++    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
+             iface, device, desc, output, swapchain);
+ 
+-    return E_NOTIMPL;
++    if (!device || !desc || !swapchain)
++    {
++        WARN("Invalid pointer.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    TRACE("Size %ux%u, format %#x, scaling %#x, swap effect %#x, alpha mode %#x, buffer count %u.\n",
++            desc->Width, desc->Height, desc->Format, desc->Scaling, desc->SwapEffect, desc->AlphaMode,
++            desc->BufferCount);
++
++    /* composition stretches the buffers into its visuals, which only a flip model can present to */
++    if (!desc->Width || !desc->Height || desc->Scaling != DXGI_SCALING_STRETCH
++            || (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
++            && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD))
++    {
++        WARN("Invalid description for a composition swapchain.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    if (output)
++        FIXME("Ignoring output %p.\n", output);
++
++    return dxgi_create_composition_swapchain(iface, device, desc, NULL, swapchain);
+ }
+ 
+ static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
+diff --git a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
+index 8ffec0505b3..38ed5852c36 100644
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "dxgi_private.h"
++#include "d3d11.h"
+ 
+ #define VKD3D_NO_VULKAN_H
+ #define VKD3D_NO_WIN32_TYPES
+@@ -210,6 +211,65 @@ static HRESULT dxgi_swapchain_resize_target(struct wined3d_swapchain_state *stat
+     return wined3d_swapchain_state_resize_target(state, &mode);
+ }
+ 
++/* Composition swapchains present to nothing on screen, but wined3d draws with a window; they get
++ * hidden ones of their own, which a thread of this module owns, so that whatever thread lets a
++ * swapchain go, its window goes with it. */
++#define WM_WINE_COMPOSITION_CREATE  (WM_USER + 0x100)
++#define WM_WINE_COMPOSITION_DESTROY (WM_USER + 0x101)
++
++static HWND composition_owner;
++static INIT_ONCE composition_owner_once = INIT_ONCE_STATIC_INIT;
++
++static LRESULT CALLBACK composition_owner_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
++{
++    switch (message)
++    {
++        case WM_WINE_COMPOSITION_CREATE:
++            return (LRESULT)CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"Static", L"", WS_POPUP,
++                    0, 0, LOWORD(wparam), HIWORD(wparam), NULL, NULL, NULL, NULL);
++        case WM_WINE_COMPOSITION_DESTROY:
++            DestroyWindow((HWND)lparam);
++            return 0;
++    }
++    return DefWindowProcW(hwnd, message, wparam, lparam);
++}
++
++static DWORD WINAPI composition_owner_thread(void *event)
++{
++    WNDCLASSW window_class = {0};
++    HMODULE module;
++    MSG msg;
++
++    /* the thread runs as long as the process; the module stays with it */
++    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++            (const WCHAR *)composition_owner_proc, &module);
++    window_class.lpfnWndProc = composition_owner_proc;
++    window_class.hInstance = module;
++    window_class.lpszClassName = L"WineDXGICompositionOwner";
++    RegisterClassW(&window_class);
++    composition_owner = CreateWindowExW(0, window_class.lpszClassName, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE,
++            NULL, module, NULL);
++    SetEvent(event);
++    while (GetMessageW(&msg, NULL, 0, 0))
++        DispatchMessageW(&msg);
++    return 0;
++}
++
++static BOOL WINAPI composition_owner_init(INIT_ONCE *once, void *param, void **context)
++{
++    HANDLE event, thread;
++
++    if (!(event = CreateEventW(NULL, TRUE, FALSE, NULL)))
++        return FALSE;
++    if ((thread = CreateThread(NULL, 0, composition_owner_thread, event, 0, NULL)))
++    {
++        WaitForSingleObject(event, INFINITE);
++        CloseHandle(thread);
++    }
++    CloseHandle(event);
++    return !!composition_owner;
++}
++
+ static HWND d3d11_swapchain_get_hwnd(struct d3d11_swapchain *swapchain)
+ {
+     struct wined3d_swapchain_desc wined3d_desc;
+@@ -246,6 +306,14 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_QueryInterface(IDXGISwapChain4
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID(riid, &IID_IWineDXGICompositionSwapChain)
++            && d3d11_swapchain_from_IDXGISwapChain4(iface)->composition_window)
++    {
++        IUnknown_AddRef(iface);
++        *object = &d3d11_swapchain_from_IDXGISwapChain4(iface)->IWineDXGICompositionSwapChain_iface;
++        return S_OK;
++    }
++
+     WARN("%s not implemented, returning E_NOINTERFACE\n", debugstr_guid(riid));
+ 
+     *object = NULL;
+@@ -283,6 +351,11 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
+         IWineDXGIFactory_Release(swapchain->factory);
+         if (swapchain->front_copy)
+             wined3d_texture_decref(swapchain->front_copy);
++        if (swapchain->presented)
++        {
++            IDXGISurface_Release(swapchain->presented);
++            swapchain->presented = NULL;
++        }
+         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
+         IWineDXGIDevice_Release(device);
+     }
+@@ -513,6 +586,8 @@ static BOOL d3d11_swapchain_is_occluded(struct d3d11_swapchain *swapchain)
+     return GetClientRect(wined3d_desc.device_window, &client_rect) && IsRectEmpty(&client_rect);
+ }
+ 
++static HRESULT d3d11_swapchain_present_composition(struct d3d11_swapchain *swapchain, unsigned int sync_interval);
++
+ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+         unsigned int sync_interval, unsigned int flags,
+         const DXGI_PRESENT_PARAMETERS *present_parameters)
+@@ -547,6 +622,9 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+     d3d11_swapchain_composite(swapchain, dirty);
+     wined3d_mutex_unlock();
+ 
++    if (swapchain->composition_window)
++        return d3d11_swapchain_present_composition(swapchain, sync_interval);
++
+     if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain,
+             NULL, NULL, NULL, sync_interval, 0)))
+     {
+@@ -853,9 +931,30 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetContainingOutput(IDXGISwapCh
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetFrameStatistics(IDXGISwapChain4 *iface,
+         DXGI_FRAME_STATISTICS *stats)
+ {
+-    FIXME("iface %p, stats %p stub!\n", iface, stats);
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
++    LARGE_INTEGER frequency;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, stats %p.\n", iface, stats);
++
++    if (!swapchain->composition_window)
++    {
++        FIXME("iface %p, stats %p stub!\n", iface, stats);
++        return E_NOTIMPL;
++    }
++    if (!stats)
++        return E_INVALIDARG;
++
++    /* A composition shows each present by the next of its frames, counted at 60 Hz here; until the
++     * first, there is nothing to count from. */
++    memset(stats, 0, sizeof(*stats));
++    if (!swapchain->present_count)
++        return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
++    QueryPerformanceFrequency(&frequency);
++    stats->PresentCount = swapchain->present_count;
++    stats->PresentRefreshCount = swapchain->last_present.QuadPart * 60 / frequency.QuadPart;
++    stats->SyncRefreshCount = stats->PresentRefreshCount;
++    stats->SyncQPCTime = swapchain->last_present;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetLastPresentCount(IDXGISwapChain4 *iface,
+@@ -901,7 +1000,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc1(IDXGISwapChain4 *iface
+     desc->BufferCount = wined3d_desc.backbuffer_count;
+     desc->Scaling = DXGI_SCALING_STRETCH;
+     desc->SwapEffect = dxgi_swap_effect_from_wined3d(wined3d_desc.swap_effect);
+-    desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++    desc->AlphaMode = swapchain->composition_window ? swapchain->alpha_mode : DXGI_ALPHA_MODE_IGNORE;
+     desc->Flags = dxgi_swapchain_flags_from_wined3d(wined3d_desc.flags);
+ 
+     return S_OK;
+@@ -945,6 +1044,10 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetHwnd(IDXGISwapChain4 *iface,
+         return DXGI_ERROR_INVALID_CALL;
+     }
+ 
++    /* a swapchain for composition has no window of the application's */
++    if (swapchain->composition_window)
++        return DXGI_ERROR_INVALID_CALL;
++
+     *hwnd = d3d11_swapchain_get_hwnd(swapchain);
+     return S_OK;
+ }
+@@ -1191,6 +1294,14 @@ static void STDMETHODCALLTYPE d3d11_swapchain_wined3d_object_released(void *pare
+ {
+     struct d3d11_swapchain *swapchain = parent;
+ 
++    /* posted: this may run where waiting on the owner of the window could deadlock */
++    if (swapchain->composition_window)
++    {
++        PostMessageW(composition_owner, WM_WINE_COMPOSITION_DESTROY, 0, (LPARAM)swapchain->composition_window);
++        swapchain->composition_cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&swapchain->composition_cs);
++        free(swapchain->listeners);
++    }
+     wined3d_private_store_cleanup(&swapchain->private_store);
+     free(parent);
+ }
+@@ -3702,3 +3813,249 @@ HRESULT d3d12_swapchain_create(IWineDXGIFactory *factory, ID3D12CommandQueue *qu
+ 
+     return S_OK;
+ }
++
++/* What a swapchain for composition does for the composition that shows it. */
++struct composition_listener
++{
++    wine_dxgi_present_callback callback;
++    void *context;
++};
++
++static inline struct d3d11_swapchain *d3d11_swapchain_from_IWineDXGICompositionSwapChain(
++        IWineDXGICompositionSwapChain *iface)
++{
++    return CONTAINING_RECORD(iface, struct d3d11_swapchain, IWineDXGICompositionSwapChain_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_QueryInterface(IWineDXGICompositionSwapChain *iface,
++        REFIID iid, void **out)
++{
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGICompositionSwapChain(iface);
++
++    return IDXGISwapChain4_QueryInterface(&swapchain->IDXGISwapChain4_iface, iid, out);
++}
++
++static ULONG STDMETHODCALLTYPE composition_swapchain_AddRef(IWineDXGICompositionSwapChain *iface)
++{
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGICompositionSwapChain(iface);
++
++    return IDXGISwapChain4_AddRef(&swapchain->IDXGISwapChain4_iface);
++}
++
++static ULONG STDMETHODCALLTYPE composition_swapchain_Release(IWineDXGICompositionSwapChain *iface)
++{
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGICompositionSwapChain(iface);
++
++    return IDXGISwapChain4_Release(&swapchain->IDXGISwapChain4_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_get_presented(IWineDXGICompositionSwapChain *iface,
++        IDXGISurface **surface, UINT *version)
++{
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGICompositionSwapChain(iface);
++
++    EnterCriticalSection(&swapchain->composition_cs);
++    if ((*surface = swapchain->presented))
++        IDXGISurface_AddRef(*surface);
++    *version = swapchain->presented_version;
++    LeaveCriticalSection(&swapchain->composition_cs);
++
++    return *surface ? S_OK : S_FALSE;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_add_present_callback(IWineDXGICompositionSwapChain *iface,
++        wine_dxgi_present_callback callback, void *context)
++{
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGICompositionSwapChain(iface);
++    struct composition_listener *listeners;
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, callback %p, context %p.\n", iface, callback, context);
++
++    EnterCriticalSection(&swapchain->composition_cs);
++    if (!(listeners = realloc(swapchain->listeners, (swapchain->listener_count + 1) * sizeof(*listeners))))
++    {
++        hr = E_OUTOFMEMORY;
++    }
++    else
++    {
++        listeners[swapchain->listener_count].callback = callback;
++        listeners[swapchain->listener_count].context = context;
++        ++swapchain->listener_count;
++        swapchain->listeners = listeners;
++    }
++    LeaveCriticalSection(&swapchain->composition_cs);
++
++    return hr;
++}
++
++/* The callback is not running, nor called again, once this returns. */
++static void STDMETHODCALLTYPE composition_swapchain_remove_present_callback(IWineDXGICompositionSwapChain *iface,
++        wine_dxgi_present_callback callback, void *context)
++{
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGICompositionSwapChain(iface);
++    unsigned int i;
++
++    TRACE("iface %p, callback %p, context %p.\n", iface, callback, context);
++
++    EnterCriticalSection(&swapchain->composition_cs);
++    for (i = 0; i < swapchain->listener_count; ++i)
++    {
++        if (swapchain->listeners[i].callback != callback || swapchain->listeners[i].context != context)
++            continue;
++        swapchain->listeners[i] = swapchain->listeners[--swapchain->listener_count];
++        break;
++    }
++    LeaveCriticalSection(&swapchain->composition_cs);
++}
++
++static const struct IWineDXGICompositionSwapChainVtbl composition_swapchain_vtbl =
++{
++    composition_swapchain_QueryInterface,
++    composition_swapchain_AddRef,
++    composition_swapchain_Release,
++    composition_swapchain_get_presented,
++    composition_swapchain_add_present_callback,
++    composition_swapchain_remove_present_callback,
++};
++
++/* A present of a swapchain for composition makes the whole of its buffer, with any dirty rectangles
++ * already composited into it, what the composition draws from now, and tells whoever shows it.  An
++ * interval waits for that many frames since the last present, as a composition draws at 60 Hz. */
++static HRESULT d3d11_swapchain_present_composition(struct d3d11_swapchain *swapchain, unsigned int sync_interval)
++{
++    IDXGISurface *presented = NULL, *old = NULL;
++    ID3D11Texture2D *source, *texture = NULL;
++    D3D11_TEXTURE2D_DESC desc, presented_desc;
++    struct wined3d_texture *back_buffer;
++    LARGE_INTEGER now, frequency;
++    ID3D11DeviceContext *context;
++    ID3D11Device *device;
++    unsigned int i;
++    HRESULT hr;
++
++    wined3d_mutex_lock();
++    if ((back_buffer = wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, 0)))
++        hr = IUnknown_QueryInterface((IUnknown *)wined3d_texture_get_parent(back_buffer),
++                &IID_ID3D11Texture2D, (void **)&source);
++    else
++        hr = DXGI_ERROR_INVALID_CALL;
++    wined3d_mutex_unlock();
++    if (FAILED(hr))
++        return hr;
++    ID3D11Texture2D_GetDesc(source, &desc);
++    ID3D11Texture2D_GetDevice(source, &device);
++
++    /* the texture is made again when the buffers change size or format */
++    EnterCriticalSection(&swapchain->composition_cs);
++    if ((presented = swapchain->presented))
++        IDXGISurface_AddRef(presented);
++    LeaveCriticalSection(&swapchain->composition_cs);
++    if (presented && SUCCEEDED(IDXGISurface_QueryInterface(presented, &IID_ID3D11Texture2D, (void **)&texture)))
++    {
++        ID3D11Texture2D_GetDesc(texture, &presented_desc);
++        if (presented_desc.Width != desc.Width || presented_desc.Height != desc.Height
++                || presented_desc.Format != desc.Format)
++        {
++            ID3D11Texture2D_Release(texture);
++            texture = NULL;
++        }
++    }
++    if (!texture)
++    {
++        if (presented)
++            IDXGISurface_Release(presented);
++        presented = NULL;
++        desc.Usage = D3D11_USAGE_DEFAULT;
++        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        desc.CPUAccessFlags = 0;
++        desc.MiscFlags = 0;
++        if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture)))
++        {
++            WARN("Failed to create the texture to compose from, hr %#lx.\n", hr);
++            goto done;
++        }
++        ID3D11Texture2D_QueryInterface(texture, &IID_IDXGISurface, (void **)&presented);
++    }
++
++    ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)texture, (ID3D11Resource *)source);
++    ID3D11DeviceContext_Release(context);
++    ID3D11Texture2D_Release(texture);
++
++    EnterCriticalSection(&swapchain->composition_cs);
++    if (swapchain->presented != presented)
++    {
++        old = swapchain->presented;
++        IDXGISurface_AddRef((swapchain->presented = presented));
++    }
++    ++swapchain->presented_version;
++    for (i = 0; i < swapchain->listener_count; ++i)
++        swapchain->listeners[i].callback(swapchain->listeners[i].context);
++    LeaveCriticalSection(&swapchain->composition_cs);
++    if (old)
++        IDXGISurface_Release(old);
++
++    InterlockedIncrement(&swapchain->present_count);
++    swapchain->presented_full = TRUE;
++
++    QueryPerformanceFrequency(&frequency);
++    QueryPerformanceCounter(&now);
++    if (sync_interval && swapchain->last_present.QuadPart)
++    {
++        LONGLONG wait = swapchain->last_present.QuadPart + frequency.QuadPart * sync_interval / 60 - now.QuadPart;
++
++        if (wait > 0)
++        {
++            Sleep(wait * 1000 / frequency.QuadPart);
++            QueryPerformanceCounter(&now);
++        }
++    }
++    swapchain->last_present = now;
++
++done:
++    if (presented)
++        IDXGISurface_Release(presented);
++    ID3D11Device_Release(device);
++    ID3D11Texture2D_Release(source);
++    return hr;
++}
++
++/* A swapchain for composition: an ordinary one on a hidden window, which a composition surface shows. */
++HRESULT dxgi_create_composition_swapchain(IWineDXGIFactory *factory, IUnknown *device,
++        const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
++{
++    IWineDXGISwapChainFactory *swapchain_factory;
++    struct d3d11_swapchain *object;
++    IDXGISwapChain1 *result;
++    HWND window;
++    HRESULT hr;
++
++    if (FAILED(IUnknown_QueryInterface(device, &IID_IWineDXGISwapChainFactory, (void **)&swapchain_factory)))
++    {
++        FIXME("Composition swapchains are only implemented for d3d11 devices.\n");
++        return E_NOTIMPL;
++    }
++    IWineDXGISwapChainFactory_Release(swapchain_factory);
++
++    if (!InitOnceExecuteOnce(&composition_owner_once, composition_owner_init, NULL, NULL))
++        return E_FAIL;
++    if (!(window = (HWND)SendMessageW(composition_owner, WM_WINE_COMPOSITION_CREATE,
++            MAKEWPARAM(desc->Width, desc->Height), 0)))
++        return E_FAIL;
++
++    if (FAILED(hr = IWineDXGIFactory_CreateSwapChainForHwnd(factory, device, window, desc, NULL, output, &result)))
++    {
++        PostMessageW(composition_owner, WM_WINE_COMPOSITION_DESTROY, 0, (LPARAM)window);
++        return hr;
++    }
++    object = d3d11_swapchain_from_IDXGISwapChain4((IDXGISwapChain4 *)result);
++    object->IWineDXGICompositionSwapChain_iface.lpVtbl = &composition_swapchain_vtbl;
++    object->composition_window = window;
++    object->alpha_mode = desc->AlphaMode;
++    InitializeCriticalSectionEx(&object->composition_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    object->composition_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": d3d11_swapchain.composition_cs");
++
++    *swapchain = result;
++    return S_OK;
++}
+diff --git a/include/wine/winedxgi.idl b/include/wine/winedxgi.idl
+index fff00dead73..57ff8b63fa4 100644
+--- a/include/wine/winedxgi.idl
++++ b/include/wine/winedxgi.idl
+@@ -95,3 +95,19 @@ interface IWineDXGIAdapter : IDXGIAdapter4
+ interface IWineDXGIFactory : IDXGIFactory7
+ {
+ }
++
++typedef void (__stdcall *wine_dxgi_present_callback)(void *context);
++
++/* What a swapchain for composition gives the composition that shows it: what it presented last, as a
++ * surface of its device, with a count of the presents that changed it, and a call on each present. */
++[
++    object,
++    local,
++    uuid(cf4de0ea-d3cc-456c-970f-10aa8cb31c16)
++]
++interface IWineDXGICompositionSwapChain : IUnknown
++{
++    HRESULT get_presented([out] IDXGISurface **surface, [out] UINT *version);
++    HRESULT add_present_callback([in] wine_dxgi_present_callback callback, [in] void *context);
++    void remove_present_callback([in] wine_dxgi_present_callback callback, [in] void *context);
++}

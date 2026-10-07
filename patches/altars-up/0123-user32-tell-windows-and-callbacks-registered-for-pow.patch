@@ -1,0 +1,776 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 11:56:44 -0400
+Subject: [PATCH] user32: tell windows and callbacks registered for power
+ settings their values.
+
+RegisterPowerSettingNotification handed back 0xdeadbeef and told
+nothing.  Windows tells a registration the current value of its setting
+soon after it is made, from another thread - a window by a sent
+WM_POWERBROADCAST with PBT_POWERSETTINGCHANGE, a callback of
+DEVICE_NOTIFY_CALLBACK by a call - and again whenever it changes.  Word
+registers its windows for six settings as it starts.
+
+Registrations are now real, and each is told what Windows tells:
+the power source and the battery's charge as NtPowerInformation reads
+them, the one power scheme there is, balanced, as the active scheme and
+its personality, the monitor and the console display on, energy saver
+off, and for the idle background task the DWORD 2 Windows sends, which
+it says means nothing.  Away mode is never on, and like settings there
+are none of and a battery that is not there, it is told nothing.  The
+power source and the charge are looked at every five seconds while
+anything is registered for them, and a change is told as it is seen.
+
+What is refused is as on Windows: flags other than the three, a
+suspend and resume registration for a service; a successful
+registration sets the last error to 0, and unregistering NULL fails
+with ERROR_INVALID_PARAMETER.  A service is not told anything yet, and
+a service status handle that is none is not refused, as Windows does
+with ERROR_SERVICE_NOT_IN_EXE.  A callback is not called after
+unregistering it returns; a window may still get what it was about to
+be sent.
+
+Suspend and resume registrations are real too, but Wine does not see
+the system suspend, so they are never told anything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit a1de13bdc54ec5fe238010d58d1b4666e5873940)
+
+diff --git a/dlls/user32/Makefile.in b/dlls/user32/Makefile.in
+index 0d8a18fddca..2324de65554 100644
+--- a/dlls/user32/Makefile.in
++++ b/dlls/user32/Makefile.in
+@@ -33,6 +33,7 @@ SOURCES = \
+ 	misc.c \
+ 	msgbox.c \
+ 	nonclient.c \
++	power.c \
+ 	property.c \
+ 	resource.c \
+ 	resources/ocr_appstarting.svg \
+diff --git a/dlls/user32/misc.c b/dlls/user32/misc.c
+index ab6d1f4d175..66af4126741 100644
+--- a/dlls/user32/misc.c
++++ b/dlls/user32/misc.c
+@@ -404,42 +404,6 @@ BOOL WINAPI UserHandleGrantAccess(HANDLE handle, HANDLE job, BOOL grant)
+     return TRUE;
+ }
+ 
+-/**********************************************************************
+- * RegisterPowerSettingNotification [USER32.@]
+- */
+-HPOWERNOTIFY WINAPI RegisterPowerSettingNotification(HANDLE recipient, const GUID *guid, DWORD flags)
+-{
+-    FIXME("(%p,%s,%lx): stub\n", recipient, debugstr_guid(guid), flags);
+-    return (HPOWERNOTIFY)0xdeadbeef;
+-}
+-
+-/**********************************************************************
+- * UnregisterPowerSettingNotification [USER32.@]
+- */
+-BOOL WINAPI UnregisterPowerSettingNotification(HPOWERNOTIFY handle)
+-{
+-    FIXME("(%p): stub\n", handle);
+-    return TRUE;
+-}
+-
+-/**********************************************************************
+- * RegisterSuspendResumeNotification (USER32.@)
+- */
+-HPOWERNOTIFY WINAPI RegisterSuspendResumeNotification(HANDLE recipient, DWORD flags)
+-{
+-    FIXME("%p, %#lx: stub.\n", recipient, flags);
+-    return (HPOWERNOTIFY)0xdeadbeef;
+-}
+-
+-/**********************************************************************
+- * UnregisterSuspendResumeNotification (USER32.@)
+- */
+-BOOL WINAPI UnregisterSuspendResumeNotification(HPOWERNOTIFY handle)
+-{
+-    FIXME("%p: stub.\n", handle);
+-    return TRUE;
+-}
+-
+ /**********************************************************************
+  * IsImmersiveProcess [USER32.@]
+  */
+diff --git a/dlls/user32/power.c b/dlls/user32/power.c
+new file mode 100644
+index 00000000000..b0e6503989f
+--- /dev/null
++++ b/dlls/user32/power.c
+@@ -0,0 +1,354 @@
++/*
++ * Power setting, and suspend and resume, notifications
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "user_private.h"
++#include "winternl.h"
++#include "powrprof.h"
++
++#include "wine/list.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(power);
++
++/* A registration.  Windows tells each one the current value of its setting
++ * soon after it is made, from another thread, and again whenever the value
++ * changes; a window by WM_POWERBROADCAST, sent, and a callback by a call. */
++struct power_notify
++{
++    struct list entry;
++    LONG refcount;
++    BOOL suspend_resume;    /* for suspend and resume, not for a setting */
++    GUID setting;
++    DWORD flags;            /* DEVICE_NOTIFY_WINDOW_HANDLE, _SERVICE_HANDLE or _CALLBACK */
++    HANDLE recipient;       /* the window, or the service status handle */
++    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS params;
++    DWORD thread;           /* the thread telling it, while one is */
++    DWORD size;             /* of the value last told, 0 before the first */
++    BYTE value[sizeof(GUID)];
++};
++
++static struct list power_notifies = LIST_INIT( power_notifies );
++static CONDITION_VARIABLE power_told = CONDITION_VARIABLE_INIT;
++static PTP_TIMER power_timer;
++
++static CRITICAL_SECTION power_section;
++static CRITICAL_SECTION_DEBUG power_section_debug =
++{
++    0, 0, &power_section,
++    { &power_section_debug.ProcessLocksList, &power_section_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": power_section") }
++};
++static CRITICAL_SECTION power_section = { &power_section_debug, -1, 0, 0, 0, 0 };
++
++/* how often a change of power source or battery charge is looked for */
++#define POWER_POLL_MS 5000
++
++static void power_notify_release( struct power_notify *notify )
++{
++    if (!InterlockedDecrement( &notify->refcount )) free( notify );
++}
++
++/* the value of a setting as Windows tells it; FALSE for one it tells nothing of */
++static BOOL power_setting_value( const GUID *setting, BYTE *value, DWORD *size )
++{
++    SYSTEM_BATTERY_STATE battery;
++    DWORD dword;
++
++    if (IsEqualGUID( setting, &GUID_POWERSCHEME_PERSONALITY ) || IsEqualGUID( setting, &GUID_ACTIVE_POWERSCHEME ))
++    {
++        /* the one scheme there is, as on a computer with modern standby: balanced, of balanced personality */
++        memcpy( value, &GUID_TYPICAL_POWER_SAVINGS, sizeof(GUID) );
++        *size = sizeof(GUID);
++        return TRUE;
++    }
++
++    if (IsEqualGUID( setting, &GUID_MONITOR_POWER_ON )) dword = TRUE;
++    else if (IsEqualGUID( setting, &GUID_CONSOLE_DISPLAY_STATE )) dword = PowerMonitorOn;
++    else if (IsEqualGUID( setting, &GUID_ENERGY_SAVER_STATUS )) dword = ENERGY_SAVER_OFF;
++    /* its data means nothing, Windows says; this is what it sends */
++    else if (IsEqualGUID( setting, &GUID_IDLE_BACKGROUND_TASK )) dword = 2;
++    else if (IsEqualGUID( setting, &GUID_ACDC_POWER_SOURCE ) || IsEqualGUID( setting, &GUID_BATTERY_PERCENTAGE_REMAINING ))
++    {
++        memset( &battery, 0, sizeof(battery) );
++        if (NtPowerInformation( SystemBatteryState, NULL, 0, &battery, sizeof(battery) )) battery.AcOnLine = TRUE;
++        if (IsEqualGUID( setting, &GUID_ACDC_POWER_SOURCE ))
++            dword = battery.AcOnLine || !battery.BatteryPresent ? PoAc : PoDc;
++        else if (!battery.BatteryPresent) return FALSE;  /* no charge to tell of */
++        else if (!battery.MaxCapacity) dword = 100;
++        else dword = min( 100, (ULONGLONG)battery.RemainingCapacity * 100 / battery.MaxCapacity );
++    }
++    /* away mode is never on here; Windows tells nothing of it then, nor of settings there are none of */
++    else return FALSE;
++
++    memcpy( value, &dword, sizeof(dword) );
++    *size = sizeof(dword);
++    return TRUE;
++}
++
++/* tell a registration its setting's value, if it changed since it was last told or it never was */
++static void power_notify_update( struct power_notify *notify )
++{
++    union
++    {
++        POWERBROADCAST_SETTING setting;
++        BYTE buffer[offsetof(POWERBROADCAST_SETTING, Data[sizeof(GUID)])];
++    } u;
++    DWORD size, thread = GetCurrentThreadId();
++    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS params;
++    BYTE value[sizeof(GUID)];
++    HANDLE recipient;
++
++    EnterCriticalSection( &power_section );
++    /* one thread at a time tells a registration, so that values arrive in order */
++    while (notify->thread && notify->thread != thread)
++        SleepConditionVariableCS( &power_told, &power_section, INFINITE );
++    if (!notify->recipient || notify->thread || !power_setting_value( &notify->setting, value, &size )
++        || (size == notify->size && !memcmp( value, notify->value, size )))
++    {
++        LeaveCriticalSection( &power_section );
++        return;
++    }
++    memcpy( notify->value, value, size );
++    notify->size = size;
++    notify->thread = thread;
++    recipient = notify->recipient;
++    params = notify->params;
++    LeaveCriticalSection( &power_section );
++
++    u.setting.PowerSetting = notify->setting;
++    u.setting.DataLength = size;
++    memcpy( u.setting.Data, value, size );
++    TRACE( "telling %p of %s, %lu bytes\n", notify, debugstr_guid( &notify->setting ), size );
++
++    switch (notify->flags)
++    {
++    case DEVICE_NOTIFY_WINDOW_HANDLE:
++        SendMessageTimeoutW( recipient, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&u.setting,
++                             SMTO_NORMAL, 20000, NULL );
++        break;
++    case DEVICE_NOTIFY_CALLBACK:
++        params.Callback( params.Context, PBT_POWERSETTINGCHANGE, &u.setting );
++        break;
++    }
++
++    EnterCriticalSection( &power_section );
++    notify->thread = 0;
++    WakeAllConditionVariable( &power_told );
++    LeaveCriticalSection( &power_section );
++}
++
++static void CALLBACK power_notify_first( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    struct power_notify *notify = context;
++
++    power_notify_update( notify );
++    power_notify_release( notify );
++}
++
++static BOOL power_setting_changes( const GUID *setting )
++{
++    return IsEqualGUID( setting, &GUID_ACDC_POWER_SOURCE ) || IsEqualGUID( setting, &GUID_BATTERY_PERCENTAGE_REMAINING );
++}
++
++/* Windows tells of a change as it happens; here the power source and the battery charge are looked at every
++ * few seconds while anything is registered for them */
++static void CALLBACK power_poll( TP_CALLBACK_INSTANCE *instance, void *context, TP_TIMER *timer )
++{
++    struct power_notify *notify, **notifies = NULL;
++    unsigned int i, count = 0;
++
++    EnterCriticalSection( &power_section );
++    LIST_FOR_EACH_ENTRY( notify, &power_notifies, struct power_notify, entry )
++        if (!notify->suspend_resume && power_setting_changes( &notify->setting )) count++;
++    if (count && (notifies = malloc( count * sizeof(*notifies) )))
++    {
++        count = 0;
++        LIST_FOR_EACH_ENTRY( notify, &power_notifies, struct power_notify, entry )
++        {
++            if (notify->suspend_resume || !power_setting_changes( &notify->setting )) continue;
++            InterlockedIncrement( &notify->refcount );
++            notifies[count++] = notify;
++        }
++    }
++    LeaveCriticalSection( &power_section );
++
++    for (i = 0; notifies && i < count; i++)
++    {
++        power_notify_update( notifies[i] );
++        power_notify_release( notifies[i] );
++    }
++    free( notifies );
++}
++
++/* the power_section is held */
++static void power_poll_update(void)
++{
++    struct power_notify *notify;
++    LARGE_INTEGER due;
++    FILETIME ft;
++
++    LIST_FOR_EACH_ENTRY( notify, &power_notifies, struct power_notify, entry )
++        if (!notify->suspend_resume && power_setting_changes( &notify->setting )) break;
++
++    if (&notify->entry == &power_notifies)
++    {
++        if (power_timer) SetThreadpoolTimer( power_timer, NULL, 0, 0 );
++        return;
++    }
++    if (!power_timer && !(power_timer = CreateThreadpoolTimer( power_poll, NULL, NULL ))) return;
++    if (IsThreadpoolTimerSet( power_timer )) return;
++    due.QuadPart = -(LONGLONG)POWER_POLL_MS * 10000;
++    ft.dwLowDateTime = due.u.LowPart;
++    ft.dwHighDateTime = due.u.HighPart;
++    SetThreadpoolTimer( power_timer, &ft, POWER_POLL_MS, POWER_POLL_MS / 5 );
++}
++
++static struct power_notify *power_notify_create( HANDLE recipient, const GUID *setting, DWORD flags )
++{
++    struct power_notify *notify;
++
++    if (!(notify = calloc( 1, sizeof(*notify) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return NULL;
++    }
++    notify->refcount = 1;
++    notify->flags = flags;
++    if (setting) notify->setting = *setting;
++    else notify->suspend_resume = TRUE;
++    if (flags == DEVICE_NOTIFY_CALLBACK)
++    {
++        /* a caller's parameters may live on its stack */
++        notify->params = *(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS *)recipient;
++        notify->recipient = &notify->params;
++    }
++    else notify->recipient = recipient;
++
++    EnterCriticalSection( &power_section );
++    list_add_tail( &power_notifies, &notify->entry );
++    if (setting) power_poll_update();
++    LeaveCriticalSection( &power_section );
++    return notify;
++}
++
++static BOOL power_notify_destroy( struct power_notify *notify, BOOL suspend_resume )
++{
++    struct power_notify *entry;
++    DWORD thread = GetCurrentThreadId();
++
++    EnterCriticalSection( &power_section );
++    LIST_FOR_EACH_ENTRY( entry, &power_notifies, struct power_notify, entry )
++        if (entry == notify && entry->suspend_resume == suspend_resume) break;
++    if (&entry->entry == &power_notifies)
++    {
++        LeaveCriticalSection( &power_section );
++        return FALSE;
++    }
++    list_remove( &notify->entry );
++    if (!suspend_resume) power_poll_update();
++    /* no call is made after this returns, but a window may still be sent what it was about to be sent */
++    notify->recipient = NULL;
++    if (notify->flags == DEVICE_NOTIFY_CALLBACK)
++        while (notify->thread && notify->thread != thread)
++            SleepConditionVariableCS( &power_told, &power_section, INFINITE );
++    LeaveCriticalSection( &power_section );
++    power_notify_release( notify );
++    return TRUE;
++}
++
++/**********************************************************************
++ * RegisterPowerSettingNotification [USER32.@]
++ */
++HPOWERNOTIFY WINAPI RegisterPowerSettingNotification( HANDLE recipient, const GUID *setting, DWORD flags )
++{
++    struct power_notify *notify;
++
++    TRACE( "(%p, %s, %#lx)\n", recipient, debugstr_guid( setting ), flags );
++
++    /* Windows does not check for a NULL setting, nor for NULL parameters */
++    if (!setting || (flags == DEVICE_NOTIFY_CALLBACK && !recipient)
++        || (flags != DEVICE_NOTIFY_WINDOW_HANDLE && flags != DEVICE_NOTIFY_SERVICE_HANDLE && flags != DEVICE_NOTIFY_CALLBACK))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (flags == DEVICE_NOTIFY_SERVICE_HANDLE)
++        FIXME( "service %p is not told of %s\n", recipient, debugstr_guid( setting ) );
++
++    if (!(notify = power_notify_create( recipient, setting, flags ))) return NULL;
++    if (flags != DEVICE_NOTIFY_SERVICE_HANDLE && (flags != DEVICE_NOTIFY_WINDOW_HANDLE || recipient))
++    {
++        InterlockedIncrement( &notify->refcount );
++        if (!TrySubmitThreadpoolCallback( power_notify_first, notify, NULL )) power_notify_release( notify );
++    }
++    SetLastError( ERROR_SUCCESS );
++    return notify;
++}
++
++/**********************************************************************
++ * UnregisterPowerSettingNotification [USER32.@]
++ */
++BOOL WINAPI UnregisterPowerSettingNotification( HPOWERNOTIFY handle )
++{
++    TRACE( "(%p)\n", handle );
++
++    if (!handle || !power_notify_destroy( handle, FALSE ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/**********************************************************************
++ * RegisterSuspendResumeNotification (USER32.@)
++ */
++HPOWERNOTIFY WINAPI RegisterSuspendResumeNotification( HANDLE recipient, DWORD flags )
++{
++    struct power_notify *notify;
++
++    TRACE( "(%p, %#lx)\n", recipient, flags );
++
++    if ((flags != DEVICE_NOTIFY_WINDOW_HANDLE && flags != DEVICE_NOTIFY_CALLBACK)
++        || (flags == DEVICE_NOTIFY_CALLBACK && !recipient))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return NULL;
++    }
++    /* the system is not seen to suspend here, so there is nothing to tell */
++    if (!(notify = power_notify_create( recipient, NULL, flags ))) return NULL;
++    SetLastError( ERROR_SUCCESS );
++    return notify;
++}
++
++/**********************************************************************
++ * UnregisterSuspendResumeNotification (USER32.@)
++ */
++BOOL WINAPI UnregisterSuspendResumeNotification( HPOWERNOTIFY handle )
++{
++    TRACE( "(%p)\n", handle );
++
++    if (!handle || !power_notify_destroy( handle, TRUE ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    return TRUE;
++}
+diff --git a/dlls/user32/tests/Makefile.in b/dlls/user32/tests/Makefile.in
+index 4bc7172bdb9..b45b4a55f78 100644
+--- a/dlls/user32/tests/Makefile.in
++++ b/dlls/user32/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = user32.dll
+-IMPORTS   = user32 gdi32 advapi32 hid imm32 setupapi
++IMPORTS   = user32 gdi32 advapi32 hid imm32 setupapi uuid
+ EXTRADLLFLAGS = -Wl,--subsystem,console:5.2
+ 
+ testdll_IMPORTS = user32
+@@ -20,6 +20,7 @@ SOURCES = \
+ 	menu.c \
+ 	monitor.c \
+ 	msg.c \
++	power.c \
+ 	resource.c \
+ 	resource.rc \
+ 	scroll.c \
+diff --git a/dlls/user32/tests/power.c b/dlls/user32/tests/power.c
+new file mode 100644
+index 00000000000..ec27d7bbefd
+--- /dev/null
++++ b/dlls/user32/tests/power.c
+@@ -0,0 +1,294 @@
++/*
++ * Unit tests for power setting, and suspend and resume, notifications
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winuser.h"
++#include "powrprof.h"
++
++#include "wine/test.h"
++
++static DWORD main_thread;
++
++/* what the last WM_POWERBROADCAST or callback told */
++static struct
++{
++    LONG count;
++    BOOL sent;
++    BOOL other_thread;
++    void *context;
++    ULONG type;
++    GUID setting;
++    DWORD size;
++    BYTE data[16];
++} told;
++static HANDLE told_event;
++
++static void remember( const POWERBROADCAST_SETTING *setting )
++{
++    told.setting = setting->PowerSetting;
++    told.size = setting->DataLength;
++    memcpy( told.data, setting->Data, min( setting->DataLength, sizeof(told.data) ));
++    told.other_thread = GetCurrentThreadId() != main_thread;
++    InterlockedIncrement( &told.count );
++}
++
++static LRESULT CALLBACK power_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    if (msg == WM_POWERBROADCAST)
++    {
++        told.type = wparam;
++        told.sent = InSendMessage();
++        if (wparam == PBT_POWERSETTINGCHANGE) remember( (const POWERBROADCAST_SETTING *)lparam );
++        else InterlockedIncrement( &told.count );
++        return TRUE;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static ULONG CALLBACK power_callback( void *context, ULONG type, void *setting )
++{
++    told.context = context;
++    told.type = type;
++    if (type == PBT_POWERSETTINGCHANGE) remember( setting );
++    else InterlockedIncrement( &told.count );
++    SetEvent( told_event );
++    return 0;
++}
++
++/* until something is told, or for as long as it might take */
++static void wait_told( DWORD timeout )
++{
++    DWORD end = GetTickCount() + timeout;
++    MSG msg;
++
++    while (!told.count && (LONG)(end - GetTickCount()) > 0)
++    {
++        MsgWaitForMultipleObjects( 1, &told_event, FALSE, 50, QS_ALLINPUT );
++        while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
++    }
++}
++
++static void test_power_setting_window( HWND hwnd )
++{
++    static const struct
++    {
++        const GUID *guid;
++        DWORD size;
++        DWORD max;      /* the highest value it takes, of those that are numbers */
++    }
++    settings[] =
++    {
++        { &GUID_ACDC_POWER_SOURCE, sizeof(DWORD), PoHot },
++        { &GUID_MONITOR_POWER_ON, sizeof(DWORD), TRUE },
++        { &GUID_CONSOLE_DISPLAY_STATE, sizeof(DWORD), PowerMonitorDim },
++        { &GUID_ENERGY_SAVER_STATUS, sizeof(DWORD), ENERGY_SAVER_HIGH_SAVINGS },
++        { &GUID_POWERSCHEME_PERSONALITY, sizeof(GUID) },
++        { &GUID_ACTIVE_POWERSCHEME, sizeof(GUID) },
++        { &GUID_IDLE_BACKGROUND_TASK, sizeof(DWORD), ~0u },
++    };
++    static const GUID unknown = {0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
++    HPOWERNOTIFY notify;
++    unsigned int i;
++    BOOL ret;
++
++    for (i = 0; i < ARRAY_SIZE(settings); i++)
++    {
++        winetest_push_context( "%s", debugstr_guid( settings[i].guid ));
++        memset( &told, 0, sizeof(told) );
++        SetLastError( 0xdeadbeef );
++        notify = RegisterPowerSettingNotification( hwnd, settings[i].guid, DEVICE_NOTIFY_WINDOW_HANDLE );
++        if (!notify && settings[i].guid == &GUID_IDLE_BACKGROUND_TASK)
++        {
++            /* outside an interactive session */
++            ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++            winetest_pop_context();
++            continue;
++        }
++        ok( !!notify, "got error %lu\n", GetLastError() );
++        ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++
++        /* the current value is sent, from another thread, soon after */
++        ok( !told.count, "told %ld times already\n", told.count );
++        wait_told( 5000 );
++        ok( told.count == 1, "told %ld times\n", told.count );
++        ok( told.sent, "not sent\n" );
++        ok( told.type == PBT_POWERSETTINGCHANGE, "got type %#lx\n", told.type );
++        ok( IsEqualGUID( &told.setting, settings[i].guid ), "got setting %s\n", debugstr_guid( &told.setting ));
++        ok( told.size == settings[i].size, "got %lu bytes\n", told.size );
++        if (settings[i].size == sizeof(DWORD))
++            ok( *(DWORD *)told.data <= settings[i].max, "got value %lu\n", *(DWORD *)told.data );
++        else
++            ok( IsEqualGUID( (GUID *)told.data, &GUID_TYPICAL_POWER_SAVINGS )
++                || IsEqualGUID( (GUID *)told.data, &GUID_MAX_POWER_SAVINGS )
++                || IsEqualGUID( (GUID *)told.data, &GUID_MIN_POWER_SAVINGS )
++                || settings[i].guid == &GUID_ACTIVE_POWERSCHEME /* a scheme of the user's own */,
++                "got scheme %s\n", debugstr_guid( (GUID *)told.data ));
++
++        ret = UnregisterPowerSettingNotification( notify );
++        ok( ret, "UnregisterPowerSettingNotification failed\n" );
++        winetest_pop_context();
++    }
++
++    /* nothing is told of away mode unless it is on, nor of settings there are none of */
++    memset( &told, 0, sizeof(told) );
++    notify = RegisterPowerSettingNotification( hwnd, &GUID_SYSTEM_AWAYMODE, DEVICE_NOTIFY_WINDOW_HANDLE );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    wait_told( 500 );
++    ok( !told.count, "told %ld times\n", told.count );
++    UnregisterPowerSettingNotification( notify );
++
++    SetLastError( 0xdeadbeef );
++    notify = RegisterPowerSettingNotification( hwnd, &unknown, DEVICE_NOTIFY_WINDOW_HANDLE );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++    wait_told( 500 );
++    ok( !told.count, "told %ld times\n", told.count );
++    UnregisterPowerSettingNotification( notify );
++
++    /* the battery's charge is told only where there is a battery */
++    notify = RegisterPowerSettingNotification( hwnd, &GUID_BATTERY_PERCENTAGE_REMAINING, DEVICE_NOTIFY_WINDOW_HANDLE );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    wait_told( 1000 );
++    if (told.count)
++    {
++        ok( told.size == sizeof(DWORD), "got %lu bytes\n", told.size );
++        ok( *(DWORD *)told.data <= 100, "got %lu percent\n", *(DWORD *)told.data );
++    }
++    UnregisterPowerSettingNotification( notify );
++
++    /* a registration without a window to tell */
++    SetLastError( 0xdeadbeef );
++    notify = RegisterPowerSettingNotification( NULL, &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_WINDOW_HANDLE );
++    ok( !!notify, "got NULL\n" );
++    ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++    ret = UnregisterPowerSettingNotification( notify );
++    ok( ret, "UnregisterPowerSettingNotification failed\n" );
++
++    SetLastError( 0xdeadbeef );
++    notify = RegisterPowerSettingNotification( hwnd, &GUID_ACDC_POWER_SOURCE, 7 );
++    ok( !notify, "got a handle\n" );
++    ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++    SetLastError( 0xdeadbeef );
++    notify = RegisterPowerSettingNotification( hwnd, &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_ALL_INTERFACE_CLASSES );
++    ok( !notify, "got a handle\n" );
++    ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++
++    /* a service status handle of no service of this process */
++    SetLastError( 0xdeadbeef );
++    notify = RegisterPowerSettingNotification( (HANDLE)0x1234, &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_SERVICE_HANDLE );
++    todo_wine ok( !notify, "got a handle\n" );
++    todo_wine ok( GetLastError() == ERROR_SERVICE_NOT_IN_EXE, "got error %lu\n", GetLastError() );
++    if (notify) UnregisterPowerSettingNotification( notify );
++
++    SetLastError( 0xdeadbeef );
++    ret = UnregisterPowerSettingNotification( NULL );
++    ok( !ret, "UnregisterPowerSettingNotification succeeded\n" );
++    ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++}
++
++static void test_power_setting_callback(void)
++{
++    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS params = { power_callback, (void *)0x1234 };
++    HPOWERNOTIFY notify;
++    DWORD ret;
++
++    memset( &told, 0, sizeof(told) );
++    SetLastError( 0xdeadbeef );
++    notify = RegisterPowerSettingNotification( &params, &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_CALLBACK );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++    ret = WaitForSingleObject( told_event, 5000 );
++    ok( !ret, "not called\n" );
++    ok( told.count == 1, "called %ld times\n", told.count );
++    ok( told.other_thread, "called on the thread that registered\n" );
++    ok( told.context == (void *)0x1234, "got context %p\n", told.context );
++    ok( told.type == PBT_POWERSETTINGCHANGE, "got type %#lx\n", told.type );
++    ok( IsEqualGUID( &told.setting, &GUID_ACDC_POWER_SOURCE ), "got setting %s\n", debugstr_guid( &told.setting ));
++    ok( told.size == sizeof(DWORD), "got %lu bytes\n", told.size );
++    ok( *(DWORD *)told.data <= PoHot, "got value %lu\n", *(DWORD *)told.data );
++    ret = UnregisterPowerSettingNotification( notify );
++    ok( ret, "UnregisterPowerSettingNotification failed\n" );
++}
++
++static void test_suspend_resume( HWND hwnd )
++{
++    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS params = { power_callback, (void *)0x1234 };
++    HPOWERNOTIFY notify;
++    BOOL ret;
++
++    SetLastError( 0xdeadbeef );
++    notify = RegisterSuspendResumeNotification( hwnd, DEVICE_NOTIFY_WINDOW_HANDLE );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++    ret = UnregisterSuspendResumeNotification( notify );
++    ok( ret, "UnregisterSuspendResumeNotification failed\n" );
++
++    SetLastError( 0xdeadbeef );
++    notify = RegisterSuspendResumeNotification( &params, DEVICE_NOTIFY_CALLBACK );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++    ret = UnregisterSuspendResumeNotification( notify );
++    ok( ret, "UnregisterSuspendResumeNotification failed\n" );
++
++    SetLastError( 0xdeadbeef );
++    notify = RegisterSuspendResumeNotification( NULL, DEVICE_NOTIFY_WINDOW_HANDLE );
++    ok( !!notify, "got error %lu\n", GetLastError() );
++    ok( GetLastError() == ERROR_SUCCESS, "got error %lu\n", GetLastError() );
++    ret = UnregisterSuspendResumeNotification( notify );
++    ok( ret, "UnregisterSuspendResumeNotification failed\n" );
++
++    SetLastError( 0xdeadbeef );
++    notify = RegisterSuspendResumeNotification( hwnd, 7 );
++    ok( !notify, "got a handle\n" );
++    ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++    SetLastError( 0xdeadbeef );
++    notify = RegisterSuspendResumeNotification( (HANDLE)0x1234, DEVICE_NOTIFY_SERVICE_HANDLE );
++    ok( !notify, "got a handle\n" );
++    ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++
++    SetLastError( 0xdeadbeef );
++    ret = UnregisterSuspendResumeNotification( NULL );
++    ok( !ret, "UnregisterSuspendResumeNotification succeeded\n" );
++    ok( GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError() );
++}
++
++START_TEST(power)
++{
++    WNDCLASSW cls = {0};
++    HWND hwnd;
++
++    main_thread = GetCurrentThreadId();
++    told_event = CreateEventW( NULL, FALSE, FALSE, NULL );
++    cls.lpfnWndProc = power_wndproc;
++    cls.lpszClassName = L"power_test";
++    RegisterClassW( &cls );
++    hwnd = CreateWindowW( L"power_test", NULL, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, NULL, NULL );
++    ok( !!hwnd, "CreateWindow failed, error %lu\n", GetLastError() );
++
++    test_power_setting_window( hwnd );
++    test_power_setting_callback();
++    test_suspend_resume( hwnd );
++
++    DestroyWindow( hwnd );
++    CloseHandle( told_event );
++}

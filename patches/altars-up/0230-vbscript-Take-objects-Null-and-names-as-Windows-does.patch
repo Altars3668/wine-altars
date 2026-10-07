@@ -1,0 +1,524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 19:14:32 -0400
+Subject: [PATCH] vbscript: Take objects, Null and names as Windows does, and
+ implement LoadPicture.
+
+Measured on Windows 11 (build 29671):
+
+- A built-in function given an object takes its default value, and
+  getting that is the error: CStr, Len, Mid, CInt and the rest of a
+  Dictionary answer 450, of a RegExp 438. IsObject, IsArray, IsDate,
+  IsEmpty, IsNull, IsNumeric, TypeName, VarType and Array take the
+  object itself; VarType answers the type of the default value where
+  there is one.
+- TypeName asks an object's IProvideClassInfo for its class first: a
+  Scripting.Dictionary is "Dictionary", a Folder "Folder".
+- Null is an invalid use of Null (94) to Chr, Sqr, String, StrReverse,
+  Round and Rnd; Trim, LTrim and RTrim of Null are Null.
+- Exp overflows with 6; CreateObject and GetObject of no name are an
+  invalid procedure call (5); Split with a count of 0 splits into no
+  substrings.
+- Calling a name nothing declared, without Option Explicit, is a type
+  mismatch (13), as in code run by Execute.
+- LoadPicture loads a picture file into a Picture object; a missing
+  file is error 432, a missing path or no name 76, and data that is no
+  picture 481.
+- The engine reports itself as VBScript 10.8.16384, and vbscript.dll's
+  file version is 10.0.29671.1000.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 62b2634e2dcd614352592ec3be1ca068dd100651)
+
+diff --git a/dlls/vbscript/Makefile.in b/dlls/vbscript/Makefile.in
+index bb19de611df..17e74ecc6c4 100644
+--- a/dlls/vbscript/Makefile.in
++++ b/dlls/vbscript/Makefile.in
+@@ -4,7 +4,7 @@ IMPORTS   = oleaut32 ole32 user32
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ VER_FILEDESCRIPTION_STR = "Wine VBScript"
+-VER_PRODUCTVERSION      = 5,8,7601,16978
++VER_PRODUCTVERSION      = 10,0,29671,1000
+ 
+ SOURCES = \
+ 	compile.c \
+diff --git a/dlls/vbscript/global.c b/dlls/vbscript/global.c
+index 6804531f901..7ff12658fdf 100644
+--- a/dlls/vbscript/global.c
++++ b/dlls/vbscript/global.c
+@@ -24,6 +24,7 @@
+ 
+ #include "mshtmhst.h"
+ #include "objsafe.h"
++#include "olectl.h"
+ #include "wchar.h"
+ 
+ #include "wine/debug.h"
+@@ -40,6 +41,7 @@ const GUID GUID_CUSTOM_CONFIRMOBJECTSAFETY =
+ #define BP_GET      1
+ #define BP_GETPUT   2
+ #define BP_BYREF    4
++#define BP_OBJECTS  8  /* takes objects as they are, where others take their default values */
+ 
+ typedef struct {
+     UINT16 len;
+@@ -172,6 +174,7 @@ static HRESULT WINAPI Builtin_Invoke(IDispatch *iface, DISPID id, REFIID riid, L
+     const builtin_prop_t *prop;
+     VARIANT args_buf[8], *args;
+     unsigned argn, i;
++    ULONGLONG owned;
+     HRESULT hres;
+ 
+     TRACE("(%p)->(%ld %s %ld %d %p %p %p %p)\n", This, id, debugstr_guid(riid), lcid, flags, dp, res, ei, err);
+@@ -262,7 +265,29 @@ static HRESULT WINAPI Builtin_Invoke(IDispatch *iface, DISPID id, REFIID riid, L
+             args[i] = dp->rgvarg[dp->cArgs-i-1];
+     }
+ 
++    /* an object argument stands for its default value, and failing to get that is the error */
++    owned = 0;
++    for(i=0; i < argn && !(prop->flags & BP_OBJECTS); i++) {
++        if(V_VT(args+i) != VT_DISPATCH || !V_DISPATCH(args+i))
++            continue;
++        if(i >= sizeof(owned) * 8) {
++            FIXME("too many object arguments\n");
++            break;
++        }
++        hres = get_disp_value(This->ctx, V_DISPATCH(args+i), args+i);
++        if(FAILED(hres)) {
++            argn = i;
++            goto done;
++        }
++        owned |= (ULONGLONG)1 << i;
++    }
++
+     hres = prop->proc(This, args, dp->cArgs, res);
++
++done:
++    for(i=0; i < argn && owned; i++)
++        if(owned & ((ULONGLONG)1 << i))
++            VariantClear(args+i);
+     if(args != args_buf)
+         free(args);
+     return hres;
+@@ -982,6 +1007,16 @@ static HRESULT Global_VarType(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt
+         return E_NOTIMPL;
+     }
+ 
++    /* an object with a default value is of its type */
++    if(vt == VT_DISPATCH && V_DISPATCH(arg)) {
++        VARIANT v;
++
++        if(SUCCEEDED(get_disp_value(This->ctx, V_DISPATCH(arg), &v))) {
++            vt = V_VT(&v);
++            VariantClear(&v);
++        }
++    }
++
+     return return_short(res, vt);
+ }
+ 
+@@ -1098,7 +1133,10 @@ static HRESULT Global_Exp(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VA
+     if(FAILED(hres))
+         return hres;
+ 
+-    return return_double(res, exp(d));
++    d = exp(d);
++    if(isinf(d))
++        return MAKE_VBSERROR(VBSE_OVERFLOW);
++    return return_double(res, d);
+ }
+ 
+ static HRESULT Global_Log(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
+@@ -1121,6 +1159,9 @@ static HRESULT Global_Sqr(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VA
+     HRESULT hres;
+     double d;
+ 
++    if(V_VT(arg) == VT_NULL)
++        return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
++
+     hres = to_double(arg, &d);
+     if(FAILED(hres))
+         return hres;
+@@ -1175,6 +1216,8 @@ static HRESULT Global_Rnd(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VA
+     value = This->ctx->script_obj->rnd;
+     if (args_cnt == 1)
+     {
++        if (V_VT(arg) == VT_NULL)
++            return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
+         hres = to_float(arg, &f);
+         if (FAILED(hres))
+             return hres;
+@@ -1828,6 +1871,9 @@ static HRESULT Global_LTrim(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt,
+ 
+     TRACE("%s\n", debugstr_variant(arg));
+ 
++    if(V_VT(arg) == VT_NULL)
++        return return_null(res);
++
+     if(V_VT(arg) == VT_BSTR) {
+         str = V_BSTR(arg);
+     }else {
+@@ -1855,6 +1901,9 @@ static HRESULT Global_RTrim(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt,
+ 
+     TRACE("%s\n", debugstr_variant(arg));
+ 
++    if(V_VT(arg) == VT_NULL)
++        return return_null(res);
++
+     if(V_VT(arg) == VT_BSTR) {
+         str = V_BSTR(arg);
+     }else {
+@@ -1882,6 +1931,9 @@ static HRESULT Global_Trim(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, V
+ 
+     TRACE("%s\n", debugstr_variant(arg));
+ 
++    if(V_VT(arg) == VT_NULL)
++        return return_null(res);
++
+     if(V_VT(arg) == VT_BSTR) {
+         str = V_BSTR(arg);
+     }else {
+@@ -1945,6 +1997,9 @@ static HRESULT Global_String(BuiltinDisp *This, VARIANT *args, unsigned args_cnt
+ 
+     TRACE("%s %s\n", debugstr_variant(args), debugstr_variant(args + 1));
+ 
++    if(V_VT(args) == VT_NULL || V_VT(args + 1) == VT_NULL)
++        return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
++
+     hres = to_int(args, &cnt);
+     if(FAILED(hres))
+         return hres;
+@@ -2251,6 +2306,9 @@ static HRESULT Global_Chr(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VA
+ 
+     TRACE("%s\n", debugstr_variant(arg));
+ 
++    if(V_VT(arg) == VT_NULL)
++        return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
++
+     hres = to_int(arg, &c);
+     if(FAILED(hres))
+         return hres;
+@@ -2825,6 +2883,9 @@ static HRESULT Global_CreateObject(BuiltinDisp *This, VARIANT *arg, unsigned arg
+         return E_INVALIDARG;
+     }
+ 
++    if(!SysStringLen(V_BSTR(arg)))
++        return MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
++
+     obj = create_object(This->ctx, V_BSTR(arg));
+     if(!obj)
+         return VB_E_CANNOT_CREATE_OBJ;
+@@ -2856,6 +2917,8 @@ static HRESULT Global_GetObject(BuiltinDisp *This, VARIANT *args, unsigned args_
+         FIXME("unsupported args\n");
+         return E_NOTIMPL;
+     }
++    if(!SysStringLen(V_BSTR(args)))
++        return MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
+ 
+     if(This->ctx->safeopt & (INTERFACE_USES_SECURITY_MANAGER|INTERFACESAFE_FOR_UNTRUSTED_DATA)) {
+         WARN("blocked in current safety mode\n");
+@@ -3274,6 +3337,7 @@ static HRESULT Global_DatePart(BuiltinDisp *This, VARIANT *args, unsigned args_c
+ 
+ static HRESULT Global_TypeName(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
+ {
++    IProvideClassInfo *class_info;
+     ITypeInfo *typeinfo;
+     BSTR name = NULL;
+     HRESULT hres;
+@@ -3317,6 +3381,21 @@ static HRESULT Global_TypeName(BuiltinDisp *This, VARIANT *arg, unsigned args_cn
+                 return return_string(res, L"Nothing");
+             if ((class_name = vbdisp_class_name(V_DISPATCH(arg))))
+                 return return_string(res, class_name);
++            /* the class an object says it is an instance of, before its interface */
++            if (SUCCEEDED(IDispatch_QueryInterface(V_DISPATCH(arg), &IID_IProvideClassInfo, (void **)&class_info)))
++            {
++                hres = IProvideClassInfo_GetClassInfo(class_info, &typeinfo);
++                IProvideClassInfo_Release(class_info);
++                if (SUCCEEDED(hres))
++                {
++                    hres = ITypeInfo_GetDocumentation(typeinfo, MEMBERID_NIL, &name, NULL, NULL, NULL);
++                    ITypeInfo_Release(typeinfo);
++                    if (SUCCEEDED(hres) && name && *name)
++                        return return_bstr(res, name);
++                    SysFreeString(name);
++                    name = NULL;
++                }
++            }
+             if (SUCCEEDED(IDispatch_GetTypeInfo(V_DISPATCH(arg), 0, GetUserDefaultLCID(), &typeinfo)))
+             {
+                 hres = ITypeInfo_GetDocumentation(typeinfo, MEMBERID_NIL, &name, NULL, NULL, NULL);
+@@ -3773,7 +3852,8 @@ static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
+ 
+     len = SysStringLen(string);
+ 
+-    if(!len) {
++    /* no string, or a count of 0, splits into no substrings */
++    if(!len || !max) {
+         bounds.lLbound = 0;
+         bounds.cElements = 0;
+         sa = SafeArrayCreate(VT_VARIANT, 1, &bounds);
+@@ -3958,6 +4038,9 @@ static HRESULT Global_StrReverse(BuiltinDisp *This, VARIANT *arg, unsigned args_
+ 
+     TRACE("%s\n", debugstr_variant(arg));
+ 
++    if(V_VT(arg) == VT_NULL)
++        return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
++
+     hres = to_string(This->ctx->lcid, arg, &ret);
+     if(FAILED(hres))
+         return hres;
+@@ -4054,8 +4137,57 @@ end:
+ 
+ static HRESULT Global_LoadPicture(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    IDispatch *picture;
++    IStream *stream;
++    DWORD size, read;
++    HANDLE file;
++    HGLOBAL mem;
++    HRESULT hres;
++    BSTR name;
++    BOOL ret;
++
++    TRACE("%s\n", debugstr_variant(arg));
++
++    hres = to_string(This->ctx->lcid, arg, &name);
++    if(FAILED(hres))
++        return hres;
++
++    /* the file fails to open as a storage's would: an empty name is a path not found */
++    file = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    SysFreeString(name);
++    if(file == INVALID_HANDLE_VALUE)
++        return MAKE_HRESULT(SEVERITY_ERROR, FACILITY_STORAGE, GetLastError());
++
++    size = GetFileSize(file, NULL);
++    if(size == INVALID_FILE_SIZE || !(mem = GlobalAlloc(GMEM_MOVEABLE, size ? size : 1))) {
++        CloseHandle(file);
++        return E_OUTOFMEMORY;
++    }
++    ret = ReadFile(file, GlobalLock(mem), size, &read, NULL);
++    GlobalUnlock(mem);
++    CloseHandle(file);
++    if(!ret) {
++        GlobalFree(mem);
++        return MAKE_HRESULT(SEVERITY_ERROR, FACILITY_STORAGE, GetLastError());
++    }
++
++    hres = CreateStreamOnHGlobal(mem, TRUE, &stream);
++    if(FAILED(hres)) {
++        GlobalFree(mem);
++        return hres;
++    }
++    hres = OleLoadPicture(stream, read, FALSE, &IID_IDispatch, (void **)&picture);
++    IStream_Release(stream);
++    if(FAILED(hres))
++        return hres;
++
++    if(!res) {
++        IDispatch_Release(picture);
++        return S_OK;
++    }
++    V_VT(res) = VT_DISPATCH;
++    V_DISPATCH(res) = picture;
++    return S_OK;
+ }
+ 
+ static HRESULT Global_ScriptEngine(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
+@@ -4439,6 +4571,9 @@ static HRESULT Global_Round(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
+ 
+     assert(args_cnt == 1 || args_cnt == 2);
+ 
++    if(V_VT(args) == VT_NULL || (args_cnt == 2 && V_VT(args + 1) == VT_NULL))
++        return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
++
+     if(!res)
+         return S_OK;
+ 
+@@ -4841,7 +4976,7 @@ static const string_constant_t vbVerticalTab = {1, {0xb}};
+ static const builtin_prop_t global_props[] = {
+     {NULL}, /* no default value */
+     {L"Abs",                       Global_Abs, 0, 1},
+-    {L"Array",                     Global_Array, 0, 0, MAXDWORD},
++    {L"Array",                     Global_Array, BP_OBJECTS, 0, MAXDWORD},
+     {L"Asc",                       Global_Asc, 0, 1},
+     {L"AscB",                      Global_AscB, 0, 1},
+     {L"AscW",                      Global_AscW, 0, 1},
+@@ -4890,12 +5025,12 @@ static const builtin_prop_t global_props[] = {
+     {L"InStrB",                    Global_InStrB, 0, 2, 4},
+     {L"InStrRev",                  Global_InStrRev, 0, 2, 4},
+     {L"Int",                       Global_Int, 0, 1},
+-    {L"IsArray",                   Global_IsArray, 0, 1},
+-    {L"IsDate",                    Global_IsDate, 0, 1},
+-    {L"IsEmpty",                   Global_IsEmpty, 0, 1},
+-    {L"IsNull",                    Global_IsNull, 0, 1},
+-    {L"IsNumeric",                 Global_IsNumeric, 0, 1},
+-    {L"IsObject",                  Global_IsObject, 0, 1},
++    {L"IsArray",                   Global_IsArray, BP_OBJECTS, 1},
++    {L"IsDate",                    Global_IsDate, BP_OBJECTS, 1},
++    {L"IsEmpty",                   Global_IsEmpty, BP_OBJECTS, 1},
++    {L"IsNull",                    Global_IsNull, BP_OBJECTS, 1},
++    {L"IsNumeric",                 Global_IsNumeric, BP_OBJECTS, 1},
++    {L"IsObject",                  Global_IsObject, BP_OBJECTS, 1},
+     {L"Join",                      Global_Join, 0, 1, 2},
+     {L"LBound",                    Global_LBound, 0, 1, 2},
+     {L"LCase",                     Global_LCase, 0, 1},
+@@ -4942,11 +5077,11 @@ static const builtin_prop_t global_props[] = {
+     {L"TimeSerial",                Global_TimeSerial, 0, 3},
+     {L"TimeValue",                 Global_TimeValue, 0, 1},
+     {L"Trim",                      Global_Trim, 0, 1},
+-    {L"TypeName",                  Global_TypeName, 0, 1},
++    {L"TypeName",                  Global_TypeName, BP_OBJECTS, 1},
+     {L"UBound",                    Global_UBound, 0, 1, 2},
+     {L"UCase",                     Global_UCase, 0, 1},
+     {L"Unescape",                  Global_Unescape, 0, 1},
+-    {L"VarType",                   Global_VarType, 0, 1},
++    {L"VarType",                   Global_VarType, BP_OBJECTS, 1},
+     {L"vbAbort",                   NULL, BP_GET, VT_I2, IDABORT},
+     {L"vbAbortRetryIgnore",        NULL, BP_GET, VT_I2, MB_ABORTRETRYIGNORE},
+     {L"vbApplicationModal",        NULL, BP_GET, VT_I2, MB_APPLMODAL},
+diff --git a/dlls/vbscript/interp.c b/dlls/vbscript/interp.c
+index cd604a74582..b650e4d4e76 100644
+--- a/dlls/vbscript/interp.c
++++ b/dlls/vbscript/interp.c
+@@ -744,8 +744,8 @@ static HRESULT do_icall(exec_ctx_t *ctx, VARIANT *res, BSTR identifier, unsigned
+         }
+         if(ctx->func->code_ctx->option_explicit)
+             return throw_error(ctx->script, MAKE_VBSERROR(VBSE_VARIABLE_UNDEFINED), identifier);
+-        FIXME("%s not found\n", debugstr_w(identifier));
+-        return DISP_E_UNKNOWNNAME;
++        /* a name nothing declared is an empty variable, and calling that a type mismatch */
++        return throw_error(ctx->script, MAKE_VBSERROR(VBSE_TYPE_MISMATCH), identifier);
+     }
+ 
+     stack_popn(ctx, arg_cnt);
+diff --git a/dlls/vbscript/tests/api.vbs b/dlls/vbscript/tests/api.vbs
+index 47aa0ef56a3..106ae917139 100644
+--- a/dlls/vbscript/tests/api.vbs
++++ b/dlls/vbscript/tests/api.vbs
+@@ -3455,4 +3455,109 @@ end sub
+ 
+ call testDateValueLocale()
+ 
++sub testWindowsBehavior()
++    dim x, d, rx, o
++
++    on error resume next
++
++    ' Null is no number or character
++    call Err.clear()
++    x = Chr(null)
++    call ok(Err.number = 94, "Chr(null): Err.number = " & Err.number)
++    call Err.clear()
++    x = Sqr(null)
++    call ok(Err.number = 94, "Sqr(null): Err.number = " & Err.number)
++    call Err.clear()
++    x = String(null, "a")
++    call ok(Err.number = 94, "String(null, ""a""): Err.number = " & Err.number)
++    call Err.clear()
++    x = String(2, null)
++    call ok(Err.number = 94, "String(2, null): Err.number = " & Err.number)
++    call Err.clear()
++    x = StrReverse(null)
++    call ok(Err.number = 94, "StrReverse(null): Err.number = " & Err.number)
++    call Err.clear()
++    x = Round(null)
++    call ok(Err.number = 94, "Round(null): Err.number = " & Err.number)
++    call Err.clear()
++    x = Rnd(null)
++    call ok(Err.number = 94, "Rnd(null): Err.number = " & Err.number)
++
++    ' while trimming passes it on
++    call Err.clear()
++    x = Trim(null)
++    call ok(Err.number = 0 and getVT(x) = "VT_NULL*", "Trim(null): " & Err.number & " " & getVT(x))
++    x = LTrim(null)
++    call ok(Err.number = 0 and getVT(x) = "VT_NULL*", "LTrim(null): " & Err.number & " " & getVT(x))
++    x = RTrim(null)
++    call ok(Err.number = 0 and getVT(x) = "VT_NULL*", "RTrim(null): " & Err.number & " " & getVT(x))
++
++    call Err.clear()
++    x = Exp(1000)
++    call ok(Err.number = 6, "Exp(1000): Err.number = " & Err.number)
++    call Err.clear()
++    set o = CreateObject("")
++    call ok(Err.number = 5, "CreateObject(""""): Err.number = " & Err.number)
++    call Err.clear()
++    set o = GetObject("")
++    call ok(Err.number = 5, "GetObject(""""): Err.number = " & Err.number)
++    call Err.clear()
++    x = Split("a,b", ",", 0)
++    call ok(Err.number = 0 and UBound(x) = -1, "Split(""a,b"", "","", 0): " & Err.number & " " & UBound(x))
++
++    ' an object argument stands for its default value, which a Dictionary has only with a key
++    set d = CreateObject("Scripting.Dictionary")
++    set rx = new RegExp
++    call Err.clear()
++    x = CStr(d)
++    call ok(Err.number = 450, "CStr(dictionary): Err.number = " & Err.number)
++    call Err.clear()
++    x = Len(d)
++    call ok(Err.number = 450, "Len(dictionary): Err.number = " & Err.number)
++    call Err.clear()
++    x = CInt(d)
++    call ok(Err.number = 450, "CInt(dictionary): Err.number = " & Err.number)
++    call Err.clear()
++    x = Mid(d, 1)
++    call ok(Err.number = 450, "Mid(dictionary, 1): Err.number = " & Err.number)
++    call Err.clear()
++    x = CStr(rx)
++    call ok(Err.number = 438, "CStr(regexp): Err.number = " & Err.number)
++    call Err.clear()
++    x = CStr(nothing)
++    call ok(Err.number = 91, "CStr(nothing): Err.number = " & Err.number)
++
++    ' but the functions that look at the type take the object itself
++    call Err.clear()
++    call ok(IsObject(d), "IsObject(dictionary) is false")
++    call ok(not IsNumeric(d), "IsNumeric(dictionary) is true")
++    call ok(not IsEmpty(d), "IsEmpty(dictionary) is true")
++    call ok(VarType(d) = vbObject, "VarType(dictionary) = " & VarType(d))
++    call ok(VarType(rx) = vbObject, "VarType(regexp) = " & VarType(rx))
++    call ok(TypeName(d) = "Dictionary", "TypeName(dictionary) = " & TypeName(d))
++    call ok(TypeName(rx) = "IRegExp2", "TypeName(regexp) = " & TypeName(rx))
++    x = Array(d)
++    call ok(x(0) is d, "Array(dictionary)(0) is not the dictionary")
++    call ok(Err.number = 0, "Err.number = " & Err.number)
++
++    ' a picture file that is not there, and one of no name
++    call Err.clear()
++    set o = LoadPicture("wine-no-such-picture.bmp")
++    call ok(Err.number = 432, "LoadPicture(missing): Err.number = " & Err.number)
++    call Err.clear()
++    set o = LoadPicture("")
++    call ok(Err.number = 76, "LoadPicture(""""): Err.number = " & Err.number)
++
++    ' calling a name nothing declared, where Option Explicit is not in force
++    call Err.clear()
++    Execute "Call NoSuchSubAnywhere()"
++    call ok(Err.number = 13, "calling an undeclared name: Err.number = " & Err.number)
++
++    call Err.clear()
++    call ok(ScriptEngineMajorVersion() = 10, "ScriptEngineMajorVersion() = " & ScriptEngineMajorVersion())
++    call ok(ScriptEngineMinorVersion() = 8, "ScriptEngineMinorVersion() = " & ScriptEngineMinorVersion())
++end sub
++
++call testWindowsBehavior()
++
+ Call reportSuccess()
+diff --git a/dlls/vbscript/vbscript.h b/dlls/vbscript/vbscript.h
+index 57163973f27..e53da7cdc8e 100644
+--- a/dlls/vbscript/vbscript.h
++++ b/dlls/vbscript/vbscript.h
+@@ -524,6 +524,6 @@ HRESULT WINAPI VBScriptRegExpFactory_CreateInstance(IClassFactory*,IUnknown*,REF
+ 
+ BSTR get_vbscript_string(int);
+ 
+-#define VBSCRIPT_BUILD_VERSION 16978
+-#define VBSCRIPT_MAJOR_VERSION 5
++#define VBSCRIPT_BUILD_VERSION 16384
++#define VBSCRIPT_MAJOR_VERSION 10
+ #define VBSCRIPT_MINOR_VERSION 8

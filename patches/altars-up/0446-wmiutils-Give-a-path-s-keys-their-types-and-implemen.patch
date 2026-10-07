@@ -1,0 +1,1759 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 10:30:29 -0400
+Subject: [PATCH] wmiutils: Give a path's keys their types, and implement its
+ key list as Windows does.
+
+Measured on Windows 11 build 29671 with tools/winmgmtsprobe (pathprobe.c):
+
+- A key's value is a string, in double or single quotes with backslash
+  escaping a quote or a backslash; a decimal number, a sint32 when it
+  fits, a sint64 when negative and a uint64 when not; a hexadecimal one,
+  a uint64; true or false; or a reference in braces.  Anything else, a
+  space or an empty name is no path.  Quoted commas and backslashes are
+  the value's: a namespace ends before a key does.
+- The path's text writes the values back: numbers in decimal, booleans
+  in lower case, strings in double quotes, escaped.  A path with no
+  namespace has no colon in front of its class, and \\. only when it has
+  a namespace; WBEMPATH_COMPRESSED is not a form.  A path that has a
+  class or a namespace is to this machine, ".", without a server.
+- GetKey and GetKey2 give a key's name, its bytes or its text (with
+  WBEMPATH_TEXT or WBEMPATH_QUOTEDTEXT) and its type; GetKey2 reads what
+  GetKey gives as the type, so a number's text reads as a number.
+  SetKey and SetKey2 replace a key of that name in its place or add one
+  last, SetKey2 reading a string given for a number as one; RemoveKey,
+  MakeSingleton (Class=@ has no keys), GetInfo and GetText work.
+- GetInfo has the singleton, compound, implied key and reference flags,
+  and a path to a namespace alone is a WMI 1.0 one.
+
+The tests have the measured paths; on Windows they have no failures.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/wmiutils/path.c b/dlls/wmiutils/path.c
+index 819edf47bab..b03163d440e 100644
+--- a/dlls/wmiutils/path.c
++++ b/dlls/wmiutils/path.c
+@@ -42,8 +42,9 @@ struct key
+ {
+     WCHAR *name;
+     int    len_name;
+-    WCHAR *value;
+-    int    len_value;
++    ULONG  type;    /* the CIM type the value appears to have */
++    BYTE  *data;    /* a string unescaped, with its terminator; a number or a boolean as its bytes */
++    ULONG  size;
+ };
+ 
+ struct path
+@@ -63,6 +64,7 @@ struct path
+     int              len_class;
+     struct key      *keys;
+     unsigned int     num_keys;
++    BOOL             singleton;
+     ULONGLONG        flags;
+ };
+ 
+@@ -139,6 +141,240 @@ static HRESULT WINAPI keylist_GetCount(
+     return S_OK;
+ }
+ 
++static void free_keys( struct key *keys, unsigned int count )
++{
++    unsigned int i;
++
++    for (i = 0; i < count; i++)
++    {
++        free( keys[i].name );
++        free( keys[i].data );
++    }
++    free( keys );
++}
++
++static BOOL is_string_type( ULONG type )
++{
++    return type == CIM_STRING || type == CIM_REFERENCE || type == CIM_DATETIME;
++}
++
++/* the bytes a key of the type holds; a string's with its terminator */
++static ULONG value_size( ULONG type, const void *value )
++{
++    switch (type)
++    {
++    case CIM_SINT8:
++    case CIM_UINT8:
++        return 1;
++    case CIM_SINT16:
++    case CIM_UINT16:
++    case CIM_CHAR16:
++        return 2;
++    case CIM_SINT32:
++    case CIM_UINT32:
++    case CIM_BOOLEAN:
++        return 4;
++    case CIM_SINT64:
++    case CIM_UINT64:
++        return 8;
++    case CIM_STRING:
++    case CIM_REFERENCE:
++    case CIM_DATETIME:
++        return (wcslen( value ) + 1) * sizeof(WCHAR);
++    default:
++        return 0;
++    }
++}
++
++/* a key's value as a path writes it: a number in decimal, a boolean as true or false, a string with its
++ * quotes and backslashes escaped and, when asked, in quotes; a reference in braces as it is */
++static WCHAR *value_text( const struct key *key, BOOL quote )
++{
++    const WCHAR *str = (const WCHAR *)key->data;
++    unsigned int len;
++    WCHAR *ret, *p;
++
++    if (!is_string_type( key->type ))
++    {
++        WCHAR buf[24];
++
++        switch (key->type)
++        {
++        case CIM_SINT8:   swprintf( buf, ARRAY_SIZE(buf), L"%d", *(const signed char *)key->data ); break;
++        case CIM_UINT8:   swprintf( buf, ARRAY_SIZE(buf), L"%u", *key->data ); break;
++        case CIM_SINT16:  swprintf( buf, ARRAY_SIZE(buf), L"%d", *(const SHORT *)key->data ); break;
++        case CIM_UINT16:
++        case CIM_CHAR16:  swprintf( buf, ARRAY_SIZE(buf), L"%u", *(const USHORT *)key->data ); break;
++        case CIM_SINT32:  swprintf( buf, ARRAY_SIZE(buf), L"%ld", *(const LONG *)key->data ); break;
++        case CIM_UINT32:  swprintf( buf, ARRAY_SIZE(buf), L"%lu", *(const ULONG *)key->data ); break;
++        case CIM_SINT64:  swprintf( buf, ARRAY_SIZE(buf), L"%I64d", *(const LONGLONG *)key->data ); break;
++        case CIM_UINT64:  swprintf( buf, ARRAY_SIZE(buf), L"%I64u", *(const ULONGLONG *)key->data ); break;
++        case CIM_BOOLEAN: wcscpy( buf, *(const VARIANT_BOOL *)key->data ? L"true" : L"false" ); break;
++        default: return NULL;
++        }
++        return wcsdup( buf );
++    }
++    if (key->type == CIM_REFERENCE && str[0] == '{') return wcsdup( str );
++
++    for (len = 0, p = (WCHAR *)str; *p; p++) len += (*p == '"' || *p == '\\') ? 2 : 1;
++    if (quote) len += 2;
++    if (!(ret = p = malloc( (len + 1) * sizeof(WCHAR) ))) return NULL;
++    if (quote) *p++ = '"';
++    for (; *str; str++)
++    {
++        if (*str == '"' || *str == '\\') *p++ = '\\';
++        *p++ = *str;
++    }
++    if (quote) *p++ = '"';
++    *p = 0;
++    return ret;
++}
++
++/* what GetKey gives for a key: its bytes, or with WBEMPATH_TEXT or WBEMPATH_QUOTEDTEXT its text; padded with
++ * zeroes to the size of the largest number, which GetKey2 may read the text as */
++static BYTE *key_value( const struct key *key, ULONG flags, ULONG *size )
++{
++    WCHAR *text = NULL;
++    const BYTE *src;
++    BYTE *ret;
++
++    if (flags)
++    {
++        if (!(text = value_text( key, flags & WBEMPATH_QUOTEDTEXT ))) return NULL;
++        src = (const BYTE *)text;
++        *size = (wcslen( text ) + 1) * sizeof(WCHAR);
++    }
++    else
++    {
++        src = key->data;
++        *size = key->size;
++    }
++    if ((ret = calloc( 1, max( *size, sizeof(ULONGLONG) ) ))) memcpy( ret, src, *size );
++    free( text );
++    return ret;
++}
++
++/* GetKey2's value: what GetKey gives, read as the key's type (so the text of a number reads as a number) */
++static HRESULT variant_from_value( ULONG type, const BYTE *value, VARIANT *var )
++{
++    WCHAR buf[24];
++
++    switch (type)
++    {
++    case CIM_SINT8:
++        V_VT( var ) = VT_I2;
++        V_I2( var ) = *(const signed char *)value;
++        return S_OK;
++    case CIM_UINT8:
++        V_VT( var ) = VT_UI1;
++        V_UI1( var ) = *value;
++        return S_OK;
++    case CIM_SINT16:
++    case CIM_CHAR16:
++        V_VT( var ) = VT_I2;
++        V_I2( var ) = *(const SHORT *)value;
++        return S_OK;
++    case CIM_UINT16:
++        V_VT( var ) = VT_I4;
++        V_I4( var ) = *(const USHORT *)value;
++        return S_OK;
++    case CIM_SINT32:
++    case CIM_UINT32:
++        V_VT( var ) = VT_I4;
++        V_I4( var ) = *(const LONG *)value;
++        return S_OK;
++    case CIM_BOOLEAN:
++        V_VT( var ) = VT_BOOL;
++        V_BOOL( var ) = *(const VARIANT_BOOL *)value;
++        return S_OK;
++    case CIM_SINT64:
++        swprintf( buf, ARRAY_SIZE(buf), L"%I64d", *(const LONGLONG *)value );
++        value = (const BYTE *)buf;
++        break;
++    case CIM_UINT64:
++        swprintf( buf, ARRAY_SIZE(buf), L"%I64u", *(const ULONGLONG *)value );
++        value = (const BYTE *)buf;
++        break;
++    default:
++        break;
++    }
++    if (!(V_BSTR( var ) = SysAllocString( (const WCHAR *)value ))) return E_OUTOFMEMORY;
++    V_VT( var ) = VT_BSTR;
++    return S_OK;
++}
++
++static void copy_key_name( const struct key *key, ULONG *len, WCHAR *name )
++{
++    if (!len) return;
++    if (name && *len > key->len_name) lstrcpyW( name, key->name );
++    *len = key->len_name + 1;
++}
++
++static HRESULT get_key( IWbemPathKeyList *iface, ULONG index, ULONG flags, ULONG *name_len, WCHAR *name,
++                        ULONG *size, BYTE **value, ULONG *type )
++{
++    struct keylist *keylist = impl_from_IWbemPathKeyList( iface );
++    struct path *parent = impl_from_IWbemPath( keylist->parent );
++    HRESULT hr = S_OK;
++
++    if (flags & ~(WBEMPATH_TEXT | WBEMPATH_QUOTEDTEXT)) return WBEM_E_INVALID_PARAMETER;
++
++    EnterCriticalSection( &parent->cs );
++
++    if (index >= parent->num_keys) hr = WBEM_E_INVALID_PARAMETER;
++    else if (!(*value = key_value( &parent->keys[index], flags, size ))) hr = E_OUTOFMEMORY;
++    else
++    {
++        copy_key_name( &parent->keys[index], name_len, name );
++        *type = parent->keys[index].type;
++    }
++
++    LeaveCriticalSection( &parent->cs );
++    return hr;
++}
++
++/* a key of that name has its value replaced, in its place; a new one goes last */
++static HRESULT set_key( struct path *path, const WCHAR *name, ULONG type, const void *value )
++{
++    struct key *key = NULL, *keys;
++    unsigned int i;
++    WCHAR *dup;
++    ULONG size;
++    BYTE *data;
++
++    if (!(size = value_size( type, value ))) return WBEM_E_INVALID_PARAMETER;
++    if (!(data = malloc( size ))) return WBEM_E_OUT_OF_MEMORY;
++    memcpy( data, value, size );
++
++    for (i = 0; i < path->num_keys; i++)
++    {
++        if (!wcsicmp( path->keys[i].name, name ))
++        {
++            key = &path->keys[i];
++            free( key->data );
++            break;
++        }
++    }
++    if (!key)
++    {
++        if (!(dup = wcsdup( name )) || !(keys = realloc( path->keys, (path->num_keys + 1) * sizeof(*keys) )))
++        {
++            free( dup );
++            free( data );
++            return WBEM_E_OUT_OF_MEMORY;
++        }
++        path->keys = keys;
++        key = &path->keys[path->num_keys++];
++        key->name = dup;
++        key->len_name = lstrlenW( dup );
++    }
++    key->type = type;
++    key->data = data;
++    key->size = size;
++    path->singleton = FALSE;
++    return S_OK;
++}
++
+ static HRESULT WINAPI keylist_SetKey(
+     IWbemPathKeyList *iface,
+     LPCWSTR wszName,
+@@ -146,10 +382,22 @@ static HRESULT WINAPI keylist_SetKey(
+     ULONG uCimType,
+     LPVOID pKeyVal )
+ {
+-    FIXME("%p, %s, %#lx, %lu, %p\n", iface, debugstr_w(wszName), uFlags, uCimType, pKeyVal);
+-    return E_NOTIMPL;
++    struct keylist *keylist = impl_from_IWbemPathKeyList( iface );
++    struct path *parent = impl_from_IWbemPath( keylist->parent );
++    HRESULT hr;
++
++    TRACE("%p, %s, %#lx, %lu, %p\n", iface, debugstr_w(wszName), uFlags, uCimType, pKeyVal);
++
++    if (!wszName || !pKeyVal) return WBEM_E_INVALID_PARAMETER;
++    if (uFlags) FIXME("flags %#lx not supported\n", uFlags);
++
++    EnterCriticalSection( &parent->cs );
++    hr = set_key( parent, wszName, uCimType, pKeyVal );
++    LeaveCriticalSection( &parent->cs );
++    return hr;
+ }
+ 
++/* the variant's string, or its data read as the type: a string given for a number is read as one */
+ static HRESULT WINAPI keylist_SetKey2(
+     IWbemPathKeyList *iface,
+     LPCWSTR wszName,
+@@ -157,8 +405,25 @@ static HRESULT WINAPI keylist_SetKey2(
+     ULONG uCimType,
+     VARIANT *pKeyVal )
+ {
+-    FIXME("%p, %s, %#lx, %lu, %p\n", iface, debugstr_w(wszName), uFlags, uCimType, pKeyVal);
+-    return E_NOTIMPL;
++    ULONGLONG buf = 0;
++    void *value;
++
++    TRACE("%p, %s, %#lx, %lu, %p\n", iface, debugstr_w(wszName), uFlags, uCimType, pKeyVal);
++
++    if (!pKeyVal) return WBEM_E_INVALID_PARAMETER;
++    if (V_VT( pKeyVal ) == VT_BSTR)
++    {
++        if (!V_BSTR( pKeyVal )) return WBEM_E_INVALID_PARAMETER;
++        if (is_string_type( uCimType )) value = V_BSTR( pKeyVal );
++        else
++        {
++            memcpy( &buf, V_BSTR( pKeyVal ), min( sizeof(buf), SysStringByteLen( V_BSTR( pKeyVal ) ) + sizeof(WCHAR) ) );
++            value = &buf;
++        }
++    }
++    else if (is_string_type( uCimType )) return WBEM_E_INVALID_PARAMETER;
++    else value = &V_I4( pKeyVal );
++    return keylist_SetKey( iface, wszName, uFlags, uCimType, value );
+ }
+ 
+ static HRESULT WINAPI keylist_GetKey(
+@@ -171,9 +436,23 @@ static HRESULT WINAPI keylist_GetKey(
+     LPVOID pKeyVal,
+     ULONG *puApparentCimType )
+ {
+-    FIXME("%p, %lu, %#lx, %p, %p, %p, %p, %p\n", iface, uKeyIx, uFlags, puNameBufSize,
++    ULONG size, type;
++    BYTE *value;
++    HRESULT hr;
++
++    TRACE("%p, %lu, %#lx, %p, %p, %p, %p, %p\n", iface, uKeyIx, uFlags, puNameBufSize,
+           pszKeyName, puKeyValBufSize, pKeyVal, puApparentCimType);
+-    return E_NOTIMPL;
++
++    if ((hr = get_key( iface, uKeyIx, uFlags, puNameBufSize, pszKeyName, &size, &value, &type )) != S_OK)
++        return hr;
++    if (puKeyValBufSize)
++    {
++        if (pKeyVal && *puKeyValBufSize >= size) memcpy( pKeyVal, value, size );
++        *puKeyValBufSize = size;
++    }
++    if (puApparentCimType) *puApparentCimType = type;
++    free( value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI keylist_GetKey2(
+@@ -185,9 +464,20 @@ static HRESULT WINAPI keylist_GetKey2(
+     VARIANT *pKeyValue,
+     ULONG *puApparentCimType )
+ {
+-    FIXME("%p, %lu, %#lx, %p, %p, %p, %p\n", iface, uKeyIx, uFlags, puNameBufSize,
++    ULONG size, type;
++    BYTE *value;
++    HRESULT hr;
++
++    TRACE("%p, %lu, %#lx, %p, %p, %p, %p\n", iface, uKeyIx, uFlags, puNameBufSize,
+           pszKeyName, pKeyValue, puApparentCimType);
+-    return E_NOTIMPL;
++
++    if (!pKeyValue) return WBEM_E_INVALID_PARAMETER;
++    if ((hr = get_key( iface, uKeyIx, uFlags, puNameBufSize, pszKeyName, &size, &value, &type )) != S_OK)
++        return hr;
++    hr = variant_from_value( type, value, pKeyValue );
++    if (puApparentCimType) *puApparentCimType = type;
++    free( value );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI keylist_RemoveKey(
+@@ -195,20 +485,31 @@ static HRESULT WINAPI keylist_RemoveKey(
+     LPCWSTR wszName,
+     ULONG uFlags )
+ {
+-    FIXME("%p, %s, %#lx\n", iface, debugstr_w(wszName), uFlags);
+-    return E_NOTIMPL;
+-}
+-
+-static void free_keys( struct key *keys, unsigned int count )
+-{
++    struct keylist *keylist = impl_from_IWbemPathKeyList( iface );
++    struct path *parent = impl_from_IWbemPath( keylist->parent );
++    HRESULT hr = WBEM_E_INVALID_PARAMETER;
+     unsigned int i;
+ 
+-    for (i = 0; i < count; i++)
++    TRACE("%p, %s, %#lx\n", iface, debugstr_w(wszName), uFlags);
++
++    if (!wszName) return WBEM_E_INVALID_PARAMETER;
++    if (uFlags) FIXME("flags %#lx not supported\n", uFlags);
++
++    EnterCriticalSection( &parent->cs );
++
++    for (i = 0; i < parent->num_keys; i++)
+     {
+-        free( keys[i].name );
+-        free( keys[i].value );
++        if (wcsicmp( parent->keys[i].name, wszName )) continue;
++        free( parent->keys[i].name );
++        free( parent->keys[i].data );
++        memmove( &parent->keys[i], &parent->keys[i + 1], (parent->num_keys - i - 1) * sizeof(*parent->keys) );
++        parent->num_keys--;
++        hr = S_OK;
++        break;
+     }
+-    free( keys );
++
++    LeaveCriticalSection( &parent->cs );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI keylist_RemoveAllKeys(
+@@ -227,17 +528,47 @@ static HRESULT WINAPI keylist_RemoveAllKeys(
+     free_keys( parent->keys, parent->num_keys );
+     parent->num_keys = 0;
+     parent->keys = NULL;
++    parent->singleton = FALSE;
+ 
+     LeaveCriticalSection( &parent->cs );
+     return S_OK;
+ }
+ 
++/* a singleton has no keys: making one drops them, unmaking one leaves the class */
+ static HRESULT WINAPI keylist_MakeSingleton(
+     IWbemPathKeyList *iface,
+     boolean bSet )
+ {
+-    FIXME("%p, %d\n", iface, bSet);
+-    return E_NOTIMPL;
++    struct keylist *keylist = impl_from_IWbemPathKeyList( iface );
++    struct path *parent = impl_from_IWbemPath( keylist->parent );
++
++    TRACE("%p, %d\n", iface, bSet);
++
++    EnterCriticalSection( &parent->cs );
++
++    free_keys( parent->keys, parent->num_keys );
++    parent->num_keys = 0;
++    parent->keys = NULL;
++    parent->singleton = !!bSet;
++
++    LeaveCriticalSection( &parent->cs );
++    return S_OK;
++}
++
++static ULONGLONG keys_info( const struct path *path )
++{
++    ULONGLONG info = 0;
++    unsigned int i;
++
++    if (path->singleton) info |= WBEMPATH_INFO_CONTAINS_SINGLETON;
++    if (path->num_keys > 1) info |= WBEMPATH_INFO_IS_COMPOUND;
++    for (i = 0; i < path->num_keys; i++)
++    {
++        if (!path->keys[i].len_name) info |= WBEMPATH_INFO_HAS_IMPLIED_KEY;
++        if (path->keys[i].type == CIM_REFERENCE && *(const WCHAR *)path->keys[i].data == '{')
++            info |= WBEMPATH_INFO_HAS_V2_REF_PATHS;
++    }
++    return info;
+ }
+ 
+ static HRESULT WINAPI keylist_GetInfo(
+@@ -245,8 +576,59 @@ static HRESULT WINAPI keylist_GetInfo(
+     ULONG uRequestedInfo,
+     ULONGLONG *puResponse )
+ {
+-    FIXME("%p, %lu, %p\n", iface, uRequestedInfo, puResponse);
+-    return E_NOTIMPL;
++    struct keylist *keylist = impl_from_IWbemPathKeyList( iface );
++    struct path *parent = impl_from_IWbemPath( keylist->parent );
++
++    TRACE("%p, %lu, %p\n", iface, uRequestedInfo, puResponse);
++
++    if (uRequestedInfo || !puResponse) return WBEM_E_INVALID_PARAMETER;
++
++    EnterCriticalSection( &parent->cs );
++    *puResponse = keys_info( parent );
++    LeaveCriticalSection( &parent->cs );
++    return S_OK;
++}
++
++/* name=value, the values quoted or not, "@" for a singleton, a value alone for a key with no name */
++static WCHAR *build_keylist( const struct path *path, BOOL quote, int *len )
++{
++    WCHAR **values, *ret = NULL, *p;
++    unsigned int i;
++
++    *len = 0;
++    if (path->singleton)
++    {
++        *len = 1;
++        return wcsdup( L"@" );
++    }
++    if (!path->num_keys) return wcsdup( L"" );
++    if (!(values = calloc( path->num_keys, sizeof(*values) ))) return NULL;
++    for (i = 0; i < path->num_keys; i++)
++    {
++        if (!(values[i] = value_text( &path->keys[i], quote ))) goto done;
++        if (i) *len += 1;
++        if (path->keys[i].len_name) *len += path->keys[i].len_name + 1;
++        *len += lstrlenW( values[i] );
++    }
++    if (!(ret = p = malloc( (*len + 1) * sizeof(WCHAR) ))) goto done;
++    for (i = 0; i < path->num_keys; i++)
++    {
++        if (i) *p++ = ',';
++        if (path->keys[i].len_name)
++        {
++            memcpy( p, path->keys[i].name, path->keys[i].len_name * sizeof(WCHAR) );
++            p += path->keys[i].len_name;
++            *p++ = '=';
++        }
++        lstrcpyW( p, values[i] );
++        p += lstrlenW( values[i] );
++    }
++    *p = 0;
++
++done:
++    for (i = 0; i < path->num_keys; i++) free( values[i] );
++    free( values );
++    return ret;
+ }
+ 
+ static HRESULT WINAPI keylist_GetText(
+@@ -255,8 +637,30 @@ static HRESULT WINAPI keylist_GetText(
+     ULONG *puBuffLength,
+     LPWSTR pszText )
+ {
+-    FIXME("%p, %#lx, %p, %p\n", iface, lFlags, puBuffLength, pszText);
+-    return E_NOTIMPL;
++    struct keylist *keylist = impl_from_IWbemPathKeyList( iface );
++    struct path *parent = impl_from_IWbemPath( keylist->parent );
++    HRESULT hr = S_OK;
++    WCHAR *str;
++    int len;
++
++    TRACE("%p, %#lx, %p, %p\n", iface, lFlags, puBuffLength, pszText);
++
++    if (!puBuffLength || (lFlags & ~(WBEMPATH_TEXT | WBEMPATH_QUOTEDTEXT))) return WBEM_E_INVALID_PARAMETER;
++
++    EnterCriticalSection( &parent->cs );
++
++    if (!(str = build_keylist( parent, lFlags & WBEMPATH_QUOTEDTEXT, &len ))) hr = E_OUTOFMEMORY;
++    else if (*puBuffLength < len + 1) *puBuffLength = len + 1;
++    else if (!pszText) hr = WBEM_E_INVALID_PARAMETER;
++    else
++    {
++        lstrcpyW( pszText, str );
++        *puBuffLength = len + 1;
++    }
++    free( str );
++
++    LeaveCriticalSection( &parent->cs );
++    return hr;
+ }
+ 
+ static const struct IWbemPathKeyListVtbl keylist_vtbl =
+@@ -308,6 +712,7 @@ static void init_path( struct path *path )
+     path->len_class      = 0;
+     path->keys           = NULL;
+     path->num_keys       = 0;
++    path->singleton      = FALSE;
+     path->flags          = 0;
+ }
+ 
+@@ -376,42 +781,223 @@ static HRESULT WINAPI path_QueryInterface(
+     return S_OK;
+ }
+ 
+-static HRESULT parse_key( struct key *key, const WCHAR *str, unsigned int *ret_len )
++static BOOL set_value( struct key *key, ULONG type, const void *value, ULONG size )
+ {
+-    const WCHAR *p, *q;
+-    unsigned int len;
++    if (!(key->data = malloc( size ))) return FALSE;
++    memcpy( key->data, value, size );
++    key->type = type;
++    key->size = size;
++    return TRUE;
++}
++
++/* a string in double or single quotes, where a backslash escapes a quote or a backslash */
++static HRESULT parse_string( struct key *key, const WCHAR **str )
++{
++    const WCHAR *p = *str;
++    WCHAR quote = *p++, *buf, *q;
+ 
+-    p = q = str;
+-    while (*q && *q != '=')
++    if (!(q = buf = malloc( (lstrlenW( p ) + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    for (; *p != quote; p++)
+     {
+-        if (*q == ',' || iswspace( *q )) return WBEM_E_INVALID_PARAMETER;
+-        q++;
++        if (!*p) goto error;
++        if (*p == '\\')
++        {
++            p++;
++            if (*p != '\\' && *p != '"' && *p != '\'') goto error;
++        }
++        *q++ = *p;
++    }
++    *q = 0;
++    if (!set_value( key, CIM_STRING, buf, (q - buf + 1) * sizeof(WCHAR) ))
++    {
++        free( buf );
++        return E_OUTOFMEMORY;
++    }
++    free( buf );
++    *str = p + 1;
++    return S_OK;
++
++error:
++    free( buf );
++    return WBEM_E_INVALID_PARAMETER;
++}
++
++/* a reference to another object in braces, kept as it is written */
++static HRESULT parse_reference( struct key *key, const WCHAR **str )
++{
++    const WCHAR *p = *str;
++    unsigned int depth = 0;
++    WCHAR *buf;
++
++    do
++    {
++        if (!*p) return WBEM_E_INVALID_PARAMETER;
++        if (*p == '{') depth++;
++        else if (*p == '}') depth--;
++        p++;
++    } while (depth);
++
++    if (!(buf = malloc( (p - *str + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    memcpy( buf, *str, (p - *str) * sizeof(WCHAR) );
++    buf[p - *str] = 0;
++    if (!set_value( key, CIM_REFERENCE, buf, (p - *str + 1) * sizeof(WCHAR) ))
++    {
++        free( buf );
++        return E_OUTOFMEMORY;
++    }
++    free( buf );
++    *str = p;
++    return S_OK;
++}
++
++/* a decimal number is a sint32 when it fits, a sint64 when negative and a uint64 when not; a hexadecimal one
++ * is a uint64 */
++static HRESULT parse_number( struct key *key, const WCHAR **str )
++{
++    const WCHAR *p = *str;
++    BOOL negative = FALSE, hex = FALSE;
++    ULONGLONG value = 0;
++    unsigned int digit;
++
++    if (*p == '-')
++    {
++        negative = TRUE;
++        p++;
++    }
++    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
++    {
++        if (negative) return WBEM_E_INVALID_PARAMETER;
++        hex = TRUE;
++        p += 2;
++        if (!iswxdigit( *p )) return WBEM_E_INVALID_PARAMETER;
+     }
+-    len = q - p;
+-    if (!(key->name = malloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
+-    memcpy( key->name, p, len * sizeof(WCHAR) );
+-    key->name[len] = 0;
+-    key->len_name = len;
++    else if (!iswdigit( *p )) return WBEM_E_INVALID_PARAMETER;
+ 
+-    p = ++q;
+-    if (!*p || *p == ',' || iswspace( *p )) return WBEM_E_INVALID_PARAMETER;
++    for (;; p++)
++    {
++        if (iswdigit( *p )) digit = *p - '0';
++        else if (hex && iswxdigit( *p )) digit = towlower( *p ) - 'a' + 10;
++        else break;
++
++        if (hex)
++        {
++            if (value >> 60) return WBEM_E_INVALID_PARAMETER;
++            value = value * 16 + digit;
++        }
++        else
++        {
++            if (value > (~0ull - digit) / 10) return WBEM_E_INVALID_PARAMETER;
++            value = value * 10 + digit;
++        }
++    }
+ 
+-    while (*q && *q != ',') q++;
+-    len = q - p;
+-    if (!(key->value = malloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
+-    memcpy( key->value, p, len * sizeof(WCHAR) );
+-    key->value[len] = 0;
+-    key->len_value = len;
++    if (hex)
++    {
++        if (!set_value( key, CIM_UINT64, &value, sizeof(value) )) return E_OUTOFMEMORY;
++    }
++    else if (negative)
++    {
++        if (value <= 0x80000000)
++        {
++            LONG val = -(LONGLONG)value;
++            if (!set_value( key, CIM_SINT32, &val, sizeof(val) )) return E_OUTOFMEMORY;
++        }
++        else if (value <= 0x8000000000000000ull)
++        {
++            LONGLONG val = -value;
++            if (!set_value( key, CIM_SINT64, &val, sizeof(val) )) return E_OUTOFMEMORY;
++        }
++        else return WBEM_E_INVALID_PARAMETER;
++    }
++    else if (value <= 0x7fffffff)
++    {
++        LONG val = value;
++        if (!set_value( key, CIM_SINT32, &val, sizeof(val) )) return E_OUTOFMEMORY;
++    }
++    else if (!set_value( key, CIM_UINT64, &value, sizeof(value) )) return E_OUTOFMEMORY;
+ 
+-    *ret_len = q - str;
+-    if (*q == ',') (*ret_len)++;
++    *str = p;
+     return S_OK;
+ }
+ 
++static HRESULT parse_value( struct key *key, const WCHAR **str )
++{
++    const WCHAR *p = *str;
++    LONG value;
++
++    if (*p == '"' || *p == '\'') return parse_string( key, str );
++    if (*p == '{') return parse_reference( key, str );
++    if (*p == '-' || iswdigit( *p )) return parse_number( key, str );
++    if (!wcsnicmp( p, L"true", 4 ) || !wcsnicmp( p, L"false", 5 ))
++    {
++        value = (towlower( *p ) == 't');
++        if (!set_value( key, CIM_BOOLEAN, &value, sizeof(value) )) return E_OUTOFMEMORY;
++        *str = p + (value ? 4 : 5);
++        return S_OK;
++    }
++    return WBEM_E_INVALID_PARAMETER;
++}
++
++/* name=value; the caller has the name end at the equals sign */
++static HRESULT parse_key( struct key *key, const WCHAR **str )
++{
++    const WCHAR *p = *str, *q = p;
++
++    while (*q != '=')
++    {
++        if (!*q || *q == ',' || *q == '"' || *q == '\'' || iswspace( *q )) return WBEM_E_INVALID_PARAMETER;
++        q++;
++    }
++    if (q == p) return WBEM_E_INVALID_PARAMETER;
++    if (!(key->name = malloc( (q - p + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    memcpy( key->name, p, (q - p) * sizeof(WCHAR) );
++    key->name[q - p] = 0;
++    key->len_name = q - p;
++
++    q++;
++    *str = q;
++    return parse_value( key, str );
++}
++
++/* Class.Name=value,..., Class=value with the key's name implied, or Class=@ for a singleton */
++static HRESULT parse_keys( struct path *path, const WCHAR *str )
++{
++    unsigned int count = 1;
++    const WCHAR *p;
++    HRESULT hr;
++
++    if (*str == '=')
++    {
++        str++;
++        if (str[0] == '@' && !str[1])
++        {
++            path->singleton = TRUE;
++            return S_OK;
++        }
++        if (!(path->keys = calloc( 1, sizeof(*path->keys) ))) return E_OUTOFMEMORY;
++        path->num_keys = 1;
++        if (!(path->keys[0].name = wcsdup( L"" ))) return E_OUTOFMEMORY;
++        if ((hr = parse_value( &path->keys[0], &str )) != S_OK) return hr;
++        return *str ? WBEM_E_INVALID_PARAMETER : S_OK;
++    }
++
++    /* at most one key a comma */
++    for (p = str + 1; *p; p++) if (*p == ',') count++;
++    if (!(path->keys = calloc( count, sizeof(*path->keys) ))) return E_OUTOFMEMORY;
++    str++;
++    for (;;)
++    {
++        if ((hr = parse_key( &path->keys[path->num_keys++], &str )) != S_OK) return hr;
++        if (!*str) return S_OK;
++        if (*str != ',' || path->num_keys == count) return WBEM_E_INVALID_PARAMETER;
++        str++;
++    }
++}
++
+ static HRESULT parse_text( struct path *path, ULONG mode, const WCHAR *text )
+ {
+     HRESULT hr = E_OUTOFMEMORY;
+-    const WCHAR *p, *q;
++    const WCHAR *p, *q, *end;
+     unsigned int i, len;
+ 
+     p = q = text;
+@@ -428,18 +1014,18 @@ static HRESULT parse_text( struct path *path, ULONG mode, const WCHAR *text )
+         path->flags |= WBEMPATH_INFO_PATH_HAD_SERVER;
+     }
+     p = q;
+-    if (wcschr( p, '\\' ) || wcschr( p, '/' ))
++    /* the namespaces end at the colon before the class, or with the path when it names no class; values
++     * can hold colons and backslashes, so they end before a key does */
++    for (end = p; *end && *end != ':' && *end != '.' && *end != '=' && *end != '"' && *end != '\''; end++);
++    if (*end != ':' && (*end || (!wcschr( p, '\\' ) && !wcschr( p, '/' )))) end = p;
++    if (end > p)
+     {
+-        if (*q != '\\' && *q != '/' && *q != ':')
++        if (*q != '\\' && *q != '/')
+         {
+             path->num_namespaces = 1;
+             q++;
+         }
+-        while (*q && *q != ':')
+-        {
+-            if (*q == '\\' || *q == '/') path->num_namespaces++;
+-            q++;
+-        }
++        for (; q < end; q++) if (*q == '\\' || *q == '/') path->num_namespaces++;
+     }
+     if (path->num_namespaces)
+     {
+@@ -448,10 +1034,9 @@ static HRESULT parse_text( struct path *path, ULONG mode, const WCHAR *text )
+ 
+         i = 0;
+         q = p;
+-        if (*q && *q != '\\' && *q != '/' && *q != ':')
++        if (*q != '\\' && *q != '/')
+         {
+-            p = q;
+-            while (*p && *p != '\\' && *p != '/' && *p != ':') p++;
++            while (p < end && *p != '\\' && *p != '/') p++;
+             len = p - q;
+             if (!(path->namespaces[i] = malloc( (len + 1) * sizeof(WCHAR) ))) goto done;
+             memcpy( path->namespaces[i], q, len * sizeof(WCHAR) );
+@@ -460,12 +1045,12 @@ static HRESULT parse_text( struct path *path, ULONG mode, const WCHAR *text )
+             q = p;
+             i++;
+         }
+-        while (*q && *q != ':')
++        for (; q < end; q++)
+         {
+             if (*q == '\\' || *q == '/')
+             {
+                 p = q + 1;
+-                while (*p && *p != '\\' && *p != '/' && *p != ':') p++;
++                while (p < end && *p != '\\' && *p != '/') p++;
+                 len = p - q - 1;
+                 if (!(path->namespaces[i] = malloc( (len + 1) * sizeof(WCHAR) ))) goto done;
+                 memcpy( path->namespaces[i], q + 1, len * sizeof(WCHAR) );
+@@ -473,44 +1058,23 @@ static HRESULT parse_text( struct path *path, ULONG mode, const WCHAR *text )
+                 path->len_namespaces[i] = len;
+                 i++;
+             }
+-            q++;
+         }
+     }
++    q = end;
+     if (*q == ':') q++;
+     p = q;
+     while (*q && *q != '.' && *q != '=') q++;
+-    len = q - p;
+-    if (!(path->class = malloc( (len + 1) * sizeof(WCHAR) ))) goto done;
+-    memcpy( path->class, p, len * sizeof(WCHAR) );
+-    path->class[len] = 0;
+-    path->len_class = len;
+-
+-    if (*q == '.')
++    if ((len = q - p))
+     {
+-        p = ++q;
+-        path->num_keys++;
+-        while (*q)
+-        {
+-            if (*q == ',') path->num_keys++;
+-            q++;
+-        }
+-        if (!(path->keys = calloc( path->num_keys, sizeof(struct key) ))) goto done;
+-        i = 0;
+-        q = p;
+-        while (*q)
+-        {
+-            if (i >= path->num_keys) break;
+-            hr = parse_key( &path->keys[i], q, &len );
+-            if (hr != S_OK) goto done;
+-            q += len;
+-            i++;
+-        }
++        if (!(path->class = malloc( (len + 1) * sizeof(WCHAR) ))) goto done;
++        memcpy( path->class, p, len * sizeof(WCHAR) );
++        path->class[len] = 0;
++        path->len_class = len;
+     }
+-    else if (*q == '=')
++    if (*q)
+     {
+-        path->num_keys = 1;
+-        if (!(path->keys = calloc( path->num_keys, sizeof(struct key) ))) goto done;
+-        hr = parse_key( &path->keys[0], q, &len );
++        if (!path->class) hr = WBEM_E_INVALID_PARAMETER;
++        else hr = parse_keys( path, q );
+         if (hr != S_OK) goto done;
+     }
+     hr = S_OK;
+@@ -577,210 +1141,89 @@ static WCHAR *build_namespace( struct path *path, int *len, BOOL leading_slash )
+     return ret;
+ }
+ 
+-static WCHAR *build_server( struct path *path, int *len )
++/* \\server\namespace, the server "." when the path has none; nothing when it has neither */
++static WCHAR *build_server_namespace( struct path *path, int *len )
+ {
+-    WCHAR *ret, *p;
++    const WCHAR *server = path->server ? path->server : L".";
++    int len_namespace, len_server = lstrlenW( server );
++    WCHAR *ret, *namespace;
+ 
+     *len = 0;
+-    if (path->len_server) *len += 2 + path->len_server;
+-    else *len += 3;
+-    if (!(p = ret = malloc( (*len + 1) * sizeof(WCHAR) ))) return NULL;
+-    if (path->len_server)
+-    {
+-        p[0] = p[1] = '\\';
+-        lstrcpyW( p + 2, path->server );
+-    }
+-    else
+-    {
+-        p[0] = p[1] = '\\';
+-        p[2] = '.';
+-        p[3] = 0;
+-    }
++    if (!path->server && !path->num_namespaces) return wcsdup( L"" );
++    if (!(namespace = build_namespace( path, &len_namespace, FALSE ))) return NULL;
++    *len = 2 + len_server + 1 + len_namespace;
++    if ((ret = malloc( (*len + 1) * sizeof(WCHAR) ))) swprintf( ret, *len + 1, L"\\\\%s\\%s", server, namespace );
++    free( namespace );
+     return ret;
+ }
+ 
+-static WCHAR *build_keylist( struct path *path, int *len )
++/* the class and its keys: Class.Name=value,..., or Class=value for a key with no name, Class=@ for a singleton */
++static WCHAR *build_relative( struct path *path, int *len )
+ {
+-    WCHAR *ret, *p;
+-    unsigned int i;
++    BOOL implied = path->singleton || (path->num_keys == 1 && !path->keys[0].len_name);
++    int len_keylist;
++    WCHAR *ret, *keylist;
+ 
+     *len = 0;
+-    for (i = 0; i < path->num_keys; i++)
+-    {
+-        if (i > 0) *len += 1;
+-        *len += path->keys[i].len_name + path->keys[i].len_value + 1;
+-    }
+-    if (!(p = ret = malloc( (*len + 1) * sizeof(WCHAR) ))) return NULL;
+-    for (i = 0; i < path->num_keys; i++)
++    if (!path->class) return wcsdup( L"" );
++    if (!(keylist = build_keylist( path, TRUE, &len_keylist ))) return NULL;
++    *len = path->len_class + (len_keylist ? len_keylist + 1 : 0);
++    if ((ret = malloc( (*len + 1) * sizeof(WCHAR) )))
+     {
+-        if (i > 0) *p++ = ',';
+-        memcpy( p, path->keys[i].name, path->keys[i].len_name * sizeof(WCHAR) );
+-        p += path->keys[i].len_name;
+-        *p++ = '=';
+-        memcpy( p, path->keys[i].value, path->keys[i].len_value * sizeof(WCHAR) );
+-        p += path->keys[i].len_value;
++        lstrcpyW( ret, path->class );
++        if (len_keylist)
++        {
++            ret[path->len_class] = implied ? '=' : '.';
++            lstrcpyW( ret + path->len_class + 1, keylist );
++        }
+     }
+-    *p = 0;
++    free( keylist );
+     return ret;
+ }
+ 
+ static WCHAR *build_path( struct path *path, LONG flags, int *len )
+ {
++    WCHAR *prefix, *relative, *ret = NULL;
++    int len_prefix, len_relative;
++
+     *len = 0;
+     switch (flags)
+     {
+     case 0:
+-    {
+-        int len_namespace, len_keylist;
+-        WCHAR *ret, *namespace = build_namespace( path, &len_namespace, FALSE );
+-        WCHAR *keylist = build_keylist( path, &len_keylist );
+-
+-        if (!namespace || !keylist)
+-        {
+-            free( namespace );
+-            free( keylist );
+-            return NULL;
+-        }
+-        *len = len_namespace;
+-        if (path->len_class)
+-        {
+-            *len += path->len_class + 1;
+-            if (path->num_keys) *len += len_keylist + 1;
+-        }
+-        if (!(ret = malloc( (*len + 1) * sizeof(WCHAR) )))
+-        {
+-            free( namespace );
+-            free( keylist );
+-            return NULL;
+-        }
+-        lstrcpyW( ret, namespace );
+-        if (path->len_class)
++    case WBEMPATH_GET_SERVER_TOO:
++        if (flags) prefix = build_server_namespace( path, &len_prefix );
++        else prefix = build_namespace( path, &len_prefix, FALSE );
++        relative = build_relative( path, &len_relative );
++        if (prefix && relative)
+         {
+-            unsigned int offset = len_namespace + path->len_class + 1;
+-
+-            ret[len_namespace] = ':';
+-            lstrcpyW( ret + len_namespace + 1, path->class );
+-            if (path->num_keys)
++            /* a colon parts the class from what comes before it */
++            *len = len_prefix + (len_prefix && len_relative ? 1 : 0) + len_relative;
++            if ((ret = malloc( (*len + 1) * sizeof(WCHAR) )))
+             {
+-                if (*keylist != '=') ret[offset++] = '.';
+-                lstrcpyW( ret + offset, keylist );
++                lstrcpyW( ret, prefix );
++                if (len_prefix && len_relative) lstrcatW( ret, L":" );
++                lstrcatW( ret, relative );
+             }
+         }
+-        free( namespace );
+-        free( keylist );
++        free( prefix );
++        free( relative );
+         return ret;
+ 
+-    }
+     case WBEMPATH_GET_RELATIVE_ONLY:
+-    {
+-        int len_keylist;
+-        WCHAR *ret, *keylist;
+-
+-        if (!path->len_class) return NULL;
+-        if (!(keylist = build_keylist( path, &len_keylist ))) return NULL;
+-
+-        *len = path->len_class;
+-        if (path->num_keys) *len += len_keylist + 1;
+-        if (!(ret = malloc( (*len + 1) * sizeof(WCHAR) )))
+-        {
+-            free( keylist );
+-            return NULL;
+-        }
+-        lstrcpyW( ret, path->class );
+-        if (path->num_keys)
+-        {
+-            unsigned int offset = path->len_class;
+-
+-            if (*keylist != '=') ret[offset++] = '.';
+-            lstrcpyW( ret + offset, keylist );
+-        }
+-        free( keylist );
+-        return ret;
+-    }
+-    case WBEMPATH_GET_SERVER_TOO:
+-    {
+-        int len_namespace, len_server, len_keylist;
+-        WCHAR *p, *ret, *namespace = build_namespace( path, &len_namespace, TRUE );
+-        WCHAR *server = build_server( path, &len_server );
+-        WCHAR *keylist = build_keylist( path, &len_keylist );
+-
+-        if (!namespace || !server || !keylist)
+-        {
+-            free( namespace );
+-            free( server );
+-            free( keylist );
+-            return NULL;
+-        }
+-        *len = len_namespace + len_server;
+-        if (path->len_class)
+-        {
+-            *len += path->len_class + 1;
+-            if (path->num_keys) *len += len_keylist + 1;
+-        }
+-        if (!(p = ret = malloc( (*len + 1) * sizeof(WCHAR) )))
+-        {
+-            free( namespace );
+-            free( server );
+-            free( keylist );
+-            return NULL;
+-        }
+-        lstrcpyW( p, server );
+-        p += len_server;
+-        lstrcpyW( p, namespace );
+-        p += len_namespace;
+-        if (path->len_class)
+-        {
+-            *p++ = ':';
+-            lstrcpyW( p, path->class );
+-            if (path->num_keys)
+-            {
+-                unsigned int offset = path->len_class;
++        return build_relative( path, len );
+ 
+-                if (*keylist != '=') p[offset++] = '.';
+-                lstrcpyW( p + offset, keylist );
+-            }
+-        }
+-        free( namespace );
+-        free( server );
+-        free( keylist );
+-        return ret;
+-    }
+     case WBEMPATH_GET_SERVER_AND_NAMESPACE_ONLY:
+-    {
+-        int len_namespace, len_server;
+-        WCHAR *p, *ret, *namespace = build_namespace( path, &len_namespace, TRUE );
+-        WCHAR *server = build_server( path, &len_server );
++        return build_server_namespace( path, len );
+ 
+-        if (!namespace || !server)
+-        {
+-            free( namespace );
+-            free( server );
+-            return NULL;
+-        }
+-        *len = len_namespace + len_server;
+-        if (!(p = ret = malloc( (*len + 1) * sizeof(WCHAR) )))
+-        {
+-            free( namespace );
+-            free( server );
+-            return NULL;
+-        }
+-        lstrcpyW( p, server );
+-        p += len_server;
+-        lstrcpyW( p, namespace );
+-        free( namespace );
+-        free( server );
+-        return ret;
+-    }
+     case WBEMPATH_GET_NAMESPACE_ONLY:
+         return build_namespace( path, len, FALSE );
+ 
+     case WBEMPATH_GET_ORIGINAL:
+-        if (!path->len_text) return NULL;
++        if (!path->len_text) return wcsdup( L"" );
+         *len = path->len_text;
+         return wcsdup( path->text );
+ 
+     default:
+-        ERR( "unhandled flags %#lx\n", flags );
+         return NULL;
+     }
+ }
+@@ -799,10 +1242,27 @@ static HRESULT WINAPI path_GetText(
+     TRACE("%p, %#lx, %p, %p\n", iface, lFlags, puBufferLength, pszText);
+ 
+     if (!puBufferLength) return WBEM_E_INVALID_PARAMETER;
++    switch (lFlags)
++    {
++    case 0:
++    case WBEMPATH_GET_RELATIVE_ONLY:
++    case WBEMPATH_GET_SERVER_TOO:
++    case WBEMPATH_GET_SERVER_AND_NAMESPACE_ONLY:
++    case WBEMPATH_GET_NAMESPACE_ONLY:
++    case WBEMPATH_GET_ORIGINAL:
++        break;
++    default:
++        /* WBEMPATH_COMPRESSED too */
++        return WBEM_E_INVALID_PARAMETER;
++    }
+ 
+     EnterCriticalSection( &path->cs );
+ 
+-    str = build_path( path, lFlags, &len );
++    if (!(str = build_path( path, lFlags, &len )))
++    {
++        hr = WBEM_E_OUT_OF_MEMORY;
++        goto done;
++    }
+     if (*puBufferLength < len + 1)
+     {
+         *puBufferLength = len + 1;
+@@ -813,8 +1273,7 @@ static HRESULT WINAPI path_GetText(
+         hr = WBEM_E_INVALID_PARAMETER;
+         goto done;
+     }
+-    if (str) lstrcpyW( pszText, str );
+-    else pszText[0] = 0;
++    lstrcpyW( pszText, str );
+     *puBufferLength = len + 1;
+ 
+     TRACE("returning %s\n", debugstr_w(pszText));
+@@ -836,8 +1295,6 @@ static HRESULT WINAPI path_GetInfo(
+ 
+     if (info || !response) return WBEM_E_INVALID_PARAMETER;
+ 
+-    FIXME("some flags are not implemented\n");
+-
+     EnterCriticalSection( &path->cs );
+ 
+     *response = path->flags;
+@@ -847,19 +1304,17 @@ static HRESULT WINAPI path_GetInfo(
+         *response |= WBEMPATH_INFO_HAS_MACHINE_NAME;
+ 
+     if (!path->class)
++    {
++        /* a valid path to a namespace is one for WMI 1.0 too, one to a class is not */
+         *response |= WBEMPATH_INFO_SERVER_NAMESPACE_ONLY;
++        if (path->flags & WBEMPATH_INFO_CIM_COMPLIANT) *response |= WBEMPATH_INFO_V1_COMPLIANT;
++    }
+     else
+     {
+-        *response |= WBEMPATH_INFO_HAS_SUBSCOPES;
+-        if (path->num_keys)
+-        {
+-            unsigned int i;
+-            for (i = 0; i < path->num_keys; i++)
+-                if (!path->keys[i].name[0]) *response |= WBEMPATH_INFO_HAS_IMPLIED_KEY;
+-            *response |= WBEMPATH_INFO_IS_INST_REF;
+-        }
+-        else
+-            *response |= WBEMPATH_INFO_IS_CLASS_REF;
++        *response |= WBEMPATH_INFO_HAS_SUBSCOPES | keys_info( path );
++        if (path->singleton) *response |= WBEMPATH_INFO_IS_INST_REF | WBEMPATH_INFO_IS_SINGLETON;
++        else if (path->num_keys) *response |= WBEMPATH_INFO_IS_INST_REF;
++        else *response |= WBEMPATH_INFO_IS_CLASS_REF;
+     }
+ 
+     LeaveCriticalSection( &path->cs );
+@@ -917,13 +1372,22 @@ static HRESULT WINAPI path_GetServer(
+ 
+     EnterCriticalSection( &path->cs );
+ 
+-    if (!path->server)
++    /* a path with no server is to this machine, unless it is no path at all */
++    if (!path->server && !path->class && !path->num_namespaces)
+     {
+         LeaveCriticalSection( &path->cs );
+         return WBEM_E_NOT_AVAILABLE;
+     }
+-    if (*len > path->len_server) lstrcpyW( name, path->server );
+-    *len = path->len_server + 1;
++    if (!path->server)
++    {
++        if (*len > 1) lstrcpyW( name, L"." );
++        *len = 2;
++    }
++    else
++    {
++        if (*len > path->len_server) lstrcpyW( name, path->server );
++        *len = path->len_server + 1;
++    }
+ 
+     LeaveCriticalSection( &path->cs );
+     return S_OK;
+diff --git a/dlls/wmiutils/tests/Makefile.in b/dlls/wmiutils/tests/Makefile.in
+index 685a695ade0..5588d60229a 100644
+--- a/dlls/wmiutils/tests/Makefile.in
++++ b/dlls/wmiutils/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = wmiutils.dll
+-IMPORTS   = ole32 uuid
++IMPORTS   = oleaut32 ole32 uuid
+ 
+ SOURCES = \
+ 	path.c
+diff --git a/dlls/wmiutils/tests/path.c b/dlls/wmiutils/tests/path.c
+index 2c641dbf227..1d80f37c9b4 100644
+--- a/dlls/wmiutils/tests/path.c
++++ b/dlls/wmiutils/tests/path.c
+@@ -97,7 +97,7 @@ static void test_IWbemPath_SetText(void)
+         { path8, WBEMPATH_TREAT_SINGLE_IDENT_AS_NS, WBEM_E_INVALID_PARAMETER, TRUE },
+         { path8, WBEMPATH_TREAT_SINGLE_IDENT_AS_NS + 1, S_OK },
+         { path9, WBEMPATH_CREATE_ACCEPT_ABSOLUTE, S_OK },
+-        { path10, WBEMPATH_CREATE_ACCEPT_ABSOLUTE, WBEM_E_INVALID_PARAMETER, TRUE },
++        { path10, WBEMPATH_CREATE_ACCEPT_ABSOLUTE, WBEM_E_INVALID_PARAMETER },
+         { path11, WBEMPATH_CREATE_ACCEPT_ABSOLUTE, S_OK },
+         { path15, WBEMPATH_CREATE_ACCEPT_ALL, S_OK }
+     };
+@@ -183,8 +183,12 @@ static void test_IWbemPath_GetText(void)
+     memset( buf, 0x55, sizeof(buf) );
+     hr = IWbemPath_GetText( path, WBEMPATH_GET_SERVER_TOO, &len, buf );
+     ok( hr == S_OK, "got %#lx\n", hr );
+-    todo_wine ok( !buf[0], "unexpected buffer contents %s\n", wine_dbgstr_w(buf) );
+-    todo_wine ok( len == 1, "unexpected length %lu\n", len );
++    ok( !buf[0], "unexpected buffer contents %s\n", wine_dbgstr_w(buf) );
++    ok( len == 1, "unexpected length %lu\n", len );
++
++    len = ARRAY_SIZE(buf);
++    hr = IWbemPath_GetText( path, WBEMPATH_COMPRESSED, &len, buf );
++    ok( hr == WBEM_E_INVALID_PARAMETER, "got %#lx\n", hr );
+ 
+     hr = IWbemPath_SetText( path, WBEMPATH_CREATE_ACCEPT_ALL, path8 );
+     ok( hr == S_OK, "got %#lx\n", hr );
+@@ -854,6 +858,386 @@ static void test_IWbemPath_marshal(void)
+     IWbemPath_Release( path );
+ }
+ 
++#define check_text(a, b, c) check_text_( __LINE__, a, b, c )
++static void check_text_( unsigned int line, IWbemPath *path, LONG flags, const WCHAR *expected )
++{
++    WCHAR buf[128];
++    ULONG len = ARRAY_SIZE(buf);
++    HRESULT hr;
++
++    buf[0] = 0;
++    hr = IWbemPath_GetText( path, flags, &len, buf );
++    ok_(__FILE__, line)( hr == S_OK, "got %#lx\n", hr );
++    ok_(__FILE__, line)( !lstrcmpW( buf, expected ), "flags %#lx: got %s\n", flags, wine_dbgstr_w(buf) );
++    ok_(__FILE__, line)( len == lstrlenW( expected ) + 1, "flags %#lx: got length %lu\n", flags, len );
++}
++
++#define check_keylist_text(a, b, c) check_keylist_text_( __LINE__, a, b, c )
++static void check_keylist_text_( unsigned int line, IWbemPathKeyList *keys, LONG flags, const WCHAR *expected )
++{
++    WCHAR buf[128];
++    ULONG len = ARRAY_SIZE(buf);
++    HRESULT hr;
++
++    buf[0] = 0;
++    hr = IWbemPathKeyList_GetText( keys, flags, &len, buf );
++    ok_(__FILE__, line)( hr == S_OK, "got %#lx\n", hr );
++    ok_(__FILE__, line)( !lstrcmpW( buf, expected ), "flags %#lx: got %s\n", flags, wine_dbgstr_w(buf) );
++    ok_(__FILE__, line)( len == lstrlenW( expected ) + 1, "flags %#lx: got length %lu\n", flags, len );
++}
++
++static void test_IWbemPathKeyList_GetKey(void)
++{
++    static const struct
++    {
++        const WCHAR *path;
++        ULONGLONG    info;
++        const WCHAR *text;          /* GetText( 0 ) */
++        const WCHAR *server_too;    /* GetText( WBEMPATH_GET_SERVER_TOO ) */
++        const WCHAR *server_ns;     /* GetText( WBEMPATH_GET_SERVER_AND_NAMESPACE_ONLY ) */
++        ULONG        count;
++        ULONGLONG    keys_info;
++        const WCHAR *keys_text;     /* the key list's text, and quoted */
++        const WCHAR *keys_quoted;
++        const WCHAR *name;          /* the first key */
++        ULONG        type;
++        VARTYPE      vt;
++        const WCHAR *value;         /* a VT_BSTR's string, the number of the others */
++    }
++    tests[] =
++    {
++        { L"\\\\srv\\root\\cimv2:Win32_Process.Handle=\"4\"", 0x20c1a, L"root\\cimv2:Win32_Process.Handle=\"4\"",
++          L"\\\\srv\\root\\cimv2:Win32_Process.Handle=\"4\"", L"\\\\srv\\root\\cimv2", 1, 0,
++          L"Handle=4", L"Handle=\"4\"", L"Handle", CIM_STRING, VT_BSTR, L"4" },
++        { L"Win32_LogicalDisk.DeviceID=\"C:\"", 0xc19, L"Win32_LogicalDisk.DeviceID=\"C:\"",
++          L"Win32_LogicalDisk.DeviceID=\"C:\"", L"", 1, 0,
++          L"DeviceID=C:", L"DeviceID=\"C:\"", L"DeviceID", CIM_STRING, VT_BSTR, L"C:" },
++        { L"Win32_OperatingSystem=@", 0x1d19, L"Win32_OperatingSystem=@", L"Win32_OperatingSystem=@", L"", 0, 0x100,
++          L"@", L"@" },
++        { L"\\\\.\\root\\cimv2:Win32_OperatingSystem=@", 0x21d19, L"root\\cimv2:Win32_OperatingSystem=@",
++          L"\\\\.\\root\\cimv2:Win32_OperatingSystem=@", L"\\\\.\\root\\cimv2", 0, 0x100, L"@", L"@" },
++        { L"Win32_LogicalDisk=\"C:\"", 0xc99, L"Win32_LogicalDisk=\"C:\"", L"Win32_LogicalDisk=\"C:\"", L"", 1, 0x80,
++          L"C:", L"\"C:\"", L"", CIM_STRING, VT_BSTR, L"C:" },
++        { L"Class.A=5", 0xc19, L"Class.A=5", L"Class.A=5", L"", 1, 0, L"A=5", L"A=5", L"A", CIM_SINT32, VT_I4, L"5" },
++        { L"Class.A=-5", 0xc19, L"Class.A=-5", L"Class.A=-5", L"", 1, 0, L"A=-5", L"A=-5", L"A", CIM_SINT32, VT_I4,
++          L"-5" },
++        { L"Class.A=4294967296", 0xc19, L"Class.A=4294967296", L"Class.A=4294967296", L"", 1, 0, L"A=4294967296",
++          L"A=4294967296", L"A", CIM_UINT64, VT_BSTR, L"4294967296" },
++        { L"Class.A=18446744073709551615", 0xc19, L"Class.A=18446744073709551615", L"Class.A=18446744073709551615",
++          L"", 1, 0, L"A=18446744073709551615", L"A=18446744073709551615", L"A", CIM_UINT64, VT_BSTR,
++          L"18446744073709551615" },
++        { L"Class.A=-9223372036854775808", 0xc19, L"Class.A=-9223372036854775808", L"Class.A=-9223372036854775808",
++          L"", 1, 0, L"A=-9223372036854775808", L"A=-9223372036854775808", L"A", CIM_SINT64, VT_BSTR,
++          L"-9223372036854775808" },
++        { L"Class.A=0x10", 0xc19, L"Class.A=16", L"Class.A=16", L"", 1, 0, L"A=16", L"A=16", L"A", CIM_UINT64,
++          VT_BSTR, L"16" },
++        { L"Class.A=010", 0xc19, L"Class.A=10", L"Class.A=10", L"", 1, 0, L"A=10", L"A=10", L"A", CIM_SINT32, VT_I4,
++          L"10" },
++        { L"Class.A=TRUE", 0xc19, L"Class.A=true", L"Class.A=true", L"", 1, 0, L"A=true", L"A=true", L"A",
++          CIM_BOOLEAN, VT_BOOL, L"1" },
++        { L"Class.A=\"x,y\",B=2", 0xc39, L"Class.A=\"x,y\",B=2", L"Class.A=\"x,y\",B=2", L"", 2, 0x20, L"A=x,y,B=2",
++          L"A=\"x,y\",B=2", L"A", CIM_STRING, VT_BSTR, L"x,y" },
++        { L"Class.A=\"q\\\"uote\"", 0xc19, L"Class.A=\"q\\\"uote\"", L"Class.A=\"q\\\"uote\"", L"", 1, 0,
++          L"A=q\\\"uote", L"A=\"q\\\"uote\"", L"A", CIM_STRING, VT_BSTR, L"q\"uote" },
++        { L"Class.A=\"back\\\\slash\"", 0xc19, L"Class.A=\"back\\\\slash\"", L"Class.A=\"back\\\\slash\"", L"", 1, 0,
++          L"A=back\\\\slash", L"A=\"back\\\\slash\"", L"A", CIM_STRING, VT_BSTR, L"back\\slash" },
++        { L"Class.A='single'", 0xc19, L"Class.A=\"single\"", L"Class.A=\"single\"", L"", 1, 0, L"A=single",
++          L"A=\"single\"", L"A", CIM_STRING, VT_BSTR, L"single" },
++        { L"Class.A=\"\"", 0xc19, L"Class.A=\"\"", L"Class.A=\"\"", L"", 1, 0, L"A=", L"A=\"\"", L"A", CIM_STRING,
++          VT_BSTR, L"" },
++        { L"Class.B=\"b\",A=5", 0xc39, L"Class.B=\"b\",A=5", L"Class.B=\"b\",A=5", L"", 2, 0x20, L"B=b,A=5",
++          L"B=\"b\",A=5", L"B", CIM_STRING, VT_BSTR, L"b" },
++        { L"Class.Ref=\"Other.K=\\\"v\\\"\"", 0xc19, L"Class.Ref=\"Other.K=\\\"v\\\"\"",
++          L"Class.Ref=\"Other.K=\\\"v\\\"\"", L"", 1, 0, L"Ref=Other.K=\\\"v\\\"", L"Ref=\"Other.K=\\\"v\\\"\"",
++          L"Ref", CIM_STRING, VT_BSTR, L"Other.K=\"v\"" },
++        { L"Class=5", 0xc99, L"Class=5", L"Class=5", L"", 1, 0x80, L"5", L"5", L"", CIM_SINT32, VT_I4, L"5" },
++        { L"Class.A=\"v\",A=\"w\"", 0xc39, L"Class.A=\"v\",A=\"w\"", L"Class.A=\"v\",A=\"w\"", L"", 2, 0x20,
++          L"A=v,A=w", L"A=\"v\",A=\"w\"", L"A", CIM_STRING, VT_BSTR, L"v" },
++        { L"Class.A={1234}", 0xc59, L"Class.A={1234}", L"Class.A={1234}", L"", 1, 0x40, L"A={1234}", L"A={1234}",
++          L"A", CIM_REFERENCE, VT_BSTR, L"{1234}" },
++        { L"root\\cimv2:Class", 0xc15, L"root\\cimv2:Class", L"\\\\.\\root\\cimv2:Class", L"\\\\.\\root\\cimv2", 0, 0,
++          L"", L"" },
++        { L"Class", 0xc15, L"Class", L"Class", L"", 0, 0, L"", L"" },
++        { L"\\\\srv\\root\\cimv2", 0x24e02, L"root\\cimv2", L"\\\\srv\\root\\cimv2", L"\\\\srv\\root\\cimv2", ~0u },
++        { L"\\\\srv", 0x24e02, L"", L"\\\\srv\\", L"\\\\srv\\", ~0u },
++    };
++    static const WCHAR *invalid[] =
++    {
++        L"Class.A=+5", L"Class.A=1.5", L"Class.A=\"tab\\tx\"", L"Class.A=\"unterminated", L"Class.A = 5",
++        L"Class.A=5 ", L"Class.=5", L"Class.A", L"Class.A=", L"Class=@,A=5", L"Class.A=@",
++    };
++    IWbemPathKeyList *keys;
++    ULONG count, len, size, type;
++    ULONGLONG info;
++    WCHAR name[32];
++    BYTE value[64];
++    IWbemPath *path;
++    unsigned int i;
++    VARIANT var;
++    HRESULT hr;
++
++    if (!(path = create_path())) return;
++
++    for (i = 0; i < ARRAY_SIZE(invalid); i++)
++    {
++        hr = IWbemPath_SetText( path, WBEMPATH_CREATE_ACCEPT_ALL, invalid[i] );
++        ok( hr == WBEM_E_INVALID_PARAMETER, "%s: got %#lx\n", wine_dbgstr_w(invalid[i]), hr );
++    }
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        winetest_push_context( "%s", wine_dbgstr_w(tests[i].path) );
++
++        hr = IWbemPath_SetText( path, WBEMPATH_CREATE_ACCEPT_ALL, tests[i].path );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        info = 0;
++        hr = IWbemPath_GetInfo( path, 0, &info );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        ok( info == tests[i].info, "got %s\n", wine_dbgstr_longlong(info) );
++        check_text( path, 0, tests[i].text );
++        check_text( path, WBEMPATH_GET_SERVER_TOO, tests[i].server_too );
++        check_text( path, WBEMPATH_GET_SERVER_AND_NAMESPACE_ONLY, tests[i].server_ns );
++        check_text( path, WBEMPATH_GET_ORIGINAL, tests[i].path );
++
++        name[0] = 0;
++        len = ARRAY_SIZE(name);
++        hr = IWbemPath_GetServer( path, &len, name );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        ok( !lstrcmpW( name, tests[i].path[0] == '\\' ? (tests[i].path[2] == 's' ? L"srv" : L".") : L"." ),
++            "got server %s\n", wine_dbgstr_w(name) );
++
++        hr = IWbemPath_GetKeyList( path, &keys );
++        if (tests[i].count == ~0u)
++        {
++            ok( hr == WBEM_E_INVALID_PARAMETER, "got %#lx\n", hr );
++            winetest_pop_context();
++            continue;
++        }
++        ok( hr == S_OK, "got %#lx\n", hr );
++
++        count = 0xdeadbeef;
++        hr = IWbemPathKeyList_GetCount( keys, &count );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        ok( count == tests[i].count, "got %lu keys\n", count );
++        info = 0xdeadbeef;
++        hr = IWbemPathKeyList_GetInfo( keys, 0, &info );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        ok( info == tests[i].keys_info, "got %s\n", wine_dbgstr_longlong(info) );
++        check_keylist_text( keys, 0, tests[i].keys_text );
++        check_keylist_text( keys, WBEMPATH_TEXT, tests[i].keys_text );
++        check_keylist_text( keys, WBEMPATH_QUOTEDTEXT, tests[i].keys_quoted );
++
++        if (count)
++        {
++            /* the name's length and the value at once */
++            len = 0;
++            type = 0xdeadbeef;
++            VariantInit( &var );
++            hr = IWbemPathKeyList_GetKey2( keys, 0, 0, &len, NULL, &var, &type );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( len == lstrlenW( tests[i].name ) + 1, "got length %lu\n", len );
++            ok( type == tests[i].type, "got type %lu\n", type );
++            ok( V_VT( &var ) == tests[i].vt, "got vt %#x\n", V_VT( &var ) );
++            VariantClear( &var );
++
++            name[0] = 0;
++            len = ARRAY_SIZE(name);
++            hr = IWbemPathKeyList_GetKey2( keys, 0, 0, &len, name, &var, &type );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( !lstrcmpW( name, tests[i].name ), "got name %s\n", wine_dbgstr_w(name) );
++            if (V_VT( &var ) == VT_BSTR)
++                ok( !lstrcmpW( V_BSTR( &var ), tests[i].value ), "got %s\n", wine_dbgstr_w(V_BSTR( &var )) );
++            else if (V_VT( &var ) == VT_I4)
++                ok( V_I4( &var ) == _wtoi( tests[i].value ), "got %ld\n", V_I4( &var ) );
++            else if (V_VT( &var ) == VT_BOOL)
++                ok( V_BOOL( &var ) == _wtoi( tests[i].value ), "got %d\n", V_BOOL( &var ) );
++            VariantClear( &var );
++
++            /* the text, which is what a path writes */
++            size = sizeof(value);
++            memset( value, 0xcc, sizeof(value) );
++            hr = IWbemPathKeyList_GetKey( keys, 0, WBEMPATH_QUOTEDTEXT, NULL, NULL, &size, value, &type );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            ok( size == (lstrlenW( (WCHAR *)value ) + 1) * sizeof(WCHAR), "got size %lu\n", size );
++            ok( type == tests[i].type, "got type %lu\n", type );
++
++            hr = IWbemPathKeyList_GetKey2( keys, count, 0, NULL, NULL, &var, &type );
++            ok( hr == WBEM_E_INVALID_PARAMETER, "got %#lx\n", hr );
++        }
++        IWbemPathKeyList_Release( keys );
++        winetest_pop_context();
++    }
++
++    /* the value's bytes: a string's unescaped, with its terminator, a number's */
++    hr = IWbemPath_SetText( path, WBEMPATH_CREATE_ACCEPT_ALL, L"Class.S=\"q\\\"\",N=-5,U=4294967296,B=TRUE" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IWbemPath_GetKeyList( path, &keys );
++    ok( hr == S_OK, "got %#lx\n", hr );
++
++    size = 0;
++    hr = IWbemPathKeyList_GetKey( keys, 0, 0, NULL, NULL, &size, NULL, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == 3 * sizeof(WCHAR), "got size %lu\n", size );
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 0, 0, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !lstrcmpW( (WCHAR *)value, L"q\"" ), "got %s\n", wine_dbgstr_w((WCHAR *)value) );
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 0, WBEMPATH_TEXT, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !lstrcmpW( (WCHAR *)value, L"q\\\"" ), "got %s\n", wine_dbgstr_w((WCHAR *)value) );
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 0, WBEMPATH_QUOTEDTEXT, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !lstrcmpW( (WCHAR *)value, L"\"q\\\"\"" ), "got %s\n", wine_dbgstr_w((WCHAR *)value) );
++
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 1, 0, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == sizeof(LONG) && *(LONG *)value == -5, "got size %lu, %ld\n", size, *(LONG *)value );
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 1, WBEMPATH_TEXT, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !lstrcmpW( (WCHAR *)value, L"-5" ), "got %s\n", wine_dbgstr_w((WCHAR *)value) );
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 2, 0, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == sizeof(ULONGLONG) && *(ULONGLONG *)value == 0x100000000ull, "got size %lu\n", size );
++    size = sizeof(value);
++    hr = IWbemPathKeyList_GetKey( keys, 3, 0, NULL, NULL, &size, value, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( size == sizeof(LONG) && *(LONG *)value == 1, "got size %lu, %ld\n", size, *(LONG *)value );
++
++    /* the text of a number read back as one */
++    hr = IWbemPathKeyList_GetKey2( keys, 1, WBEMPATH_TEXT, NULL, NULL, &var, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( V_VT( &var ) == VT_I4 && V_I4( &var ) == MAKELONG( '-', '5' ), "got %#x, %ld\n", V_VT( &var ), V_I4( &var ) );
++    hr = IWbemPathKeyList_GetKey2( keys, 0, WBEMPATH_QUOTEDTEXT, NULL, NULL, &var, &type );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( V_VT( &var ) == VT_BSTR && !lstrcmpW( V_BSTR( &var ), L"\"q\\\"\"" ), "got %s\n", wine_dbgstr_variant(&var) );
++    VariantClear( &var );
++
++    hr = IWbemPathKeyList_GetKey( keys, 0, 4, NULL, NULL, &size, value, &type );
++    ok( hr == WBEM_E_INVALID_PARAMETER, "got %#lx\n", hr );
++    IWbemPathKeyList_Release( keys );
++
++    hr = IWbemPath_SetText( path, WBEMPATH_CREATE_ACCEPT_ALL, L"" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    len = ARRAY_SIZE(name);
++    hr = IWbemPath_GetServer( path, &len, name );
++    ok( hr == WBEM_E_NOT_AVAILABLE, "got %#lx\n", hr );
++    info = 0;
++    hr = IWbemPath_GetInfo( path, 0, &info );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( info == (WBEMPATH_INFO_SERVER_NAMESPACE_ONLY | WBEMPATH_INFO_ANON_LOCAL_MACHINE), "got %s\n",
++        wine_dbgstr_longlong(info) );
++
++    IWbemPath_Release( path );
++}
++
++static void test_IWbemPathKeyList_SetKey(void)
++{
++    IWbemPathKeyList *keys;
++    ULONGLONG info;
++    ULONG count;
++    LONG value = 5;
++    IWbemPath *path;
++    VARIANT var;
++    HRESULT hr;
++
++    if (!(path = create_path())) return;
++
++    hr = IWbemPath_SetText( path, WBEMPATH_CREATE_ACCEPT_ALL, L"Class" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IWbemPath_GetKeyList( path, &keys );
++    ok( hr == S_OK, "got %#lx\n", hr );
++
++    V_VT( &var ) = VT_I4;
++    V_I4( &var ) = 5;
++    hr = IWbemPathKeyList_SetKey2( keys, L"A", 0, CIM_SINT32, &var );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_text( path, 0, L"Class.A=5" );
++    check_text( path, WBEMPATH_GET_ORIGINAL, L"Class" );
++    info = 0;
++    hr = IWbemPath_GetInfo( path, 0, &info );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( info == 0xc19, "got %s\n", wine_dbgstr_longlong(info) );
++
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = SysAllocString( L"x,y \"q\" \\" );
++    hr = IWbemPathKeyList_SetKey2( keys, L"B", 0, CIM_STRING, &var );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    VariantClear( &var );
++    /* a string given as a number is read as one */
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = SysAllocString( L"7" );
++    hr = IWbemPathKeyList_SetKey2( keys, L"C", 0, CIM_UINT32, &var );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    VariantClear( &var );
++    V_VT( &var ) = VT_BOOL;
++    V_BOOL( &var ) = VARIANT_TRUE;
++    hr = IWbemPathKeyList_SetKey2( keys, L"D", 0, CIM_BOOLEAN, &var );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IWbemPathKeyList_SetKey( keys, L"E", 0, CIM_SINT32, &value );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IWbemPathKeyList_SetKey( keys, L"F", 0, CIM_STRING, (void *)L"text" );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    V_VT( &var ) = VT_I4;
++    V_I4( &var ) = 9;
++    hr = IWbemPathKeyList_SetKey2( keys, L"A", 0, CIM_SINT32, &var );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_text( path, 0, L"Class.A=9,B=\"x,y \\\"q\\\" \\\\\",C=55,D=true,E=5,F=\"text\"" );
++    check_keylist_text( keys, 0, L"A=9,B=x,y \\\"q\\\" \\\\,C=55,D=true,E=5,F=text" );
++    count = 0;
++    hr = IWbemPathKeyList_GetCount( keys, &count );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( count == 6, "got %lu\n", count );
++
++    hr = IWbemPathKeyList_RemoveKey( keys, L"B", 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IWbemPathKeyList_RemoveKey( keys, L"nonesuch", 0 );
++    ok( hr == WBEM_E_INVALID_PARAMETER, "got %#lx\n", hr );
++    check_text( path, 0, L"Class.A=9,C=55,D=true,E=5,F=\"text\"" );
++
++    hr = IWbemPathKeyList_MakeSingleton( keys, TRUE );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_text( path, 0, L"Class=@" );
++    count = 0xdeadbeef;
++    hr = IWbemPathKeyList_GetCount( keys, &count );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( !count, "got %lu\n", count );
++    info = 0;
++    hr = IWbemPath_GetInfo( path, 0, &info );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( info == 0x1d19, "got %s\n", wine_dbgstr_longlong(info) );
++
++    hr = IWbemPathKeyList_MakeSingleton( keys, FALSE );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_text( path, 0, L"Class" );
++    info = 0;
++    hr = IWbemPath_GetInfo( path, 0, &info );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( info == 0xc15, "got %s\n", wine_dbgstr_longlong(info) );
++
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = SysAllocString( L"C:" );
++    hr = IWbemPathKeyList_SetKey2( keys, L"", 0, CIM_STRING, &var );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    VariantClear( &var );
++    check_text( path, 0, L"Class=\"C:\"" );
++    info = 0;
++    hr = IWbemPath_GetInfo( path, 0, &info );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    ok( info == 0xc99, "got %s\n", wine_dbgstr_longlong(info) );
++
++    hr = IWbemPathKeyList_RemoveAllKeys( keys, 0 );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    check_text( path, 0, L"Class" );
++
++    IWbemPathKeyList_Release( keys );
++    IWbemPath_Release( path );
++}
++
+ START_TEST (path)
+ {
+     CoInitialize( NULL );
+@@ -870,6 +1254,8 @@ START_TEST (path)
+     test_IWbemPath_RemoveNamespaceAt();
+     test_IWbemPath_SetNamespaceAt();
+     test_IWbemPath_marshal();
++    test_IWbemPathKeyList_GetKey();
++    test_IWbemPathKeyList_SetKey();
+ 
+     CoUninitialize();
+ }
+diff --git a/include/wmiutils.idl b/include/wmiutils.idl
+index 5753c97d317..3851f943663 100644
+--- a/include/wmiutils.idl
++++ b/include/wmiutils.idl
+@@ -61,6 +61,12 @@ typedef [v1_enum] enum tag_WBEM_GET_TEXT_FLAGS
+     WBEMPATH_GET_ORIGINAL                   = 0x20
+ } tag_WBEM_GET_TEXT_FLAGS;
+ 
++typedef [v1_enum] enum tag_WBEM_GET_KEY_FLAGS
++{
++    WBEMPATH_TEXT       = 0x1,
++    WBEMPATH_QUOTEDTEXT = 0x2
++} tag_WBEM_GET_KEY_FLAGS;
++
+ [
+     local,
+     object,

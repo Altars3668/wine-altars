@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 19:14:12 -0400
+Subject: [PATCH] combase: Let go of a call's stub in the apartment, before the
+ caller is answered.
+
+A call from another process to a single-threaded apartment holds its
+stub manager and stub buffer while the apartment makes it, and the
+dispatching thread let go of them after it was told the call was made.
+When the apartment disconnected the object in the meantime, the last
+references COM held were released later, from the dispatching thread:
+off the object's apartment, and after the application had let the
+object go.  Excel, driven by automation, disconnects an object of the
+VBA project this way as the script reads VBProject; the late release
+faulted ("Got page fault when releasing stub"), and Excel never exited
+after Quit.  The apartment now lets go of them itself when the call has
+been made.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+index 87066ea5cbd..b4cbbe1322c 100644
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -105,6 +105,7 @@ struct dispatch_params
+ {
+     RPCOLEMESSAGE     *msg; /* message */
+     IRpcStubBuffer    *stub; /* stub buffer, if applicable */
++    struct stub_manager *stub_manager; /* the stub's manager, for a call from another process */
+     IRpcChannelBuffer *chan; /* server channel buffer, if applicable */
+     IID                iid; /* ID of interface being called */
+     IUnknown          *iface; /* interface being called */
+@@ -2065,6 +2066,17 @@ exit_reset_state:
+ 
+ exit:
+     free(message_state);
++    /* A call from another process holds the object's stub until the call is made.  It lets go of it here,
++     * in the apartment, before the dispatching thread is told: once the apartment goes on to disconnect
++     * the object (CoDisconnectObject), COM must hold nothing of it, or the last release comes later from
++     * the dispatching thread, after the application has let the object go. */
++    if (params->stub_manager)
++    {
++        IRpcStubBuffer_Release(params->stub);
++        params->stub = NULL;
++        stub_manager_int_release(params->stub_manager);
++        params->stub_manager = NULL;
++    }
+     if (params->handle) SetEvent(params->handle);
+ }
+ 
+@@ -2097,6 +2109,7 @@ static void __RPC_STUB dispatch_rpc(RPC_MESSAGE *msg)
+         return;
+     }
+ 
++    params->stub_manager = stub_manager;
+     params->msg = (RPCOLEMESSAGE *)msg;
+     params->status = RPC_S_OK;
+     params->hr = S_OK;
+@@ -2148,11 +2161,14 @@ static void __RPC_STUB dispatch_rpc(RPC_MESSAGE *msg)
+     hr = params->hr;
+     if (params->chan)
+         IRpcChannelBuffer_Release(params->chan);
+-    if (params->stub)
++    /* the call not made, when posting it failed */
++    if (params->stub_manager)
++    {
+         IRpcStubBuffer_Release(params->stub);
++        stub_manager_int_release(params->stub_manager);
++    }
+     free(params);
+ 
+-    stub_manager_int_release(stub_manager);
+     apartment_release(apt);
+ 
+     /* if IRpcStubBuffer_Invoke fails, we should raise an exception to tell
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index f85632294d9..581eb145077 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -4976,6 +4976,149 @@ static void test_local_server(void)
+     CloseHandle(quit_event);
+ }
+ 
++/* an object of a single-threaded apartment in another process, which disconnects itself in a call made
++ * on it: COM lets it go once the call has been answered, and only ever from the apartment's thread */
++static struct
++{
++    IPersist IPersist_iface;
++    LONG refcount;
++    DWORD apartment_tid;
++    LONG foreign_releases;
++} disconnect_object;
++
++static HRESULT WINAPI disconnect_object_QueryInterface(IPersist *iface, REFIID riid, void **out)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IPersist))
++    {
++        *out = iface;
++        IPersist_AddRef(iface);
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI disconnect_object_AddRef(IPersist *iface)
++{
++    return InterlockedIncrement(&disconnect_object.refcount);
++}
++
++static ULONG WINAPI disconnect_object_Release(IPersist *iface)
++{
++    if (GetCurrentThreadId() != disconnect_object.apartment_tid)
++        InterlockedIncrement(&disconnect_object.foreign_releases);
++    return InterlockedDecrement(&disconnect_object.refcount);
++}
++
++static HRESULT WINAPI disconnect_object_GetClassID(IPersist *iface, CLSID *clsid)
++{
++    HRESULT hr;
++
++    hr = CoDisconnectObject((IUnknown *)iface, 0);
++    ok_ole_success(hr, CoDisconnectObject);
++    PostThreadMessageA(GetCurrentThreadId(), WM_APP, 0, 0);
++    *clsid = CLSID_WineOOPTest;
++    return S_OK;
++}
++
++static const IPersistVtbl disconnect_object_vtbl =
++{
++    disconnect_object_QueryInterface,
++    disconnect_object_AddRef,
++    disconnect_object_Release,
++    disconnect_object_GetClassID,
++};
++
++static void test_disconnect_after_call_server(void)
++{
++    HANDLE ready, mapping;
++    HGLOBAL hglobal;
++    IStream *stream;
++    DWORD *view;
++    HRESULT hr;
++    MSG msg;
++
++    disconnect_object.IPersist_iface.lpVtbl = &disconnect_object_vtbl;
++    disconnect_object.refcount = 1;
++    disconnect_object.apartment_tid = GetCurrentThreadId();
++
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    ok_ole_success(hr, CreateStreamOnHGlobal);
++    hr = CoMarshalInterface(stream, &IID_IPersist, (IUnknown *)&disconnect_object.IPersist_iface,
++                            MSHCTX_LOCAL, NULL, MSHLFLAGS_NORMAL);
++    ok_ole_success(hr, CoMarshalInterface);
++    GetHGlobalFromStream(stream, &hglobal);
++    mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096,
++                                 "Wine COM Test Disconnect Objref");
++    view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0);
++    view[0] = GlobalSize(hglobal);
++    memcpy(view + 1, GlobalLock(hglobal), view[0]);
++    GlobalUnlock(hglobal);
++    IStream_Release(stream);
++
++    ready = CreateEventA(NULL, FALSE, FALSE, "Wine COM Test Disconnect Ready");
++    SetEvent(ready);
++
++    /* the call from the other process, then the message it posted */
++    while (GetMessageA(&msg, NULL, 0, 0))
++    {
++        if (!msg.hwnd && msg.message == WM_APP)
++        {
++            int i;
++
++            for (i = 0; i < 50 && disconnect_object.refcount > 1; i++) Sleep(100);
++            /* COM has let the object go, in this thread: what is left is this apartment's own reference */
++            ok(disconnect_object.refcount == 1, "got refcount %ld.\n", disconnect_object.refcount);
++            ok(!disconnect_object.foreign_releases, "released %ld times on other threads.\n",
++               disconnect_object.foreign_releases);
++            IPersist_Release(&disconnect_object.IPersist_iface);
++            ok(!disconnect_object.refcount, "got refcount %ld.\n", disconnect_object.refcount);
++            break;
++        }
++        DispatchMessageA(&msg);
++    }
++
++    UnmapViewOfFile(view);
++    CloseHandle(mapping);
++    CloseHandle(ready);
++}
++
++static void test_disconnect_after_call(void)
++{
++    PROCESS_INFORMATION info;
++    LARGE_INTEGER zero = {{0}};
++    HANDLE ready, mapping;
++    const DWORD *view;
++    IPersist *proxy;
++    IStream *stream;
++    CLSID clsid;
++    HRESULT hr;
++
++    ready = CreateEventA(NULL, FALSE, FALSE, "Wine COM Test Disconnect Ready");
++    create_target_process("-Disconnect", &info);
++    ok(!WaitForSingleObject(ready, 10000), "wait timed out\n");
++
++    mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Wine COM Test Disconnect Objref");
++    ok(!!mapping, "OpenFileMapping failed, error %lu.\n", GetLastError());
++    view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    ok_ole_success(hr, CreateStreamOnHGlobal);
++    IStream_Write(stream, view + 1, view[0], NULL);
++    IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++    hr = CoUnmarshalInterface(stream, &IID_IPersist, (void **)&proxy);
++    ok_ole_success(hr, CoUnmarshalInterface);
++    IStream_Release(stream);
++    UnmapViewOfFile(view);
++    CloseHandle(mapping);
++
++    hr = IPersist_GetClassID(proxy, &clsid);
++    ok_ole_success(hr, IPersist_GetClassID);
++    IPersist_Release(proxy);
++
++    wait_child_process(&info);
++    CloseHandle(ready);
++}
++
+ struct git_params
+ {
+ 	DWORD cookie;
+@@ -5633,6 +5776,13 @@ START_TEST(marshal)
+ 
+         return;
+     }
++    if (argc > 2 && !strcmp(argv[2], "-Disconnect"))
++    {
++        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++        test_disconnect_after_call_server();
++        CoUninitialize();
++        return;
++    }
+ 
+     register_test_window();
+ 
+@@ -5701,6 +5851,7 @@ START_TEST(marshal)
+     test_client_security();
+ 
+     test_local_server();
++    test_disconnect_after_call();
+ 
+     test_globalinterfacetable();
+     test_manualresetevent();

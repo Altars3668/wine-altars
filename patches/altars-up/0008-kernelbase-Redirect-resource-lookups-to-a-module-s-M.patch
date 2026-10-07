@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 13:32:42 -0400
+Subject: [PATCH] kernelbase: Redirect resource lookups to a module's MUI file.
+
+Windows keeps a module's dialogs, strings and menus in a separate
+<dir>\<language>\<module>.mui and redirects resource lookups there. Wine
+does not, and GetFileMUIPath returned ERROR_CALL_NOT_IMPLEMENTED. A module
+built that way carries no RT_DIALOG and no RT_STRING at all, so every dialog
+it opens and every string it loads fails -- and code that reads a failed
+dialog as a refusal takes decisions nobody made.
+
+FindResourceExW now falls back to the module's .mui, cached per module and
+searched over the user's then the system's preferred UI languages before en-
+US. LoadResource checks which module's resource directory the HRSRC actually
+lies in, because an entry found in the .mui carries an offset relative to
+that file rather than to the module it was asked about. GetFileMUIPath is
+implemented over the same search.
+
+EnumResourceTypes and EnumResourceNames still enumerate only the module's
+own directory, so a .mui's resources are findable but not listable.
+
+Signed-off-by: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+(cherry picked from commit 825c1e64efa285977155a9815362f1aa7efc794c)
+
+diff --git a/dlls/kernelbase/loader.c b/dlls/kernelbase/loader.c
+index 6c6f1f31881..3efa2fcec2a 100644
+--- a/dlls/kernelbase/loader.c
++++ b/dlls/kernelbase/loader.c
+@@ -36,6 +36,9 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(module);
+ 
++/* Resource redirection; defined with the rest of the MUI handling below. */
++static HMODULE get_module_mui( HMODULE module );
++
+ 
+ /* to keep track of LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE file handles */
+ struct exclusive_datafile
+@@ -876,8 +879,10 @@ done:
+ /**********************************************************************
+  *	EnumResourceNamesExW	(kernelbase.@)
+  */
+-BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceNamesExW( HMODULE module, LPCWSTR type, ENUMRESNAMEPROCW func,
+-                                                    LONG_PTR param, DWORD flags, LANGID lang )
++/* Report every name of one type, reading from `from` and telling the callback
++ * about `report`; the two differ when the resources live in a .mui. */
++static BOOL enum_resource_names_in( HMODULE from, HMODULE report, LPCWSTR type,
++                                    ENUMRESNAMEPROCW func, LONG_PTR param )
+ {
+     int i, len = 0;
+     BOOL ret = FALSE;
+@@ -889,22 +894,13 @@ BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceNamesExW( HMODULE module, LPCWSTR type
+     const IMAGE_RESOURCE_DIRECTORY_ENTRY *et;
+     const IMAGE_RESOURCE_DIR_STRING_U *str;
+ 
+-    TRACE( "%p %s %p %Ix\n", module, debugstr_w(type), func, param );
+-
+-    if (flags & (RESOURCE_ENUM_MUI | RESOURCE_ENUM_MUI_SYSTEM | RESOURCE_ENUM_VALIDATE))
+-        FIXME( "unimplemented flags: %lx\n", flags );
+-
+-    if (!flags) flags = RESOURCE_ENUM_LN | RESOURCE_ENUM_MUI;
+-    if (!(flags & RESOURCE_ENUM_LN)) return ret;
+-
+-    if (!module) module = GetModuleHandleW( 0 );
+     typeW.Buffer = NULL;
+-    if ((status = LdrFindResourceDirectory_U( module, NULL, 0, &basedir )) != STATUS_SUCCESS)
++    if ((status = LdrFindResourceDirectory_U( from, NULL, 0, &basedir )) != STATUS_SUCCESS)
+         goto done;
+     if ((status = get_res_nameW( type, &typeW )) != STATUS_SUCCESS)
+         goto done;
+     info.Type = (ULONG_PTR)typeW.Buffer;
+-    if ((status = LdrFindResourceDirectory_U( module, &info, 1, &resdir )) != STATUS_SUCCESS)
++    if ((status = LdrFindResourceDirectory_U( from, &info, 1, &resdir )) != STATUS_SUCCESS)
+         goto done;
+ 
+     et = (const IMAGE_RESOURCE_DIRECTORY_ENTRY *)(resdir + 1);
+@@ -927,11 +923,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceNamesExW( HMODULE module, LPCWSTR type
+                 }
+                 memcpy(name, str->NameString, str->Length * sizeof (WCHAR));
+                 name[str->Length] = 0;
+-                ret = func( module, type, name, param );
++                ret = func( report, type, name, param );
+             }
+             else
+             {
+-                ret = func( module, type, UIntToPtr(et[i].Id), param );
++                ret = func( report, type, UIntToPtr(et[i].Id), param );
+             }
+             if (!ret) break;
+         }
+@@ -948,6 +944,33 @@ done:
+     if (status != STATUS_SUCCESS) SetLastError( RtlNtStatusToDosError(status) );
+     return ret;
+ }
++BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceNamesExW( HMODULE module, LPCWSTR type, ENUMRESNAMEPROCW func,
++                                                    LONG_PTR param, DWORD flags, LANGID lang )
++{
++    BOOL ret = FALSE;
++
++    TRACE( "%p %s %p %Ix\n", module, debugstr_w(type), func, param );
++
++    if (flags & (RESOURCE_ENUM_MUI_SYSTEM | RESOURCE_ENUM_VALIDATE))
++        FIXME( "unimplemented flags: %lx\n", flags );
++
++    if (!flags) flags = RESOURCE_ENUM_LN | RESOURCE_ENUM_MUI;
++
++    if (!module) module = GetModuleHandleW( 0 );
++
++    /* As in EnumResourceTypesExW: a split module's names are in its .mui, and
++     * the callback is told about the module rather than the file. */
++    if (flags & RESOURCE_ENUM_MUI)
++    {
++        HMODULE mui = get_module_mui( module );
++
++        if (mui && mui != module) ret = enum_resource_names_in( mui, module, type, func, param );
++    }
++
++    if (!(flags & RESOURCE_ENUM_LN)) return ret;
++
++    return enum_resource_names_in( module, module, type, func, param );
++}
+ 
+ 
+ /**********************************************************************
+@@ -1017,24 +1040,16 @@ BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceTypesExA( HMODULE module, ENUMRESTYPEP
+ /**********************************************************************
+  *	EnumResourceTypesExW	(kernelbase.@)
+  */
+-BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceTypesExW( HMODULE module, ENUMRESTYPEPROCW func, LONG_PTR param,
+-                                                    DWORD flags, LANGID lang )
++/* Report every type in one resource directory, naming a module that may not be
++ * the one the directory came from -- see the callers. */
++static BOOL enum_resource_types_dir( HMODULE module, const IMAGE_RESOURCE_DIRECTORY *resdir,
++                                     ENUMRESTYPEPROCW func, LONG_PTR param )
+ {
+-    int i, len = 0;
+-    BOOL ret = FALSE;
+-    LPWSTR type = NULL;
+-    const IMAGE_RESOURCE_DIRECTORY *resdir;
+     const IMAGE_RESOURCE_DIRECTORY_ENTRY *et;
+     const IMAGE_RESOURCE_DIR_STRING_U *str;
+-
+-    TRACE( "%p %p %Ix\n", module, func, param );
+-
+-    if (!flags) flags = RESOURCE_ENUM_LN | RESOURCE_ENUM_MUI;
+-    if (!(flags & RESOURCE_ENUM_LN)) return ret;
+-
+-    if (!module) module = GetModuleHandleW( 0 );
+-
+-    if (!set_ntstatus( LdrFindResourceDirectory_U( module, NULL, 0, &resdir ))) return FALSE;
++    WCHAR *type = NULL;
++    BOOL ret = FALSE;
++    int i, len = 0;
+ 
+     et = (const IMAGE_RESOURCE_DIRECTORY_ENTRY *)(resdir + 1);
+     for (i = 0; i < resdir->NumberOfNamedEntries + resdir->NumberOfIdEntries; i++)
+@@ -1048,20 +1063,197 @@ BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceTypesExW( HMODULE module, ENUMRESTYPEP
+                 HeapFree( GetProcessHeap(), 0, type );
+                 if (!(type = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) ))) return FALSE;
+             }
+-            memcpy(type, str->NameString, str->Length * sizeof (WCHAR));
++            memcpy( type, str->NameString, str->Length * sizeof(WCHAR) );
+             type[str->Length] = 0;
+             ret = func( module, type, param );
+         }
+-        else
+-        {
+-            ret = func( module, UIntToPtr(et[i].Id), param );
+-        }
++        else ret = func( module, UIntToPtr(et[i].Id), param );
++
+         if (!ret) break;
+     }
+     HeapFree( GetProcessHeap(), 0, type );
+     return ret;
+ }
+ 
++BOOL WINAPI DECLSPEC_HOTPATCH EnumResourceTypesExW( HMODULE module, ENUMRESTYPEPROCW func, LONG_PTR param,
++                                                    DWORD flags, LANGID lang )
++{
++    const IMAGE_RESOURCE_DIRECTORY *resdir;
++    BOOL ret = FALSE;
++
++    TRACE( "%p %p %Ix\n", module, func, param );
++
++    if (!flags) flags = RESOURCE_ENUM_LN | RESOURCE_ENUM_MUI;
++
++    if (!module) module = GetModuleHandleW( 0 );
++
++    /* A module whose resources were split into a .mui has none of its own, so
++     * enumerating only the module reports nothing while FindResource finds
++     * everything -- the two have to agree about what a module contains. The
++     * callback is handed the module that was asked about rather than the .mui,
++     * since that is the handle it will pass back to FindResource. */
++    if (flags & RESOURCE_ENUM_MUI)
++    {
++        HMODULE mui = get_module_mui( module );
++
++        if (mui && mui != module &&
++            set_ntstatus( LdrFindResourceDirectory_U( mui, NULL, 0, &resdir )))
++            ret = enum_resource_types_dir( module, resdir, func, param );
++    }
++
++    if (!(flags & RESOURCE_ENUM_LN)) return ret;
++
++    if (!set_ntstatus( LdrFindResourceDirectory_U( module, NULL, 0, &resdir ))) return ret;
++
++    return enum_resource_types_dir( module, resdir, func, param );
++}
++
++
++/***********************************************************************
++ * MUI resource redirection
++ *
++ * Windows keeps a module's localisable resources -- dialogs, strings, menus --
++ * in a separate <dir>\<language>\<module>.mui file, and its loader redirects
++ * resource lookups there when the module itself has none. A module built that
++ * way carries no RT_DIALOG and no RT_STRING at all, so without the redirection
++ * every dialog it opens and every string it loads fails, and code that reads a
++ * failed dialog as a refusal takes decisions nobody made.
++ *
++ * The .mui is mapped as a data file, which LdrFindResource_U and
++ * LdrAccessResource already handle. What they cannot do is tell that an HRSRC
++ * belongs to a different module than the caller passed, so LoadResource checks
++ * which of the two the pointer actually lies in.
++ ***********************************************************************/
++
++struct mui_module
++{
++    struct list entry;
++    HMODULE     module;
++    HMODULE     mui;      /* NULL once looked for and not found */
++};
++
++static struct list mui_list = LIST_INIT( mui_list );
++
++static CRITICAL_SECTION mui_section;
++static CRITICAL_SECTION_DEBUG mui_critsect_debug =
++{
++    0, 0, &mui_section,
++    { &mui_critsect_debug.ProcessLocksList, &mui_critsect_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": mui_section") }
++};
++static CRITICAL_SECTION mui_section = { &mui_critsect_debug, -1, 0, 0, 0, 0 };
++
++/* Where a module's .mui would be, for one language. */
++static HMODULE load_mui_for_language( const WCHAR *path, const WCHAR *lang )
++{
++    WCHAR *full, *file;
++    HMODULE ret;
++    SIZE_T len;
++
++    if (!(file = wcsrchr( path, '\\' ))) return NULL;
++
++    len = wcslen( path ) + wcslen( lang ) + ARRAY_SIZE(L"\\.mui") + 1;
++    if (!(full = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) ))) return NULL;
++
++    memcpy( full, path, (file - path + 1) * sizeof(WCHAR) );
++    full[file - path + 1] = 0;
++    wcscat( full, lang );
++    wcscat( full, L"\\" );
++    wcscat( full, file + 1 );
++    wcscat( full, L".mui" );
++
++    ret = LoadLibraryExW( full, 0, LOAD_LIBRARY_AS_DATAFILE );
++    TRACE( "%s -> %p\n", debugstr_w(full), ret );
++    HeapFree( GetProcessHeap(), 0, full );
++    return ret;
++}
++
++/* The languages to try, in the order Windows would: the user's preferences,
++ * then the system's, then the language the module was built in. */
++static HMODULE find_module_mui( HMODULE module )
++{
++    WCHAR path[MAX_PATH], langs[256];
++    ULONG count = 0, size = ARRAY_SIZE(langs);
++    const WCHAR *lang;
++    HMODULE ret = NULL;
++
++    if (!GetModuleFileNameW( module, path, ARRAY_SIZE(path) )) return NULL;
++
++    if (GetUserPreferredUILanguages( MUI_LANGUAGE_NAME, &count, langs, &size ))
++    {
++        for (lang = langs; *lang; lang += wcslen( lang ) + 1)
++            if ((ret = load_mui_for_language( path, lang ))) return ret;
++    }
++
++    count = 0;
++    size = ARRAY_SIZE(langs);
++    if (GetSystemPreferredUILanguages( MUI_LANGUAGE_NAME, &count, langs, &size ))
++    {
++        for (lang = langs; *lang; lang += wcslen( lang ) + 1)
++            if ((ret = load_mui_for_language( path, lang ))) return ret;
++    }
++
++    /* Almost everything ships en-US whatever else it ships. */
++    return load_mui_for_language( path, L"en-US" );
++}
++
++static HMODULE get_module_mui( HMODULE module )
++{
++    struct mui_module *entry;
++    HMODULE ret;
++
++    if (!module) return NULL;
++
++    RtlEnterCriticalSection( &mui_section );
++    LIST_FOR_EACH_ENTRY( entry, &mui_list, struct mui_module, entry )
++    {
++        if (entry->module == module)
++        {
++            ret = entry->mui;
++            RtlLeaveCriticalSection( &mui_section );
++            return ret;
++        }
++    }
++    RtlLeaveCriticalSection( &mui_section );
++
++    ret = find_module_mui( module );
++
++    RtlEnterCriticalSection( &mui_section );
++    /* Another thread may have got there first; one extra mapping is harmless
++     * and the list must not gain two entries for the same module. */
++    LIST_FOR_EACH_ENTRY( entry, &mui_list, struct mui_module, entry )
++    {
++        if (entry->module == module)
++        {
++            HMODULE other = entry->mui;
++            RtlLeaveCriticalSection( &mui_section );
++            if (ret && ret != other) FreeLibrary( ret );
++            return other;
++        }
++    }
++    if ((entry = HeapAlloc( GetProcessHeap(), 0, sizeof(*entry) )))
++    {
++        entry->module = module;
++        entry->mui = ret;
++        list_add_tail( &mui_list, &entry->entry );
++    }
++    RtlLeaveCriticalSection( &mui_section );
++    return ret;
++}
++
++/* An HRSRC points into its module's resource directory, which is how the
++ * owning module can be identified after the fact. */
++static BOOL rsrc_belongs_to( HMODULE module, HRSRC rsrc )
++{
++    const char *base;
++    ULONG size = 0;
++
++    if (!module) return FALSE;
++    if (!(base = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_RESOURCE, &size )))
++        return FALSE;
++    return (const char *)rsrc >= base && (const char *)rsrc < base + size;
++}
++
+ 
+ /**********************************************************************
+  *	    FindResourceExW  (kernelbase.@)
+@@ -1085,7 +1277,14 @@ HRSRC WINAPI DECLSPEC_HOTPATCH FindResourceExW( HMODULE module, LPCWSTR type, LP
+         info.Type = (ULONG_PTR)typeW.Buffer;
+         info.Name = (ULONG_PTR)nameW.Buffer;
+         info.Language = lang;
+-        status = LdrFindResource_U( module, &info, 3, &entry );
++        if ((status = LdrFindResource_U( module, &info, 3, &entry )))
++        {
++            HMODULE mui = get_module_mui( module );
++
++            /* A module whose resources live in a .mui has none of its own to
++             * find, so this is the normal path for it rather than a fallback. */
++            if (mui) status = LdrFindResource_U( mui, &info, 3, &entry );
++        }
+     done:
+         if (status != STATUS_SUCCESS) SetLastError( RtlNtStatusToDosError(status) );
+     }
+@@ -1130,6 +1329,16 @@ HGLOBAL WINAPI DECLSPEC_HOTPATCH LoadResource( HINSTANCE module, HRSRC rsrc )
+ 
+     if (!rsrc) return 0;
+     if (!module) module = GetModuleHandleW( 0 );
++
++    if (!rsrc_belongs_to( module, rsrc ))
++    {
++        HMODULE mui = get_module_mui( module );
++
++        /* FindResourceEx answered out of the .mui, so the offset in the entry
++         * is relative to that file and not to the module asked about here. */
++        if (rsrc_belongs_to( mui, rsrc )) module = mui;
++    }
++
+     if (!set_ntstatus( LdrAccessResource( module, (IMAGE_RESOURCE_DATA_ENTRY *)rsrc, &ret, NULL )))
+         return 0;
+     return ret;
+diff --git a/dlls/kernelbase/locale.c b/dlls/kernelbase/locale.c
+index 798e4bedea8..dc3e33bf839 100644
+--- a/dlls/kernelbase/locale.c
++++ b/dlls/kernelbase/locale.c
+@@ -5991,9 +5991,72 @@ BOOL WINAPI /* DECLSPEC_HOTPATCH */ GetFileMUIPath( DWORD flags, const WCHAR *fi
+                                                     WCHAR *muipath, ULONG *muipathlen,
+                                                     ULONGLONG *enumerator )
+ {
+-    FIXME( "stub: 0x%lx, %s, %s, %p, %p, %p, %p\n", flags, debugstr_w(filepath),
++    WCHAR langs[256], path[MAX_PATH], *file;
++    ULONG count = 0, size = ARRAY_SIZE(langs), len;
++    const WCHAR *lang;
++
++    TRACE( "0x%lx, %s, %s, %p, %p, %p, %p\n", flags, debugstr_w(filepath),
+            debugstr_w(language), languagelen, muipath, muipathlen, enumerator );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++
++    if (!filepath || !muipathlen)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    /* Only the first match is reported; enumerating the rest would need state
++     * to carry between calls, and nothing has asked for it. */
++    if (enumerator && *enumerator)
++    {
++        SetLastError( ERROR_NO_MORE_FILES );
++        return FALSE;
++    }
++
++    if (!(file = wcsrchr( filepath, '\\' )))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    if (language && languagelen && *languagelen)
++    {
++        /* A caller that names a language wants that one or nothing. */
++        lstrcpynW( langs, language, min( *languagelen, ARRAY_SIZE(langs) - 1 ));
++        langs[min( *languagelen, ARRAY_SIZE(langs) - 1 )] = 0;
++        langs[wcslen( langs ) + 1] = 0;
++    }
++    else if (!GetUserPreferredUILanguages( MUI_LANGUAGE_NAME, &count, langs, &size ))
++    {
++        wcscpy( langs, L"en-US" );
++        langs[wcslen( langs ) + 1] = 0;
++    }
++
++    for (lang = langs; *lang; lang += wcslen( lang ) + 1)
++    {
++        len = swprintf( path, ARRAY_SIZE(path), L"%.*s%s\\%s.mui",
++                        (int)(file - filepath + 1), filepath, lang, file + 1 );
++        if (GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES) continue;
++
++        if (!muipath || *muipathlen <= len)
++        {
++            *muipathlen = len + 1;
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        wcscpy( muipath, path );
++        *muipathlen = len + 1;
++
++        if (language && languagelen)
++        {
++            len = wcslen( lang );
++            if (*languagelen > len) wcscpy( language, lang );
++            *languagelen = len + 1;
++        }
++        if (enumerator) *enumerator = 1;
++        return TRUE;
++    }
++
++    SetLastError( ERROR_FILE_NOT_FOUND );
+     return FALSE;
+ }
+ 

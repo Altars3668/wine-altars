@@ -1,0 +1,702 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 11:55:30 -0400
+Subject: [PATCH] ntdll: count the cycles threads and processes ran for, and
+ read other processes' times.
+
+Office asks for its process's cycle time hundreds of times as it starts,
+and for threads'; ProcessCycleTime answered zero from a stub and
+ThreadCycleTime and QueryThreadCycleTime did not answer at all.
+
+Windows counts in time stamp counter ticks, so that no two queries give
+the same count; set against a thread's kernel and user time, a count on
+the machine measured came to one steady rate, 282 and 281 cycles per
+100ns for threads that spun 0.3s and 3.3s.  The counts here are the
+processor time a thread or a process ran for, as finely as the system
+keeps it - CLOCK_THREAD_CPUTIME_ID and CLOCK_PROCESS_CPUTIME_ID for this
+thread and process, the scheduler's nanoseconds in /proc for other
+threads and the process clock of another process - times the rate of the
+time stamp counter, timed once against the monotonic clock.
+CurrentCycleCount is the time stamp counter, as Windows gives it for a
+thread that is not the one asking.
+
+ProcessTimes gave every process this one's times, which is what
+"user/kernel times only work for current process" meant.  A
+get_process_times request, as get_thread_times is for threads, hands
+back the Unix pid of a process that still runs, and its times are read
+from /proc; this process's come from getrusage(), to the microsecond
+instead of the clock tick.  A process that is gone has no pid to read,
+and no times, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 3f198ace783cf01b163c2b0418d4b4fe0c8f0af4)
+
+diff --git a/dlls/kernelbase/tests/process.c b/dlls/kernelbase/tests/process.c
+index e662fc1ac62..65a04eed9c0 100644
+--- a/dlls/kernelbase/tests/process.c
++++ b/dlls/kernelbase/tests/process.c
+@@ -625,7 +625,6 @@ static void test_QueryProcessCycleTime(void)
+     ret = QueryProcessCycleTime( GetCurrentProcess(), &cycles2 );
+     ok( ret, "QueryProcessCycleTime failed, error %lu.\n", GetLastError() );
+ 
+-    todo_wine
+     ok( cycles2 > cycles1, "CPU cycles used by process should be increasing.\n" );
+ }
+ 
+@@ -669,6 +668,25 @@ static void test_GetMachineTypeAttributes(void)
+     }
+ }
+ 
++static void test_QueryThreadCycleTime(void)
++{
++    ULONG64 cycles1, cycles2;
++    BOOL ret;
++
++    ret = QueryThreadCycleTime( GetCurrentThread(), &cycles1 );
++    ok( ret, "QueryThreadCycleTime failed, error %lu.\n", GetLastError() );
++
++    ret = QueryThreadCycleTime( GetCurrentThread(), &cycles2 );
++    ok( ret, "QueryThreadCycleTime failed, error %lu.\n", GetLastError() );
++
++    ok( cycles2 > cycles1, "CPU cycles used by thread should be increasing.\n" );
++
++    SetLastError( 0xdeadbeef );
++    ret = QueryThreadCycleTime( (HANDLE)0xdeadbeef, &cycles1 );
++    ok( !ret, "QueryThreadCycleTime succeeded.\n" );
++    ok( GetLastError() == ERROR_INVALID_HANDLE, "got error %lu.\n", GetLastError() );
++}
++
+ static void init_funcs(void)
+ {
+     HMODULE hmod = GetModuleHandleA("kernelbase.dll");
+@@ -708,4 +726,5 @@ START_TEST(process)
+     test_MapViewOfFileFromApp();
+     test_QueryProcessCycleTime();
+     test_GetMachineTypeAttributes();
++    test_QueryThreadCycleTime();
+ }
+diff --git a/dlls/kernelbase/thread.c b/dlls/kernelbase/thread.c
+index 92ef0731435..7470b43b12e 100644
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -429,10 +429,13 @@ DWORD WINAPI DECLSPEC_HOTPATCH QueueUserAPC2( PAPCFUNC func, HANDLE thread, ULON
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH QueryThreadCycleTime( HANDLE thread, ULONG64 *cycle )
+ {
+-    static int once;
+-    if (!once++) FIXME( "(%p,%p): stub!\n", thread, cycle );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    THREAD_CYCLE_TIME_INFORMATION time;
++
++    if (!set_ntstatus( NtQueryInformationThread( thread, ThreadCycleTime, &time, sizeof(time), NULL ) ))
++        return FALSE;
++
++    *cycle = time.AccumulatedCycles;
++    return TRUE;
+ }
+ 
+ 
+diff --git a/dlls/ntdll/tests/info.c b/dlls/ntdll/tests/info.c
+index 84e54a60f1f..8cf6f5b212c 100644
+--- a/dlls/ntdll/tests/info.c
++++ b/dlls/ntdll/tests/info.c
+@@ -4518,6 +4518,96 @@ static void test_process_id(void)
+     }
+ }
+ 
++static volatile LONG cycle_spin_stop;
++
++static DWORD WINAPI cycle_spin_thread( void *arg )
++{
++    while (!cycle_spin_stop) YieldProcessor();
++    return 0;
++}
++
++static DWORD WINAPI cycle_sleep_thread( void *arg )
++{
++    WaitForSingleObject( arg, INFINITE );
++    return 0;
++}
++
++static void test_cycle_time( char **argv )
++{
++    THREAD_CYCLE_TIME_INFORMATION spinning, sleeping, thread1, thread2;
++    PROCESS_CYCLE_TIME_INFORMATION process, other;
++    STARTUPINFOA si = { sizeof(si) };
++    KERNEL_USER_TIMES self, child;
++    char cmdline[MAX_PATH + 32];
++    HANDLE spinner, sleeper, event;
++    PROCESS_INFORMATION pi;
++    NTSTATUS status;
++    DWORD start;
++    ULONG len;
++    BOOL ret;
++
++    /* counted as finely as the time stamp counter, so that no two queries give the same count */
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadCycleTime, &thread1, sizeof(thread1), &len );
++    ok( !status, "got %#lx\n", status );
++    ok( len == sizeof(thread1), "got %lu\n", len );
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadCycleTime, &thread2, sizeof(thread2), NULL );
++    ok( !status, "got %#lx\n", status );
++    ok( thread2.AccumulatedCycles > thread1.AccumulatedCycles, "the cycles did not grow\n" );
++    ok( thread1.CurrentCycleCount, "got no current count\n" );
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadCycleTime, &thread1, sizeof(ULONGLONG), NULL );
++    ok( status == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", status );
++
++    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessCycleTime, &process, sizeof(process), &len );
++    ok( !status, "got %#lx\n", status );
++    ok( len == sizeof(process), "got %lu\n", len );
++    ok( process.AccumulatedCycles >= thread2.AccumulatedCycles, "the process ran for fewer cycles than a thread\n" );
++
++    /* a thread that runs runs for more cycles than one that waits */
++    event = CreateEventA( NULL, TRUE, FALSE, NULL );
++    cycle_spin_stop = 0;
++    spinner = CreateThread( NULL, 0, cycle_spin_thread, NULL, 0, NULL );
++    sleeper = CreateThread( NULL, 0, cycle_sleep_thread, event, 0, NULL );
++    Sleep( 300 );
++    status = pNtQueryInformationThread( spinner, ThreadCycleTime, &spinning, sizeof(spinning), NULL );
++    ok( !status, "got %#lx\n", status );
++    status = pNtQueryInformationThread( sleeper, ThreadCycleTime, &sleeping, sizeof(sleeping), NULL );
++    ok( !status, "got %#lx\n", status );
++    ok( spinning.AccumulatedCycles > sleeping.AccumulatedCycles * 10, "spinning %s, sleeping %s\n",
++        wine_dbgstr_longlong( spinning.AccumulatedCycles ), wine_dbgstr_longlong( sleeping.AccumulatedCycles ));
++    cycle_spin_stop = 1;
++    SetEvent( event );
++    WaitForSingleObject( spinner, INFINITE );
++    WaitForSingleObject( sleeper, INFINITE );
++    CloseHandle( spinner );
++    CloseHandle( sleeper );
++    CloseHandle( event );
++
++    /* another process's time is its own */
++    sprintf( cmdline, "\"%s\" info sleep", argv[0] );
++    ret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi );
++    ok( ret, "CreateProcess failed, error %lu\n", GetLastError() );
++    Sleep( 500 );
++    start = GetTickCount();
++    while (GetTickCount() - start < 500) YieldProcessor();
++    status = pNtQueryInformationProcess( pi.hProcess, ProcessTimes, &child, sizeof(child), NULL );
++    ok( !status, "got %#lx\n", status );
++    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &self, sizeof(self), NULL );
++    ok( !status, "got %#lx\n", status );
++    ok( child.UserTime.QuadPart < self.UserTime.QuadPart, "child %s, this one %s\n",
++        wine_dbgstr_longlong( child.UserTime.QuadPart ), wine_dbgstr_longlong( self.UserTime.QuadPart ));
++    ok( child.CreateTime.QuadPart > self.CreateTime.QuadPart, "the child was made first\n" );
++    status = pNtQueryInformationProcess( pi.hProcess, ProcessCycleTime, &other, sizeof(other), NULL );
++    ok( !status, "got %#lx\n", status );
++    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessCycleTime, &process, sizeof(process), NULL );
++    ok( !status, "got %#lx\n", status );
++    ok( other.AccumulatedCycles < process.AccumulatedCycles, "child %s, this one %s\n",
++        wine_dbgstr_longlong( other.AccumulatedCycles ), wine_dbgstr_longlong( process.AccumulatedCycles ));
++    TerminateProcess( pi.hProcess, 0 );
++    WaitForSingleObject( pi.hProcess, INFINITE );
++    CloseHandle( pi.hProcess );
++    CloseHandle( pi.hThread );
++}
++
+ static void test_processor_idle_cycle_time(void)
+ {
+     unsigned int cpu_count = NtCurrentTeb()->Peb->NumberOfProcessors;
+@@ -4686,6 +4776,7 @@ START_TEST(info)
+     {
+         if (strcmp(argv[2], "debuggee:dbgport") == 0) test_debuggee_dbgport(argc - 2, argv + 2);
+         else if (!strcmp(argv[2], "check_pp_flags"))  test_debuggee_process_parameters_flags(argc - 2, argv + 2);
++        else if (strcmp(argv[2], "sleep") == 0) Sleep(10000);
+         return; /* Child */
+     }
+ 
+@@ -4758,4 +4849,5 @@ START_TEST(info)
+     test_process_id();
+     test_processor_idle_cycle_time();
+     test_process_parameters_flags(argc, argv);
++    test_cycle_time(argv);
+ }
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 9dad6c38289..fcb09323c65 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -38,6 +38,9 @@
+ #ifdef HAVE_SYS_TIMES_H
+ # include <sys/times.h>
+ #endif
++#ifdef HAVE_SYS_RESOURCE_H
++# include <sys/resource.h>
++#endif
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #ifdef HAVE_SYS_SYSCTL_H
+@@ -1081,6 +1084,67 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
+         ret = STATUS_INVALID_INFO_CLASS; \
+         break
+ 
++/* the time the threads of a process ran for, kernel and user; of this one to the microsecond, of others as
++ * finely as the system says, of one that is gone not at all */
++static void get_process_cpu_times( int unix_pid, LARGE_INTEGER *kernel, LARGE_INTEGER *user )
++{
++#ifdef HAVE_SYS_RESOURCE_H
++    struct rusage usage;
++#endif
++
++    kernel->QuadPart = user->QuadPart = 0;
++    if (unix_pid == -1) return;
++#ifdef HAVE_SYS_RESOURCE_H
++    if (unix_pid == getpid() && !getrusage( RUSAGE_SELF, &usage ))
++    {
++        kernel->QuadPart = (ULONGLONG)usage.ru_stime.tv_sec * 10000000 + usage.ru_stime.tv_usec * 10;
++        user->QuadPart = (ULONGLONG)usage.ru_utime.tv_sec * 10000000 + usage.ru_utime.tv_usec * 10;
++        return;
++    }
++#endif
++    get_thread_times( unix_pid, -1, kernel, user );
++}
++
++/* the time the threads of a process ran for, in nanoseconds, as finely as the system counts it */
++static NTSTATUS get_process_cpu_time( HANDLE handle, ULONGLONG *ns )
++{
++    LARGE_INTEGER kernel, user;
++    struct timespec ts;
++    int unix_pid = -1;
++    NTSTATUS status;
++    clockid_t clock;
++
++    if (handle == NtCurrentProcess() && !clock_gettime( CLOCK_PROCESS_CPUTIME_ID, &ts ))
++    {
++        *ns = ts.tv_sec * 1000000000ull + ts.tv_nsec;
++        return STATUS_SUCCESS;
++    }
++
++    SERVER_START_REQ( get_process_times )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        if (!(status = wine_server_call( req ))) unix_pid = reply->unix_pid;
++    }
++    SERVER_END_REQ;
++    if (status) return status;
++
++    *ns = 0;
++    if (unix_pid == -1) return STATUS_SUCCESS;
++    if (unix_pid == getpid()) clock = CLOCK_PROCESS_CPUTIME_ID;
++#ifdef linux
++    else if (clock_getcpuclockid( unix_pid, &clock )) clock = -1;
++#else
++    else clock = -1;
++#endif
++    if (clock != -1 && !clock_gettime( clock, &ts )) *ns = ts.tv_sec * 1000000000ull + ts.tv_nsec;
++    else
++    {
++        get_process_cpu_times( unix_pid, &kernel, &user );
++        *ns = (kernel.QuadPart + user.QuadPart) * 100;
++    }
++    return STATUS_SUCCESS;
++}
++
+ /**********************************************************************
+  *           NtQueryInformationProcess  (NTDLL.@)
+  */
+@@ -1239,27 +1303,21 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
+                 else if (!handle) ret = STATUS_INVALID_HANDLE;
+                 else
+                 {
+-                    long ticks = sysconf(_SC_CLK_TCK);
+-                    struct tms tms;
++                    int unix_pid = -1;
+ 
+-                    /* FIXME: user/kernel times only work for current process */
+-                    if (ticks && times( &tms ) != -1)
+-                    {
+-                        pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
+-                        pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
+-                    }
+-
+-                    SERVER_START_REQ(get_process_info)
++                    SERVER_START_REQ(get_process_times)
+                     {
+                         req->handle = wine_server_obj_handle( handle );
+                         if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
+                         {
+                             pti.CreateTime.QuadPart = reply->start_time;
+                             pti.ExitTime.QuadPart = reply->end_time;
++                            unix_pid = reply->unix_pid;
+                         }
+                     }
+                     SERVER_END_REQ;
+ 
++                    if (!ret) get_process_cpu_times( unix_pid, &pti.KernelTime, &pti.UserTime );
+                     memcpy(info, &pti, sizeof(KERNEL_USER_TIMES));
+                     len = sizeof(KERNEL_USER_TIMES);
+                 }
+@@ -1545,13 +1603,15 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
+             if (!info) ret = STATUS_ACCESS_VIOLATION;
+             else
+             {
+-                PROCESS_CYCLE_TIME_INFORMATION cycles;
+-
+-                FIXME( "ProcessCycleTime (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
+-                cycles.AccumulatedCycles = 0;
+-                cycles.CurrentCycleCount = 0;
++                PROCESS_CYCLE_TIME_INFORMATION *cycles = info;
++                ULONGLONG ns;
+ 
+-                memcpy(info, &cycles, sizeof(PROCESS_CYCLE_TIME_INFORMATION));
++                /* the cycles its threads ran for */
++                if (!(ret = get_process_cpu_time( handle, &ns )))
++                {
++                    cycles->AccumulatedCycles = cycles_from_ns( ns );
++                    cycles->CurrentCycleCount = current_cycle_count();
++                }
+             }
+         }
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index aaae9a2fd8e..3eee65e6036 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -4371,6 +4371,64 @@ static ULONG mhz_from_cpuinfo(void)
+     return cmz;
+ }
+ 
++/* the time stamp counter, which Windows counts the cycles a thread runs for in */
++ULONGLONG current_cycle_count(void)
++{
++#if defined(__i386__) || defined(__x86_64__)
++    return __builtin_ia32_rdtsc();
++#else
++    return 0;
++#endif
++}
++
++/* the rate the time stamp counter runs at: timed against the clock where there is one to read, else what the
++ * processor is rated for, else 1GHz */
++static ULONGLONG cycle_rate(void)
++{
++    static ULONGLONG hz;
++
++    if (!hz)
++    {
++        ULONGLONG rate = 0;
++#if defined(__i386__) || defined(__x86_64__)
++        struct timespec start, now;
++        ULONGLONG begin, ns = 0;
++
++        clock_gettime( CLOCK_MONOTONIC, &start );
++        begin = current_cycle_count();
++        while (ns < 2000000)
++        {
++            clock_gettime( CLOCK_MONOTONIC, &now );
++            ns = (now.tv_sec - start.tv_sec) * 1000000000ull + now.tv_nsec - start.tv_nsec;
++        }
++        rate = (current_cycle_count() - begin) * 1000000000 / ns;
++#elif defined(linux)
++        unsigned long long khz = 0;
++        FILE *f;
++
++        if ((f = fopen( "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "r" )))
++        {
++            if (fscanf( f, "%llu", &khz ) != 1) khz = 0;
++            fclose( f );
++        }
++        if (!khz) khz = (ULONGLONG)mhz_from_cpuinfo() * 1000;
++        rate = khz * 1000;
++#endif
++        hz = rate ? rate : 1000000000;
++        TRACE( "%s cycles a second\n", wine_dbgstr_longlong( hz ));
++    }
++    return hz;
++}
++
++/* the cycles the time stamp counter runs through in a stretch of time given in nanoseconds; the cycle times
++ * Windows keeps are the cycles a thread or a process ran for */
++ULONGLONG cycles_from_ns( ULONGLONG ns )
++{
++    ULONGLONG hz = cycle_rate();
++
++    return ns / 1000000000 * hz + ns % 1000000000 * hz / 1000000000;
++}
++
+ static const char * get_sys_str(const char *dirname, const char *basename, char *s)
+ {
+     char path[64];
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index d5a5f57c8aa..d2cdb127ada 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -2054,6 +2054,58 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
+ #endif
+ }
+ 
++/* the time a thread ran for, in nanoseconds, as finely as the system counts it */
++static NTSTATUS get_thread_cpu_time( HANDLE handle, ULONGLONG *ns )
++{
++    LARGE_INTEGER kernel, user;
++    int unix_pid = -1, unix_tid = -1;
++    struct timespec ts;
++    NTSTATUS status;
++#ifdef linux
++    unsigned long long run;
++    char path[64];
++    FILE *f;
++#endif
++
++    if (handle == GetCurrentThread() && !clock_gettime( CLOCK_THREAD_CPUTIME_ID, &ts ))
++    {
++        *ns = ts.tv_sec * 1000000000ull + ts.tv_nsec;
++        return STATUS_SUCCESS;
++    }
++
++    SERVER_START_REQ( get_thread_times )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        if (!(status = wine_server_call( req )))
++        {
++            unix_pid = reply->unix_pid;
++            unix_tid = reply->unix_tid;
++        }
++    }
++    SERVER_END_REQ;
++    if (status) return status;
++
++    *ns = 0;
++    if (unix_pid == -1 || unix_tid == -1) return STATUS_SUCCESS;
++#ifdef linux
++    /* the scheduler counts it in nanoseconds */
++    snprintf( path, sizeof(path), "/proc/%u/task/%u/schedstat", unix_pid, unix_tid );
++    if ((f = fopen( path, "r" )))
++    {
++        BOOL found = fscanf( f, "%llu", &run ) == 1;
++
++        fclose( f );
++        if (found)
++        {
++            *ns = run;
++            return STATUS_SUCCESS;
++        }
++    }
++#endif
++    if (get_thread_times( unix_pid, unix_tid, &kernel, &user )) *ns = (kernel.QuadPart + user.QuadPart) * 100;
++    return STATUS_SUCCESS;
++}
++
+ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
+ {
+ #ifdef linux
+@@ -2345,6 +2397,20 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+         if (ret_len) *ret_len = sizeof(BOOL);
+         return STATUS_SUCCESS;
+ 
++    case ThreadCycleTime:
++    {
++        THREAD_CYCLE_TIME_INFORMATION *cycles = data;
++        ULONGLONG ns;
++
++        if (length != sizeof(*cycles)) return STATUS_INFO_LENGTH_MISMATCH;
++        /* the cycles it ran for */
++        if ((status = get_thread_cpu_time( handle, &ns ))) return status;
++        cycles->AccumulatedCycles = cycles_from_ns( ns );
++        cycles->CurrentCycleCount = current_cycle_count();
++        if (ret_len) *ret_len = sizeof(*cycles);
++        return STATUS_SUCCESS;
++    }
++
+     case ThreadIsTerminated:
+     {
+         ULONG terminated;
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 9b6401ee37d..27cbbe58c8c 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -348,6 +348,8 @@ extern BOOL is_emulated_code( ULONG_PTR ptr );
+ extern NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *info, ULONG len );
+ extern void *get_native_context( CONTEXT *context );
+ extern void *get_wow_context( CONTEXT *context );
++extern ULONGLONG current_cycle_count(void);
++extern ULONGLONG cycles_from_ns( ULONGLONG ns );
+ extern BOOL get_thread_times( int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time,
+                               LARGE_INTEGER *user_time );
+ extern NTSTATUS signal_alloc_thread( TEB *teb );
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index d12c1dd3ac3..055970b322b 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1341,6 +1341,22 @@ struct get_process_image_name_reply
+ 
+ 
+ 
++struct get_process_times_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++};
++struct get_process_times_reply
++{
++    struct reply_header __header;
++    timeout_t    start_time;
++    timeout_t    end_time;
++    int          unix_pid;
++    char __pad_28[4];
++};
++
++
++
+ struct get_process_vm_counters_request
+ {
+     struct request_header __header;
+@@ -6260,6 +6276,7 @@ enum request
+     REQ_get_process_info,
+     REQ_get_process_debug_info,
+     REQ_get_process_image_name,
++    REQ_get_process_times,
+     REQ_get_process_vm_counters,
+     REQ_set_process_info,
+     REQ_get_thread_info,
+@@ -6575,6 +6592,7 @@ union generic_request
+     struct get_process_info_request get_process_info_request;
+     struct get_process_debug_info_request get_process_debug_info_request;
+     struct get_process_image_name_request get_process_image_name_request;
++    struct get_process_times_request get_process_times_request;
+     struct get_process_vm_counters_request get_process_vm_counters_request;
+     struct set_process_info_request set_process_info_request;
+     struct get_thread_info_request get_thread_info_request;
+@@ -6888,6 +6906,7 @@ union generic_reply
+     struct get_process_info_reply get_process_info_reply;
+     struct get_process_debug_info_reply get_process_debug_info_reply;
+     struct get_process_image_name_reply get_process_image_name_reply;
++    struct get_process_times_reply get_process_times_reply;
+     struct get_process_vm_counters_reply get_process_vm_counters_reply;
+     struct set_process_info_reply set_process_info_reply;
+     struct get_thread_info_reply get_thread_info_reply;
+@@ -7186,6 +7205,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 963
++#define SERVER_PROTOCOL_VERSION 964
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/process.c b/server/process.c
+index f1a8c065c76..bae43a5199f 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -1547,6 +1547,21 @@ DECL_HANDLER(get_process_image_name)
+ }
+ 
+ /* retrieve information about a process memory usage */
++/* retrieve information about process times */
++DECL_HANDLER(get_process_times)
++{
++    struct process *process;
++
++    if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
++    {
++        reply->start_time = process->start_time;
++        reply->end_time   = process->end_time;
++        /* the pid of a process that is gone may be another's already */
++        reply->unix_pid   = process->running_threads ? process->unix_pid : -1;
++        release_object( process );
++    }
++}
++
+ DECL_HANDLER(get_process_vm_counters)
+ {
+     struct process *process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION );
+diff --git a/server/protocol.def b/server/protocol.def
+index 040f65a1ad8..6acebc7d3ca 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1281,6 +1281,16 @@ typedef volatile struct
+ @END
+ 
+ 
++/* Retrieve information about process times */
++@REQ(get_process_times)
++    obj_handle_t handle;           /* process handle */
++@REPLY
++    timeout_t    start_time;       /* process start time */
++    timeout_t    end_time;         /* process end time */
++    int          unix_pid;         /* process native pid, while it runs */
++@END
++
++
+ /* Retrieve information about a process memory usage */
+ @REQ(get_process_vm_counters)
+     obj_handle_t handle;                        /* process handle */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 254946c009b..58870f22955 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -19,6 +19,7 @@ DECL_HANDLER(terminate_thread);
+ DECL_HANDLER(get_process_info);
+ DECL_HANDLER(get_process_debug_info);
+ DECL_HANDLER(get_process_image_name);
++DECL_HANDLER(get_process_times);
+ DECL_HANDLER(get_process_vm_counters);
+ DECL_HANDLER(set_process_info);
+ DECL_HANDLER(get_thread_info);
+@@ -331,6 +332,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_get_process_info,
+     (req_handler)req_get_process_debug_info,
+     (req_handler)req_get_process_image_name,
++    (req_handler)req_get_process_times,
+     (req_handler)req_get_process_vm_counters,
+     (req_handler)req_set_process_info,
+     (req_handler)req_get_thread_info,
+@@ -781,6 +783,12 @@ C_ASSERT( offsetof(struct get_process_image_name_request, win32) == 20 );
+ C_ASSERT( sizeof(struct get_process_image_name_request) == 24 );
+ C_ASSERT( offsetof(struct get_process_image_name_reply, len) == 8 );
+ C_ASSERT( sizeof(struct get_process_image_name_reply) == 16 );
++C_ASSERT( offsetof(struct get_process_times_request, handle) == 12 );
++C_ASSERT( sizeof(struct get_process_times_request) == 16 );
++C_ASSERT( offsetof(struct get_process_times_reply, start_time) == 8 );
++C_ASSERT( offsetof(struct get_process_times_reply, end_time) == 16 );
++C_ASSERT( offsetof(struct get_process_times_reply, unix_pid) == 24 );
++C_ASSERT( sizeof(struct get_process_times_reply) == 32 );
+ C_ASSERT( offsetof(struct get_process_vm_counters_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_process_vm_counters_request) == 16 );
+ C_ASSERT( offsetof(struct get_process_vm_counters_reply, peak_virtual_size) == 8 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 3a926132780..75e85cd0d07 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -241,6 +241,18 @@ static void dump_get_process_image_name_reply( const struct get_process_image_na
+     dump_varargs_unicode_str( ", name=", cur_size );
+ }
+ 
++static void dump_get_process_times_request( const struct get_process_times_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_get_process_times_reply( const struct get_process_times_reply *req )
++{
++    dump_timeout( " start_time=", &req->start_time );
++    dump_timeout( ", end_time=", &req->end_time );
++    fprintf( stderr, ", unix_pid=%d", req->unix_pid );
++}
++
+ static void dump_get_process_vm_counters_request( const struct get_process_vm_counters_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+@@ -3555,6 +3567,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_process_info_request,
+     (dump_func)dump_get_process_debug_info_request,
+     (dump_func)dump_get_process_image_name_request,
++    (dump_func)dump_get_process_times_request,
+     (dump_func)dump_get_process_vm_counters_request,
+     (dump_func)dump_set_process_info_request,
+     (dump_func)dump_get_thread_info_request,
+@@ -3867,6 +3880,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_process_info_reply,
+     (dump_func)dump_get_process_debug_info_reply,
+     (dump_func)dump_get_process_image_name_reply,
++    (dump_func)dump_get_process_times_reply,
+     (dump_func)dump_get_process_vm_counters_reply,
+     NULL,
+     (dump_func)dump_get_thread_info_reply,
+@@ -4179,6 +4193,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "get_process_info",
+     "get_process_debug_info",
+     "get_process_image_name",
++    "get_process_times",
+     "get_process_vm_counters",
+     "set_process_info",
+     "get_thread_info",

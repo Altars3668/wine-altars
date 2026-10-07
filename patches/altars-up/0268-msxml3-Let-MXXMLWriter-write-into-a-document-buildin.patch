@@ -1,0 +1,797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 09:38:58 -0400
+Subject: [PATCH] msxml3: Let MXXMLWriter write into a document, building it as
+ the events come.
+
+An MXXMLWriter whose output is a DOM document is what Click-to-Run builds
+the configuration of Office's App-V layer with, and put_output() refused
+a document.  What Windows does is in msxml6's test_mxwriter_domdoc,
+whose todo_wine lines now all pass: startDocument() empties the document
+and locks it -- createNode() fails until endDocument() -- startElement()
+puts the element into the tree at once, and text shows up when its
+element ends.  Comments, processing instructions and CDATA sections from
+the lexical handler become nodes too; that part is not yet measured on
+Windows.
+
+The reader writing into the writer, from the old tree's tests, passes,
+and so do the old tree's newline cases for MXXMLWriter40.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index ac468cbb216..320eab03203 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -1120,6 +1120,12 @@ static HRESULT WINAPI domdoc_createNode(IXMLDOMDocument3 *iface, VARIANT type, B
+     if (!node)
+         return E_INVALIDARG;
+ 
++    if (doc->node->properties->writer_locks)
++    {
++        *node = NULL;
++        return E_FAIL;
++    }
++
+     if (FAILED(hr = get_node_type(&type, &node_type)))
+         return hr;
+ 
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index ee163ca9451..58db231674c 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -221,6 +221,7 @@ struct domdoc_properties
+     bool resolve_externals;
+     bool new_parser;
+     bool use_inline_schema;
++    unsigned int writer_locks;
+     int max_element_depth;
+     int max_xml_size;
+     IUri *uri;
+@@ -262,6 +263,8 @@ extern struct domdoc_properties *domdoc_create_properties(MSXML_VERSION version)
+ extern MSXML_VERSION domdoc_version(const struct domnode *doc);
+ extern HRESULT domnode_create(DOMNodeType type, const WCHAR *name, int name_len,
+         const WCHAR *uri, int uri_len, struct domnode *owner, struct domnode **node);
++extern void domnode_append_child(struct domnode *parent, struct domnode *node);
++extern void domnode_insert_attribute(struct domnode *parent, struct domnode *node, struct domnode *ref_node);
+ extern void domnode_destroy_tree(struct domnode *tree);
+ extern struct domnode *domnode_addref(struct domnode *node);
+ extern void domnode_release(struct domnode *node);
+diff --git a/dlls/msxml3/mxwriter.c b/dlls/msxml3/mxwriter.c
+index 947777e6fb4..536df680cb6 100644
+--- a/dlls/msxml3/mxwriter.c
++++ b/dlls/msxml3/mxwriter.c
+@@ -31,7 +31,7 @@
+ 
+ #include "wine/debug.h"
+ 
+-#include "msxml_dispex.h"
++#include "msxml_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(msxml);
+ 
+@@ -159,6 +159,12 @@ typedef struct
+     BSTR element;
+ 
+     IStream *dest;
++    IXMLDOMDocument *dest_doc;
++    struct domnode *dest_node;
++    struct domnode *doc_current;
++    BSTR doc_text;
++    DOMNodeType doc_text_type;
++    bool doc_active;
+ 
+     output_buffer buffer;
+ } mxwriter;
+@@ -743,6 +749,79 @@ static inline mxwriter *impl_from_IVBSAXErrorHandler(IVBSAXErrorHandler *iface)
+     return CONTAINING_RECORD(iface, mxwriter, IVBSAXErrorHandler_iface);
+ }
+ 
++static HRESULT mxwriter_dom_add_node(mxwriter *writer, DOMNodeType type, const WCHAR *name, int name_len,
++        const WCHAR *uri, int uri_len, const WCHAR *data, int data_len, struct domnode **result)
++{
++    struct domnode *node;
++    HRESULT hr;
++    BSTR value;
++
++    if (FAILED(hr = domnode_create(type, name, name_len, uri, uri_len, writer->dest_node, &node)))
++        return hr;
++
++    if (data)
++    {
++        if (!(value = SysAllocStringLen(data, data_len)))
++            hr = E_OUTOFMEMORY;
++        else
++        {
++            hr = node_put_data(node, value);
++            SysFreeString(value);
++        }
++    }
++
++    if (SUCCEEDED(hr))
++    {
++        domnode_append_child(writer->doc_current, node);
++        if (result) *result = node;
++    }
++    else
++        domnode_destroy_tree(node);
++
++    return hr;
++}
++
++static HRESULT mxwriter_dom_add_text(mxwriter *writer, const WCHAR *chars, int count)
++{
++    UINT length = SysStringLen(writer->doc_text);
++    BSTR text;
++
++    if (!count) return S_OK;
++    if (!(text = SysAllocStringLen(NULL, length + count))) return E_OUTOFMEMORY;
++    if (length) memcpy(text, writer->doc_text, length * sizeof(WCHAR));
++    memcpy(text + length, chars, count * sizeof(WCHAR));
++    SysFreeString(writer->doc_text);
++    writer->doc_text = text;
++    return S_OK;
++}
++
++static HRESULT mxwriter_dom_flush_text(mxwriter *writer)
++{
++    HRESULT hr = S_OK;
++
++    if (writer->doc_text && writer->doc_current != writer->dest_node)
++        hr = mxwriter_dom_add_node(writer, writer->doc_text_type, NULL, 0, NULL, 0,
++                writer->doc_text, SysStringLen(writer->doc_text), NULL);
++    SysFreeString(writer->doc_text);
++    writer->doc_text = NULL;
++    return hr;
++}
++
++static void mxwriter_release_document(mxwriter *writer)
++{
++    if (writer->doc_active)
++    {
++        --writer->dest_node->properties->writer_locks;
++        writer->doc_active = false;
++    }
++    SysFreeString(writer->doc_text);
++    writer->doc_text = NULL;
++    writer->doc_current = NULL;
++    writer->dest_node = NULL;
++    if (writer->dest_doc) IXMLDOMDocument_Release(writer->dest_doc);
++    writer->dest_doc = NULL;
++}
++
+ static HRESULT WINAPI mxwriter_QueryInterface(IMXWriter *iface, REFIID riid, void **obj)
+ {
+     mxwriter *This = impl_from_IMXWriter( iface );
+@@ -836,6 +915,7 @@ static ULONG WINAPI mxwriter_Release(IMXWriter *iface)
+         free_output_buffer(&This->buffer);
+ 
+         if (This->dest) IStream_Release(This->dest);
++        mxwriter_release_document(This);
+         SysFreeString(This->version);
+         SysFreeString(This->encoding);
+ 
+@@ -900,14 +980,36 @@ static HRESULT WINAPI mxwriter_put_output(IMXWriter *iface, VARIANT dest)
+     {
+         if (This->dest) IStream_Release(This->dest);
+         This->dest = NULL;
++        mxwriter_release_document(This);
+         close_output_buffer(This);
+         break;
+     }
+     case VT_UNKNOWN:
++    case VT_DISPATCH:
+     {
++        IUnknown *unknown = V_UNKNOWN(&dest);
++        struct domnode *node;
++        IXMLDOMDocument *doc;
+         IStream *stream;
+ 
+-        hr = IUnknown_QueryInterface(V_UNKNOWN(&dest), &IID_IStream, (void**)&stream);
++        if (unknown && IUnknown_QueryInterface(unknown, &IID_IXMLDOMDocument, (void **)&doc) == S_OK)
++        {
++            if (!(node = get_node_obj(doc)) || node->type != NODE_DOCUMENT || !node->properties)
++            {
++                IXMLDOMDocument_Release(doc);
++                return E_NOTIMPL;
++            }
++            close_output_buffer(This);
++            if (This->dest) IStream_Release(This->dest);
++            This->dest = NULL;
++            mxwriter_release_document(This);
++            This->dest_doc = doc;
++            This->dest_node = node;
++            This->doc_current = node;
++            break;
++        }
++
++        hr = unknown ? IUnknown_QueryInterface(unknown, &IID_IStream, (void **)&stream) : E_INVALIDARG;
+         if (hr == S_OK)
+         {
+             /* Recreate the output buffer to make sure it's using the correct encoding. */
+@@ -915,10 +1017,11 @@ static HRESULT WINAPI mxwriter_put_output(IMXWriter *iface, VARIANT dest)
+ 
+             if (This->dest) IStream_Release(This->dest);
+             This->dest = stream;
++            mxwriter_release_document(This);
+             break;
+         }
+ 
+-        FIXME("unhandled interface type for VT_UNKNOWN destination\n");
++        FIXME("unhandled interface type for output destination\n");
+         return E_NOTIMPL;
+     }
+     default:
+@@ -1204,6 +1307,20 @@ static HRESULT WINAPI SAXContentHandler_startDocument(ISAXContentHandler *iface)
+         This->prop_changed = FALSE;
+     }
+ 
++    if (This->dest_doc)
++    {
++        node_unlink_children(This->dest_node);
++        This->doc_current = This->dest_node;
++        SysFreeString(This->doc_text);
++        This->doc_text = NULL;
++        This->doc_text_type = NODE_TEXT;
++        if (!This->doc_active)
++        {
++            ++This->dest_node->properties->writer_locks;
++            This->doc_active = true;
++        }
++        return S_OK;
++    }
+     if (This->props[MXWriter_OmitXmlDecl] == VARIANT_TRUE) return S_OK;
+ 
+     write_prolog_buffer(This);
+@@ -1224,9 +1341,22 @@ static HRESULT WINAPI SAXContentHandler_startDocument(ISAXContentHandler *iface)
+ static HRESULT WINAPI SAXContentHandler_endDocument(ISAXContentHandler *iface)
+ {
+     mxwriter *This = impl_from_ISAXContentHandler( iface );
++    HRESULT hr;
++
+     TRACE("(%p)\n", This);
+     This->prop_changed = FALSE;
+-    return flush_output_buffer(This);
++    hr = flush_output_buffer(This);
++    if (This->dest_doc)
++    {
++        if (SUCCEEDED(hr)) hr = mxwriter_dom_flush_text(This);
++        if (This->doc_active)
++        {
++            --This->dest_node->properties->writer_locks;
++            This->doc_active = false;
++        }
++        This->doc_current = This->dest_node;
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SAXContentHandler_startPrefixMapping(
+@@ -1290,6 +1420,8 @@ static HRESULT WINAPI SAXContentHandler_startElement(
+     ISAXAttributes *attr)
+ {
+     mxwriter *This = impl_from_ISAXContentHandler( iface );
++    struct domnode *element = NULL;
++    HRESULT hr;
+ 
+     TRACE("(%p)->(%s %s %s %p)\n", This, debugstr_wn(namespaceUri, nnamespaceUri),
+         debugstr_wn(local_name, nlocal_name), debugstr_wn(QName, nQName), attr);
+@@ -1300,10 +1432,18 @@ static HRESULT WINAPI SAXContentHandler_startElement(
+ 
+     mxwriter_write_starttag(This, QName, nQName);
+ 
++    if (This->dest_doc)
++    {
++        if (FAILED(hr = mxwriter_dom_flush_text(This))) return hr;
++        if (FAILED(hr = mxwriter_dom_add_node(This, NODE_ELEMENT, QName,
++                nQName == -1 ? wcslen(QName) : nQName, namespaceUri, nnamespaceUri, NULL, 0, &element)))
++            return hr;
++        This->doc_current = element;
++    }
++
+     if (attr)
+     {
+         int length, i, escape;
+-        HRESULT hr;
+ 
+         hr = ISAXAttributes_getLength(attr, &length);
+         if (FAILED(hr)) return hr;
+@@ -1323,6 +1463,32 @@ static HRESULT WINAPI SAXContentHandler_startElement(
+             if (FAILED(hr)) return hr;
+ 
+             mxwriter_write_attribute(This, qname, qname_len, value, value_len, escape);
++
++            if (element)
++            {
++                struct domnode *attribute;
++                BSTR data;
++
++                if (FAILED(hr = domnode_create(NODE_ATTRIBUTE, qname, qname_len, NULL, 0,
++                        This->dest_node, &attribute)))
++                    return hr;
++                if (!(data = SysAllocStringLen(value, value_len)))
++                    hr = E_OUTOFMEMORY;
++                else
++                {
++                    hr = node_put_data(attribute, data);
++                    SysFreeString(data);
++                }
++                if (FAILED(hr))
++                {
++                    domnode_destroy_tree(attribute);
++                    return hr;
++                }
++                attribute->flags |= DOMNODE_PARSED_VALUE;
++                if (domnode_is_namespace_declaration(attribute))
++                    attribute->flags |= DOMNODE_READONLY_VALUE;
++                domnode_insert_attribute(element, attribute, NULL);
++            }
+         }
+     }
+ 
+@@ -1339,6 +1505,7 @@ static HRESULT WINAPI SAXContentHandler_endElement(
+     int nQName)
+ {
+     mxwriter *This = impl_from_ISAXContentHandler( iface );
++    HRESULT hr;
+ 
+     TRACE("(%p)->(%s:%d %s:%d %s:%d)\n", This, debugstr_wn(namespaceUri, nnamespaceUri), nnamespaceUri,
+         debugstr_wn(local_name, nlocal_name), nlocal_name, debugstr_wn(QName, nQName), nQName);
+@@ -1363,6 +1530,12 @@ static HRESULT WINAPI SAXContentHandler_endElement(
+ 
+     set_element_name(This, NULL, 0);
+ 
++    if (This->dest_doc && This->doc_current != This->dest_node)
++    {
++        if (FAILED(hr = mxwriter_dom_flush_text(This))) return hr;
++        This->doc_current = This->doc_current->parent;
++    }
++
+     return S_OK;
+ }
+ 
+@@ -1388,6 +1561,7 @@ static HRESULT WINAPI SAXContentHandler_characters(ISAXContentHandler *iface, co
+             write_output_buffer(writer, chars, nchars);
+         else
+             write_escaped_string(writer, chars, nchars, EscapeText);
++        if (writer->dest_doc) return mxwriter_dom_add_text(writer, chars, nchars);
+     }
+ 
+     return S_OK;
+@@ -1405,6 +1579,7 @@ static HRESULT WINAPI SAXContentHandler_ignorableWhitespace(
+     if (!chars) return E_INVALIDARG;
+ 
+     write_output_buffer(This, chars, nchars);
++    if (This->dest_doc) return mxwriter_dom_add_text(This, chars, nchars);
+ 
+     return S_OK;
+ }
+@@ -1417,6 +1592,7 @@ static HRESULT WINAPI SAXContentHandler_processingInstruction(
+     int ndata)
+ {
+     mxwriter *writer = impl_from_ISAXContentHandler(iface);
++    HRESULT hr;
+ 
+     TRACE("%p, %s, %s.\n", iface, debugstr_wn(target, ntarget), debugstr_wn(data, ndata));
+ 
+@@ -1437,6 +1613,13 @@ static HRESULT WINAPI SAXContentHandler_processingInstruction(
+     write_output_buffer(writer, L"?>\r\n", 4);
+     writer->newline = TRUE;
+ 
++    if (writer->dest_doc)
++    {
++        if (FAILED(hr = mxwriter_dom_flush_text(writer))) return hr;
++        return mxwriter_dom_add_node(writer, NODE_PROCESSING_INSTRUCTION, target,
++                ntarget == -1 ? wcslen(target) : ntarget, NULL, 0, data ? data : L"",
++                data ? (ndata == -1 ? wcslen(data) : ndata) : 0, NULL);
++    }
+     return S_OK;
+ }
+ 
+@@ -1563,6 +1746,7 @@ static HRESULT WINAPI SAXLexicalHandler_endEntity(ISAXLexicalHandler *iface, con
+ static HRESULT WINAPI SAXLexicalHandler_startCDATA(ISAXLexicalHandler *iface)
+ {
+     mxwriter *writer = impl_from_ISAXLexicalHandler(iface);
++    HRESULT hr;
+ 
+     TRACE("%p.\n", iface);
+ 
+@@ -1570,6 +1754,12 @@ static HRESULT WINAPI SAXLexicalHandler_startCDATA(ISAXLexicalHandler *iface)
+     write_output_buffer(writer, L"<![CDATA[", 9);
+     writer->cdata = TRUE;
+ 
++    if (writer->dest_doc)
++    {
++        if (FAILED(hr = mxwriter_dom_flush_text(writer))) return hr;
++        writer->doc_text_type = NODE_CDATA_SECTION;
++        if (!(writer->doc_text = SysAllocStringLen(NULL, 0))) return E_OUTOFMEMORY;
++    }
+     return S_OK;
+ }
+ 
+@@ -1582,12 +1772,19 @@ static HRESULT WINAPI SAXLexicalHandler_endCDATA(ISAXLexicalHandler *iface)
+     write_output_buffer(writer, L"]]>", 3);
+     writer->cdata = FALSE;
+ 
++    if (writer->dest_doc)
++    {
++        HRESULT hr = mxwriter_dom_flush_text(writer);
++        writer->doc_text_type = NODE_TEXT;
++        return hr;
++    }
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SAXLexicalHandler_comment(ISAXLexicalHandler *iface, const WCHAR *chars, int nchars)
+ {
+     mxwriter *writer = impl_from_ISAXLexicalHandler(iface);
++    HRESULT hr;
+ 
+     TRACE("%p, %s:%d.\n", iface, debugstr_wn(chars, nchars), nchars);
+ 
+@@ -1601,6 +1798,11 @@ static HRESULT WINAPI SAXLexicalHandler_comment(ISAXLexicalHandler *iface, const
+         write_output_buffer(writer, chars, nchars);
+     write_output_buffer(writer, L"-->\r\n", 5);
+ 
++    if (writer->dest_doc)
++    {
++        if (FAILED(hr = mxwriter_dom_flush_text(writer))) return hr;
++        return mxwriter_dom_add_node(writer, NODE_COMMENT, NULL, 0, NULL, 0, chars, nchars, NULL);
++    }
+     return S_OK;
+ }
+ 
+@@ -2581,6 +2783,12 @@ HRESULT MXWriter_create(MSXML_VERSION version, void **ppObj)
+     This->newline = TRUE;
+ 
+     This->dest = NULL;
++    This->dest_doc = NULL;
++    This->dest_node = NULL;
++    This->doc_current = NULL;
++    This->doc_text = NULL;
++    This->doc_text_type = NODE_TEXT;
++    This->doc_active = false;
+ 
+     hr = init_output_buffer(This->xml_enc, &This->buffer);
+     if (hr != S_OK) {
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index 992192f52e2..dcf962a6b98 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -726,7 +726,7 @@ void node_unlink_children(struct domnode *node)
+     }
+ }
+ 
+-static void domnode_append_child(struct domnode *parent, struct domnode *node)
++void domnode_append_child(struct domnode *parent, struct domnode *node)
+ {
+     domnode_unlink_child(node);
+ 
+@@ -1116,7 +1116,7 @@ static bool domnode_has_namespace_declaration_name(const struct domnode *node)
+     return false;
+ }
+ 
+-static void domnode_insert_attribute(struct domnode *parent, struct domnode *node, struct domnode *ref_node)
++void domnode_insert_attribute(struct domnode *parent, struct domnode *node, struct domnode *ref_node)
+ {
+     domnode_unlink_attribute(node);
+ 
+@@ -1376,6 +1376,7 @@ static struct domdoc_properties* domdoc_properties_clone(struct domdoc_propertie
+         pcopy->resolve_externals = properties->resolve_externals;
+         pcopy->new_parser = properties->new_parser;
+         pcopy->use_inline_schema = properties->use_inline_schema;
++        pcopy->writer_locks = 0;
+         pcopy->max_xml_size = properties->max_xml_size;
+         pcopy->schemaCache = properties->schemaCache;
+         if (pcopy->schemaCache)
+diff --git a/dlls/msxml3/tests/saxreader.c b/dlls/msxml3/tests/saxreader.c
+index e07e2373b08..6a24c20e74c 100644
+--- a/dlls/msxml3/tests/saxreader.c
++++ b/dlls/msxml3/tests/saxreader.c
+@@ -3611,6 +3611,7 @@ static struct msxmlsupported_data_t mxwriter_support_data[] =
+ {
+     { &CLSID_MXXMLWriter,   "MXXMLWriter"   },
+     { &CLSID_MXXMLWriter30, "MXXMLWriter30" },
++    { &CLSID_MXXMLWriter40, "MXXMLWriter40" },
+     { NULL }
+ };
+ 
+@@ -4593,6 +4594,9 @@ struct writer_startendelement_t {
+ static const WCHAR startelement_xml[] = L"<uri:local a:attr1=\"a1\" attr2=\"a2\" attr3=\"&lt;&amp;&quot;&gt;\'\" attr4=\"a\r\nb\r\nc\r\n\">";
+ static const WCHAR startendelement_xml[] = L"<uri:local a:attr1=\"a1\" attr2=\"a2\" attr3=\"&lt;&amp;&quot;&gt;\'\" attr4=\"a\r\nb\r\nc\r\n\"/>";
+ static const WCHAR startendelement_noescape_xml[] = L"<uri:local a:attr1=\"a1\" attr2=\"a2\" attr3=\"<&\">\'\" attr4=\"a\r\nb\r\nc\r\n\"/>";
++/* MSXML 4.0 writes a newline in an attribute value as a character reference. */
++static const WCHAR startelement40_xml[] = L"<uri:local a:attr1=\"a1\" attr2=\"a2\" attr3=\"&lt;&amp;&quot;&gt;\'\" attr4=\"a&#xA;b&#xA;c&#xA;\">";
++static const WCHAR startendelement40_xml[] = L"<uri:local a:attr1=\"a1\" attr2=\"a2\" attr3=\"&lt;&amp;&quot;&gt;\'\" attr4=\"a&#xA;b&#xA;c&#xA;\"/>";
+ 
+ static const struct writer_startendelement_t writer_startendelement[] =
+ {
+@@ -4641,15 +4645,18 @@ static const struct writer_startendelement_t writer_startendelement[] =
+     /* with attributes */
+     { &CLSID_MXXMLWriter,   StartElement, L"uri", L"local", L"uri:local", startelement_xml, S_OK, &saxattributes },
+     { &CLSID_MXXMLWriter30, StartElement, L"uri", L"local", L"uri:local", startelement_xml, S_OK, &saxattributes },
++    { &CLSID_MXXMLWriter40, StartElement, L"uri", L"local", L"uri:local", startelement40_xml, S_OK, &saxattributes },
+     /* empty elements */
+     { &CLSID_MXXMLWriter,   StartEndElement, L"uri", L"local", L"uri:local", startendelement_xml, S_OK, &saxattributes },
+     { &CLSID_MXXMLWriter30, StartEndElement, L"uri", L"local", L"uri:local", startendelement_xml, S_OK, &saxattributes },
++    { &CLSID_MXXMLWriter40, StartEndElement, L"uri", L"local", L"uri:local", startendelement40_xml, S_OK, &saxattributes },
+     { &CLSID_MXXMLWriter,   StartEndElement, L"", L"", L"", L"</>", S_OK },
+     { &CLSID_MXXMLWriter30, StartEndElement, L"", L"", L"", L"</>", S_OK },
+ 
+     /* with disabled output escaping */
+     { &CLSID_MXXMLWriter,   StartEndElement | DisableEscaping, L"uri", L"local", L"uri:local", startendelement_noescape_xml, S_OK, &saxattributes },
+     { &CLSID_MXXMLWriter30, StartEndElement | DisableEscaping, L"uri", L"local", L"uri:local", startendelement_noescape_xml, S_OK, &saxattributes },
++    { &CLSID_MXXMLWriter40, StartEndElement | DisableEscaping, L"uri", L"local", L"uri:local", startendelement40_xml, S_OK, &saxattributes },
+ 
+     { NULL }
+ };
+@@ -6736,6 +6743,39 @@ static void test_mxwriter_from_reader(void)
+     IVBSAXContentHandler_Release(content_handler);
+ }
+ 
++static void test_mxwriter_from_isaxreader(void)
++{
++    ISAXContentHandler *content;
++    ISAXXMLReader *reader;
++    IMXWriter *writer;
++    VARIANT source;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&CLSID_MXXMLWriter, NULL, CLSCTX_INPROC_SERVER, &IID_IMXWriter, (void **)&writer);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMXWriter_QueryInterface(writer, &IID_ISAXContentHandler, (void **)&content);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMXWriter_put_omitXMLDeclaration(writer, VARIANT_TRUE);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    hr = CoCreateInstance(&CLSID_SAXXMLReader, NULL, CLSCTX_INPROC_SERVER, &IID_ISAXXMLReader, (void **)&reader);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXXMLReader_putContentHandler(reader, content);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    V_VT(&source) = VT_BSTR;
++    V_BSTR(&source) = SysAllocString(L"<a x=\"1\"><b>text</b><c/></a>");
++    hr = ISAXXMLReader_parse(reader, source);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&source);
++
++    check_writer_output(writer, L"<a x=\"1\"><b>text</b><c/></a>");
++
++    ISAXXMLReader_Release(reader);
++    ISAXContentHandler_Release(content);
++    IMXWriter_Release(writer);
++}
++
+ static const WCHAR xml_dtd[] =
+     L"<?xml version=\"1.0\" ?>\n"
+     "<!DOCTYPE dummy:td-name PUBLIC \"dtd-pub-id\" \"dtd-sys-id\" [\n"
+@@ -8080,6 +8120,7 @@ START_TEST(saxreader)
+         test_mxwriter_dispex();
+         test_mxwriter_indent();
+         test_mxwriter_from_reader();
++        test_mxwriter_from_isaxreader();
+     }
+     else
+         win_skip("MXXMLWriter not supported\n");
+diff --git a/dlls/msxml6/tests/saxreader.c b/dlls/msxml6/tests/saxreader.c
+index 27e6e8c688b..7adddf7f009 100644
+--- a/dlls/msxml6/tests/saxreader.c
++++ b/dlls/msxml6/tests/saxreader.c
+@@ -2333,11 +2333,11 @@ static void test_mxwriter_domdoc(void)
+     V_DISPATCH(&dest) = (IDispatch *)domdoc;
+ 
+     hr = IMXWriter_put_output(writer, dest);
+-    todo_wine
+     ok(hr == S_OK, "Failed to set writer output, hr %#lx.\n", hr);
+     if (FAILED(hr))
+     {
+         IXMLDOMDocument_Release(domdoc);
++        ISAXContentHandler_Release(content);
+         IMXWriter_Release(writer);
+         return;
+     }
+@@ -2359,11 +2359,9 @@ static void test_mxwriter_domdoc(void)
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMDocument_get_documentElement(domdoc, &root);
+-    todo_wine
+     ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMDocument_createElement(domdoc, _bstr_("TestElement"), &root);
+-    todo_wine
+     ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
+ 
+     /* startElement allows document root node to be accessed. */
+@@ -2376,7 +2374,6 @@ static void test_mxwriter_domdoc(void)
+ 
+     hr = IXMLDOMElement_get_nodeName(root, &str);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(!lstrcmpW(L"BankAccount", str), "Unexpected name %s.\n", wine_dbgstr_w(str));
+     SysFreeString(str);
+ 
+@@ -2389,18 +2386,14 @@ static void test_mxwriter_domdoc(void)
+ 
+     hr = IXMLDOMNodeList_get_length(node_list, &list_length);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-    todo_wine
+     ok(list_length == 1, "list length %ld, expected 1\n", list_length);
+ 
+     hr = IXMLDOMNodeList_get_item(node_list, 0, &node);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMNode_get_nodeName(node, &str);
+-todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(!lstrcmpW(L"Number", str), "got %s\n", wine_dbgstr_w(str));
+-}
+     SysFreeString(str);
+ 
+     /* characters not immediately visible. */
+@@ -2408,10 +2401,8 @@ todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMNode_get_text(node, &str);
+-todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(!lstrcmpW(L"", str), "got %s\n", wine_dbgstr_w(str));
+-}
+     SysFreeString(str);
+ 
+     /* characters visible after endElement. */
+@@ -2419,10 +2410,8 @@ todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMNode_get_text(node, &str);
+-todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(!lstrcmpW(L"12345", str), "got %s\n", wine_dbgstr_w(str));
+-}
+     SysFreeString(str);
+ 
+     IXMLDOMNode_Release(node);
+@@ -2442,27 +2431,19 @@ todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMNodeList_get_length(node_list, &list_length);
+-todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(2 == list_length, "list length %ld, expected 2\n", list_length);
+-}
+     hr = IXMLDOMNodeList_get_item(node_list, 1, &node);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMNode_get_nodeName(node, &str);
+-todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(!lstrcmpW(L"Name", str), "got %s\n", wine_dbgstr_w(str));
+-}
+     SysFreeString(str);
+ 
+     hr = IXMLDOMNode_get_text(node, &str);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-todo_wine {
+-    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(!lstrcmpW(L"Captain Ahab", str), "got %s\n", wine_dbgstr_w(str));
+-}
+     SysFreeString(str);
+ 
+     IXMLDOMNode_Release(node);
+@@ -2480,7 +2461,6 @@ todo_wine {
+ 
+     /* finally check doc output */
+     hr = IXMLDOMDocument_get_xml(domdoc, &str);
+-todo_wine {
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(!lstrcmpW(
+             L"<BankAccount>"
+@@ -2489,7 +2469,6 @@ todo_wine {
+             "</BankAccount>\r\n",
+             str),
+         "got %s\n", wine_dbgstr_w(str));
+-}
+     SysFreeString(str);
+ 
+     IXMLDOMDocument_Release(domdoc);
+@@ -2499,6 +2478,91 @@ todo_wine {
+     free_bstrs();
+ }
+ 
++static void test_mxwriter_domdoc_events(void)
++{
++    ISAXContentHandler *content;
++    ISAXLexicalHandler *lexical;
++    IXMLDOMDocument *domdoc;
++    IXMLDOMElement *root;
++    ISAXAttributes *attrs;
++    IMXAttributes *mxattrs;
++    IMXWriter *writer;
++    VARIANT dest, value;
++    HRESULT hr;
++    BSTR str;
++
++    hr = CoCreateInstance(&CLSID_MXXMLWriter60, NULL, CLSCTX_INPROC_SERVER, &IID_IMXWriter, (void **)&writer);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMXWriter_QueryInterface(writer, &IID_ISAXContentHandler, (void **)&content);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMXWriter_QueryInterface(writer, &IID_ISAXLexicalHandler, (void **)&lexical);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = CoCreateInstance(&CLSID_DOMDocument60, NULL, CLSCTX_INPROC_SERVER, &IID_IXMLDOMDocument, (void **)&domdoc);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = CoCreateInstance(&CLSID_SAXAttributes60, NULL, CLSCTX_INPROC_SERVER, &IID_IMXAttributes, (void **)&mxattrs);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMXAttributes_addAttribute(mxattrs, _bstr_(""), _bstr_("a"), _bstr_("a"), _bstr_("CDATA"), _bstr_("1"));
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMXAttributes_QueryInterface(mxattrs, &IID_ISAXAttributes, (void **)&attrs);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    V_VT(&dest) = VT_DISPATCH;
++    V_DISPATCH(&dest) = (IDispatch *)domdoc;
++    hr = IMXWriter_put_output(writer, dest);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_startDocument(content);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_startElement(content, L"", 0, L"", 0, L"r", 1, attrs);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IXMLDOMDocument_get_documentElement(domdoc, &root);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (hr == S_OK)
++    {
++        VariantInit(&value);
++        hr = IXMLDOMElement_getAttribute(root, _bstr_("a"), &value);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(V_VT(&value) == VT_BSTR && !lstrcmpW(V_BSTR(&value), L"1"), "Unexpected attribute %s.\n",
++                wine_dbgstr_variant(&value));
++        VariantClear(&value);
++        IXMLDOMElement_Release(root);
++    }
++
++    hr = ISAXContentHandler_characters(content, L"<&", 2);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXLexicalHandler_startCDATA(lexical);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_characters(content, L"<&", 2);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXLexicalHandler_endCDATA(lexical);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXLexicalHandler_comment(lexical, L"note", 4);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_processingInstruction(content, L"p", 1, L"d", 1);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_ignorableWhitespace(content, L" ", 1);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_characters(content, L"tail", 4);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_endElement(content, L"", 0, L"", 0, L"r", 1);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = ISAXContentHandler_endDocument(content);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    hr = IXMLDOMDocument_get_xml(domdoc, &str);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!lstrcmpW(str, L"<r a=\"1\">&lt;&amp;<![CDATA[<&]]><!--note--><?p d?> tail</r>\r\n"),
++            "Unexpected content %s.\n", wine_dbgstr_w(str));
++    SysFreeString(str);
++
++    ISAXAttributes_Release(attrs);
++    IMXAttributes_Release(mxattrs);
++    IXMLDOMDocument_Release(domdoc);
++    ISAXLexicalHandler_Release(lexical);
++    ISAXContentHandler_Release(content);
++    IMXWriter_Release(writer);
++    free_bstrs();
++}
++
+ static const char *encoding_names[] = {
+     "iso-8859-1",
+     "iso-8859-2",
+@@ -5414,6 +5478,7 @@ START_TEST(saxreader)
+         test_mxwriter_properties();
+         test_mxwriter_flush();
+         test_mxwriter_domdoc();
++        test_mxwriter_domdoc_events();
+         test_mxwriter_encoding();
+         test_mxwriter_dispex();
+         test_mxwriter_indent();

@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 20:20:24 -0400
+Subject: [PATCH] server: Give window stations and desktops the security
+ descriptors Windows does.
+
+Window stations and desktops were created without a security
+descriptor, so GetSecurityInfo() found no DACL on them.  PowerPoint's
+3D model import runs in a sandbox whose broker (in mso.dll) reads the
+DACL of the thread's desktop to add the sandboxed token's SID to it,
+and passes the DACL to GetAclInformation() without checking for NULL:
+inserting a 3D model took PowerPoint down with an access violation in
+RtlQueryInformationAcl().
+
+Measured on Windows 11 build 29671, in the interactive session and in
+an ssh service session: a desktop created without security attributes
+has the ACEs its window station marks for objects to inherit, with
+generic rights mapped to desktop rights and no inheritance flags; a
+window station created later has the DACL of the creating process's
+window station.  The first window station now grants what WinSta0
+does: the logon SID, restricted code and the system everything,
+administrators and all (restricted) application packages less, each
+once for the station and once for its desktops to inherit.  Owner and
+group come from the creating token.
+
+The test passes on Windows in both kinds of session, and fails without
+this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit bfd4e06c5fd7659a8b325b65bab2f784d2202216)
+
+diff --git a/dlls/user32/tests/winstation.c b/dlls/user32/tests/winstation.c
+index 62f8b10f3cd..a435df78f3b 100644
+--- a/dlls/user32/tests/winstation.c
++++ b/dlls/user32/tests/winstation.c
+@@ -24,6 +24,7 @@
+ #include "winuser.h"
+ #include "winnls.h"
+ #include "winternl.h"
++#include "aclapi.h"
+ 
+ static NTSTATUS (WINAPI *pNtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+ 
+@@ -1103,6 +1104,112 @@ static void test_get_security(void)
+     ok( IsValidSecurityDescriptor(buffer), "expected valid SD\n" );
+ }
+ 
++/* A window station or desktop created without a security descriptor has a DACL, from either interface; a desktop's
++ * is what its window station hands on to objects, generic rights mapped to the desktop's own.  Office's sandbox
++ * adds an entry to the desktop's DACL this way and uses the DACL without checking for NULL. */
++static void test_default_security(void)
++{
++    static const GENERIC_MAPPING desktop_mapping =
++    {
++        STANDARD_RIGHTS_READ | DESKTOP_ENUMERATE | DESKTOP_READOBJECTS,
++        STANDARD_RIGHTS_WRITE | DESKTOP_WRITEOBJECTS | DESKTOP_JOURNALPLAYBACK | DESKTOP_JOURNALRECORD |
++        DESKTOP_HOOKCONTROL | DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW,
++        STANDARD_RIGHTS_EXECUTE | DESKTOP_SWITCHDESKTOP,
++        STANDARD_RIGHTS_REQUIRED | DESKTOP_ALL_ACCESS
++    };
++    static const SE_OBJECT_TYPE types[] = { SE_KERNEL_OBJECT, SE_WINDOW_OBJECT };
++    HWINSTA winsta = GetProcessWindowStation();
++    HDESK desktop = GetThreadDesktop( GetCurrentThreadId() ), new_desktop;
++    PSECURITY_DESCRIPTOR winsta_sd, desktop_sd, sd;
++    ACL *winsta_dacl, *desktop_dacl, *new_dacl, *dacl;
++    ACCESS_ALLOWED_ACE *ace, *desktop_ace;
++    SID_IDENTIFIER_AUTHORITY nt = { SECURITY_NT_AUTHORITY };
++    EXPLICIT_ACCESSW entry;
++    unsigned int i, count;
++    PSID restricted;
++    ACCESS_MASK mask;
++    DWORD ret;
++
++    for (i = 0; i < ARRAY_SIZE(types); i++)
++    {
++        winetest_push_context( "type %u", types[i] );
++        dacl = (void *)0xdeadbeef;
++        ret = GetSecurityInfo( winsta, types[i], DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd );
++        ok( !ret, "got error %lu\n", ret );
++        ok( dacl && dacl != (void *)0xdeadbeef, "window station without a DACL\n" );
++        if (!ret) LocalFree( sd );
++        dacl = (void *)0xdeadbeef;
++        ret = GetSecurityInfo( desktop, types[i], DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd );
++        ok( !ret, "got error %lu\n", ret );
++        ok( dacl && dacl != (void *)0xdeadbeef, "desktop without a DACL\n" );
++        if (!ret) LocalFree( sd );
++        winetest_pop_context();
++    }
++
++    new_desktop = CreateDesktopW( L"winetest_default_security", NULL, NULL, 0,
++                                  DESKTOP_ALL_ACCESS | READ_CONTROL | WRITE_DAC, NULL );
++    ok( !!new_desktop, "CreateDesktopW failed, error %lu\n", GetLastError() );
++    if (!new_desktop) return;
++
++    ret = GetSecurityInfo( winsta, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &winsta_dacl, NULL,
++                           &winsta_sd );
++    ok( !ret, "got error %lu\n", ret );
++    ret = GetSecurityInfo( new_desktop, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &desktop_dacl,
++                           NULL, &desktop_sd );
++    ok( !ret, "got error %lu\n", ret );
++    ok( winsta_dacl && desktop_dacl, "got DACLs %p, %p\n", winsta_dacl, desktop_dacl );
++    if (!winsta_dacl || !desktop_dacl)
++    {
++        CloseDesktop( new_desktop );
++        return;
++    }
++
++    for (i = count = 0; i < winsta_dacl->AceCount; i++)
++    {
++        if (!GetAce( winsta_dacl, i, (void **)&ace )) break;
++        if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE || !(ace->Header.AceFlags & OBJECT_INHERIT_ACE)) continue;
++        winetest_push_context( "ACE %u", count );
++        ok( GetAce( desktop_dacl, count, (void **)&desktop_ace ), "no ACE\n" );
++        if (count < desktop_dacl->AceCount)
++        {
++            mask = ace->Mask;
++            MapGenericMask( &mask, (GENERIC_MAPPING *)&desktop_mapping );
++            ok( desktop_ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE, "got type %u\n", desktop_ace->Header.AceType );
++            ok( !desktop_ace->Header.AceFlags, "got flags %#x\n", desktop_ace->Header.AceFlags );
++            ok( desktop_ace->Mask == mask, "got mask %#lx, expected %#lx\n", desktop_ace->Mask, mask );
++            ok( EqualSid( &desktop_ace->SidStart, &ace->SidStart ), "different SID\n" );
++        }
++        winetest_pop_context();
++        count++;
++    }
++    ok( count, "no ACE for objects to inherit\n" );
++    ok( desktop_dacl->AceCount == count, "got %u ACEs, expected %u\n", desktop_dacl->AceCount, count );
++
++    /* an entry added the way a sandbox does, and read back */
++    AllocateAndInitializeSid( &nt, 1, SECURITY_RESTRICTED_CODE_RID, 0, 0, 0, 0, 0, 0, 0, &restricted );
++    memset( &entry, 0, sizeof(entry) );
++    entry.grfAccessPermissions = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS;
++    entry.grfAccessMode = GRANT_ACCESS;
++    entry.grfInheritance = NO_INHERITANCE;
++    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
++    entry.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
++    entry.Trustee.ptstrName = restricted;
++    ret = SetEntriesInAclW( 1, &entry, desktop_dacl, &new_dacl );
++    ok( !ret, "got error %lu\n", ret );
++    ret = SetSecurityInfo( new_desktop, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, new_dacl, NULL );
++    ok( !ret, "got error %lu\n", ret );
++    LocalFree( new_dacl );
++    FreeSid( restricted );
++    ret = GetSecurityInfo( new_desktop, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd );
++    ok( !ret, "got error %lu\n", ret );
++    ok( dacl && dacl->AceCount >= count, "got %u ACEs\n", dacl ? dacl->AceCount : 0 );
++    if (!ret) LocalFree( sd );
++
++    LocalFree( winsta_sd );
++    LocalFree( desktop_sd );
++    CloseDesktop( new_desktop );
++}
++
+ START_TEST(winstation)
+ {
+     char **argv;
+@@ -1137,4 +1244,5 @@ START_TEST(winstation)
+     test_foregroundwindow();
+     test_invisible_winstation(argv);
+     test_get_security();
++    test_default_security();
+ }
+diff --git a/server/security.h b/server/security.h
+index f4dff679179..120a96ec8b5 100644
+--- a/server/security.h
++++ b/server/security.h
+@@ -74,6 +74,7 @@ extern int token_check_privileges( struct token *token, int all_required,
+ extern const struct acl *token_get_default_dacl( struct token *token );
+ extern const struct sid *token_get_owner( struct token *token );
+ extern const struct sid *token_get_primary_group( struct token *token );
++extern const struct sid *token_get_logon_sid( struct token *token );
+ extern unsigned int token_get_session_id( struct token *token );
+ extern int token_sid_present( struct token *token, const struct sid *sid, int deny );
+ 
+diff --git a/server/token.c b/server/token.c
+index ff8650fc12e..3570102f921 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -1072,6 +1072,16 @@ const struct sid *token_get_primary_group( struct token *token )
+     return token->primary_group;
+ }
+ 
++/* the SID of the logon session the token belongs to, NULL if it has none */
++const struct sid *token_get_logon_sid( struct token *token )
++{
++    struct group *group;
++
++    LIST_FOR_EACH_ENTRY( group, &token->groups, struct group, entry )
++        if (group->attrs & SE_GROUP_LOGON_ID) return &group->sid;
++    return NULL;
++}
++
+ unsigned int token_get_session_id( struct token *token )
+ {
+     return token->session_id;
+diff --git a/server/winstation.c b/server/winstation.c
+index c0564feba4e..01049e58478 100644
+--- a/server/winstation.c
++++ b/server/winstation.c
+@@ -127,6 +127,140 @@ static void winstation_dump( struct object *obj, int verbose )
+              winstation->flags, winstation->clipboard, winstation->atom_table );
+ }
+ 
++/* Security descriptors Windows gives window stations and desktops created without one.  The first window station
++ * grants its logon session, restricted code, the system, administrators and app containers what the interactive
++ * one on Windows does, and with the ACEs marked for objects to inherit hands rights on to its desktops; a window
++ * station created later takes the DACL of the creating process's own; a desktop takes the inheritable ACEs of its
++ * window station, their generic rights mapped to its own.  Owner and group come from the creating token. */
++
++static const struct sid restricted_code_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_RESTRICTED_CODE_RID } };
++static const struct sid all_packages_sid = { SID_REVISION, 2, SECURITY_APP_PACKAGE_AUTHORITY,
++                                             { SECURITY_APP_PACKAGE_BASE_RID, SECURITY_BUILTIN_PACKAGE_ANY_PACKAGE } };
++static const struct sid all_restricted_packages_sid = { SID_REVISION, 2, SECURITY_APP_PACKAGE_AUTHORITY,
++                                                        { SECURITY_APP_PACKAGE_BASE_RID, 2 } };
++
++struct default_ace
++{
++    const struct sid *sid;
++    unsigned char     flags;
++    unsigned int      mask;
++};
++
++static void set_default_sd( struct object *obj, const struct default_ace *aces, unsigned int count )
++{
++    struct security_descriptor *sd;
++    size_t dacl_size = sizeof(struct acl);
++    struct acl *dacl;
++    struct ace *ace;
++    unsigned int i;
++
++    for (i = 0; i < count; i++) dacl_size += sizeof(struct ace) + sid_len( aces[i].sid );
++    if (!(sd = mem_alloc( sizeof(*sd) + dacl_size ))) return;
++    sd->control   = SE_DACL_PRESENT;
++    sd->owner_len = 0;
++    sd->group_len = 0;
++    sd->sacl_len  = 0;
++    sd->dacl_len  = dacl_size;
++    dacl = (struct acl *)(sd + 1);
++    dacl->revision = ACL_REVISION;
++    dacl->pad1     = 0;
++    dacl->size     = dacl_size;
++    dacl->count    = count;
++    dacl->pad2     = 0;
++    for (i = 0, ace = ace_first( dacl ); i < count; i++, ace = ace_next( ace ))
++        set_ace( ace, aces[i].sid, ACCESS_ALLOWED_ACE_TYPE, aces[i].flags, aces[i].mask );
++    default_set_sd( obj, sd, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION );
++    free( sd );
++}
++
++static void set_winstation_default_sd( struct winstation *winstation )
++{
++    static const unsigned int inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE;
++    static const unsigned int all = GENERIC_ALL | GENERIC_EXECUTE | GENERIC_WRITE | GENERIC_READ;
++    const struct sid *logon = token_get_logon_sid( current->process->token );
++    struct winstation *parent;
++    struct default_ace aces[16];
++    unsigned int count = 0;
++
++    if (current->process->winstation &&
++        (parent = (struct winstation *)get_handle_obj( current->process, current->process->winstation,
++                                                       0, &winstation_ops )))
++    {
++        const struct acl *dacl = NULL;
++        int present = 0;
++
++        if (parent->obj.sd) dacl = sd_get_dacl( parent->obj.sd, &present );
++        if (present && dacl)
++        {
++            struct security_descriptor *sd;
++
++            if ((sd = mem_alloc( sizeof(*sd) + dacl->size )))
++            {
++                sd->control   = SE_DACL_PRESENT;
++                sd->owner_len = sd->group_len = sd->sacl_len = 0;
++                sd->dacl_len  = dacl->size;
++                memcpy( sd + 1, dacl, dacl->size );
++                default_set_sd( &winstation->obj, sd, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
++                                DACL_SECURITY_INFORMATION );
++                free( sd );
++            }
++            release_object( parent );
++            return;
++        }
++        release_object( parent );
++    }
++    clear_error();
++
++    if (!logon) logon = token_get_owner( current->process->token );
++    aces[count++] = (struct default_ace){ logon, inherit, all };
++    aces[count++] = (struct default_ace){ logon, NO_PROPAGATE_INHERIT_ACE, STANDARD_RIGHTS_REQUIRED | WINSTA_ALL_ACCESS };
++    aces[count++] = (struct default_ace){ &restricted_code_sid, inherit, all };
++    aces[count++] = (struct default_ace){ &restricted_code_sid, NO_PROPAGATE_INHERIT_ACE,
++                                          STANDARD_RIGHTS_REQUIRED | WINSTA_ALL_ACCESS };
++    aces[count++] = (struct default_ace){ &builtin_admins_sid, inherit, DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW |
++                                          DESKTOP_CREATEMENU | DESKTOP_ENUMERATE | DESKTOP_WRITEOBJECTS | GENERIC_EXECUTE };
++    aces[count++] = (struct default_ace){ &builtin_admins_sid, NO_PROPAGATE_INHERIT_ACE, WINSTA_READATTRIBUTES |
++                                          WINSTA_ACCESSCLIPBOARD | WINSTA_ACCESSGLOBALATOMS | WINSTA_EXITWINDOWS |
++                                          WINSTA_ENUMERATE | READ_CONTROL };
++    aces[count++] = (struct default_ace){ &local_system_sid, inherit, all };
++    aces[count++] = (struct default_ace){ &local_system_sid, NO_PROPAGATE_INHERIT_ACE,
++                                          STANDARD_RIGHTS_REQUIRED | WINSTA_ALL_ACCESS };
++    aces[count++] = (struct default_ace){ &all_restricted_packages_sid, inherit, GENERIC_EXECUTE | GENERIC_READ };
++    aces[count++] = (struct default_ace){ &all_restricted_packages_sid, NO_PROPAGATE_INHERIT_ACE,
++                                          WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ACCESSCLIPBOARD |
++                                          WINSTA_ACCESSGLOBALATOMS | WINSTA_ENUMERATE | WINSTA_READSCREEN |
++                                          READ_CONTROL };
++    aces[count++] = (struct default_ace){ &all_packages_sid, inherit, GENERIC_EXECUTE | GENERIC_READ };
++    aces[count++] = (struct default_ace){ &all_packages_sid, NO_PROPAGATE_INHERIT_ACE,
++                                          WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | WINSTA_ACCESSCLIPBOARD |
++                                          WINSTA_ACCESSGLOBALATOMS | WINSTA_ENUMERATE | WINSTA_READSCREEN |
++                                          READ_CONTROL };
++    set_default_sd( &winstation->obj, aces, count );
++}
++
++static void set_desktop_default_sd( struct desktop *desktop, struct winstation *winstation )
++{
++    const struct acl *dacl = NULL;
++    struct default_ace *aces;
++    const struct ace *ace;
++    unsigned int i, count = 0;
++    int present = 0;
++
++    if (winstation->obj.sd) dacl = sd_get_dacl( winstation->obj.sd, &present );
++    if (!present || !dacl) return;
++    if (!(aces = mem_alloc( (dacl->count ? dacl->count : 1) * sizeof(*aces) ))) return;
++    for (i = 0, ace = ace_first( dacl ); i < dacl->count; i++, ace = ace_next( ace ))
++    {
++        if (ace->type != ACCESS_ALLOWED_ACE_TYPE || !(ace->flags & OBJECT_INHERIT_ACE)) continue;
++        aces[count].sid   = (const struct sid *)(ace + 1);
++        aces[count].flags = 0;
++        aces[count].mask  = map_access( ace->mask, &desktop_type.mapping );
++        count++;
++    }
++    set_default_sd( &desktop->obj, aces, count );
++    free( aces );
++}
++
+ static bool winstation_init( struct object *obj, const void *init_data )
+ {
+     struct winstation *winstation = (struct winstation *)obj;
+@@ -143,6 +277,7 @@ static bool winstation_init( struct object *obj, const void *init_data )
+     winstation->monitor_serial = 1;
+     list_init( &winstation->desktops );
+     list_add_tail( &winstation_list, &winstation->entry );
++    if (!obj->sd) set_winstation_default_sd( winstation );
+     return true;
+ }
+ 
+@@ -269,6 +404,7 @@ static bool desktop_init( struct object *obj, const void *init_data )
+     if (!(desktop->shared = alloc_shared_object( sizeof(*desktop->shared) ))) return false;
+ 
+     desktop->winstation = (struct winstation *)grab_object( winstation );
++    if (!obj->sd) set_desktop_default_sd( desktop, winstation );
+     desktop->top_window = NULL;
+     desktop->msg_window = NULL;
+     desktop->shell_window = NULL;

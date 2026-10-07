@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 19:47:01 -0400
+Subject: [PATCH] msctf: Input scopes of windows, edit transactions and the
+ termination of no composition.
+
+SetInputScope, SetInputScopes and SetInputScopeXML keep a window's scopes
+(IS_DEFAULT taking them away, the phrase list, regular expression and
+SRGS scopes added when given, IS_XML for the XML), for windows of the
+calling thread only, and TF_GetInputScope hands them out as an
+ITfInputScope (tools/startupgapsprobe misc2).  A text store's edit
+transaction defers the IME rectangle it asks for until it ends, and
+terminating all compositions of a context that never starts one is
+done.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/msctf/context.c b/dlls/msctf/context.c
+index 7b0c8689434..3619e4c8b30 100644
+--- a/dlls/msctf/context.c
++++ b/dlls/msctf/context.c
+@@ -70,6 +70,8 @@ typedef struct tagContext {
+     /* set when the caret has moved and the IME needs to be told where it is;
+      * the answer only comes out of the text store under a document lock. */
+     BOOL            want_ime_rect;
++    LONG            edit_transaction;   /* how deep in edit transactions the store is */
++    BOOL            pending_ime_rect;   /* its layout or selection changed in one */
+ 
+     /* kept as separate lists to reduce unnecessary iterations */
+     struct list     pContextKeyEventSink;
+@@ -652,8 +654,12 @@ static HRESULT WINAPI ContextOwnerCompositionServices_TerminateComposition(ITfCo
+         ITfCompositionView *pComposition)
+ {
+     Context *This = impl_from_ITfContextOwnerCompositionServices(iface);
+-    FIXME("STUB:(%p) %p\n", This, pComposition);
+-    return E_NOTIMPL;
++
++    TRACE("(%p) %p\n", This, pComposition);
++
++    /* no composition is ever started in this context, so terminating all of them is done, and a view of
++     * one is none of this context's */
++    return pComposition ? E_INVALIDARG : S_OK;
+ }
+ 
+ static const ITfContextOwnerCompositionServicesVtbl ContextOwnerCompositionServicesVtbl =
+@@ -869,6 +875,12 @@ static void context_request_ime_rect( Context *This )
+     HRESULT hr, hrSession;
+ 
+     if (!This->pITextStoreACP) return;
++    /* the store said it changes more first; ask once it is done */
++    if (This->edit_transaction)
++    {
++        This->pending_ime_rect = TRUE;
++        return;
++    }
+ 
+     This->want_ime_rect = TRUE;
+     hr = ITextStoreACP_RequestLock( This->pITextStoreACP, TS_LF_READ, &hrSession );
+@@ -1007,18 +1019,30 @@ static HRESULT WINAPI TextStoreACPSink_OnLockGranted(ITextStoreACPSink *iface,
+     return hr;
+ }
+ 
++/* the store makes several changes, which are reported when they are all made */
+ static HRESULT WINAPI TextStoreACPSink_OnStartEditTransaction(ITextStoreACPSink *iface)
+ {
+     Context *This = impl_from_ITextStoreACPSink(iface);
+-    FIXME("STUB:(%p)\n",This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)\n",This);
++
++    This->edit_transaction++;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TextStoreACPSink_OnEndEditTransaction(ITextStoreACPSink *iface)
+ {
+     Context *This = impl_from_ITextStoreACPSink(iface);
+-    FIXME("STUB:(%p)\n",This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)\n",This);
++
++    if (!This->edit_transaction) return S_OK;
++    if (!--This->edit_transaction && This->pending_ime_rect)
++    {
++        This->pending_ime_rect = FALSE;
++        context_request_ime_rect( This );
++    }
++    return S_OK;
+ }
+ 
+ static const ITextStoreACPSinkVtbl TextStoreACPSinkVtbl =
+diff --git a/dlls/msctf/msctf.c b/dlls/msctf/msctf.c
+index 0d7b86566b4..34a8d4f1125 100644
+--- a/dlls/msctf/msctf.c
++++ b/dlls/msctf/msctf.c
+@@ -579,29 +579,359 @@ HRESULT WINAPI TF_CreateThreadMgr(ITfThreadMgr **pptim)
+     return ThreadMgr_Constructor(NULL,(IUnknown**)pptim);
+ }
+ 
++/* What a window of the process was given to tell the text services what input it expects: the scopes, and the
++ * phrases, regular expression, SRGS grammar and XML some of them come with. */
++struct input_scope
++{
++    struct list entry;
++    HWND        hwnd;
++    InputScope *scopes;
++    UINT        count;
++    WCHAR     **phrases;
++    UINT        phrase_count;
++    WCHAR      *regexp;
++    WCHAR      *srgs;
++    WCHAR      *xml;
++};
++
++static struct list input_scopes = LIST_INIT( input_scopes );
++static CRITICAL_SECTION input_scope_cs;
++static CRITICAL_SECTION_DEBUG input_scope_cs_debug =
++{
++    0, 0, &input_scope_cs,
++    { &input_scope_cs_debug.ProcessLocksList, &input_scope_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": input_scope_cs") }
++};
++static CRITICAL_SECTION input_scope_cs = { &input_scope_cs_debug, -1, 0, 0, 0, 0 };
++
++static void free_input_scope( struct input_scope *scope )
++{
++    UINT i;
++
++    for (i = 0; i < scope->phrase_count; i++) free( scope->phrases[i] );
++    free( scope->phrases );
++    free( scope->scopes );
++    free( scope->regexp );
++    free( scope->srgs );
++    free( scope->xml );
++    free( scope );
++}
++
++/* the critical section is held: the scopes of windows that are gone go too */
++static struct input_scope *find_input_scope( HWND hwnd )
++{
++    struct input_scope *scope, *next, *ret = NULL;
++
++    LIST_FOR_EACH_ENTRY_SAFE( scope, next, &input_scopes, struct input_scope, entry )
++    {
++        if (!IsWindow( scope->hwnd ))
++        {
++            list_remove( &scope->entry );
++            free_input_scope( scope );
++        }
++        else if (scope->hwnd == hwnd) ret = scope;
++    }
++    return ret;
++}
++
++/* a window's scopes are set by the thread it belongs to */
++static BOOL is_own_window( HWND hwnd )
++{
++    return hwnd && GetWindowThreadProcessId( hwnd, NULL ) == GetCurrentThreadId();
++}
++
++static HRESULT set_input_scope( HWND hwnd, struct input_scope *new )
++{
++    struct input_scope *old;
++
++    EnterCriticalSection( &input_scope_cs );
++    if ((old = find_input_scope( hwnd )))
++    {
++        list_remove( &old->entry );
++        free_input_scope( old );
++    }
++    if (new)
++    {
++        new->hwnd = hwnd;
++        list_add_tail( &input_scopes, &new->entry );
++    }
++    LeaveCriticalSection( &input_scope_cs );
++    return S_OK;
++}
++
++static BOOL add_scope( struct input_scope *scope, InputScope value )
++{
++    InputScope *scopes = realloc( scope->scopes, (scope->count + 1) * sizeof(*scopes) );
++
++    if (!scopes) return FALSE;
++    scope->scopes = scopes;
++    scope->scopes[scope->count++] = value;
++    return TRUE;
++}
++
++static WCHAR *dup_wstr( const WCHAR *str )
++{
++    WCHAR *ret;
++
++    if (!str) return NULL;
++    if ((ret = malloc( (wcslen( str ) + 1) * sizeof(WCHAR) ))) wcscpy( ret, str );
++    return ret;
++}
++
+ /***********************************************************************
+  *              SetInputScope(MSCTF.@)
+  */
+ HRESULT WINAPI SetInputScope(HWND hwnd, InputScope inputscope)
+ {
+-    FIXME("STUB: %p %i\n",hwnd,inputscope);
+-    return S_OK;
++    struct input_scope *scope;
++
++    TRACE( "%p %d\n", hwnd, inputscope );
++
++    if (!is_own_window( hwnd )) return E_INVALIDARG;
++    /* the default is no scope at all */
++    if (inputscope == IS_DEFAULT) return set_input_scope( hwnd, NULL );
++    if (!(scope = calloc( 1, sizeof(*scope) )) || !add_scope( scope, inputscope ))
++    {
++        free( scope );
++        return E_OUTOFMEMORY;
++    }
++    return set_input_scope( hwnd, scope );
+ }
+ 
+ /***********************************************************************
+  *              SetInputScopes(MSCTF.@)
++ *
++ * The phrases, regular expression and SRGS grammar given add IS_PHRASELIST, IS_REGULAREXPRESSION and IS_SRGS to the
++ * scopes.
+  */
+ HRESULT WINAPI SetInputScopes(HWND hwnd, const InputScope *pInputScopes,
+                               UINT cInputScopes, WCHAR **ppszPhraseList,
+                               UINT cPhrases, WCHAR *pszRegExp, WCHAR *pszSRGS)
+ {
++    struct input_scope *scope;
++    BOOL ok = TRUE;
++    UINT i;
++
++    TRACE( "%p %p %u %p %u %s %s\n", hwnd, pInputScopes, cInputScopes, ppszPhraseList, cPhrases,
++           debugstr_w(pszRegExp), debugstr_w(pszSRGS) );
++
++    if (!is_own_window( hwnd )) return E_INVALIDARG;
++    if (!(scope = calloc( 1, sizeof(*scope) ))) return E_OUTOFMEMORY;
++    for (i = 0; ok && i < cInputScopes; i++) ok = add_scope( scope, pInputScopes ? pInputScopes[i] : IS_DEFAULT );
++    if (ok && ppszPhraseList && cPhrases)
++    {
++        if (!(scope->phrases = calloc( cPhrases, sizeof(*scope->phrases) ))) ok = FALSE;
++        for (i = 0; ok && i < cPhrases; i++, scope->phrase_count++)
++            if (ppszPhraseList[i] && !(scope->phrases[i] = dup_wstr( ppszPhraseList[i] ))) ok = FALSE;
++        if (ok) ok = add_scope( scope, IS_PHRASELIST );
++    }
++    if (ok && pszRegExp) ok = (scope->regexp = dup_wstr( pszRegExp )) && add_scope( scope, IS_REGULAREXPRESSION );
++    if (ok && pszSRGS) ok = (scope->srgs = dup_wstr( pszSRGS )) && add_scope( scope, IS_SRGS );
++    if (!ok)
++    {
++        free_input_scope( scope );
++        return E_OUTOFMEMORY;
++    }
++    return set_input_scope( hwnd, scope );
++}
++
++/***********************************************************************
++ *              SetInputScopeXML(MSCTF.@)
++ */
++HRESULT WINAPI SetInputScopeXML(HWND hwnd, WCHAR *xml)
++{
++    struct input_scope *scope;
++
++    TRACE( "%p %s\n", hwnd, debugstr_w(xml) );
++
++    if (!is_own_window( hwnd )) return E_INVALIDARG;
++    if (!(scope = calloc( 1, sizeof(*scope) )) || !add_scope( scope, IS_XML ) ||
++        (xml && !(scope->xml = dup_wstr( xml ))))
++    {
++        if (scope) free_input_scope( scope );
++        return E_OUTOFMEMORY;
++    }
++    return set_input_scope( hwnd, scope );
++}
++
++struct input_scope_object
++{
++    ITfInputScope       ITfInputScope_iface;
++    LONG                refcount;
++    struct input_scope *scope;
++};
++
++static inline struct input_scope_object *impl_from_ITfInputScope( ITfInputScope *iface )
++{
++    return CONTAINING_RECORD( iface, struct input_scope_object, ITfInputScope_iface );
++}
++
++static HRESULT WINAPI input_scope_QueryInterface( ITfInputScope *iface, REFIID iid, void **out )
++{
++    TRACE( "%p, %s, %p\n", iface, debugstr_guid(iid), out );
++
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_ITfInputScope ))
++    {
++        *out = iface;
++        ITfInputScope_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI input_scope_AddRef( ITfInputScope *iface )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++    return InterlockedIncrement( &object->refcount );
++}
++
++static ULONG WINAPI input_scope_Release( ITfInputScope *iface )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++    ULONG ref = InterlockedDecrement( &object->refcount );
++
++    if (!ref)
++    {
++        free_input_scope( object->scope );
++        free( object );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI input_scope_GetInputScopes( ITfInputScope *iface, InputScope **scopes, UINT *count )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++
++    TRACE( "%p, %p, %p\n", iface, scopes, count );
++
++    if (!scopes || !count) return E_INVALIDARG;
++    *scopes = NULL;
++    *count = object->scope->count;
++    if (!object->scope->count) return S_OK;
++    if (!(*scopes = CoTaskMemAlloc( object->scope->count * sizeof(**scopes) ))) return E_OUTOFMEMORY;
++    memcpy( *scopes, object->scope->scopes, object->scope->count * sizeof(**scopes) );
++    return S_OK;
++}
++
++static HRESULT WINAPI input_scope_GetPhrase( ITfInputScope *iface, BSTR **phrases, UINT *count )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++    UINT i;
++
++    TRACE( "%p, %p, %p\n", iface, phrases, count );
++
++    if (!phrases || !count) return E_INVALIDARG;
++    *phrases = NULL;
++    *count = 0;
++    if (!object->scope->phrase_count) return S_OK;
++    if (!(*phrases = CoTaskMemAlloc( object->scope->phrase_count * sizeof(**phrases) ))) return E_OUTOFMEMORY;
++    for (i = 0; i < object->scope->phrase_count; i++) (*phrases)[i] = SysAllocString( object->scope->phrases[i] );
++    *count = object->scope->phrase_count;
++    return S_OK;
++}
++
++/* a string it has, or S_FALSE */
++static HRESULT get_string( const WCHAR *str, BSTR *ret )
++{
++    if (!ret) return E_INVALIDARG;
++    if (!str)
++    {
++        *ret = NULL;
++        return S_FALSE;
++    }
++    return (*ret = SysAllocString( str )) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI input_scope_GetRegularExpression( ITfInputScope *iface, BSTR *regexp )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++
++    TRACE( "%p, %p\n", iface, regexp );
++    return get_string( object->scope->regexp, regexp );
++}
++
++static HRESULT WINAPI input_scope_GetSRGS( ITfInputScope *iface, BSTR *srgs )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++
++    TRACE( "%p, %p\n", iface, srgs );
++    return get_string( object->scope->srgs, srgs );
++}
++
++static HRESULT WINAPI input_scope_GetXML( ITfInputScope *iface, BSTR *xml )
++{
++    struct input_scope_object *object = impl_from_ITfInputScope( iface );
++
++    TRACE( "%p, %p\n", iface, xml );
++    return get_string( object->scope->xml, xml );
++}
++
++static const ITfInputScopeVtbl input_scope_vtbl =
++{
++    input_scope_QueryInterface,
++    input_scope_AddRef,
++    input_scope_Release,
++    input_scope_GetInputScopes,
++    input_scope_GetPhrase,
++    input_scope_GetRegularExpression,
++    input_scope_GetSRGS,
++    input_scope_GetXML,
++};
++
++/* a copy of what a window was given, as it is now */
++static struct input_scope *copy_input_scope( const struct input_scope *scope )
++{
++    struct input_scope *copy;
++    BOOL ok = TRUE;
+     UINT i;
+-    FIXME("STUB: %p ... %s %s\n",hwnd, debugstr_w(pszRegExp), debugstr_w(pszSRGS));
+-    for (i = 0; i < cInputScopes; i++)
+-        TRACE("\tScope[%u] = %i\n",i,pInputScopes[i]);
+-    for (i = 0; i < cPhrases; i++)
+-        TRACE("\tPhrase[%u] = %s\n",i,debugstr_w(ppszPhraseList[i]));
+ 
++    if (!(copy = calloc( 1, sizeof(*copy) ))) return NULL;
++    copy->hwnd = scope->hwnd;
++    if (scope->count && !(copy->scopes = malloc( scope->count * sizeof(*copy->scopes) ))) ok = FALSE;
++    if (ok && scope->count)
++    {
++        memcpy( copy->scopes, scope->scopes, scope->count * sizeof(*copy->scopes) );
++        copy->count = scope->count;
++    }
++    if (ok && scope->phrase_count && !(copy->phrases = calloc( scope->phrase_count, sizeof(*copy->phrases) ))) ok = FALSE;
++    for (i = 0; ok && i < scope->phrase_count; i++, copy->phrase_count++)
++        if (scope->phrases[i] && !(copy->phrases[i] = dup_wstr( scope->phrases[i] ))) ok = FALSE;
++    if (ok && scope->regexp && !(copy->regexp = dup_wstr( scope->regexp ))) ok = FALSE;
++    if (ok && scope->srgs && !(copy->srgs = dup_wstr( scope->srgs ))) ok = FALSE;
++    if (ok && scope->xml && !(copy->xml = dup_wstr( scope->xml ))) ok = FALSE;
++    if (ok) return copy;
++    free_input_scope( copy );
++    return NULL;
++}
++
++/***********************************************************************
++ *              TF_GetInputScope(MSCTF.@)
++ */
++HRESULT WINAPI TF_GetInputScope(HWND hwnd, ITfInputScope **out)
++{
++    struct input_scope_object *object;
++    struct input_scope *scope, *copy = NULL;
++
++    TRACE( "%p %p\n", hwnd, out );
++
++    if (!out) return E_INVALIDARG;
++    *out = NULL;
++    if (!hwnd || !IsWindow( hwnd )) return E_INVALIDARG;
++
++    EnterCriticalSection( &input_scope_cs );
++    if ((scope = find_input_scope( hwnd ))) copy = copy_input_scope( scope );
++    LeaveCriticalSection( &input_scope_cs );
++    if (!scope) return S_FALSE;
++    if (!copy || !(object = calloc( 1, sizeof(*object) )))
++    {
++        if (copy) free_input_scope( copy );
++        return E_OUTOFMEMORY;
++    }
++    object->ITfInputScope_iface.lpVtbl = &input_scope_vtbl;
++    object->refcount = 1;
++    object->scope = copy;
++    *out = &object->ITfInputScope_iface;
+     return S_OK;
+ }
+ 
+diff --git a/dlls/msctf/msctf.spec b/dlls/msctf/msctf.spec
+index c3d909ccf5d..1317760c8aa 100644
+--- a/dlls/msctf/msctf.spec
++++ b/dlls/msctf/msctf.spec
+@@ -3,7 +3,7 @@
+ @ stdcall -private DllRegisterServer()
+ @ stdcall -private DllUnregisterServer()
+ @ stdcall SetInputScope(long long)
+-@ stub SetInputScopeXML
++@ stdcall SetInputScopeXML(long wstr)
+ @ stdcall SetInputScopes(long ptr long ptr long wstr wstr)
+ @ stub TF_CUASAppFix
+ @ stub TF_CheckThreadInputIdle
+@@ -17,7 +17,7 @@
+ @ stdcall TF_CreateThreadMgr(ptr)
+ @ stub TF_DllDetachInOther
+ @ stub TF_GetGlobalCompartment
+-@ stub TF_GetInputScope
++@ stdcall TF_GetInputScope(long ptr)
+ @ stub TF_GetLangIcon
+ @ stub TF_GetMlngHKL
+ @ stub TF_GetMlngIconIndex
+diff --git a/libs/uuid/uuid.c b/libs/uuid/uuid.c
+index f31b9bf7802..cb9359ad5c1 100644
+--- a/libs/uuid/uuid.c
++++ b/libs/uuid/uuid.c
+@@ -89,6 +89,7 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+ #include "netfw.h"
+ #include "natupnp.h"
+ #include "msctf.h"
++#include "inputscope.h"
+ #include "sensevts.h"
+ #include "ocmm.h"
+ #include "commoncontrols.h"

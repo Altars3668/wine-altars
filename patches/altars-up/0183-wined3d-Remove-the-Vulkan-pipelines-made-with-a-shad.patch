@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:01:05 -0400
+Subject: [PATCH] wined3d: Remove the Vulkan pipelines made with a shader
+ module when it goes.
+
+Graphics pipelines are cached by the handles of their shader modules.
+When a shader went, its modules were destroyed and the contexts let go of
+them, but the pipelines made with them stayed in the cache; a module made
+later can be given the same handle, and then the stale pipeline is found
+and a shader long gone is run.  Drawing the same thing with shaders
+released one after another gave different results depending on which
+shaders had been made before.
+
+The pipelines made with a module are now taken out of the cache, and
+destroyed once the command buffer is done, as the module goes.  With the
+Vulkan renderer the d3d11 tests go from 303 failures to 12 here, with this
+and the per-sample fixes just before together; many of the tests make and
+release shaders in loops.  Four of ps_ibfe's cases marked todo now pass
+with both renderers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit fc2489e2fedddf05f902c79eaf673940756a1f86)
+
+diff --git a/dlls/d3d11/tests/d3d11.c b/dlls/d3d11/tests/d3d11.c
+index dfb9e6bd3bb..3726823c6bf 100644
+--- a/dlls/d3d11/tests/d3d11.c
++++ b/dlls/d3d11/tests/d3d11.c
+@@ -21438,10 +21438,10 @@ static void test_uint_shader_instructions(void)
+         {&ps_ibfe, {15, 15, 0xffff00ff}, {0xfffffffe, 0xfffffffe, 0xfffffffe, 0xfffffffe}},
+         {&ps_ibfe, {16, 15, 0xffffffff}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}},
+         {&ps_ibfe, {16, 15, 0x3fffffff}, {0x00007fff, 0x00007fff, 0x00007fff, 0x00007fff}},
+-        {&ps_ibfe, {20, 15, 0xffffffff}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}, .todo = true},
+-        {&ps_ibfe, {31, 31, 0xffffffff}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}, .todo = true},
+-        {&ps_ibfe, {31, 31, 0x80000000}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}, .todo = true},
+-        {&ps_ibfe, {31, 31, 0x7fffffff}, {0x00000000, 0x00000000, 0x00000000, 0x00000000}, .todo = true},
++        {&ps_ibfe, {20, 15, 0xffffffff}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}},
++        {&ps_ibfe, {31, 31, 0xffffffff}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}},
++        {&ps_ibfe, {31, 31, 0x80000000}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}},
++        {&ps_ibfe, {31, 31, 0x7fffffff}, {0x00000000, 0x00000000, 0x00000000, 0x00000000}},
+ 
+         {&ps_ibfe2, {16, 15, 0x3fffffff}, {0x00007fff, 0x00007fff, 0x00007fff, 0x00007fff}},
+ 
+diff --git a/dlls/wined3d/context_vk.c b/dlls/wined3d/context_vk.c
+index 77519c28a33..39d4d94737c 100644
+--- a/dlls/wined3d/context_vk.c
++++ b/dlls/wined3d/context_vk.c
+@@ -3745,6 +3745,40 @@ fail:
+     return NULL;
+ }
+ 
++/* The pipelines made with a shader module go with it: the handle of one made later may be the same, and
++ * would find them. */
++void wined3d_context_vk_remove_graphics_pipelines(struct wined3d_context_vk *context_vk, VkShaderModule vk_module)
++{
++    struct wined3d_graphics_pipeline_vk *pipeline_vk, **pipelines = NULL;
++    SIZE_T size = 0, count = 0, i;
++    unsigned int j;
++
++    RB_FOR_EACH_ENTRY(pipeline_vk, &context_vk->graphics_pipelines, struct wined3d_graphics_pipeline_vk, entry)
++    {
++        for (j = 0; j < pipeline_vk->key.pipeline_desc.stageCount; ++j)
++        {
++            if (pipeline_vk->key.stages[j].module != vk_module)
++                continue;
++            if (!wined3d_array_reserve((void **)&pipelines, &size, count + 1, sizeof(*pipelines)))
++            {
++                ERR("Failed to grow the array of pipelines to remove.\n");
++                break;
++            }
++            pipelines[count++] = pipeline_vk;
++            break;
++        }
++    }
++
++    for (i = 0; i < count; ++i)
++    {
++        wine_rb_remove(&context_vk->graphics_pipelines, &pipelines[i]->entry);
++        wined3d_context_vk_destroy_vk_pipeline(context_vk, pipelines[i]->vk_pipeline,
++                context_vk->current_command_buffer.id);
++        free(pipelines[i]);
++    }
++    free(pipelines);
++}
++
+ static VkPipeline wined3d_context_vk_get_graphics_pipeline(struct wined3d_context_vk *context_vk)
+ {
+     struct wined3d_device_vk *device_vk = wined3d_device_vk(context_vk->c.device);
+diff --git a/dlls/wined3d/shader_spirv.c b/dlls/wined3d/shader_spirv.c
+index 08c6952a86f..70d03611660 100644
+--- a/dlls/wined3d/shader_spirv.c
++++ b/dlls/wined3d/shader_spirv.c
+@@ -1066,6 +1066,7 @@ static void shader_spirv_invalidate_graphics_program_variant(struct wined3d_cont
+         context_vk->graphics.vk_modules[shader_type] = VK_NULL_HANDLE;
+         context_vk->c.shader_update_mask |= (1u << shader_type);
+     }
++    wined3d_context_vk_remove_graphics_pipelines(context_vk, variant->vk_module);
+ }
+ 
+ static void shader_spirv_invalidate_contexts_graphics_program_variant(struct wined3d_device *device,
+diff --git a/dlls/wined3d/wined3d_vk.h b/dlls/wined3d/wined3d_vk.h
+index 330ab1f7a54..ba7e011b247 100644
+--- a/dlls/wined3d/wined3d_vk.h
++++ b/dlls/wined3d/wined3d_vk.h
+@@ -799,6 +799,8 @@ void wined3d_context_vk_destroy_vk_event(struct wined3d_context_vk *context_vk,
+         VkEvent vk_event, uint64_t command_buffer_id);
+ void wined3d_context_vk_destroy_vk_pipeline(struct wined3d_context_vk *context_vk,
+         VkPipeline vk_pipeline, uint64_t command_buffer_id);
++void wined3d_context_vk_remove_graphics_pipelines(struct wined3d_context_vk *context_vk,
++        VkShaderModule vk_module);
+ void wined3d_context_vk_destroy_vk_video_parameters(struct wined3d_context_vk *context_vk,
+         VkVideoSessionParametersKHR vk_video_parameters, uint64_t command_buffer_id);
+ void wined3d_context_vk_destroy_vk_video_session(struct wined3d_context_vk *context_vk,

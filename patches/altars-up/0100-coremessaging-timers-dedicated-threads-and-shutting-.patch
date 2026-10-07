@@ -1,0 +1,1674 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 07:59:22 -0400
+Subject: [PATCH] coremessaging: timers, dedicated threads, and shutting a
+ queue down.
+
+A dispatcher queue could run what was queued on it and nothing more:
+CreateTimer failed, a dedicated thread was the calling thread,
+ShutdownQueueAsync completed without doing anything, and the two
+shutdown events were never raised.  Windows.UI.Composition draws its
+animations' frames with a queue's timer, and WinAppSDK code shuts its
+queues down, so all of it is now there.
+
+A timer ticks through a window timer on the queue's window, on the
+queue's thread, whichever thread starts or stops it.  As measured on
+Windows: a new timer has no interval, repeats and is not running;
+IsRunning is FALSE while its handlers run, even for a repeating timer;
+a negative interval is E_INVALIDARG and leaves the interval as it was;
+a handler may stop its own timer; and the queue holds no reference to a
+timer, so one released while running stops.
+
+A dedicated thread makes its queue, runs its messages, and holds a
+reference to the queue until the queue shuts down.  A shutdown is a
+message posted to the queue, so what was queued before runs first;
+ShutdownStarting's handlers can hold it with a deferral; then the queue
+takes nothing more, TryEnqueue saying so with FALSE rather than
+failing, the operation completes, ShutdownCompleted is raised, and a
+dedicated thread ends.  The operation is completed before that event,
+as the tests expect of it.
+
+The tests of the existing file now pass without their todos, and new
+ones for the timer pass on Windows as they do here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 4566ae2e1288e24f6a58a14cb5daebc9d764d779)
+
+diff --git a/dlls/coremessaging/main.c b/dlls/coremessaging/main.c
+index d7d61d35fbd..5387b54e046 100644
+--- a/dlls/coremessaging/main.c
++++ b/dlls/coremessaging/main.c
+@@ -205,20 +205,17 @@ static HRESULT WINAPI dispatcher_queue_controller_get_DispatcherQueue( IDispatch
+     return S_OK;
+ }
+ 
+-static HRESULT shutdown_queue_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+-{
+-    if (!called_async) return STATUS_PENDING;
+-    return S_OK;
+-}
+-
++/* the queue runs what was queued before, raises its events, and takes nothing more */
+ static HRESULT WINAPI dispatcher_queue_controller_ShutdownQueueAsync( IDispatcherQueueController *iface, IAsyncAction **operation )
+ {
+-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
++    struct dispatcher_queue_controller *impl = impl_from_IDispatcherQueueController( iface );
++
++    TRACE( "iface %p, operation %p.\n", iface, operation );
+ 
+     if (!operation) return E_POINTER;
+     *operation = NULL;
+-
+-    return async_action_create( NULL, shutdown_queue_async, operation );
++    if (!impl->queue) return RO_E_CLOSED;
++    return dispatcher_queue_shutdown( impl->queue, operation );
+ }
+ 
+ static const struct IDispatcherQueueControllerVtbl dispatcher_queue_controller_vtbl =
+@@ -237,10 +234,16 @@ static const struct IDispatcherQueueControllerVtbl dispatcher_queue_controller_v
+ 
+ DEFINE_IINSPECTABLE( dispatcher_queue_controller_statics, IDispatcherQueueControllerStatics, struct dispatcher_queue_controller_statics, IActivationFactory_iface )
+ 
++static HRESULT dispatcher_queue_controller_create( DISPATCHERQUEUE_THREAD_TYPE thread_type,
++                                                   DISPATCHERQUEUE_THREAD_APARTMENTTYPE apartment_type,
++                                                   IDispatcherQueueController **out );
++
+ static HRESULT WINAPI dispatcher_queue_controller_statics_CreateOnDedicatedThread( IDispatcherQueueControllerStatics *iface, IDispatcherQueueController **result )
+ {
+-    FIXME( "iface %p, result %p stub!\n", iface, result );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, result %p.\n", iface, result );
++
++    if (!result) return E_POINTER;
++    return dispatcher_queue_controller_create( DQTYPE_THREAD_DEDICATED, DQTAT_COM_STA, result );
+ }
+ 
+ static const struct IDispatcherQueueControllerStaticsVtbl dispatcher_queue_controller_statics_vtbl =
+@@ -282,32 +285,97 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+ 
+-HRESULT WINAPI CreateDispatcherQueueController( DispatcherQueueOptions options, PDISPATCHERQUEUECONTROLLER *queue_controller )
++/*
++ * A dedicated thread is the queue's own: it makes the queue, runs its
++ * messages until the queue shuts down, and holds a reference to it until then.
++ */
++struct dedicated_thread
+ {
+-    struct dispatcher_queue_controller *impl;
+-
++    DISPATCHERQUEUE_THREAD_APARTMENTTYPE apartment_type;
++    HANDLE ready;
++    IDispatcherQueue *queue;
+     HRESULT hr;
++};
+ 
+-    TRACE( "options.dwSize = %lu, options.threadType = %d, options.apartmentType = %d, queue_controller %p.\n",
+-            options.dwSize, options.threadType, options.apartmentType, queue_controller );
++static DWORD WINAPI dedicated_thread_proc( void *arg )
++{
++    struct dedicated_thread *params = arg;
++    IDispatcherQueue *queue;
++    BOOL com;
++    MSG msg;
+ 
+-    if (!queue_controller) return E_POINTER;
+-    if (options.dwSize != sizeof( DispatcherQueueOptions )) return E_INVALIDARG;
+-    if (options.threadType != DQTYPE_THREAD_DEDICATED && options.threadType != DQTYPE_THREAD_CURRENT) return E_INVALIDARG;
+-    if (options.threadType == DQTYPE_THREAD_DEDICATED)
+-        FIXME( "DQTYPE_THREAD_DEDICATED not implemented, using the calling thread.\n" );
+-    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
++    SetThreadDescription( GetCurrentThread(), L"wine_coremessaging_dispatcher_queue" );
++    com = params->apartment_type != DQTAT_COM_NONE && SUCCEEDED(CoInitializeEx( NULL, COINIT_APARTMENTTHREADED ));
++    if (SUCCEEDED(params->hr = dispatcher_queue_create_for_current_thread( TRUE, &queue )))
++    {
++        IDispatcherQueue_AddRef( queue );
++        params->queue = queue;
++    }
++    SetEvent( params->ready );
++    if (FAILED(params->hr)) goto done;
++
++    while (GetMessageW( &msg, NULL, 0, 0 ))
++    {
++        TranslateMessage( &msg );
++        DispatchMessageW( &msg );
++    }
++    IDispatcherQueue_Release( queue );
++
++done:
++    if (com) CoUninitialize();
++    return 0;
++}
++
++static HRESULT dispatcher_queue_controller_create( DISPATCHERQUEUE_THREAD_TYPE thread_type,
++                                                   DISPATCHERQUEUE_THREAD_APARTMENTTYPE apartment_type,
++                                                   IDispatcherQueueController **out )
++{
++    struct dispatcher_queue_controller *impl;
++    struct dedicated_thread params;
++    HANDLE thread;
++    HRESULT hr;
+ 
++    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
+     impl->IDispatcherQueueController_iface.lpVtbl = &dispatcher_queue_controller_vtbl;
+     impl->ref = 1;
+ 
+-    if (FAILED(hr = dispatcher_queue_create_for_current_thread( &impl->queue )))
++    if (thread_type == DQTYPE_THREAD_CURRENT)
++        hr = dispatcher_queue_create_for_current_thread( FALSE, &impl->queue );
++    else
++    {
++        params.apartment_type = apartment_type;
++        params.ready = CreateEventW( NULL, TRUE, FALSE, NULL );
++        params.queue = NULL;
++        params.hr = E_FAIL;
++        if (!(thread = CreateThread( NULL, 0, dedicated_thread_proc, &params, 0, NULL )))
++            hr = HRESULT_FROM_WIN32( GetLastError() );
++        else
++        {
++            WaitForSingleObject( params.ready, INFINITE );
++            CloseHandle( thread );
++            impl->queue = params.queue;
++            hr = params.hr;
++        }
++        CloseHandle( params.ready );
++    }
++    if (FAILED(hr))
+     {
+         free( impl );
+         return hr;
+     }
+ 
+-    *queue_controller = &impl->IDispatcherQueueController_iface;
+-    TRACE( "created IDispatcherQueueController %p.\n", *queue_controller );
++    *out = &impl->IDispatcherQueueController_iface;
++    TRACE( "created IDispatcherQueueController %p.\n", *out );
+     return S_OK;
+ }
++
++HRESULT WINAPI CreateDispatcherQueueController( DispatcherQueueOptions options, PDISPATCHERQUEUECONTROLLER *queue_controller )
++{
++    TRACE( "options.dwSize = %lu, options.threadType = %d, options.apartmentType = %d, queue_controller %p.\n",
++            options.dwSize, options.threadType, options.apartmentType, queue_controller );
++
++    if (!queue_controller) return E_POINTER;
++    if (options.dwSize != sizeof( DispatcherQueueOptions )) return E_INVALIDARG;
++    if (options.threadType != DQTYPE_THREAD_DEDICATED && options.threadType != DQTYPE_THREAD_CURRENT) return E_INVALIDARG;
++    return dispatcher_queue_controller_create( options.threadType, options.apartmentType, queue_controller );
++}
+diff --git a/dlls/coremessaging/private.h b/dlls/coremessaging/private.h
+index 3e1687e61cb..e82ec20c670 100644
+--- a/dlls/coremessaging/private.h
++++ b/dlls/coremessaging/private.h
+@@ -43,7 +43,8 @@
+ HRESULT async_action_create( IUnknown *invoker, async_operation_callback callback, IAsyncAction **out );
+ 
+ extern IActivationFactory *dispatcher_queue_factory;
+-HRESULT dispatcher_queue_create_for_current_thread( IDispatcherQueue **out );
++HRESULT dispatcher_queue_create_for_current_thread( BOOL dedicated, IDispatcherQueue **out );
++HRESULT dispatcher_queue_shutdown( IDispatcherQueue *queue, IAsyncAction **operation );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/coremessaging/queue.c b/dlls/coremessaging/queue.c
+index 151382d43db..ff208536493 100644
+--- a/dlls/coremessaging/queue.c
++++ b/dlls/coremessaging/queue.c
+@@ -19,6 +19,7 @@
+ 
+ #include "private.h"
+ #include "dispatcherqueue.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(messaging);
+ 
+@@ -27,11 +28,25 @@ WINE_DEFAULT_DEBUG_CHANNEL(messaging);
+  * window on its thread; TryEnqueue posts the handler to it and the window
+  * procedure is what actually runs on the far side. */
+ #define WM_DISPATCHER_QUEUE_INVOKE (WM_USER + 0)
++/* a timer is started or stopped on the queue's thread, which owns the window its timer is set on */
++#define WM_DISPATCHER_QUEUE_TIMER  (WM_USER + 1)
++/* the queue shuts down, after what was queued before; and goes on once the last deferral completes */
++#define WM_DISPATCHER_QUEUE_SHUTDOWN (WM_USER + 2)
++#define WM_DISPATCHER_QUEUE_SHUTDOWN_CONTINUE (WM_USER + 3)
+ 
+ static const WCHAR queue_class_name[] = L"WineDispatcherQueue";
+ 
+ static DWORD queue_tls = TLS_OUT_OF_INDEXES;
+ 
++struct queue_handler
++{
++    struct list entry;
++    EventRegistrationToken token;
++    IUnknown *handler;
++};
++
++struct shutdown_action;
++
+ struct dispatcher_queue
+ {
+     IDispatcherQueue IDispatcherQueue_iface;
+@@ -40,6 +55,15 @@ struct dispatcher_queue
+ 
+     DWORD thread_id;
+     HWND hwnd;
++    BOOL dedicated;                 /* its thread is its own, and ends when it shuts down */
++
++    CRITICAL_SECTION cs;
++    struct list starting_handlers;
++    struct list completed_handlers;
++    UINT64 next_token;
++    struct shutdown_action *shutdown;   /* asked for */
++    LONG deferrals;                 /* of ShutdownStarting, not completed yet */
++    BOOL shut_down;
+ };
+ 
+ static inline struct dispatcher_queue *impl_from_IDispatcherQueue( IDispatcherQueue *iface )
+@@ -47,18 +71,78 @@ static inline struct dispatcher_queue *impl_from_IDispatcherQueue( IDispatcherQu
+     return CONTAINING_RECORD( iface, struct dispatcher_queue, IDispatcherQueue_iface );
+ }
+ 
++/*
++ * A timer ticks through a window timer on its queue's window, named by its
++ * own address.  The queue holds no reference to it -- as on Windows, a timer
++ * released while running stops -- so a tick only goes to a timer that is still
++ * in the list of live ones.
++ */
++struct timer_handler
++{
++    struct list entry;
++    EventRegistrationToken token;
++    ITypedEventHandler_DispatcherQueueTimer_IInspectable *handler;
++};
++
++struct dispatcher_queue_timer
++{
++    IDispatcherQueueTimer IDispatcherQueueTimer_iface;
++    LONG ref;
++    struct list entry;              /* in the live timers */
++
++    struct dispatcher_queue *queue;
++    TimeSpan interval;
++    boolean repeating;
++    boolean running;
++    boolean ticking;                /* its handlers are being called */
++    LONG generation;                /* counts starts and stops, for a tick to tell it was stopped or restarted */
++    struct list handlers;
++    UINT64 next_token;
++};
++
++static struct list live_timers = LIST_INIT( live_timers );
++static CRITICAL_SECTION timers_cs;
++static CRITICAL_SECTION_DEBUG timers_cs_debug =
++{
++    0, 0, &timers_cs,
++    { &timers_cs_debug.ProcessLocksList, &timers_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": timers_cs") }
++};
++static CRITICAL_SECTION timers_cs = { &timers_cs_debug, -1, 0, 0, 0, 0 };
++
++static void timer_tick( UINT_PTR id );
++static void queue_shutdown_start( struct dispatcher_queue *queue );
++static void queue_shutdown_finish( struct dispatcher_queue *queue );
++
+ static LRESULT CALLBACK queue_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+     IDispatcherQueueHandler *handler;
+ 
+-    if (msg != WM_DISPATCHER_QUEUE_INVOKE) return DefWindowProcW( hwnd, msg, wparam, lparam );
+-
+-    if ((handler = (IDispatcherQueueHandler *)lparam))
++    switch (msg)
+     {
+-        IDispatcherQueueHandler_Invoke( handler );
+-        IDispatcherQueueHandler_Release( handler );
++    case WM_DISPATCHER_QUEUE_INVOKE:
++        if ((handler = (IDispatcherQueueHandler *)lparam))
++        {
++            IDispatcherQueueHandler_Invoke( handler );
++            IDispatcherQueueHandler_Release( handler );
++        }
++        return 0;
++    case WM_DISPATCHER_QUEUE_TIMER:
++        /* wparam is the timer's id, lparam its interval in ms, or -1 to stop it */
++        if (lparam == -1) KillTimer( hwnd, wparam );
++        else SetTimer( hwnd, wparam, lparam, NULL );
++        return 0;
++    case WM_TIMER:
++        timer_tick( wparam );
++        return 0;
++    case WM_DISPATCHER_QUEUE_SHUTDOWN:
++        queue_shutdown_start( (struct dispatcher_queue *)lparam );
++        return 0;
++    case WM_DISPATCHER_QUEUE_SHUTDOWN_CONTINUE:
++        queue_shutdown_finish( (struct dispatcher_queue *)lparam );
++        return 0;
+     }
+-    return 0;
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
+ }
+ 
+ static BOOL WINAPI queue_init_once( INIT_ONCE *once, void *param, void **context )
+@@ -82,6 +166,946 @@ static void queue_init( void )
+     InitOnceExecuteOnce( &once, queue_init_once, NULL, NULL );
+ }
+ 
++
++/*** DispatcherQueueTimer ***/
++
++static inline struct dispatcher_queue_timer *impl_from_IDispatcherQueueTimer( IDispatcherQueueTimer *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_queue_timer, IDispatcherQueueTimer_iface );
++}
++
++static UINT timer_ms( const struct dispatcher_queue_timer *timer )
++{
++    INT64 ms = (timer->interval.Duration + 9999) / 10000;
++    return ms > USER_TIMER_MAXIMUM ? USER_TIMER_MAXIMUM : ms;
++}
++
++/* called with timers_cs held */
++static void timer_set( struct dispatcher_queue_timer *timer, BOOL start )
++{
++    HWND hwnd = timer->queue->hwnd;
++    UINT_PTR id = (UINT_PTR)timer;
++
++    if (!hwnd) return;
++    if (timer->queue->thread_id == GetCurrentThreadId())
++    {
++        if (start) SetTimer( hwnd, id, timer_ms( timer ), NULL );
++        else KillTimer( hwnd, id );
++    }
++    else PostMessageW( hwnd, WM_DISPATCHER_QUEUE_TIMER, id, start ? timer_ms( timer ) : -1 );
++}
++
++static void timer_tick( UINT_PTR id )
++{
++    ITypedEventHandler_DispatcherQueueTimer_IInspectable **handlers = NULL;
++    struct dispatcher_queue_timer *timer, *found = NULL;
++    struct timer_handler *entry;
++    unsigned int count = 0, i;
++    LONG generation;
++
++    EnterCriticalSection( &timers_cs );
++    LIST_FOR_EACH_ENTRY( timer, &live_timers, struct dispatcher_queue_timer, entry )
++    {
++        if ((UINT_PTR)timer != id) continue;
++        found = timer;
++        break;
++    }
++    if (!found || !found->running)
++    {
++        LeaveCriticalSection( &timers_cs );
++        return;
++    }
++    timer = found;
++    IDispatcherQueueTimer_AddRef( &timer->IDispatcherQueueTimer_iface );
++    /* while its handlers run, a timer does not count as running */
++    timer->running = FALSE;
++    timer->ticking = TRUE;
++    generation = timer->generation;
++    if (!timer->repeating) KillTimer( timer->queue->hwnd, id );
++    if ((handlers = calloc( list_count( &timer->handlers ) + 1, sizeof(*handlers) )))
++    {
++        LIST_FOR_EACH_ENTRY( entry, &timer->handlers, struct timer_handler, entry )
++        {
++            handlers[count] = entry->handler;
++            ITypedEventHandler_DispatcherQueueTimer_IInspectable_AddRef( handlers[count++] );
++        }
++    }
++    LeaveCriticalSection( &timers_cs );
++
++    TRACE( "timer %p ticks, %u handlers.\n", timer, count );
++    for (i = 0; i < count; i++)
++    {
++        ITypedEventHandler_DispatcherQueueTimer_IInspectable_Invoke( handlers[i], &timer->IDispatcherQueueTimer_iface, NULL );
++        ITypedEventHandler_DispatcherQueueTimer_IInspectable_Release( handlers[i] );
++    }
++    free( handlers );
++
++    EnterCriticalSection( &timers_cs );
++    timer->ticking = FALSE;
++    /* a repeating timer goes on unless a handler stopped or restarted it */
++    if (timer->repeating && timer->generation == generation) timer->running = TRUE;
++    LeaveCriticalSection( &timers_cs );
++    IDispatcherQueueTimer_Release( &timer->IDispatcherQueueTimer_iface );
++}
++
++static HRESULT WINAPI timer_QueryInterface( IDispatcherQueueTimer *iface, REFIID iid, void **out )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDispatcherQueueTimer ))
++    {
++        *out = &timer->IDispatcherQueueTimer_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI timer_AddRef( IDispatcherQueueTimer *iface )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++    ULONG ref = InterlockedIncrement( &timer->ref );
++    TRACE( "iface %p increasing ref to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI timer_Release( IDispatcherQueueTimer *iface )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++    ULONG ref = InterlockedDecrement( &timer->ref );
++    struct timer_handler *entry, *next;
++
++    TRACE( "iface %p decreasing ref to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        EnterCriticalSection( &timers_cs );
++        list_remove( &timer->entry );
++        timer_set( timer, FALSE );
++        LeaveCriticalSection( &timers_cs );
++        LIST_FOR_EACH_ENTRY_SAFE( entry, next, &timer->handlers, struct timer_handler, entry )
++        {
++            list_remove( &entry->entry );
++            ITypedEventHandler_DispatcherQueueTimer_IInspectable_Release( entry->handler );
++            free( entry );
++        }
++        IDispatcherQueue_Release( &timer->queue->IDispatcherQueue_iface );
++        free( timer );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI timer_GetIids( IDispatcherQueueTimer *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI timer_GetRuntimeClassName( IDispatcherQueueTimer *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.System.DispatcherQueueTimer";
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI timer_GetTrustLevel( IDispatcherQueueTimer *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_get_Interval( IDispatcherQueueTimer *iface, TimeSpan *value )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    EnterCriticalSection( &timers_cs );
++    *value = timer->interval;
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++/* a running timer goes on at the new interval */
++static HRESULT WINAPI timer_put_Interval( IDispatcherQueueTimer *iface, TimeSpan value )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p, value %I64d.\n", iface, value.Duration );
++
++    if (value.Duration < 0) return E_INVALIDARG;
++    EnterCriticalSection( &timers_cs );
++    timer->interval = value;
++    if (timer->running) timer_set( timer, TRUE );
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_get_IsRunning( IDispatcherQueueTimer *iface, boolean *value )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    EnterCriticalSection( &timers_cs );
++    *value = timer->running;
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_get_IsRepeating( IDispatcherQueueTimer *iface, boolean *value )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    EnterCriticalSection( &timers_cs );
++    *value = timer->repeating;
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_put_IsRepeating( IDispatcherQueueTimer *iface, boolean value )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p, value %d.\n", iface, value );
++
++    EnterCriticalSection( &timers_cs );
++    timer->repeating = !!value;
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_Start( IDispatcherQueueTimer *iface )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &timers_cs );
++    timer->generation++;
++    timer->running = TRUE;
++    timer_set( timer, TRUE );
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_Stop( IDispatcherQueueTimer *iface )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &timers_cs );
++    timer->generation++;
++    if (timer->running || timer->ticking) timer_set( timer, FALSE );
++    timer->running = FALSE;
++    LeaveCriticalSection( &timers_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_add_Tick( IDispatcherQueueTimer *iface,
++                                      ITypedEventHandler_DispatcherQueueTimer_IInspectable *handler,
++                                      EventRegistrationToken *token )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++    struct timer_handler *entry;
++
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++
++    if (!token) return E_POINTER;
++    if (!handler) return E_INVALIDARG;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    entry->handler = handler;
++    ITypedEventHandler_DispatcherQueueTimer_IInspectable_AddRef( handler );
++    EnterCriticalSection( &timers_cs );
++    entry->token.value = ++timer->next_token;
++    list_add_tail( &timer->handlers, &entry->entry );
++    LeaveCriticalSection( &timers_cs );
++    *token = entry->token;
++    return S_OK;
++}
++
++static HRESULT WINAPI timer_remove_Tick( IDispatcherQueueTimer *iface, EventRegistrationToken token )
++{
++    struct dispatcher_queue_timer *timer = impl_from_IDispatcherQueueTimer( iface );
++    struct timer_handler *entry, *found = NULL;
++
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++
++    EnterCriticalSection( &timers_cs );
++    LIST_FOR_EACH_ENTRY( entry, &timer->handlers, struct timer_handler, entry )
++    {
++        if (entry->token.value != token.value) continue;
++        list_remove( &entry->entry );
++        found = entry;
++        break;
++    }
++    LeaveCriticalSection( &timers_cs );
++    if (found)
++    {
++        ITypedEventHandler_DispatcherQueueTimer_IInspectable_Release( found->handler );
++        free( found );
++    }
++    return S_OK;
++}
++
++static const struct IDispatcherQueueTimerVtbl timer_vtbl =
++{
++    timer_QueryInterface,
++    timer_AddRef,
++    timer_Release,
++    /* IInspectable methods */
++    timer_GetIids,
++    timer_GetRuntimeClassName,
++    timer_GetTrustLevel,
++    /* IDispatcherQueueTimer methods */
++    timer_get_Interval,
++    timer_put_Interval,
++    timer_get_IsRunning,
++    timer_get_IsRepeating,
++    timer_put_IsRepeating,
++    timer_Start,
++    timer_Stop,
++    timer_add_Tick,
++    timer_remove_Tick,
++};
++
++/*** shutting down ***/
++
++/* the operation ShutdownQueueAsync hands out: completed by the queue, on its thread */
++struct shutdown_action
++{
++    IAsyncAction IAsyncAction_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    CRITICAL_SECTION cs;
++    AsyncStatus status;
++    IAsyncActionCompletedHandler *handler;
++    BOOL handler_set;
++};
++
++#define Closed 4
++
++static inline struct shutdown_action *impl_from_IAsyncAction( IAsyncAction *iface )
++{
++    return CONTAINING_RECORD( iface, struct shutdown_action, IAsyncAction_iface );
++}
++
++static HRESULT WINAPI shutdown_action_QueryInterface( IAsyncAction *iface, REFIID iid, void **out )
++{
++    struct shutdown_action *action = impl_from_IAsyncAction( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncAction ))
++        *out = &action->IAsyncAction_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo )) *out = &action->IAsyncInfo_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI shutdown_action_AddRef( IAsyncAction *iface )
++{
++    struct shutdown_action *action = impl_from_IAsyncAction( iface );
++    return InterlockedIncrement( &action->ref );
++}
++
++static ULONG WINAPI shutdown_action_Release( IAsyncAction *iface )
++{
++    struct shutdown_action *action = impl_from_IAsyncAction( iface );
++    ULONG ref = InterlockedDecrement( &action->ref );
++
++    if (!ref)
++    {
++        if (action->handler) IAsyncActionCompletedHandler_Release( action->handler );
++        action->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &action->cs );
++        free( action );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI shutdown_action_GetIids( IAsyncAction *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shutdown_action_GetRuntimeClassName( IAsyncAction *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Foundation.IAsyncAction";
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI shutdown_action_GetTrustLevel( IAsyncAction *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI shutdown_action_put_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler *handler )
++{
++    struct shutdown_action *action = impl_from_IAsyncAction( iface );
++    AsyncStatus status;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    EnterCriticalSection( &action->cs );
++    if (action->status == Closed)
++    {
++        LeaveCriticalSection( &action->cs );
++        return E_ILLEGAL_METHOD_CALL;
++    }
++    if (action->handler_set)
++    {
++        LeaveCriticalSection( &action->cs );
++        return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    }
++    action->handler_set = TRUE;
++    if ((action->handler = handler)) IAsyncActionCompletedHandler_AddRef( handler );
++    status = action->status;
++    LeaveCriticalSection( &action->cs );
++
++    /* a handler set once it has completed is called at once */
++    if (handler && status != Started) IAsyncActionCompletedHandler_Invoke( handler, iface, status );
++    return S_OK;
++}
++
++static HRESULT WINAPI shutdown_action_get_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler **handler )
++{
++    struct shutdown_action *action = impl_from_IAsyncAction( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (!handler) return E_POINTER;
++    EnterCriticalSection( &action->cs );
++    if (action->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    else if ((*handler = action->handler)) IAsyncActionCompletedHandler_AddRef( *handler );
++    LeaveCriticalSection( &action->cs );
++    return hr;
++}
++
++static HRESULT WINAPI shutdown_action_GetResults( IAsyncAction *iface )
++{
++    struct shutdown_action *action = impl_from_IAsyncAction( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &action->cs );
++    hr = action->status == Completed ? S_OK : E_ILLEGAL_METHOD_CALL;
++    LeaveCriticalSection( &action->cs );
++    return hr;
++}
++
++static const struct IAsyncActionVtbl shutdown_action_vtbl =
++{
++    shutdown_action_QueryInterface,
++    shutdown_action_AddRef,
++    shutdown_action_Release,
++    /* IInspectable methods */
++    shutdown_action_GetIids,
++    shutdown_action_GetRuntimeClassName,
++    shutdown_action_GetTrustLevel,
++    /* IAsyncAction methods */
++    shutdown_action_put_Completed,
++    shutdown_action_get_Completed,
++    shutdown_action_GetResults,
++};
++
++DEFINE_IINSPECTABLE( shutdown_info, IAsyncInfo, struct shutdown_action, IAsyncAction_iface )
++
++static HRESULT WINAPI shutdown_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI shutdown_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    struct shutdown_action *action = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &action->cs );
++    if (action->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    *status = action->status;
++    LeaveCriticalSection( &action->cs );
++    return hr;
++}
++
++static HRESULT WINAPI shutdown_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
++{
++    struct shutdown_action *action = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &action->cs );
++    if (action->status == Closed) *error_code = hr = E_ILLEGAL_METHOD_CALL;
++    else *error_code = S_OK;
++    LeaveCriticalSection( &action->cs );
++    return hr;
++}
++
++/* a shutdown, once asked for, happens */
++static HRESULT WINAPI shutdown_info_Cancel( IAsyncInfo *iface )
++{
++    struct shutdown_action *action = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &action->cs );
++    if (action->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    LeaveCriticalSection( &action->cs );
++    return hr;
++}
++
++static HRESULT WINAPI shutdown_info_Close( IAsyncInfo *iface )
++{
++    struct shutdown_action *action = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &action->cs );
++    if (action->status == Started) hr = E_ILLEGAL_STATE_CHANGE;
++    else action->status = Closed;
++    LeaveCriticalSection( &action->cs );
++    return hr;
++}
++
++static const struct IAsyncInfoVtbl shutdown_info_vtbl =
++{
++    shutdown_info_QueryInterface,
++    shutdown_info_AddRef,
++    shutdown_info_Release,
++    /* IInspectable methods */
++    shutdown_info_GetIids,
++    shutdown_info_GetRuntimeClassName,
++    shutdown_info_GetTrustLevel,
++    /* IAsyncInfo methods */
++    shutdown_info_get_Id,
++    shutdown_info_get_Status,
++    shutdown_info_get_ErrorCode,
++    shutdown_info_Cancel,
++    shutdown_info_Close,
++};
++
++static struct shutdown_action *shutdown_action_create(void)
++{
++    struct shutdown_action *action;
++
++    if (!(action = calloc( 1, sizeof(*action) ))) return NULL;
++    action->IAsyncAction_iface.lpVtbl = &shutdown_action_vtbl;
++    action->IAsyncInfo_iface.lpVtbl = &shutdown_info_vtbl;
++    action->ref = 1;
++    action->status = Started;
++    InitializeCriticalSectionEx( &action->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    action->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": shutdown_action.cs");
++    return action;
++}
++
++static void shutdown_action_complete( struct shutdown_action *action )
++{
++    IAsyncActionCompletedHandler *handler;
++
++    EnterCriticalSection( &action->cs );
++    if (action->status == Started) action->status = Completed;
++    if ((handler = action->handler)) IAsyncActionCompletedHandler_AddRef( handler );
++    LeaveCriticalSection( &action->cs );
++    if (handler)
++    {
++        IAsyncActionCompletedHandler_Invoke( handler, &action->IAsyncAction_iface, Completed );
++        IAsyncActionCompletedHandler_Release( handler );
++    }
++}
++
++/* what ShutdownStarting's handlers get: a deferral holds the shutdown until it completes */
++struct shutdown_args
++{
++    IDispatcherQueueShutdownStartingEventArgs IDispatcherQueueShutdownStartingEventArgs_iface;
++    LONG ref;
++    struct dispatcher_queue *queue;
++};
++
++struct deferral
++{
++    IDeferral IDeferral_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++    struct dispatcher_queue *queue;
++    BOOL completed;
++};
++
++static inline struct deferral *impl_from_IDeferral( IDeferral *iface )
++{
++    return CONTAINING_RECORD( iface, struct deferral, IDeferral_iface );
++}
++
++static HRESULT WINAPI deferral_QueryInterface( IDeferral *iface, REFIID iid, void **out )
++{
++    struct deferral *deferral = impl_from_IDeferral( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDeferral ))
++        *out = &deferral->IDeferral_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable )) *out = &deferral->IClosable_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI deferral_AddRef( IDeferral *iface )
++{
++    struct deferral *deferral = impl_from_IDeferral( iface );
++    return InterlockedIncrement( &deferral->ref );
++}
++
++static ULONG WINAPI deferral_Release( IDeferral *iface )
++{
++    struct deferral *deferral = impl_from_IDeferral( iface );
++    ULONG ref = InterlockedDecrement( &deferral->ref );
++
++    if (!ref)
++    {
++        IDispatcherQueue_Release( &deferral->queue->IDispatcherQueue_iface );
++        free( deferral );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI deferral_GetIids( IDeferral *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI deferral_GetRuntimeClassName( IDeferral *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Foundation.Deferral";
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI deferral_GetTrustLevel( IDeferral *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++/* the last of them to complete lets the shutdown go on */
++static HRESULT WINAPI deferral_Complete( IDeferral *iface )
++{
++    struct deferral *deferral = impl_from_IDeferral( iface );
++    struct dispatcher_queue *queue = deferral->queue;
++
++    TRACE( "iface %p.\n", iface );
++
++    if (InterlockedExchange( (LONG *)&deferral->completed, TRUE )) return S_OK;
++    if (!InterlockedDecrement( &queue->deferrals ))
++        PostMessageW( queue->hwnd, WM_DISPATCHER_QUEUE_SHUTDOWN_CONTINUE, 0, (LPARAM)queue );
++    return S_OK;
++}
++
++static const struct IDeferralVtbl deferral_vtbl =
++{
++    deferral_QueryInterface,
++    deferral_AddRef,
++    deferral_Release,
++    /* IInspectable methods */
++    deferral_GetIids,
++    deferral_GetRuntimeClassName,
++    deferral_GetTrustLevel,
++    /* IDeferral methods */
++    deferral_Complete,
++};
++
++DEFINE_IINSPECTABLE( deferral_closable, IClosable, struct deferral, IDeferral_iface )
++
++static HRESULT WINAPI deferral_closable_Close( IClosable *iface )
++{
++    struct deferral *deferral = impl_from_IClosable( iface );
++    return IDeferral_Complete( &deferral->IDeferral_iface );
++}
++
++static const struct IClosableVtbl deferral_closable_vtbl =
++{
++    deferral_closable_QueryInterface,
++    deferral_closable_AddRef,
++    deferral_closable_Release,
++    /* IInspectable methods */
++    deferral_closable_GetIids,
++    deferral_closable_GetRuntimeClassName,
++    deferral_closable_GetTrustLevel,
++    /* IClosable methods */
++    deferral_closable_Close,
++};
++
++static inline struct shutdown_args *impl_from_IDispatcherQueueShutdownStartingEventArgs( IDispatcherQueueShutdownStartingEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct shutdown_args, IDispatcherQueueShutdownStartingEventArgs_iface );
++}
++
++static HRESULT WINAPI shutdown_args_QueryInterface( IDispatcherQueueShutdownStartingEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDispatcherQueueShutdownStartingEventArgs ))
++    {
++        IDispatcherQueueShutdownStartingEventArgs_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI shutdown_args_AddRef( IDispatcherQueueShutdownStartingEventArgs *iface )
++{
++    struct shutdown_args *args = impl_from_IDispatcherQueueShutdownStartingEventArgs( iface );
++    return InterlockedIncrement( &args->ref );
++}
++
++static ULONG WINAPI shutdown_args_Release( IDispatcherQueueShutdownStartingEventArgs *iface )
++{
++    struct shutdown_args *args = impl_from_IDispatcherQueueShutdownStartingEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &args->ref );
++
++    if (!ref)
++    {
++        IDispatcherQueue_Release( &args->queue->IDispatcherQueue_iface );
++        free( args );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI shutdown_args_GetIids( IDispatcherQueueShutdownStartingEventArgs *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shutdown_args_GetRuntimeClassName( IDispatcherQueueShutdownStartingEventArgs *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.System.DispatcherQueueShutdownStartingEventArgs";
++    return WindowsCreateString( name, ARRAY_SIZE(name) - 1, class_name );
++}
++
++static HRESULT WINAPI shutdown_args_GetTrustLevel( IDispatcherQueueShutdownStartingEventArgs *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI shutdown_args_GetDeferral( IDispatcherQueueShutdownStartingEventArgs *iface, IDeferral **result )
++{
++    struct shutdown_args *args = impl_from_IDispatcherQueueShutdownStartingEventArgs( iface );
++    struct deferral *deferral;
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++
++    if (!result) return E_POINTER;
++    if (!(deferral = calloc( 1, sizeof(*deferral) ))) return E_OUTOFMEMORY;
++    deferral->IDeferral_iface.lpVtbl = &deferral_vtbl;
++    deferral->IClosable_iface.lpVtbl = &deferral_closable_vtbl;
++    deferral->ref = 1;
++    deferral->queue = args->queue;
++    IDispatcherQueue_AddRef( &args->queue->IDispatcherQueue_iface );
++    InterlockedIncrement( &args->queue->deferrals );
++    *result = &deferral->IDeferral_iface;
++    return S_OK;
++}
++
++static const struct IDispatcherQueueShutdownStartingEventArgsVtbl shutdown_args_vtbl =
++{
++    shutdown_args_QueryInterface,
++    shutdown_args_AddRef,
++    shutdown_args_Release,
++    /* IInspectable methods */
++    shutdown_args_GetIids,
++    shutdown_args_GetRuntimeClassName,
++    shutdown_args_GetTrustLevel,
++    /* IDispatcherQueueShutdownStartingEventArgs methods */
++    shutdown_args_GetDeferral,
++};
++
++/* the handlers of an event, as they are when it is raised */
++static IUnknown **handlers_snapshot( struct dispatcher_queue *queue, struct list *list, unsigned int *count )
++{
++    struct queue_handler *entry;
++    IUnknown **handlers;
++
++    *count = 0;
++    EnterCriticalSection( &queue->cs );
++    if ((handlers = calloc( list_count( list ) + 1, sizeof(*handlers) )))
++    {
++        LIST_FOR_EACH_ENTRY( entry, list, struct queue_handler, entry )
++        {
++            handlers[(*count)++] = entry->handler;
++            IUnknown_AddRef( entry->handler );
++        }
++    }
++    LeaveCriticalSection( &queue->cs );
++    return handlers;
++}
++
++/* on the queue's thread, once what was queued before the shutdown has run */
++static void queue_shutdown_start( struct dispatcher_queue *queue )
++{
++    struct shutdown_args *args;
++    unsigned int count, i;
++    IUnknown **handlers;
++
++    TRACE( "queue %p.\n", queue );
++
++    /* the handlers' deferrals, and one of the queue's own while it calls them */
++    InterlockedIncrement( &queue->deferrals );
++    if ((args = calloc( 1, sizeof(*args) )))
++    {
++        args->IDispatcherQueueShutdownStartingEventArgs_iface.lpVtbl = &shutdown_args_vtbl;
++        args->ref = 1;
++        args->queue = queue;
++        IDispatcherQueue_AddRef( &queue->IDispatcherQueue_iface );
++        handlers = handlers_snapshot( queue, &queue->starting_handlers, &count );
++        for (i = 0; i < count; i++)
++        {
++            ITypedEventHandler_DispatcherQueue_DispatcherQueueShutdownStartingEventArgs_Invoke(
++                    (ITypedEventHandler_DispatcherQueue_DispatcherQueueShutdownStartingEventArgs *)handlers[i],
++                    &queue->IDispatcherQueue_iface, &args->IDispatcherQueueShutdownStartingEventArgs_iface );
++            IUnknown_Release( handlers[i] );
++        }
++        free( handlers );
++        IDispatcherQueueShutdownStartingEventArgs_Release( &args->IDispatcherQueueShutdownStartingEventArgs_iface );
++    }
++    if (!InterlockedDecrement( &queue->deferrals )) queue_shutdown_finish( queue );
++}
++
++/* nothing more is queued; the operation completes, and ShutdownCompleted is raised */
++static void queue_shutdown_finish( struct dispatcher_queue *queue )
++{
++    struct shutdown_action *action;
++    unsigned int count, i;
++    IUnknown **handlers;
++
++    TRACE( "queue %p.\n", queue );
++
++    EnterCriticalSection( &queue->cs );
++    queue->shut_down = TRUE;
++    action = queue->shutdown;
++    LeaveCriticalSection( &queue->cs );
++
++    if (action) shutdown_action_complete( action );
++    handlers = handlers_snapshot( queue, &queue->completed_handlers, &count );
++    for (i = 0; i < count; i++)
++    {
++        ITypedEventHandler_DispatcherQueue_IInspectable_Invoke( (ITypedEventHandler_DispatcherQueue_IInspectable *)handlers[i],
++                                                                &queue->IDispatcherQueue_iface, NULL );
++        IUnknown_Release( handlers[i] );
++    }
++    free( handlers );
++
++    /* a thread of the queue's own has nothing more to do */
++    if (queue->dedicated) PostQuitMessage( 0 );
++}
++
++/* ShutdownQueueAsync: the operation of the one shutdown there is */
++HRESULT dispatcher_queue_shutdown( IDispatcherQueue *iface, IAsyncAction **operation )
++{
++    struct dispatcher_queue *queue = impl_from_IDispatcherQueue( iface );
++    struct shutdown_action *action;
++    BOOL start = FALSE;
++
++    EnterCriticalSection( &queue->cs );
++    if (!(action = queue->shutdown))
++    {
++        if (!(action = queue->shutdown = shutdown_action_create()))
++        {
++            LeaveCriticalSection( &queue->cs );
++            return E_OUTOFMEMORY;
++        }
++        start = TRUE;
++    }
++    IAsyncAction_AddRef( &action->IAsyncAction_iface );
++    LeaveCriticalSection( &queue->cs );
++
++    if (start && !PostMessageW( queue->hwnd, WM_DISPATCHER_QUEUE_SHUTDOWN, 0, (LPARAM)queue ))
++    {
++        WARN( "queue %p has no window to shut down.\n", queue );
++        queue_shutdown_finish( queue );
++    }
++    *operation = &action->IAsyncAction_iface;
++    return S_OK;
++}
++
++static HRESULT queue_add_handler( struct dispatcher_queue *queue, struct list *list, IUnknown *handler,
++                                  EventRegistrationToken *token )
++{
++    struct queue_handler *entry;
++
++    if (!token) return E_POINTER;
++    if (!handler) return E_INVALIDARG;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    entry->handler = handler;
++    IUnknown_AddRef( handler );
++    EnterCriticalSection( &queue->cs );
++    entry->token.value = ++queue->next_token;
++    list_add_tail( list, &entry->entry );
++    LeaveCriticalSection( &queue->cs );
++    *token = entry->token;
++    return S_OK;
++}
++
++static HRESULT queue_remove_handler( struct dispatcher_queue *queue, struct list *list, EventRegistrationToken token )
++{
++    struct queue_handler *entry, *found = NULL;
++
++    EnterCriticalSection( &queue->cs );
++    LIST_FOR_EACH_ENTRY( entry, list, struct queue_handler, entry )
++    {
++        if (entry->token.value != token.value) continue;
++        list_remove( &entry->entry );
++        found = entry;
++        break;
++    }
++    LeaveCriticalSection( &queue->cs );
++    if (found)
++    {
++        IUnknown_Release( found->handler );
++        free( found );
++    }
++    return S_OK;
++}
++
++static void queue_free_handlers( struct list *list )
++{
++    struct queue_handler *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( entry, next, list, struct queue_handler, entry )
++    {
++        list_remove( &entry->entry );
++        IUnknown_Release( entry->handler );
++        free( entry );
++    }
++}
++
+ static HRESULT WINAPI dispatcher_queue_QueryInterface( IDispatcherQueue *iface, REFIID iid, void **out )
+ {
+     struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
+@@ -136,6 +1160,11 @@ static ULONG WINAPI dispatcher_queue_Release( IDispatcherQueue *iface )
+         }
+         if (queue_tls != TLS_OUT_OF_INDEXES && TlsGetValue( queue_tls ) == impl)
+             TlsSetValue( queue_tls, NULL );
++        queue_free_handlers( &impl->starting_handlers );
++        queue_free_handlers( &impl->completed_handlers );
++        if (impl->shutdown) IAsyncAction_Release( &impl->shutdown->IAsyncAction_iface );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
+         free( impl );
+     }
+     return ref;
+@@ -162,10 +1191,27 @@ static HRESULT WINAPI dispatcher_queue_GetTrustLevel( IDispatcherQueue *iface, T
+ 
+ static HRESULT WINAPI dispatcher_queue_CreateTimer( IDispatcherQueue *iface, IDispatcherQueueTimer **result )
+ {
+-    FIXME( "iface %p, result %p stub!\n", iface, result );
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    struct dispatcher_queue_timer *timer;
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++
+     if (!result) return E_POINTER;
+     *result = NULL;
+-    return E_NOTIMPL;
++    if (!(timer = calloc( 1, sizeof(*timer) ))) return E_OUTOFMEMORY;
++    timer->IDispatcherQueueTimer_iface.lpVtbl = &timer_vtbl;
++    timer->ref = 1;
++    timer->queue = impl;
++    IDispatcherQueue_AddRef( iface );
++    /* as Windows has it: no interval, repeating */
++    timer->repeating = TRUE;
++    list_init( &timer->handlers );
++    EnterCriticalSection( &timers_cs );
++    list_add_tail( &live_timers, &timer->entry );
++    LeaveCriticalSection( &timers_cs );
++
++    *result = &timer->IDispatcherQueueTimer_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dispatcher_queue_TryEnqueue( IDispatcherQueue *iface, IDispatcherQueueHandler *callback, boolean *result )
+@@ -177,7 +1223,8 @@ static HRESULT WINAPI dispatcher_queue_TryEnqueue( IDispatcherQueue *iface, IDis
+     if (!result) return E_POINTER;
+     *result = FALSE;
+     if (!callback) return E_POINTER;
+-    if (!impl->hwnd) return RO_E_CLOSED;
++    /* a queue that has shut down takes nothing more, and says so in result */
++    if (!impl->hwnd || impl->shut_down || impl->shutdown) return S_OK;
+ 
+     IDispatcherQueueHandler_AddRef( callback );
+     if (!PostMessageW( impl->hwnd, WM_DISPATCHER_QUEUE_INVOKE, 0, (LPARAM)callback ))
+@@ -202,31 +1249,31 @@ static HRESULT WINAPI dispatcher_queue_add_ShutdownStarting( IDispatcherQueue *i
+         ITypedEventHandler_DispatcherQueue_DispatcherQueueShutdownStartingEventArgs *handler,
+         EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    if (!token) return E_POINTER;
+-    token->value = 0;
+-    return S_OK;
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return queue_add_handler( impl, &impl->starting_handlers, (IUnknown *)handler, token );
+ }
+ 
+ static HRESULT WINAPI dispatcher_queue_remove_ShutdownStarting( IDispatcherQueue *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return S_OK;
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return queue_remove_handler( impl, &impl->starting_handlers, token );
+ }
+ 
+ static HRESULT WINAPI dispatcher_queue_add_ShutdownCompleted( IDispatcherQueue *iface,
+         ITypedEventHandler_DispatcherQueue_IInspectable *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    if (!token) return E_POINTER;
+-    token->value = 0;
+-    return S_OK;
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return queue_add_handler( impl, &impl->completed_handlers, (IUnknown *)handler, token );
+ }
+ 
+ static HRESULT WINAPI dispatcher_queue_remove_ShutdownCompleted( IDispatcherQueue *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return S_OK;
++    struct dispatcher_queue *impl = impl_from_IDispatcherQueue( iface );
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return queue_remove_handler( impl, &impl->completed_handlers, token );
+ }
+ 
+ static const struct IDispatcherQueueVtbl dispatcher_queue_vtbl =
+@@ -275,8 +1322,9 @@ static const struct IDispatcherQueue2Vtbl dispatcher_queue2_vtbl =
+ };
+ 
+ /* Creates the queue for the calling thread and records it there, so that
+- * DispatcherQueue.GetForCurrentThread finds it afterwards. */
+-HRESULT dispatcher_queue_create_for_current_thread( IDispatcherQueue **out )
++ * DispatcherQueue.GetForCurrentThread finds it afterwards.  A dedicated
++ * thread's queue ends the thread's message loop when it shuts down. */
++HRESULT dispatcher_queue_create_for_current_thread( BOOL dedicated, IDispatcherQueue **out )
+ {
+     struct dispatcher_queue *impl;
+ 
+@@ -294,11 +1342,18 @@ HRESULT dispatcher_queue_create_for_current_thread( IDispatcherQueue **out )
+     impl->IDispatcherQueue2_iface.lpVtbl = &dispatcher_queue2_vtbl;
+     impl->ref = 1;
+     impl->thread_id = GetCurrentThreadId();
++    impl->dedicated = dedicated;
++    list_init( &impl->starting_handlers );
++    list_init( &impl->completed_handlers );
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": dispatcher_queue.cs");
+     impl->hwnd = CreateWindowExW( 0, queue_class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
+                                   GetModuleHandleW( L"coremessaging.dll" ), NULL );
+     if (!impl->hwnd)
+     {
+         HRESULT hr = HRESULT_FROM_WIN32( GetLastError() );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
+         free( impl );
+         return hr;
+     }
+@@ -469,5 +1524,5 @@ HRESULT WINAPI CreateDispatcherQueueForCurrentThread( PDISPATCHERQUEUE *queue )
+     TRACE( "queue %p.\n", queue );
+ 
+     if (!queue) return E_POINTER;
+-    return dispatcher_queue_create_for_current_thread( queue );
++    return dispatcher_queue_create_for_current_thread( FALSE, queue );
+ }
+diff --git a/dlls/coremessaging/tests/coremessaging.c b/dlls/coremessaging/tests/coremessaging.c
+index cabc3ccd809..f2f0583a214 100644
+--- a/dlls/coremessaging/tests/coremessaging.c
++++ b/dlls/coremessaging/tests/coremessaging.c
+@@ -267,7 +267,6 @@ static void check_create_dispatcher_queue_controller_( unsigned int line, DWORD
+     if (hr == E_INVALIDARG) return;
+ 
+     hr = IDispatcherQueueController_get_DispatcherQueue( dispatcher_queue_controller, &dispatcher_queue );
+-    todo_wine
+     ok_(__FILE__, line)( hr == S_OK, "got IDispatcherQueueController_get_DispatcherQueue hr %#lx.\n", hr );
+     if (FAILED(hr)) goto done;
+ 
+@@ -309,7 +308,7 @@ static void check_create_dispatcher_queue_controller_( unsigned int line, DWORD
+     /* shutdown waits for queued handlers */
+     if (winetest_platform_is_wine) Sleep( 200 );
+     ret = WaitForSingleObject( event_handler->event, 100 );
+-    todo_wine ok_(__FILE__, line)( ret == WAIT_TIMEOUT, "Unexpected wait result %lu.\n", ret );
++    ok_(__FILE__, line)( ret == WAIT_TIMEOUT, "Unexpected wait result %lu.\n", ret );
+     SetEvent( queue_handler->event );
+ 
+     /* queue uses the message loop when dispatched on current thread */
+@@ -438,18 +437,14 @@ static void test_DispatcherQueueController_Statics(void)
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+ 
+     hr = IDispatcherQueueControllerStatics_CreateOnDedicatedThread( dispatcher_queue_controller_statics, NULL );
+-    todo_wine
+     ok( hr == E_POINTER || hr == 0x80000005 /* win10 22h2 */, "got hr %#lx.\n", hr );
+     hr = IDispatcherQueueControllerStatics_CreateOnDedicatedThread( dispatcher_queue_controller_statics, &dispatcher_queue_controller );
+-    todo_wine
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+     if (FAILED(hr)) goto done;
+ 
+     hr = IDispatcherQueueController_get_DispatcherQueue( dispatcher_queue_controller, NULL );
+-    todo_wine
+     ok( hr == E_POINTER || hr == 0x80000005 /* win10 22h2 */, "got hr %#lx.\n", hr );
+     hr = IDispatcherQueueController_get_DispatcherQueue( dispatcher_queue_controller, &dispatcher_queue );
+-    todo_wine
+     ok( hr == S_OK, "got hr %#lx.\n", hr );
+ 
+     check_interface( dispatcher_queue, &IID_IUnknown );
+@@ -500,7 +495,7 @@ static void test_DispatcherQueueController_Statics(void)
+     /* shutdown waits for queued handlers */
+     if (winetest_platform_is_wine) Sleep( 200 );
+     ret = WaitForSingleObject( event_handler->event, 100 );
+-    todo_wine ok( ret == WAIT_TIMEOUT, "Unexpected wait result %lu.\n", ret );
++    ok( ret == WAIT_TIMEOUT, "Unexpected wait result %lu.\n", ret );
+ 
+     SetEvent( queue_handler->event );
+     ret = WaitForSingleObject( event_handler->event, 5000 );
+@@ -536,6 +531,184 @@ done:
+     ok( ref == 1, "got ref %ld.\n", ref );
+ }
+ 
++struct tick_handler
++{
++    ITypedEventHandler_DispatcherQueueTimer_IInspectable ITypedEventHandler_DispatcherQueueTimer_IInspectable_iface;
++    LONG ref;
++    LONG ticks;
++    boolean running;            /* what IsRunning said during the last tick */
++    BOOL stop;                  /* stop the timer from its tick */
++    DWORD thread_id;
++};
++
++static struct tick_handler *impl_from_ITypedEventHandler_DispatcherQueueTimer_IInspectable( ITypedEventHandler_DispatcherQueueTimer_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct tick_handler, ITypedEventHandler_DispatcherQueueTimer_IInspectable_iface );
++}
++
++static HRESULT WINAPI tick_handler_QueryInterface( ITypedEventHandler_DispatcherQueueTimer_IInspectable *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_ITypedEventHandler_DispatcherQueueTimer_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IUnknown ))
++    {
++        *out = iface;
++        ITypedEventHandler_DispatcherQueueTimer_IInspectable_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI tick_handler_AddRef( ITypedEventHandler_DispatcherQueueTimer_IInspectable *iface )
++{
++    struct tick_handler *handler = impl_from_ITypedEventHandler_DispatcherQueueTimer_IInspectable( iface );
++    return InterlockedIncrement( &handler->ref );
++}
++
++static ULONG WINAPI tick_handler_Release( ITypedEventHandler_DispatcherQueueTimer_IInspectable *iface )
++{
++    struct tick_handler *handler = impl_from_ITypedEventHandler_DispatcherQueueTimer_IInspectable( iface );
++    return InterlockedDecrement( &handler->ref );
++}
++
++static HRESULT WINAPI tick_handler_Invoke( ITypedEventHandler_DispatcherQueueTimer_IInspectable *iface,
++                                           IDispatcherQueueTimer *timer, IInspectable *args )
++{
++    struct tick_handler *handler = impl_from_ITypedEventHandler_DispatcherQueueTimer_IInspectable( iface );
++
++    ok( !args, "got args %p.\n", args );
++    ok( GetCurrentThreadId() == handler->thread_id, "ticked on thread %#lx.\n", GetCurrentThreadId() );
++    handler->ticks++;
++    handler->running = 2;
++    IDispatcherQueueTimer_get_IsRunning( timer, &handler->running );
++    if (handler->stop) IDispatcherQueueTimer_Stop( timer );
++    return S_OK;
++}
++
++static const ITypedEventHandler_DispatcherQueueTimer_IInspectableVtbl tick_handler_vtbl =
++{
++    tick_handler_QueryInterface,
++    tick_handler_AddRef,
++    tick_handler_Release,
++    tick_handler_Invoke,
++};
++
++static void test_DispatcherQueueTimer(void)
++{
++    struct tick_handler handler = {{&tick_handler_vtbl}, 1};
++    IDispatcherQueueController *controller = NULL;
++    struct DispatcherQueueOptions options = {sizeof(options), DQTYPE_THREAD_CURRENT, DQTAT_COM_NONE};
++    IDispatcherQueueTimer *timer, *timer2;
++    IDispatcherQueue *queue;
++    EventRegistrationToken token, token2;
++    IInspectable *inspectable;
++    TimeSpan interval;
++    HSTRING name;
++    boolean value;
++    HRESULT hr;
++    LONG ref;
++
++    handler.thread_id = GetCurrentThreadId();
++    hr = CreateDispatcherQueueController( options, &controller );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueueController_get_DispatcherQueue( controller, &queue );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++    hr = IDispatcherQueue_CreateTimer( queue, &timer );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueue_CreateTimer( queue, &timer2 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( timer != timer2, "got the same timer.\n" );
++    check_interface( timer, &IID_IAgileObject );
++    hr = IDispatcherQueueTimer_QueryInterface( timer, &IID_IInspectable, (void **)&inspectable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IInspectable_GetRuntimeClassName( inspectable, &name );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( !wcscmp( WindowsGetStringRawBuffer( name, NULL ), L"Windows.System.DispatcherQueueTimer" ), "got class %s.\n",
++        debugstr_hstring( name ) );
++    WindowsDeleteString( name );
++    IInspectable_Release( inspectable );
++
++    interval.Duration = -1;
++    hr = IDispatcherQueueTimer_get_Interval( timer, &interval );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( !interval.Duration, "got interval %I64d.\n", interval.Duration );
++    value = 2;
++    IDispatcherQueueTimer_get_IsRepeating( timer, &value );
++    ok( value == TRUE, "got IsRepeating %d.\n", value );
++    value = 2;
++    IDispatcherQueueTimer_get_IsRunning( timer, &value );
++    ok( value == FALSE, "got IsRunning %d.\n", value );
++    interval.Duration = -10000;
++    hr = IDispatcherQueueTimer_put_Interval( timer, interval );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++
++    hr = IDispatcherQueueTimer_add_Tick( timer, &handler.ITypedEventHandler_DispatcherQueueTimer_IInspectable_iface, &token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueueTimer_add_Tick( timer2, &handler.ITypedEventHandler_DispatcherQueueTimer_IInspectable_iface, &token2 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++    /* once, at 50ms, with the timer not running while its handlers run */
++    interval.Duration = 500000;
++    hr = IDispatcherQueueTimer_put_Interval( timer, interval );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueueTimer_put_IsRepeating( timer, FALSE );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueueTimer_Start( timer );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    value = FALSE;
++    IDispatcherQueueTimer_get_IsRunning( timer, &value );
++    ok( value == TRUE, "got IsRunning %d.\n", value );
++    ok( !handler.ticks, "ticked before the message loop ran.\n" );
++    wait_messages( 400 );
++    ok( handler.ticks == 1, "got %ld ticks.\n", handler.ticks );
++    ok( handler.running == FALSE, "got IsRunning %d while ticking.\n", handler.running );
++    value = 2;
++    IDispatcherQueueTimer_get_IsRunning( timer, &value );
++    ok( value == FALSE, "got IsRunning %d.\n", value );
++
++    /* repeating until stopped */
++    handler.ticks = 0;
++    IDispatcherQueueTimer_put_IsRepeating( timer, TRUE );
++    IDispatcherQueueTimer_Start( timer );
++    wait_messages( 500 );
++    ok( handler.ticks >= 3, "got %ld ticks.\n", handler.ticks );
++    hr = IDispatcherQueueTimer_Stop( timer );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueueTimer_Stop( timer );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    handler.ticks = 0;
++    wait_messages( 200 );
++    ok( !handler.ticks, "got %ld ticks after Stop.\n", handler.ticks );
++
++    /* stopped from its own tick */
++    handler.stop = TRUE;
++    IDispatcherQueueTimer_Start( timer );
++    wait_messages( 400 );
++    ok( handler.ticks == 1, "got %ld ticks.\n", handler.ticks );
++    handler.stop = FALSE;
++
++    hr = IDispatcherQueueTimer_remove_Tick( timer, token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDispatcherQueueTimer_remove_Tick( timer, token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++    /* a timer let go of while running stops: the queue holds none */
++    handler.ticks = 0;
++    interval.Duration = 100000;
++    IDispatcherQueueTimer_put_Interval( timer2, interval );
++    IDispatcherQueueTimer_Start( timer2 );
++    ref = IDispatcherQueueTimer_Release( timer2 );
++    ok( !ref, "got ref %ld.\n", ref );
++    wait_messages( 200 );
++    ok( !handler.ticks, "got %ld ticks.\n", handler.ticks );
++    ok( handler.ref == 1, "got handler ref %ld.\n", handler.ref );
++
++    IDispatcherQueueTimer_Release( timer );
++    IDispatcherQueue_Release( queue );
++    IDispatcherQueueController_Release( controller );
++}
++
+ START_TEST(coremessaging)
+ {
+     HRESULT hr;
+@@ -545,6 +718,7 @@ START_TEST(coremessaging)
+ 
+     test_CreateDispatcherQueueController();
+     test_DispatcherQueueController_Statics();
++    test_DispatcherQueueTimer();
+ 
+     RoUninitialize();
+ }

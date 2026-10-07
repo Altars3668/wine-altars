@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:35:16 -0400
+Subject: [PATCH] winex11: Take the monitors' DPI from the desktop's Xft.dpi.
+
+Desktops tell X clients their scale through Xft.dpi in the root window's resource database.
+GNOME's Xwayland gives X clients the monitors' physical pixels and says 192 at 200%, so Office,
+drawing at the 96 DPI Wine reported, was half the size of everything else on a 4K monitor.
+
+Unless the user set a DPI, report Xft.dpi as the monitors' DPI, and rescan the monitors when the
+desktop changes it.  On Windows a process's system DPI is the primary monitor's DPI when the
+process starts; a Wine process reads its system DPI from the registry before it could ask the
+desktop, so keep the desktop's DPI as the current hardware profile's LogPixels, which the processes
+that start from then on read.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/winex11.drv/display.c b/dlls/winex11.drv/display.c
+index 6e3447858bc..83adefeca34 100644
+--- a/dlls/winex11.drv/display.c
++++ b/dlls/winex11.drv/display.c
+@@ -31,6 +31,7 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
+ 
+ static struct x11drv_display_device_handler host_handler;
++static UINT host_dpi;  /* the last Xft.dpi seen, 0 if none */
+ static struct x11drv_settings_handler settings_handler;
+ 
+ #define NEXT_DEVMODEW(mode) ((DEVMODEW *)((char *)((mode) + 1) + (mode)->dmDriverExtra))
+@@ -205,6 +206,99 @@ static DWORD x11drv_mode_from_devmode( x11drv_settings_id id, DEVMODEW *mode, st
+     return i < count ? DISP_CHANGE_SUCCESSFUL : DISP_CHANGE_BADMODE;
+ }
+ 
++/* The DPI the desktop asks X clients to draw at: Xft.dpi in the root window's resource database, which
++ * desktops set to their scale.  GNOME's Xwayland gives X clients the monitors' physical pixels and says 192
++ * at 200%, and a program left at 96 there is drawn at half the size it should be. */
++static UINT read_host_dpi(void)
++{
++    unsigned long count, remaining;
++    unsigned char *data = NULL;
++    const char *p;
++    double value = 0;
++    int format;
++    Atom type;
++
++    if (XGetWindowProperty( gdi_display, DefaultRootWindow( gdi_display ), XA_RESOURCE_MANAGER, 0, 65536, False,
++                            XA_STRING, &type, &format, &count, &remaining, &data ) != Success || !data)
++        return 0;
++    for (p = (const char *)data; p && *p; p = strchr( p, '\n' ), p = p ? p + 1 : NULL)
++    {
++        if (strncmp( p, "Xft.dpi:", 8 )) continue;
++        value = strtod( p + 8, NULL );
++        break;
++    }
++    XFree( data );
++    return value >= 48 && value <= 960 ? (UINT)(value + 0.5) : 0;
++}
++
++/* a DPI the user set (winecfg writes it) wins over the desktop's */
++static BOOL user_set_dpi(void)
++{
++    char buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(DWORD)])];
++    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
++    WCHAR nameW[16];
++    BOOL ret = FALSE;
++    HKEY hkey;
++
++    if (!(hkey = open_hkcu_key( "Control Panel\\Desktop" ))) return FALSE;
++    asciiz_to_unicode( nameW, "LogPixels" );
++    if (query_reg_value( hkey, nameW, info, sizeof(buffer) ) && info->Type == REG_DWORD && *(DWORD *)info->Data)
++        ret = TRUE;
++    NtClose( hkey );
++    return ret;
++}
++
++/* On Windows a process's system DPI is that of the primary monitor when the process starts.  A Wine
++ * process reads its system DPI from the registry when it starts, before it could ask the desktop: the
++ * desktop's DPI goes where Windows keeps the current hardware profile's, for the processes that start
++ * from now on, the first one of the next session among them. */
++static void set_default_dpi( UINT dpi )
++{
++    static const char keyA[] = "\\Registry\\Machine\\System\\CurrentControlSet\\Hardware Profiles\\Current\\Software\\Fonts";
++    char buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(DWORD)])];
++    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
++    WCHAR keyW[ARRAY_SIZE(keyA)], nameW[16];
++    UNICODE_STRING name;
++    DWORD value = dpi;
++    HKEY hkey;
++
++    if (!(hkey = reg_open_key( NULL, keyW, asciiz_to_unicode( keyW, keyA ) - sizeof(WCHAR) ))) return;
++    name.Length = name.MaximumLength = asciiz_to_unicode( nameW, "LogPixels" ) - sizeof(WCHAR);
++    name.Buffer = nameW;
++    if (!query_reg_value( hkey, nameW, info, sizeof(buffer) ) || info->Type != REG_DWORD || *(DWORD *)info->Data != dpi)
++    {
++        TRACE( "processes starting from now on get a system DPI of %u\n", dpi );
++        NtSetValueKey( hkey, &name, 0, REG_DWORD, &value, sizeof(value) );
++    }
++    NtClose( hkey );
++}
++
++/* the DPI of the monitors: the desktop's, unless the user set one */
++static UINT get_monitor_dpi(void)
++{
++    host_dpi = read_host_dpi();
++    if (host_dpi && !user_set_dpi())
++    {
++        set_default_dpi( host_dpi );
++        return host_dpi;
++    }
++    return NtUserGetSystemDpiForProcess( NULL );
++}
++
++/* the root window's resource database changed: if Xft.dpi did, the desktop rescans the monitors */
++void X11DRV_ResourceManagerChanged( HWND hwnd )
++{
++    UINT dpi = read_host_dpi();
++
++    if (dpi == host_dpi) return;
++    TRACE( "Xft.dpi %u -> %u\n", host_dpi, dpi );
++    host_dpi = dpi;
++    if (hwnd == NtUserGetDesktopWindow() && NtUserGetWindowThread( hwnd, NULL ) == GetCurrentThreadId())
++        NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
++    else
++        NtUserPostMessage( NtUserGetDesktopWindow(), WM_WINE_DISPLAYMODECHANGED, 0, 0 );
++}
++
+ /***********************************************************************
+  *      ChangeDisplaySettings  (X11DRV.@)
+  *
+@@ -517,7 +611,7 @@ UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manage
+             char buffer[32];
+             x11drv_settings_id settings_id;
+             BOOL is_primary = adapters[adapter].state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE;
+-            UINT dpi = NtUserGetSystemDpiForProcess( NULL );
++            UINT dpi = get_monitor_dpi();
+ 
+             sprintf( buffer, "%04lx", adapters[adapter].id );
+             device_manager->add_source( buffer, adapters[adapter].state_flags, dpi, param );
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index 3443459f2f6..fe90997fbfa 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -1264,6 +1264,7 @@ static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *xev )
+     if (event->atom == x11drv_atom(WM_NORMAL_HINTS)) handle_wm_normal_hints_notify( hwnd, event );
+     if (event->atom == x11drv_atom(_NET_SUPPORTED)) handle_net_supported_notify( event );
+     if (event->atom == x11drv_atom(_NET_ACTIVE_WINDOW)) handle_net_active_window( event );
++    if (event->atom == XA_RESOURCE_MANAGER && event->window == root_window) X11DRV_ResourceManagerChanged( hwnd );
+ 
+     return TRUE;
+ }
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 327fea8b991..0f32c381098 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -2911,6 +2911,7 @@ BOOL X11DRV_CreateWindow( HWND hwnd )
+     if (hwnd == NtUserGetDesktopWindow())
+     {
+         struct x11drv_thread_data *data = x11drv_init_thread_data();
++        XWindowAttributes root_attr;
+         XSetWindowAttributes attr;
+ 
+         /* create the cursor clipping window */
+@@ -2919,6 +2920,9 @@ BOOL X11DRV_CreateWindow( HWND hwnd )
+         data->clip_window = XCreateWindow( data->display, root_window, 0, 0, 1, 1, 0, 0,
+                                            InputOnly, default_visual.visual,
+                                            CWOverrideRedirect | CWEventMask, &attr );
++        /* the monitors' DPI follows Xft.dpi in the root window's resource database */
++        if (XGetWindowAttributes( data->display, root_window, &root_attr ))
++            XSelectInput( data->display, root_window, root_attr.your_event_mask | PropertyChangeMask );
+         XFlush( data->display );
+         NtUserSetProp( hwnd, clip_window_prop, (HANDLE)data->clip_window );
+         X11DRV_DisplayDevices_RegisterEventHandlers();
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 7950199dd0e..4e027cabd0e 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -928,6 +928,7 @@ struct x11drv_display_device_handler
+ 
+ extern void X11DRV_DisplayDevices_SetHandler(const struct x11drv_display_device_handler *handler);
+ extern void X11DRV_DisplayDevices_RegisterEventHandlers(void);
++extern void X11DRV_ResourceManagerChanged( HWND hwnd );
+ extern BOOL X11DRV_DisplayDevices_SupportEventHandlers(void);
+ /* Display device handler used in virtual desktop mode */
+ extern struct x11drv_display_device_handler desktop_handler;

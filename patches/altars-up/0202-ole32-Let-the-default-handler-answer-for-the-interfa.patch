@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:12:46 -0400
+Subject: [PATCH] ole32: Let the default handler answer for the interfaces of
+ the object it runs.
+
+The handler of an object in a local server answered every interface it
+had not itself with CO_E_OBJNOTCONNECTED, even while the object ran,
+so Word could neither in-place deactivate an embedded Excel worksheet
+nor get its object model.  As on Windows, an object that runs now
+answers for them; one that has never run has not got them; one that
+has run and stopped is not connected; and an embedded object is never
+a link.  Where running the object fails is now reported.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit c3cde46347d8a43f0d07fd46e876bfbe53a91c2c)
+
+diff --git a/dlls/ole32/defaulthandler.c b/dlls/ole32/defaulthandler.c
+index b69a054b572..894c962e8a4 100644
+--- a/dlls/ole32/defaulthandler.c
++++ b/dlls/ole32/defaulthandler.c
+@@ -144,6 +144,8 @@ struct DefaultHandler
+   IClassFactory *pCFObject;
+   /* TRUE if acting as an inproc server instead of an inproc handler */
+   BOOL inproc_server;
++  /* TRUE once the object has run */
++  BOOL has_run;
+ };
+ 
+ typedef struct DefaultHandler DefaultHandler;
+@@ -244,8 +246,9 @@ static HRESULT WINAPI DefaultHandler_NDIUnknown_QueryInterface(
+     if (FAILED(hr)) FIXME("interface %s not implemented by data cache\n", debugstr_guid(riid));
+     return hr;
+   }
+-  else if (This->inproc_server && This->pOleDelegate)
++  else if (This->pOleDelegate && !IsEqualIID(&IID_IOleLink, riid))
+   {
++    /* the object, while it runs, answers for the interfaces the handler has not */
+     return IOleObject_QueryInterface(This->pOleDelegate, riid, ppvObject);
+   }
+ 
+@@ -253,7 +256,9 @@ static HRESULT WINAPI DefaultHandler_NDIUnknown_QueryInterface(
+   if (*ppvObject == NULL)
+   {
+     WARN( "() : asking for unsupported interface %s\n", debugstr_guid(riid));
+-    return E_NOINTERFACE;
++    /* an object that has run may have the interface again once it runs, one that has never run has not, and an
++     * embedded object is never a link */
++    return This->has_run && !IsEqualIID(&IID_IOleLink, riid) ? CO_E_OBJNOTCONNECTED : E_NOINTERFACE;
+   }
+ 
+   /*
+@@ -1442,6 +1447,7 @@ static HRESULT WINAPI DefaultHandler_Run(
+ 	    IBindCtx*            pbc)
+ {
+   DefaultHandler *This = impl_from_IRunnableObject(iface);
++  const char *step = NULL;
+   HRESULT hr;
+   IOleCacheControl *cache_ctrl;
+ 
+@@ -1456,21 +1462,28 @@ static HRESULT WINAPI DefaultHandler_Run(
+   hr = CoCreateInstance(&This->clsid, NULL, CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER,
+                         &IID_IOleObject, (void **)&This->pOleDelegate);
+   if (FAILED(hr))
++  {
++    WARN("creating %s failed, hr %#lx\n", debugstr_guid(&This->clsid), hr);
+     return hr;
++  }
+ 
++  step = "Advise";
+   hr = IOleObject_Advise(This->pOleDelegate, &This->IAdviseSink_iface, &This->dwAdvConn);
+   if (FAILED(hr)) goto fail;
+ 
+   if (This->clientSite)
+   {
++    step = "SetClientSite";
+     hr = IOleObject_SetClientSite(This->pOleDelegate, This->clientSite);
+     if (FAILED(hr)) goto fail;
+   }
+ 
++  step = "QueryInterface(IPersistStorage)";
+   hr = IOleObject_QueryInterface(This->pOleDelegate, &IID_IPersistStorage,
+                                  (void **)&This->pPSDelegate);
+   if (FAILED(hr)) goto fail;
+ 
++  step = "loading the storage";
+   if (This->storage_state == storage_state_initialised)
+       hr = IPersistStorage_InitNew(This->pPSDelegate, This->storage);
+   else if (This->storage_state == storage_state_loaded)
+@@ -1479,6 +1492,7 @@ static HRESULT WINAPI DefaultHandler_Run(
+ 
+   if (This->containerApp)
+   {
++    step = "SetHostNames";
+     hr = IOleObject_SetHostNames(This->pOleDelegate, This->containerApp,
+                                  This->containerObj);
+     if (FAILED(hr)) goto fail;
+@@ -1489,18 +1503,22 @@ static HRESULT WINAPI DefaultHandler_Run(
+    * - IOleObject_GetMoniker
+    */
+ 
++  step = "QueryInterface(IDataObject)";
+   hr = IOleObject_QueryInterface(This->pOleDelegate, &IID_IDataObject,
+                                  (void **)&This->pDataDelegate);
+   if (FAILED(hr)) goto fail;
+ 
+   This->object_state = object_state_running;
++  This->has_run = TRUE;
+ 
+   if (This->dataAdviseHolder)
+   {
++    step = "connecting the data advise holder";
+     hr = DataAdviseHolder_OnConnect(This->dataAdviseHolder, This->pDataDelegate);
+     if (FAILED(hr)) goto fail;
+   }
+ 
++  step = "starting the cache";
+   hr = IUnknown_QueryInterface( This->dataCache, &IID_IOleCacheControl, (void **)&cache_ctrl );
+   if (FAILED(hr)) goto fail;
+   hr = IOleCacheControl_OnRun( cache_ctrl, This->pDataDelegate );
+@@ -1510,6 +1528,7 @@ static HRESULT WINAPI DefaultHandler_Run(
+   return hr;
+ 
+ fail:
++  WARN("running %s failed at %s, hr %#lx\n", debugstr_guid(&This->clsid), step, hr);
+   DefaultHandler_Stop(This);
+   return hr;
+ }
+@@ -2127,6 +2146,7 @@ static DefaultHandler* DefaultHandler_Construct(
+   This->pPSDelegate = NULL;
+   This->pDataDelegate = NULL;
+   This->object_state = object_state_not_running;
++  This->has_run = FALSE;
+   This->in_call = 0;
+ 
+   This->dwAdvConn = 0;
+@@ -2147,7 +2167,10 @@ static DefaultHandler* DefaultHandler_Construct(
+     if (SUCCEEDED(hr))
+       hr = IOleObject_QueryInterface(This->pOleDelegate, &IID_IDataObject, (void **)&This->pDataDelegate);
+     if (SUCCEEDED(hr))
++    {
+       This->object_state = object_state_running;
++      This->has_run = TRUE;
++    }
+     if (FAILED(hr))
+       WARN("object creation failed with error %#lx\n", hr);
+   }

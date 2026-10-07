@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:40:18 -0400
+Subject: [PATCH] server: Correct default token owners and owner access rights.
+
+An owner implicitly has READ_CONTROL and WRITE_DAC, not every standard
+right. Preserve these rights when MAXIMUM_ALLOWED meets a deny ACE,
+unless an OWNER RIGHTS ACE explicitly supplies the owner's permissions.
+
+Administrator tokens have an Administrators owner and the native
+Administrators/System/logon default DACL. Token duplication keeps owner
+and primary group separate, and a filtered owner falls back to the user.
+OpenAsSelf uses the process token for the access check and restores the
+thread token afterwards. Synthetic file DACLs grant DELETE explicitly
+rather than depending on the excessive implicit owner rights.
+
+Measured with native Windows 11 access and RPC probes; the isolated
+owner tests also pass on Windows. No server protocol change.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+diff --git a/dlls/advapi32/tests/security.c b/dlls/advapi32/tests/security.c
+index edd79bc8c3d..979aa4a491b 100644
+--- a/dlls/advapi32/tests/security.c
++++ b/dlls/advapi32/tests/security.c
+@@ -9200,6 +9200,77 @@ static void test_lookupPrivilegeDisplayName(void)
+     ok( len == strlen( bufA ), "got length %lu, %s\n", len, debugstr_a(bufA) );
+ }
+ 
++static void test_AccessCheck_owner_rights(void)
++{
++    static const DWORD desired[] = {MAXIMUM_ALLOWED, READ_CONTROL, WRITE_DAC, DELETE, SYNCHRONIZE};
++    static const struct
++    {
++        const WCHAR *sddl;
++        DWORD granted[5];
++    } tests[] =
++    {
++        {L"O:BAG:BAD:", {READ_CONTROL | WRITE_DAC, READ_CONTROL, WRITE_DAC, 0, 0}},
++        {L"O:BAG:BAD:(D;;GA;;;WD)(A;;GA;;;WD)", {READ_CONTROL | WRITE_DAC, READ_CONTROL, WRITE_DAC, 0, 0}},
++        {L"O:BAG:BAD:(A;;RC;;;OW)", {READ_CONTROL, READ_CONTROL, 0, 0, 0}},
++        {L"O:BAG:BAD:(D;;GA;;;OW)(A;;GA;;;WD)", {0, 0, 0, 0, 0}},
++    };
++    GENERIC_MAPPING mapping = {READ_CONTROL | 1, READ_CONTROL | 1, READ_CONTROL | 1, STANDARD_RIGHTS_ALL | 1};
++    union { TOKEN_OWNER owner; BYTE bytes[sizeof(TOKEN_OWNER) + SECURITY_MAX_SID_SIZE]; } owner;
++    union { TOKEN_USER user; BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]; } user;
++    BYTE admin_sid[SECURITY_MAX_SID_SIZE];
++    DWORD sid_size = sizeof(admin_sid), size, i, j;
++    HANDLE primary, token;
++    BOOL ret, member;
++
++    ret = CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, admin_sid, &sid_size);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    if (!ret) return;
++    ret = CheckTokenMembership(NULL, admin_sid, &member);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    if (!ret || !member)
++    {
++        skip("An enabled Administrators group is needed for owner access tests.\n");
++        return;
++    }
++    ret = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &primary);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    if (!ret) return;
++    ret = GetTokenInformation(primary, TokenUser, &user, sizeof(user), &size);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    if (ret && !IsWellKnownSid(user.user.User.Sid, WinLocalSystemSid))
++    {
++        ret = GetTokenInformation(primary, TokenOwner, &owner, sizeof(owner), &size);
++        ok(ret, "Got error %lu.\n", GetLastError());
++        if (ret) ok(EqualSid(owner.owner.Owner, admin_sid), "Unexpected default owner.\n");
++    }
++    ret = DuplicateToken(primary, SecurityImpersonation, &token);
++    ok(ret, "Got error %lu.\n", GetLastError());
++    CloseHandle(primary);
++    if (!ret) return;
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        PSECURITY_DESCRIPTOR sd;
++        ret = ConvertStringSecurityDescriptorToSecurityDescriptorW(tests[i].sddl, SDDL_REVISION_1, &sd, NULL);
++        ok(ret, "Got error %lu.\n", GetLastError());
++        if (!ret) continue;
++        for (j = 0; j < ARRAY_SIZE(desired); ++j)
++        {
++            PRIVILEGE_SET privileges;
++            DWORD privilege_size = sizeof(privileges), granted = 0xdeadbeef;
++            BOOL access = FALSE;
++
++            winetest_push_context("owner %lu desired %#lx", i, desired[j]);
++            ret = AccessCheck(sd, token, desired[j], &mapping, &privileges, &privilege_size, &granted, &access);
++            ok(ret, "Got error %lu.\n", GetLastError());
++            ok(access == !!tests[i].granted[j], "Got access %u.\n", access);
++            ok(granted == tests[i].granted[j], "Got mask %#lx, expected %#lx.\n", granted, tests[i].granted[j]);
++            winetest_pop_context();
++        }
++        LocalFree(sd);
++    }
++    CloseHandle(token);
++}
++
+ START_TEST(security)
+ {
+     init();
+@@ -9217,6 +9288,8 @@ START_TEST(security)
+             test_create_process_token_child();
+         else if (!strcmp(myARGV[2], "session") && myARGC >= 4)
+             test_token_session_child(atoi(myARGV[3]));
++        else if (!strcmp(myARGV[2], "owner_access"))
++            test_AccessCheck_owner_rights();
+         return;
+     }
+     test_kernel_objects_security();
+@@ -9229,6 +9302,7 @@ START_TEST(security)
+     test_CreateWellKnownSid();
+     test_FileSecurity();
+     test_AccessCheck();
++    test_AccessCheck_owner_rights();
+     test_token_attr();
+     test_GetTokenInformation();
+     test_LookupAccountSid();
+diff --git a/server/file.c b/server/file.c
+index 40bc678e051..295658ea354 100644
+--- a/server/file.c
++++ b/server/file.c
+@@ -342,7 +342,7 @@ struct security_descriptor *mode_to_sd( mode_t mode, const struct sid *user, con
+     if (mode & S_IRWXU)
+     {
+         /* appropriate access rights for the user */
+-        ace = set_ace( ace_next( ace ), user, ACCESS_ALLOWED_ACE_TYPE, flags, WRITE_DAC | WRITE_OWNER );
++        ace = set_ace( ace_next( ace ), user, ACCESS_ALLOWED_ACE_TYPE, flags, WRITE_DAC | WRITE_OWNER | DELETE );
+         if (mode & S_IRUSR) ace->mask |= FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+         if (mode & S_IWUSR) ace->mask |= FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+     }
+diff --git a/server/token.c b/server/token.c
+index c11886224e4..c4116549843 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -85,6 +85,7 @@ static const struct sid interactive_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORI
+ static const struct sid anonymous_logon_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_ANONYMOUS_LOGON_RID } };
+ static const struct sid authenticated_user_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_AUTHENTICATED_USER_RID } };
+ static const struct sid high_label_sid = { SID_REVISION, 1, SECURITY_MANDATORY_LABEL_AUTHORITY, { SECURITY_MANDATORY_HIGH_RID } };
++static const struct sid owner_rights_sid = { SID_REVISION, 1, SECURITY_CREATOR_SID_AUTHORITY, { SECURITY_CREATOR_OWNER_RIGHTS_RID } };
+ 
+ static struct luid prev_luid_value = { 1000, 0 };
+ 
+@@ -614,7 +615,8 @@ struct token *token_duplicate( struct token *src_token, unsigned primary,
+                           0, impersonation_level, src_token->elevation );
+     if (!token) return token;
+ 
+-    /* copy groups */
++    /* copy groups and keep the owner independent of the primary group */
++    token->owner = token->user;
+     token->primary_group = NULL;
+     LIST_FOR_EACH_ENTRY( group, &src_token->groups, struct group, entry )
+     {
+@@ -632,11 +634,10 @@ struct token *token_duplicate( struct token *src_token, unsigned primary,
+             newgroup->attrs |= SE_GROUP_USE_FOR_DENY_ONLY;
+         }
+         list_add_tail( &token->groups, &newgroup->entry );
+-        if (src_token->primary_group == &group->sid)
+-        {
++        if (src_token->primary_group == &group->sid) token->primary_group = &newgroup->sid;
++        if (src_token->owner == &group->sid && (newgroup->attrs & SE_GROUP_ENABLED) &&
++            !(newgroup->attrs & SE_GROUP_USE_FOR_DENY_ONLY))
+             token->owner = &newgroup->sid;
+-            token->primary_group = &newgroup->sid;
+-        }
+     }
+     assert( token->primary_group );
+ 
+@@ -675,26 +676,27 @@ struct token *token_duplicate( struct token *src_token, unsigned primary,
+     return token;
+ }
+ 
+-static struct acl *create_default_dacl( const struct sid *user )
++static struct acl *create_default_dacl( const struct sid *user, const struct sid *logon )
+ {
+     struct ace *ace;
+     struct acl *default_dacl;
+     size_t default_dacl_size = sizeof(*default_dacl) + 2 * sizeof(*ace) +
+                                sid_len( &local_system_sid ) + sid_len( user );
+ 
++    if (logon) default_dacl_size += sizeof(*ace) + sid_len( logon );
+     default_dacl = mem_alloc( default_dacl_size );
+     if (!default_dacl) return NULL;
+ 
+     default_dacl->revision = ACL_REVISION;
+     default_dacl->pad1     = 0;
+     default_dacl->size     = default_dacl_size;
+-    default_dacl->count    = 2;
++    default_dacl->count    = logon ? 3 : 2;
+     default_dacl->pad2     = 0;
+ 
+-    /* GENERIC_ALL for Local System */
+-    ace = set_ace( ace_first( default_dacl ), &local_system_sid, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_ALL );
+-    /* GENERIC_ALL for specified user */
+-    set_ace( ace_next( ace ), user, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_ALL );
++    /* GENERIC_ALL for the owner and Local System, and read/execute for this logon. */
++    ace = set_ace( ace_first( default_dacl ), user, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_ALL );
++    ace = set_ace( ace_next( ace ), &local_system_sid, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_ALL );
++    if (logon) set_ace( ace_next( ace ), logon, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_READ | GENERIC_EXECUTE );
+ 
+     return default_dacl;
+ }
+@@ -758,12 +760,13 @@ struct token *get_token_obj( struct process *process, obj_handle_t handle, unsig
+ struct token *token_create_admin( unsigned primary, int impersonation_level, int elevation, unsigned int session_id )
+ {
+     struct token *token = NULL;
++    struct group *group;
+     struct sid alias_admins_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS }};
+     struct sid alias_users_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS }};
+     /* on Windows, this value changes every time the user logs on */
+     struct sid logon_sid = { SID_REVISION, 3, SECURITY_NT_AUTHORITY, { SECURITY_LOGON_IDS_RID, 0, 0 /* FIXME: should be randomly generated when tokens are inherited by new processes */ }};
+     const struct sid *user_sid = security_unix_uid_to_sid( getuid() );
+-    struct acl *default_dacl = create_default_dacl( &domain_users_sid );
++    struct acl *default_dacl = create_default_dacl( &builtin_admins_sid, &logon_sid );
+     const struct luid_attr admin_privs[] =
+     {
+         { SeChangeNotifyPrivilege, SE_PRIVILEGE_ENABLED },
+@@ -807,11 +810,25 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
+         { &logon_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY|SE_GROUP_LOGON_ID },
+     };
+ 
++    if (!default_dacl) return NULL;
+     token = create_token( primary, session_id, user_sid, admin_groups, ARRAY_SIZE( admin_groups ),
+                           admin_privs, ARRAY_SIZE( admin_privs ), default_dacl,
+                           NULL, 4 /* domain_users */, impersonation_level, elevation );
++    if (!token)
++    {
++        free( default_dacl );
++        return NULL;
++    }
+     /* we really need a primary group */
+     assert( token->primary_group );
++    LIST_FOR_EACH_ENTRY( group, &token->groups, struct group, entry )
++    {
++        if (equal_sid( &group->sid, &builtin_admins_sid ))
++        {
++            token->owner = &group->sid;
++            break;
++        }
++    }
+ 
+     /* Assign a high security label to the token. The default would be medium
+      * but Wine provides admin access to all applications right now so high
+@@ -943,7 +960,8 @@ static unsigned int token_access_check( struct token *token,
+                                  unsigned int *status )
+ {
+     unsigned int current_access = 0;
+-    unsigned int denied_access = 0;
++    unsigned int denied_access = 0, owner_access = 0;
++    int is_owner, owner_rights_present = FALSE;
+     ULONG i;
+     const struct acl *dacl;
+     int dacl_present;
+@@ -1021,9 +1039,21 @@ static unsigned int token_access_check( struct token *token,
+     /* NOTE: SeTakeOwnershipPrivilege is not checked for here - it is instead
+      * checked when a "set owner" call is made, overriding the access rights
+      * determined here. */
+-    if (token_sid_present( token, owner, FALSE ))
++    is_owner = token_sid_present( token, owner, FALSE );
++    if (is_owner)
+     {
+-        current_access |= (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE);
++        for (i = 0, ace = ace_first( dacl ); i < dacl->count; i++, ace = ace_next( ace ))
++        {
++            if (ace->flags & INHERIT_ONLY_ACE) continue;
++            if ((ace->type == ACCESS_ALLOWED_ACE_TYPE || ace->type == ACCESS_DENIED_ACE_TYPE) &&
++                equal_sid( (const struct sid *)(ace + 1), &owner_rights_sid ))
++            {
++                owner_rights_present = TRUE;
++                break;
++            }
++        }
++        if (!owner_rights_present) owner_access = READ_CONTROL | WRITE_DAC;
++        current_access |= owner_access;
+         if (desired_access == current_access)
+         {
+             *granted_access = current_access;
+@@ -1041,11 +1071,11 @@ static unsigned int token_access_check( struct token *token,
+         switch (ace->type)
+         {
+         case ACCESS_DENIED_ACE_TYPE:
+-            if (token_sid_present( token, sid, TRUE ))
++            if (equal_sid( sid, &owner_rights_sid ) ? is_owner : token_sid_present( token, sid, TRUE ))
+             {
+                 unsigned int access = map_access( ace->mask, mapping );
+                 if (desired_access & MAXIMUM_ALLOWED)
+-                    denied_access |= access;
++                    denied_access |= access & ~owner_access;
+                 else
+                 {
+                     denied_access |= (access & ~current_access);
+@@ -1054,7 +1084,7 @@ static unsigned int token_access_check( struct token *token,
+             }
+             break;
+         case ACCESS_ALLOWED_ACE_TYPE:
+-            if (token_sid_present( token, sid, FALSE ))
++            if (equal_sid( sid, &owner_rights_sid ) ? is_owner : token_sid_present( token, sid, FALSE ))
+             {
+                 unsigned int access = map_access( ace->mask, mapping );
+                 if (desired_access & MAXIMUM_ALLOWED)
+@@ -1230,7 +1260,7 @@ DECL_HANDLER(create_token)
+         }
+     }
+     else
+-        dacl = default_dacl = create_default_dacl( &domain_users_sid );
++        dacl = default_dacl = create_default_dacl( &domain_users_sid, NULL );
+ 
+     token = create_token( req->primary, default_session_id, user, groups, req->group_count,
+                           privs, req->priv_count, dacl, NULL, req->primary_group, req->impersonation_level, 0 );
+@@ -1257,8 +1287,13 @@ DECL_HANDLER(open_token)
+                 if (!thread->token->primary && thread->token->impersonation_level <= SecurityAnonymous)
+                     set_error( STATUS_CANT_OPEN_ANONYMOUS );
+                 else
+-                    reply->token = alloc_handle( current->process, thread->token,
+-                                                 req->access, req->attributes );
++                {
++                    struct token *target = thread->token, *saved = current->token;
++
++                    if (req->flags & OPEN_TOKEN_AS_SELF) current->token = NULL;
++                    reply->token = alloc_handle( current->process, target, req->access, req->attributes );
++                    current->token = saved;
++                }
+             }
+             else
+                 set_error( STATUS_NO_TOKEN );

@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 22:07:00 -0400
+Subject: [PATCH] combase: Take no reference of its own for an object's
+ IUnknown stub, and keep a delayed agile reference's object.
+
+Marshaling an object's IUnknown took two references, one for the stub
+manager and one for the interface stub; Windows 11 takes one, the
+IUnknown being the stub manager's own (tools/startupgapsprobe comrel).
+An agile reference made with AGILEREFERENCE_DELAYEDMARSHAL let go of the
+object once it was marshaled, which the stub's extra reference had hidden
+in the tests; Windows keeps it, answers the thread that made the
+reference with the object itself, and marshals for the other threads,
+those of the same apartment too.  The reference counts the tests had as
+todo now match.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/combase/roapi.c b/dlls/combase/roapi.c
+index c610b611897..58682380937 100644
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -272,6 +272,7 @@ struct agile_reference
+     IUnknown *obj;
+     BOOLEAN is_agile;
+     IUnknown *ctx;
++    DWORD tid; /* the thread that made it */
+     LONG ref;
+ };
+ 
+@@ -359,12 +360,9 @@ struct marshal_context_params
+ static HRESULT WINAPI marshal_object_in_context(ComCallData *arg)
+ {
+     struct marshal_context_params *params = (struct marshal_context_params *)arg;
+-    HRESULT hr;
+ 
+-    hr = marshal_object_in_agile_reference(params->impl, params->iid, params->impl->obj);
+-    IUnknown_Release(params->impl->obj);
+-    params->impl->obj = NULL;
+-    return hr;
++    /* the object itself stays held, as on Windows: its thread still gets it */
++    return marshal_object_in_agile_reference(params->impl, params->iid, params->impl->obj);
+ }
+ 
+ static HRESULT WINAPI agile_ref_Resolve(IAgileReference *iface, REFIID riid, void **obj)
+@@ -379,6 +377,10 @@ static HRESULT WINAPI agile_ref_Resolve(IAgileReference *iface, REFIID riid, voi
+     if (impl->is_agile)
+         return IUnknown_QueryInterface(impl->obj, riid, obj);
+ 
++    /* a delayed marshal is made for the other threads only, even those of the same apartment */
++    if (impl->option == AGILEREFERENCE_DELAYEDMARSHAL && impl->tid == GetCurrentThreadId())
++        return IUnknown_QueryInterface(impl->obj, riid, obj);
++
+     if (FAILED(hr = CoGetContextToken((ULONG_PTR *)&cur_ctx)))
+         return hr;
+ 
+@@ -465,6 +467,7 @@ HRESULT WINAPI RoGetAgileReference(enum AgileReferenceOptions option, REFIID rii
+     impl->IAgileReference_iface.lpVtbl = &agile_ref_vtbl;
+     impl->option = option;
+     impl->is_agile = object_has_interface(obj, &IID_IAgileObject);
++    impl->tid = GetCurrentThreadId();
+     impl->ref = 1;
+     if (FAILED(hr = CoGetContextToken((ULONG_PTR *)&impl->ctx)))
+     {
+diff --git a/dlls/combase/stubmanager.c b/dlls/combase/stubmanager.c
+index 4756e334f9f..13d08afd0d1 100644
+--- a/dlls/combase/stubmanager.c
++++ b/dlls/combase/stubmanager.c
+@@ -82,8 +82,10 @@ struct ifstub * stub_manager_new_ifstub(struct stub_manager *m, IRpcStubBuffer *
+     stub = calloc(1, sizeof(struct ifstub));
+     if (!stub) return NULL;
+ 
+-    hr = IUnknown_QueryInterface(m->object, iid, (void **)&stub->iface);
+-    if (hr != S_OK)
++    /* the object's IUnknown is the one the stub manager holds already: Windows takes no other reference for it */
++    if (IsEqualIID(iid, &IID_IUnknown))
++        stub->iface = m->object;
++    else if ((hr = IUnknown_QueryInterface(m->object, iid, (void **)&stub->iface)) != S_OK)
+     {
+         free(stub);
+         return NULL;
+@@ -92,7 +94,7 @@ struct ifstub * stub_manager_new_ifstub(struct stub_manager *m, IRpcStubBuffer *
+     hr = rpc_create_serverchannel(dest_context, dest_context_data, &stub->chan);
+     if (hr != S_OK)
+     {
+-        IUnknown_Release(stub->iface);
++        if (!IsEqualIID(iid, &IID_IUnknown)) IUnknown_Release(stub->iface);
+         free(stub);
+         return NULL;
+     }
+@@ -131,7 +133,7 @@ static void stub_manager_delete_ifstub(struct stub_manager *m, struct ifstub *if
+         rpc_unregister_interface(&ifstub->iid, TRUE);
+ 
+     if (ifstub->stubbuffer) IRpcStubBuffer_Release(ifstub->stubbuffer);
+-    IUnknown_Release(ifstub->iface);
++    if (!IsEqualIID(&ifstub->iid, &IID_IUnknown)) IUnknown_Release(ifstub->iface);
+     IRpcChannelBuffer_Release(ifstub->chan);
+ 
+     free(ifstub);
+diff --git a/dlls/combase/tests/roapi.c b/dlls/combase/tests/roapi.c
+index 70977c9920e..d436fa6ed3f 100644
+--- a/dlls/combase/tests/roapi.c
++++ b/dlls/combase/tests/roapi.c
+@@ -642,13 +642,11 @@ static DWORD CALLBACK test_RoGetAgileReference_thread_proc(void *arg)
+     else if (param->from_type == RO_INIT_MULTITHREADED && param->to_type == RO_INIT_MULTITHREADED)
+     {
+         ok(unknown == param->unk_obj, "Expected the same object.\n");
+-        todo_wine_if(param->option == AGILEREFERENCE_DEFAULT)
+         EXPECT_REF(param->unk_obj, param->option == AGILEREFERENCE_DEFAULT ? 5 : 6);
+     }
+     else
+     {
+         ok(unknown != param->unk_obj, "Expected a different object pointer.\n");
+-        todo_wine_if(param->option == AGILEREFERENCE_DEFAULT)
+         EXPECT_REF(param->unk_obj, param->option == AGILEREFERENCE_DEFAULT ? 4 : 5);
+         EXPECT_REF(unknown, 1);
+     }
+@@ -734,7 +732,6 @@ static void test_RoGetAgileReference(void)
+             hr = RoGetAgileReference(option, &IID_IUnknown, &unk_obj.IUnknown_iface, &agile_reference);
+             ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+             ok(!!agile_reference, "Got unexpected agile_reference.\n");
+-            todo_wine_if(option == AGILEREFERENCE_DEFAULT)
+             EXPECT_REF(&unk_obj, 2);
+ 
+             /* Check the created agile reference object has IAgileObject */
+@@ -748,7 +745,6 @@ static void test_RoGetAgileReference(void)
+             ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+             ok(!!unknown, "Expected pointer not NULL.\n");
+             ok(unknown == &unk_obj.IUnknown_iface, "Expected the same object.\n");
+-            todo_wine
+             EXPECT_REF(&unk_obj, 3);
+ 
+             /* Resolve twice */
+@@ -757,7 +753,6 @@ static void test_RoGetAgileReference(void)
+             ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+             ok(!!unknown2, "Expected pointer not NULL.\n");
+             ok(unknown2 == &unk_obj.IUnknown_iface, "Expected the same object.\n");
+-            todo_wine
+             EXPECT_REF(&unk_obj, 4);
+ 
+             /* Resolve in another apartment */
+diff --git a/dlls/ole32/tests/usrmarshal.c b/dlls/ole32/tests/usrmarshal.c
+index 825e848a791..84e0de385a9 100644
+--- a/dlls/ole32/tests/usrmarshal.c
++++ b/dlls/ole32/tests/usrmarshal.c
+@@ -720,7 +720,6 @@ static void marshal_WdtpInterfacePointer(DWORD umcb_ctx, DWORD ctx, BOOL client,
+     IStream_Seek(stm, zero, STREAM_SEEK_CUR, &pos);
+     marshal_size = pos.u.LowPart;
+     marshal_data = GlobalLock(h);
+-    todo_wine
+     ok(Test_Unknown.refs == 2, "got %ld\n", Test_Unknown.refs);
+ 
+     init_user_marshal_cb(&umcb, &stub_msg, &rpc_msg, NULL, 0, umcb_ctx);
+@@ -729,7 +728,6 @@ static void marshal_WdtpInterfacePointer(DWORD umcb_ctx, DWORD ctx, BOOL client,
+     buffer = malloc(size);
+     init_user_marshal_cb(&umcb, &stub_msg, &rpc_msg, buffer, size, umcb_ctx);
+     buffer_end = WdtpInterfacePointer_UserMarshal(&umcb.Flags, ctx, buffer, unk, &IID_IUnknown);
+-    todo_wine
+     ok(Test_Unknown.refs == 2, "got %ld\n", Test_Unknown.refs);
+     wireip = buffer;
+ 

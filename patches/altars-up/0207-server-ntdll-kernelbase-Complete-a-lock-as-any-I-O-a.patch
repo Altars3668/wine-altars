@@ -1,0 +1,727 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 08:02:52 -0400
+Subject: [PATCH] server, ntdll, kernelbase: Complete a lock as any I/O, and
+ grant one that waits when the lock in its way goes.
+
+NtLockFile refused a status block, an APC or a completion port, set the
+event only on success, and a lock on a handle for overlapped I/O that had
+to wait returned STATUS_PENDING and was then forgotten: it was never
+granted, and nothing ever completed it.  LockFileEx passed no status block,
+so its OVERLAPPED was never written.
+
+Measured on Windows (tools/fileinfoprobe/lockiocp in the outer tree), a
+lock granted or refused at once writes the status block (the OVERLAPPED;
+STATUS_LOCK_NOT_GRANTED for a refusal, Information 0), sets the event, and
+posts a completion packet, a refusal too, unless the handle skips the port
+for what did not wait, refusals included.  One that has to wait returns
+STATUS_PENDING with Internal STATUS_PENDING and InternalHigh untouched, and
+completes when the lock in its way is unlocked or its handle closed
+(STATUS_SUCCESS), when it is cancelled (STATUS_CANCELLED), or when its own
+handle's last handle is closed (STATUS_RANGE_NOT_LOCKED), each time with
+the event and a packet.  NtLockFile without a status block fails with
+STATUS_ACCESS_VIOLATION before locking anything.
+
+The lock_file request now carries the async parameters, with the count as
+data for lack of room.  The server queues a lock that has to wait on a
+handle for overlapped I/O as a request async on the inode, and grants the
+queued locks in order whenever a lock of the inode goes; while a Unix lock
+outside Wine is in the way, it looks again every 100 ms, as a client
+waiting on a handle without overlapped I/O does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 6057e5fef97aa2e06220cc8bf745248b3fcc561e)
+
+diff --git a/dlls/kernel32/tests/file.c b/dlls/kernel32/tests/file.c
+index 140c9e3d4e3..515af04148c 100644
+--- a/dlls/kernel32/tests/file.c
++++ b/dlls/kernel32/tests/file.c
+@@ -2328,6 +2328,13 @@ static void test_LockFile(void)
+     ok( iosb.Status == status, "got %lu.\n", iosb.Status);
+     ok( !iosb.Information, "got %Iu.\n", iosb.Information);
+ 
++    /* no status block, nothing locked */
++    count.QuadPart = 1;
++    status = NtLockFile( handle, NULL, NULL, NULL, NULL, &offset, &count, NULL, TRUE, TRUE );
++    ok( status == STATUS_ACCESS_VIOLATION, "got %#lx.\n", status );
++    ok( LockFile( handle2, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ok( UnlockFile( handle2, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++
+     ok( WriteFile( handle, sillytext, strlen(sillytext), &written, NULL ), "write failed\n" );
+ 
+     ok( LockFile( handle, 0, 0, 0, 0 ), "LockFile failed\n" );
+@@ -2451,6 +2458,160 @@ cleanup:
+     DeleteFileA( filename );
+ }
+ 
++#define check_lock_packet(a,b,c) check_lock_packet_(__LINE__,a,b,c)
++static void check_lock_packet_( unsigned int line, HANDLE port, OVERLAPPED *expect, DWORD error )
++{
++    OVERLAPPED *ov = NULL;
++    ULONG_PTR key = 0;
++    DWORD size = 0xdeadbeef;
++    BOOL ret;
++
++    SetLastError( 0xdeadbeef );
++    ret = GetQueuedCompletionStatus( port, &size, &key, &ov, 0 );
++    if (!expect)
++    {
++        ok_(__FILE__, line)( !ret && !ov && GetLastError() == WAIT_TIMEOUT, "got a packet, ret %d, error %lu, ov %p.\n",
++                             ret, GetLastError(), ov );
++        return;
++    }
++    ok_(__FILE__, line)( ov == expect, "got ov %p, error %lu.\n", ov, GetLastError() );
++    ok_(__FILE__, line)( ret == !error, "got ret %d.\n", ret );
++    if (error) ok_(__FILE__, line)( GetLastError() == error, "got error %lu.\n", GetLastError() );
++    ok_(__FILE__, line)( key == 0x1234, "got key %#Ix.\n", key );
++    ok_(__FILE__, line)( !size, "got size %lu.\n", size );
++}
++
++#define lock_overlapped(a,b,c,d) lock_overlapped_(__LINE__,a,b,c,d)
++static BOOL lock_overlapped_( unsigned int line, HANDLE file, DWORD flags, OVERLAPPED *ov, HANDLE event )
++{
++    ResetEvent( event );
++    memset( ov, 0x55, sizeof(*ov) );
++    ov->Offset = ov->OffsetHigh = 0;
++    ov->hEvent = event;
++    SetLastError( 0xdeadbeef );
++    return LockFileEx( file, flags, 0, 1, 0, ov );
++}
++
++/* a lock of a handle for overlapped I/O completes as any I/O does: its status block, its event, and a completion
++ * port; one that has to wait completes when it is granted, cancelled, or its handle closed */
++static void test_LockFile_overlapped(void)
++{
++    HANDLE file, other, holder, port, event;
++    ULONG_PTR pattern;
++    OVERLAPPED ov;
++    BOOL ret;
++
++    file = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                        CREATE_ALWAYS, FILE_FLAG_OVERLAPPED, 0 );
++    ok( file != INVALID_HANDLE_VALUE, "got error %lu.\n", GetLastError() );
++    other = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                         OPEN_EXISTING, 0, 0 );
++    ok( other != INVALID_HANDLE_VALUE, "got error %lu.\n", GetLastError() );
++    port = CreateIoCompletionPort( file, NULL, 0x1234, 0 );
++    ok( !!port, "got error %lu.\n", GetLastError() );
++    event = CreateEventA( NULL, TRUE, FALSE, NULL );
++    memset( &pattern, 0x55, sizeof(pattern) );
++
++    ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++    ok( ret, "got error %lu.\n", GetLastError() );
++    ok( (NTSTATUS)ov.Internal == STATUS_SUCCESS, "got status %#Ix.\n", ov.Internal );
++    ok( !ov.InternalHigh, "got information %#Ix.\n", ov.InternalHigh );
++    ok( !WaitForSingleObject( event, 0 ), "event not set.\n" );
++    check_lock_packet( port, &ov, 0 );
++    ok( UnlockFile( file, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++
++    ok( LockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, &ov, event );
++    ok( !ret && GetLastError() == ERROR_LOCK_VIOLATION, "got ret %d, error %lu.\n", ret, GetLastError() );
++    ok( (NTSTATUS)ov.Internal == STATUS_LOCK_NOT_GRANTED, "got status %#Ix.\n", ov.Internal );
++    ok( !ov.InternalHigh, "got information %#Ix.\n", ov.InternalHigh );
++    ok( !WaitForSingleObject( event, 0 ), "event not set.\n" );
++    check_lock_packet( port, &ov, ERROR_LOCK_VIOLATION );
++
++    ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++    ok( !ret && GetLastError() == ERROR_IO_PENDING, "got ret %d, error %lu.\n", ret, GetLastError() );
++    ok( (NTSTATUS)ov.Internal == STATUS_PENDING, "got status %#Ix.\n", ov.Internal );
++    ok( ov.InternalHigh == pattern, "got information %#Ix.\n", ov.InternalHigh );
++    ok( WaitForSingleObject( event, 0 ) == WAIT_TIMEOUT, "event set.\n" );
++    check_lock_packet( port, NULL, 0 );
++    ok( UnlockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ok( !WaitForSingleObject( event, 1000 ), "event not set.\n" );
++    ok( (NTSTATUS)ov.Internal == STATUS_SUCCESS, "got status %#Ix.\n", ov.Internal );
++    ok( !ov.InternalHigh, "got information %#Ix.\n", ov.InternalHigh );
++    check_lock_packet( port, &ov, 0 );
++    ok( !LockFile( other, 0, 0, 1, 0 ), "the waiting lock was not granted.\n" );
++    ok( UnlockFile( file, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++
++    ok( LockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++    ok( !ret && GetLastError() == ERROR_IO_PENDING, "got ret %d, error %lu.\n", ret, GetLastError() );
++    ok( CancelIoEx( file, &ov ), "got error %lu.\n", GetLastError() );
++    ok( !WaitForSingleObject( event, 1000 ), "event not set.\n" );
++    ok( (NTSTATUS)ov.Internal == STATUS_CANCELLED, "got status %#Ix.\n", ov.Internal );
++    ok( !ov.InternalHigh, "got information %#Ix.\n", ov.InternalHigh );
++    check_lock_packet( port, &ov, ERROR_OPERATION_ABORTED );
++    ok( UnlockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ok( !UnlockFile( file, 0, 0, 1, 0 ), "the cancelled lock was granted.\n" );
++
++    /* the handle whose lock is in the way closed */
++    holder = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                          OPEN_EXISTING, 0, 0 );
++    ok( holder != INVALID_HANDLE_VALUE, "got error %lu.\n", GetLastError() );
++    ok( LockFile( holder, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++    ok( !ret && GetLastError() == ERROR_IO_PENDING, "got ret %d, error %lu.\n", ret, GetLastError() );
++    CloseHandle( holder );
++    ok( !WaitForSingleObject( event, 1000 ), "event not set.\n" );
++    ok( (NTSTATUS)ov.Internal == STATUS_SUCCESS, "got status %#Ix.\n", ov.Internal );
++    check_lock_packet( port, &ov, 0 );
++    ok( UnlockFile( file, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++
++    if (pSetFileCompletionNotificationModes)
++    {
++        /* what does not wait posts nothing, a refusal as little as a lock granted */
++        ret = pSetFileCompletionNotificationModes( file, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS );
++        ok( ret, "got error %lu.\n", GetLastError() );
++        ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++        ok( ret, "got error %lu.\n", GetLastError() );
++        ok( (NTSTATUS)ov.Internal == STATUS_SUCCESS, "got status %#Ix.\n", ov.Internal );
++        ok( !WaitForSingleObject( event, 0 ), "event not set.\n" );
++        check_lock_packet( port, NULL, 0 );
++        ok( UnlockFile( file, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++
++        ok( LockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++        ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, &ov, event );
++        ok( !ret && GetLastError() == ERROR_LOCK_VIOLATION, "got ret %d, error %lu.\n", ret, GetLastError() );
++        ok( (NTSTATUS)ov.Internal == STATUS_LOCK_NOT_GRANTED, "got status %#Ix.\n", ov.Internal );
++        ok( !WaitForSingleObject( event, 0 ), "event not set.\n" );
++        check_lock_packet( port, NULL, 0 );
++
++        ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++        ok( !ret && GetLastError() == ERROR_IO_PENDING, "got ret %d, error %lu.\n", ret, GetLastError() );
++        ok( UnlockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++        ok( !WaitForSingleObject( event, 1000 ), "event not set.\n" );
++        ok( (NTSTATUS)ov.Internal == STATUS_SUCCESS, "got status %#Ix.\n", ov.Internal );
++        check_lock_packet( port, &ov, 0 );
++        ok( UnlockFile( file, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    }
++    else win_skip( "SetFileCompletionNotificationModes not available.\n" );
++
++    /* a lock still waiting when the handle is closed is not granted */
++    ok( LockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++    ret = lock_overlapped( file, LOCKFILE_EXCLUSIVE_LOCK, &ov, event );
++    ok( !ret && GetLastError() == ERROR_IO_PENDING, "got ret %d, error %lu.\n", ret, GetLastError() );
++    CloseHandle( file );
++    ok( !WaitForSingleObject( event, 1000 ), "event not set.\n" );
++    ok( (NTSTATUS)ov.Internal == STATUS_RANGE_NOT_LOCKED, "got status %#Ix.\n", ov.Internal );
++    ok( !ov.InternalHigh, "got information %#Ix.\n", ov.InternalHigh );
++    check_lock_packet( port, &ov, ERROR_NOT_LOCKED );
++    ok( UnlockFile( other, 0, 0, 1, 0 ), "got error %lu.\n", GetLastError() );
++
++    CloseHandle( other );
++    CloseHandle( port );
++    CloseHandle( event );
++    DeleteFileA( filename );
++}
++
+ static BOOL create_fake_dll( LPCSTR filename )
+ {
+     IMAGE_DOS_HEADER *dos;
+@@ -7154,6 +7315,7 @@ START_TEST(file)
+     test_FindFirstFileExA(FindExInfoStandard, FindExSearchLimitToDirectories, FIND_FIRST_EX_LARGE_FETCH);
+     test_FindFirstFileExA(FindExInfoBasic, FindExSearchLimitToDirectories, 0);
+     test_LockFile();
++    test_LockFile_overlapped();
+     test_file_sharing();
+     test_offset_in_overlapped_structure();
+     test_MapFile();
+diff --git a/dlls/kernelbase/file.c b/dlls/kernelbase/file.c
+index 459776f2998..cf4924d349a 100644
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -3467,6 +3467,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFile( HANDLE file, DWORD offset_low, DWORD off
+                                         DWORD count_low, DWORD count_high )
+ {
+     LARGE_INTEGER count, offset;
++    IO_STATUS_BLOCK io;
+ 
+     TRACE( "%p %lx%08lx %lx%08lx\n", file, offset_high, offset_low, count_high, count_low );
+ 
+@@ -3474,7 +3475,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFile( HANDLE file, DWORD offset_low, DWORD off
+     count.u.HighPart = count_high;
+     offset.u.LowPart = offset_low;
+     offset.u.HighPart = offset_high;
+-    return set_ntstatus( NtLockFile( file, 0, NULL, NULL, NULL, &offset, &count, NULL, TRUE, TRUE ));
++    return set_ntstatus( NtLockFile( file, 0, NULL, NULL, &io, &offset, &count, NULL, TRUE, TRUE ));
+ }
+ 
+ 
+@@ -3503,8 +3504,10 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFileEx( HANDLE file, DWORD flags, DWORD reserv
+ 
+     if (((ULONG_PTR)overlapped->hEvent & 1) == 0) cvalue = overlapped;
+ 
++    /* the OVERLAPPED is the status block, as for any I/O */
++    overlapped->Internal = STATUS_PENDING;
+     return set_ntstatus( NtLockFile( file, overlapped->hEvent, NULL, cvalue,
+-                                     NULL, &offset, &count, NULL,
++                                     (IO_STATUS_BLOCK *)overlapped, &offset, &count, NULL,
+                                      flags & LOCKFILE_FAIL_IMMEDIATELY,
+                                      flags & LOCKFILE_EXCLUSIVE_LOCK ));
+ }
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index c3a94d40602..b9a7e244ca9 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7124,43 +7124,54 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
+                             IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset,
+                             LARGE_INTEGER *count, ULONG *key, BOOLEAN dont_wait, BOOLEAN exclusive )
+ {
+-    static int warn;
++    struct async_irp *async;
+     unsigned int ret;
+     HANDLE handle;
+-    BOOLEAN async;
++    BOOLEAN overlapped;
+ 
+-    if (apc || io_status || key)
++    if (key)
+     {
+         FIXME("Unimplemented yet parameter\n");
+         return STATUS_NOT_IMPLEMENTED;
+     }
+-    if (apc_user && !warn++) FIXME("I/O completion on lock not implemented yet\n");
++    /* the status block is checked before anything is locked */
++    if (!io_status) return STATUS_ACCESS_VIOLATION;
+ 
+     for (;;)
+     {
++        if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion )))
++            return STATUS_NO_MEMORY;
++        async->buffer = NULL;
++        async->size   = 0;
++
+         SERVER_START_REQ( lock_file )
+         {
+-            req->handle      = wine_server_obj_handle( file );
+-            req->offset      = offset->QuadPart;
+-            req->count       = count->QuadPart;
+-            req->shared      = !exclusive;
+-            req->wait        = !dont_wait;
++            req->flags  = (exclusive ? 0 : LOCK_FILE_SHARED) | (dont_wait ? 0 : LOCK_FILE_WAIT);
++            req->async  = server_async( file, &async->io, event, apc, apc_user, iosb_client_ptr(io_status) );
++            req->offset = offset->QuadPart;
++            wine_server_add_data( req, &count->QuadPart, sizeof(count->QuadPart) );
+             ret = wine_server_call( req );
+             handle = wine_server_ptr_handle( reply->handle );
+-            async  = reply->overlapped;
++            overlapped = reply->overlapped;
+         }
+         SERVER_END_REQ;
++
++        /* one on a handle for overlapped I/O that has to wait completes when it is granted, cancelled, or its
++         * handle closed */
++        if (ret == STATUS_PENDING && overlapped) return STATUS_PENDING;
++        free( async );
++
+         if (ret != STATUS_PENDING)
+         {
+-            if (!ret && event) NtSetEvent( event, NULL );
++            /* granted or refused at once, the request completes as any I/O that did not wait does, a refusal
++             * too: the status block, the event, and an APC or a completion packet, unless the handle skips
++             * those for what does not wait */
++            if (ret == STATUS_FILE_LOCK_CONFLICT) ret = STATUS_LOCK_NOT_GRANTED;
++            if (!ret || ret == STATUS_LOCK_NOT_GRANTED)
++                file_complete_async( file, overlapped ? 0 : FILE_SYNCHRONOUS_IO_NONALERT, event, apc, apc_user,
++                                     io_status, ret, 0 );
+             return ret;
+         }
+-        if (async)
+-        {
+-            FIXME( "Async I/O lock wait not implemented, might deadlock\n" );
+-            if (handle) NtClose( handle );
+-            return STATUS_PENDING;
+-        }
+         if (handle)
+         {
+             NtWaitForSingleObject( handle, FALSE, NULL );
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 36953ec66cb..b82aeed34b6 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -2060,11 +2060,10 @@ struct get_volume_info_reply
+ struct lock_file_request
+ {
+     struct request_header __header;
+-    obj_handle_t handle;
++    unsigned int flags;
++    struct async_data async;
+     file_pos_t   offset;
+-    file_pos_t   count;
+-    int          shared;
+-    int          wait;
++    /* VARARG(count,uints64); */
+ };
+ struct lock_file_reply
+ {
+@@ -2072,6 +2071,8 @@ struct lock_file_reply
+     obj_handle_t handle;
+     int          overlapped;
+ };
++#define LOCK_FILE_SHARED 0x01
++#define LOCK_FILE_WAIT   0x02
+ 
+ 
+ 
+@@ -7206,6 +7207,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 965
++#define SERVER_PROTOCOL_VERSION 966
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/fd.c b/server/fd.c
+index 19aee9417b2..1f7161c849c 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -211,6 +211,7 @@ struct inode
+     ino_t               ino;        /* inode number */
+     struct list         open;       /* list of open file descriptors */
+     struct list         locks;      /* list of file locks */
++    struct list         pending_locks; /* list of locks waiting to be granted, in the order they were asked for */
+     struct list         closed;     /* list of file descriptors to close at destroy time */
+ };
+ 
+@@ -1135,6 +1136,7 @@ static struct inode *get_inode( dev_t dev, ino_t ino, int unix_fd )
+         inode->ino    = ino;
+         list_init( &inode->open );
+         list_init( &inode->locks );
++        list_init( &inode->pending_locks );
+         list_init( &inode->closed );
+         list_add_head( &device->inode_hash[hash], &inode->entry );
+     }
+@@ -1383,8 +1385,38 @@ static void remove_unix_locks( struct fd *fd, file_pos_t start, file_pos_t end )
+     free( buffer );
+ }
+ 
++/* a lock asked for on a handle for overlapped I/O that has to wait: the request completes when it is granted */
++struct pending_lock
++{
++    struct list         entry;       /* entry in the inode's list of pending locks */
++    struct async       *async;       /* the request */
++    struct fd          *fd;          /* fd the lock is for */
++    struct process     *process;     /* process asking for it */
++    int                 shared;      /* shared lock? */
++    file_pos_t          start;       /* region to lock is interval [start;end) */
++    file_pos_t          end;
++    struct timeout_user *retry;      /* to look again while a lock outside Wine is in the way */
++};
++
++static void grant_pending_locks( struct inode *inode );
++
++/* the lock someone holds that a lock of the region would conflict with */
++static struct file_lock *find_conflicting_lock( struct fd *fd, file_pos_t start, file_pos_t end, int shared )
++{
++    struct file_lock *lock;
++
++    LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
++    {
++        if (!lock_overlaps( lock, start, end )) continue;
++        if (shared && (lock->shared || lock->fd == fd)) continue;
++        return lock;
++    }
++    return NULL;
++}
++
+ /* create a new lock on a fd */
+-static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start, file_pos_t end )
++static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start, file_pos_t end,
++                                   struct process *process )
+ {
+     struct file_lock *lock;
+ 
+@@ -1394,7 +1426,7 @@ static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start,
+     lock->start   = start;
+     lock->end     = end;
+     lock->fd      = fd;
+-    lock->process = current->process;
++    lock->process = process;
+ 
+     if (!(lock->sync = create_internal_sync( 1, 0 ))) goto error;
+     /* now try to set a Unix lock */
+@@ -1418,10 +1450,99 @@ static void remove_lock( struct file_lock *lock, int remove_unix )
+     list_remove( &lock->inode_entry );
+     list_remove( &lock->proc_entry );
+     if (remove_unix) remove_unix_locks( lock->fd, lock->start, lock->end );
+-    if (list_empty( &inode->locks )) inode_close_pending( inode, 1 );
+     lock->process = NULL;
+     signal_sync( lock->sync );
+     release_object( lock );
++    grant_pending_locks( inode );
++    if (list_empty( &inode->locks )) inode_close_pending( inode, 1 );
++}
++
++/* a pending lock's request completed, whether granted, cancelled or given up */
++static void pending_lock_completed( void *private )
++{
++    struct pending_lock *pending = private;
++
++    if (pending->retry) remove_timeout_user( pending->retry );
++    list_remove( &pending->entry );
++    release_object( pending->process );
++    release_object( pending->async );
++    free( pending );
++}
++
++static void retry_pending_locks( void *private )
++{
++    struct pending_lock *pending = private;
++
++    pending->retry = NULL;
++    grant_pending_locks( pending->fd->inode );
++}
++
++/* grant the locks waiting on the inode that nothing is in the way of any more, in the order asked for */
++static void grant_pending_locks( struct inode *inode )
++{
++    struct pending_lock *pending, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( pending, next, &inode->pending_locks, struct pending_lock, entry )
++    {
++        struct iosb *iosb = async_get_iosb( pending->async );
++        int waiting = iosb->status == STATUS_PENDING;
++
++        release_object( iosb );
++        if (!waiting) continue;  /* cancelled: its completion takes it off the list */
++        if (find_conflicting_lock( pending->fd, pending->start, pending->end, pending->shared )) continue;
++        if (!add_lock( pending->fd, pending->shared, pending->start, pending->end, pending->process ))
++        {
++            /* a Unix lock is in the way: look again in a while, as a client waiting on its own does */
++            clear_error();
++            if (!pending->retry)
++                pending->retry = add_timeout_user( -TICKS_PER_SEC / 10, retry_pending_locks, pending );
++            continue;
++        }
++        list_remove( &pending->entry );
++        list_init( &pending->entry );
++        async_request_complete( pending->async, STATUS_SUCCESS, 0, 0, NULL );
++    }
++}
++
++/* complete the locks still waiting for the fd, as when its last handle is closed */
++void complete_pending_locks( struct fd *fd, unsigned int status )
++{
++    struct pending_lock *pending, *next;
++
++    if (!fd->inode) return;
++    LIST_FOR_EACH_ENTRY_SAFE( pending, next, &fd->inode->pending_locks, struct pending_lock, entry )
++    {
++        if (pending->fd != fd) continue;
++        list_remove( &pending->entry );
++        list_init( &pending->entry );
++        async_request_complete( pending->async, status, 0, 0, NULL );
++    }
++}
++
++/* queue a lock that has to wait, on a handle for overlapped I/O */
++static void queue_pending_lock( struct fd *fd, file_pos_t start, file_pos_t end, int shared,
++                                const struct async_data *data, int unix_conflict )
++{
++    struct pending_lock *pending;
++    struct async *async;
++
++    if (!(pending = mem_alloc( sizeof(*pending) ))) return;
++    if (!(async = create_request_async( fd, data, 0 )))
++    {
++        free( pending );
++        return;
++    }
++    pending->async   = async;
++    pending->fd      = fd;
++    pending->process = (struct process *)grab_object( current->process );
++    pending->shared  = shared;
++    pending->start   = start;
++    pending->end     = end;
++    pending->retry   = unix_conflict ? add_timeout_user( -TICKS_PER_SEC / 10, retry_pending_locks, pending ) : NULL;
++    list_add_tail( &fd->inode->pending_locks, &pending->entry );
++    async_set_completion_callback( async, pending_lock_completed, pending );
++    set_error( STATUS_PENDING );
++    async_handoff( async, NULL, 0 );
+ }
+ 
+ /* remove all locks owned by a given process */
+@@ -1453,8 +1574,9 @@ static void remove_fd_locks( struct fd *fd )
+ }
+ 
+ /* add a lock on an fd */
+-/* returns handle to wait on */
+-obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int shared, int wait )
++/* returns handle to wait on; one for overlapped I/O that has to wait completes its request instead */
++obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int shared, int wait,
++                      const struct async_data *async )
+ {
+     struct file_lock *lock;
+     file_pos_t end = start + count;
+@@ -1473,26 +1595,33 @@ obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int sha
+     }
+ 
+     /* check if another lock on that file overlaps the area */
+-    LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
++    if ((lock = find_conflicting_lock( fd, start, end, shared )))
+     {
+-        if (!lock_overlaps( lock, start, end )) continue;
+-        if (shared && (lock->shared || lock->fd == fd)) continue;
+-        /* found one */
+         if (!wait)
+         {
+             set_error( STATUS_FILE_LOCK_CONFLICT );
+             return 0;
+         }
++        if (is_fd_overlapped( fd ))
++        {
++            queue_pending_lock( fd, start, end, shared, async, 0 );
++            return 0;
++        }
+         set_error( STATUS_PENDING );
+         return alloc_handle( current->process, lock, SYNCHRONIZE, 0 );
+     }
+ 
+     /* not found, add it */
+-    if (add_lock( fd, shared, start, end )) return 0;
+-    if (get_error() == STATUS_FILE_LOCK_CONFLICT)
++    if (add_lock( fd, shared, start, end, current->process )) return 0;
++    if (get_error() == STATUS_FILE_LOCK_CONFLICT && wait)
+     {
+-        /* Unix lock conflict -> tell client to wait and retry */
+-        if (wait) set_error( STATUS_PENDING );
++        /* Unix lock conflict -> tell client to wait and retry, or wait for the Wine locks to go */
++        if (is_fd_overlapped( fd ))
++        {
++            clear_error();
++            queue_pending_lock( fd, start, end, shared, async, 1 );
++        }
++        else set_error( STATUS_PENDING );
+     }
+     return 0;
+ }
+diff --git a/server/file.c b/server/file.c
+index 11f3b0ed6db..40bc678e051 100644
+--- a/server/file.c
++++ b/server/file.c
+@@ -81,6 +81,7 @@ static struct object *file_lookup_name( struct object *obj, struct unicode_str *
+ static struct object *file_open_file( struct object *obj, unsigned int access,
+                                       unsigned int sharing, unsigned int options );
+ static struct list *file_get_kernel_obj_list( struct object *obj );
++static int file_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
+ static void file_destroy( struct object *obj );
+ 
+ static enum server_fd_type file_get_fd_type( struct fd *fd );
+@@ -98,6 +99,7 @@ static const struct object_ops file_ops =
+     .lookup_name         = file_lookup_name,
+     .open_file           = file_open_file,
+     .get_kernel_obj_list = file_get_kernel_obj_list,
++    .close_handle        = file_close_handle,
+     .destroy             = file_destroy,
+ };
+ 
+@@ -561,6 +563,15 @@ static struct list *file_get_kernel_obj_list( struct object *obj )
+     return &file->kernel_object;
+ }
+ 
++/* a lock still waiting to be granted when the file's last handle goes is not granted */
++static int file_close_handle( struct object *obj, struct process *process, obj_handle_t handle )
++{
++    struct file *file = (struct file *)obj;
++
++    if (obj->handle_count == 1 && file->fd) complete_pending_locks( file->fd, STATUS_RANGE_NOT_LOCKED );
++    return 1;
++}
++
+ static void file_destroy( struct object *obj )
+ {
+     struct file *file = (struct file *)obj;
+@@ -675,10 +686,18 @@ DECL_HANDLER(alloc_file_handle)
+ DECL_HANDLER(lock_file)
+ {
+     struct file *file;
++    file_pos_t count;
+ 
+-    if ((file = get_file_obj( current->process, req->handle, 0 )))
++    if (get_req_data_size() != sizeof(count))
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++    memcpy( &count, get_req_data(), sizeof(count) );
++    if ((file = get_file_obj( current->process, req->async.handle, 0 )))
+     {
+-        reply->handle = lock_fd( file->fd, req->offset, req->count, req->shared, req->wait );
++        reply->handle = lock_fd( file->fd, req->offset, count, req->flags & LOCK_FILE_SHARED,
++                                 req->flags & LOCK_FILE_WAIT, &req->async );
+         reply->overlapped = is_fd_overlapped( file->fd );
+         release_object( file );
+     }
+diff --git a/server/file.h b/server/file.h
+index 59ca04383c9..0458ff327ac 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -103,7 +103,9 @@ extern int is_same_file_fd( struct fd *fd1, struct fd *fd2 );
+ extern int is_fd_removable( struct fd *fd );
+ extern int check_fd_events( struct fd *fd, int events );
+ extern void set_fd_events( struct fd *fd, int events );
+-extern obj_handle_t lock_fd( struct fd *fd, file_pos_t offset, file_pos_t count, int shared, int wait );
++extern obj_handle_t lock_fd( struct fd *fd, file_pos_t offset, file_pos_t count, int shared, int wait,
++                             const struct async_data *async );
++extern void complete_pending_locks( struct fd *fd, unsigned int status );
+ extern void unlock_fd( struct fd *fd, file_pos_t offset, file_pos_t count );
+ extern void allow_fd_caching( struct fd *fd );
+ extern void set_fd_signaled( struct fd *fd, int signaled );
+diff --git a/server/protocol.def b/server/protocol.def
+index 8799f06f275..c1dc27ab1aa 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1745,15 +1745,16 @@ enum server_fd_type
+ 
+ /* Lock a region of a file */
+ @REQ(lock_file)
+-    obj_handle_t handle;        /* handle to the file */
++    unsigned int flags;         /* LOCK_FILE_* flags below */
++    struct async_data async;    /* async I/O parameters: the handle, and how a lock that has to wait completes */
+     file_pos_t   offset;        /* offset of start of lock */
+-    file_pos_t   count;         /* count of bytes to lock */
+-    int          shared;        /* shared or exclusive lock? */
+-    int          wait;          /* do we want to wait? */
++    VARARG(count,uints64);      /* count of bytes to lock, which the request itself has no room for */
+ @REPLY
+     obj_handle_t handle;        /* handle to wait on */
+     int          overlapped;    /* is it an overlapped I/O handle? */
+ @END
++#define LOCK_FILE_SHARED 0x01   /* a shared lock, not an exclusive one */
++#define LOCK_FILE_WAIT   0x02   /* wait for a lock in the way to go */
+ 
+ 
+ /* Unlock a region of a file */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 58870f22955..058f4c4cd2a 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -1031,12 +1031,10 @@ C_ASSERT( offsetof(struct get_volume_info_request, info_class) == 56 );
+ C_ASSERT( sizeof(struct get_volume_info_request) == 64 );
+ C_ASSERT( offsetof(struct get_volume_info_reply, wait) == 8 );
+ C_ASSERT( sizeof(struct get_volume_info_reply) == 16 );
+-C_ASSERT( offsetof(struct lock_file_request, handle) == 12 );
+-C_ASSERT( offsetof(struct lock_file_request, offset) == 16 );
+-C_ASSERT( offsetof(struct lock_file_request, count) == 24 );
+-C_ASSERT( offsetof(struct lock_file_request, shared) == 32 );
+-C_ASSERT( offsetof(struct lock_file_request, wait) == 36 );
+-C_ASSERT( sizeof(struct lock_file_request) == 40 );
++C_ASSERT( offsetof(struct lock_file_request, flags) == 12 );
++C_ASSERT( offsetof(struct lock_file_request, async) == 16 );
++C_ASSERT( offsetof(struct lock_file_request, offset) == 56 );
++C_ASSERT( sizeof(struct lock_file_request) == 64 );
+ C_ASSERT( offsetof(struct lock_file_reply, handle) == 8 );
+ C_ASSERT( offsetof(struct lock_file_reply, overlapped) == 12 );
+ C_ASSERT( sizeof(struct lock_file_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 75e85cd0d07..e4c0206e862 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -752,11 +752,10 @@ static void dump_get_volume_info_reply( const struct get_volume_info_reply *req
+ 
+ static void dump_lock_file_request( const struct lock_file_request *req )
+ {
+-    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, " flags=%08x", req->flags );
++    dump_async_data( ", async=", &req->async );
+     dump_uint64( ", offset=", &req->offset );
+-    dump_uint64( ", count=", &req->count );
+-    fprintf( stderr, ", shared=%d", req->shared );
+-    fprintf( stderr, ", wait=%d", req->wait );
++    dump_varargs_uints64( ", count=", cur_size );
+ }
+ 
+ static void dump_lock_file_reply( const struct lock_file_reply *req )

@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 11:33:32 -0400
+Subject: [PATCH] win32u: Set the owner of another process's window without
+ waiting for its thread.
+
+SetWindowLongPtr(GWLP_HWNDPARENT) on a top-level window of another
+process sent that window WM_WINE_SETWINDOWLONG and waited for the
+answer, so it hung while the window's thread took no messages.  On
+Windows the owner changes at once (tools/ownerprobe in the wine-altars
+repository, its "taking no messages" section), and another thread of
+the owned window's process sees the new owner straight away.
+
+Change it on the server at once, as destroying the owner already does,
+and tell the window's thread with a notification; until its thread has
+heard of it, other threads of its process ask the server rather than
+the copy of its owner that thread keeps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/user32/tests/win.c b/dlls/user32/tests/win.c
+index 29f0ff8b650..fc7a3924bb9 100644
+--- a/dlls/user32/tests/win.c
++++ b/dlls/user32/tests/win.c
+@@ -13374,7 +13374,7 @@ static void other_process_proc(HWND hwnd)
+     HANDLE window_ready_event, test_done_event;
+     WINDOWPLACEMENT wp = {0};
+     RECT normal;
+-    HWND owned;
++    HWND owned, owner;
+     DWORD ret;
+ 
+     window_ready_event = OpenEventA(EVENT_ALL_ACCESS, FALSE, "test_opw_window");
+@@ -13441,6 +13441,20 @@ static void other_process_proc(HWND hwnd)
+        wine_dbgstr_rect(&wp.rcNormalPosition), wine_dbgstr_rect(&normal));
+     SetEvent(test_done_event);
+ 
++    /* its owner, set from here while its thread takes no messages, changes at once */
++    ret = WaitForSingleObject(window_ready_event, 5000);
++    ok(ret == WAIT_OBJECT_0, "Unexpected ret %lx.\n", ret);
++    owner = CreateWindowExA(0, "static", NULL, WS_POPUP, 0, 0, 10, 10, 0, 0, NULL, NULL);
++    ok(!!owner, "CreateWindowEx failed.\n");
++    SetWindowLongPtrA(hwnd, GWLP_HWNDPARENT, (LONG_PTR)owner);
++    ok(GetWindow(hwnd, GW_OWNER) == owner, "Unexpected owner %p.\n", GetWindow(hwnd, GW_OWNER));
++    SetEvent(test_done_event);
++    ret = WaitForSingleObject(window_ready_event, 5000);
++    ok(ret == WAIT_OBJECT_0, "Unexpected ret %lx.\n", ret);
++    DestroyWindow(owner);
++    ok(!GetWindow(hwnd, GW_OWNER), "Unexpected owner %p.\n", GetWindow(hwnd, GW_OWNER));
++    SetEvent(test_done_event);
++
+     /* the owner is destroyed: the owned window stays, owned by nothing */
+     ret = WaitForSingleObject(window_ready_event, 5000);
+     ok(ret == WAIT_OBJECT_0, "Unexpected ret %lx.\n", ret);
+@@ -13493,6 +13507,23 @@ static void test_SC_SIZE(void)
+     DestroyWindow(hwnd);
+ }
+ 
++static DWORD WINAPI get_owner_thread(void *arg)
++{
++    return GetWindow(arg, GW_OWNER) != NULL;
++}
++
++/* whether another thread of this process sees the window owned */
++static BOOL is_owned_on_another_thread(HWND hwnd)
++{
++    HANDLE thread = CreateThread(NULL, 0, get_owner_thread, hwnd, 0, NULL);
++    DWORD code = 0xdeadbeef;
++
++    WaitForSingleObject(thread, 5000);
++    GetExitCodeThread(thread, &code);
++    CloseHandle(thread);
++    return code;
++}
++
+ static void test_other_process_window(const char *argv0)
+ {
+     HANDLE window_ready_event, test_done_event;
+@@ -13547,6 +13578,19 @@ static void test_other_process_window(const char *argv0)
+     ret = wait_for_events(1, &test_done_event, 5000);
+     ok(ret == WAIT_OBJECT_0, "Unexpected ret %x.\n", ret);
+ 
++    /* and sets its owner, while this thread takes none: not waiting for it, and the change is
++     * seen at once in this process too */
++    SetEvent(window_ready_event);
++    ret = WaitForSingleObject(test_done_event, 5000);
++    ok(ret == WAIT_OBJECT_0, "Unexpected ret %x.\n", ret);
++    ok(is_owned_on_another_thread(hwnd), "Not owned.\n");
++    SetEvent(window_ready_event);
++    ret = WaitForSingleObject(test_done_event, 5000);
++    ok(ret == WAIT_OBJECT_0, "Unexpected ret %x.\n", ret);
++    ok(!is_owned_on_another_thread(hwnd), "Still owned.\n");
++    flush_events(TRUE);
++    ok(!GetWindow(hwnd, GW_OWNER), "Unexpected owner %p.\n", GetWindow(hwnd, GW_OWNER));
++
+     DestroyWindow(hwnd);
+     SetEvent(window_ready_event);
+     ret = WaitForSingleObject(test_done_event, 5000);
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index cac3b39772b..c050a162092 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -715,7 +715,8 @@ HWND get_parent( HWND hwnd )
+         if (popup) retval = win->owner;
+         else if (win->dwStyle & WS_CHILD) retval = win->parent;
+         release_win_ptr( win );
+-        if (popup && retval && !is_window( retval )) retval = get_window_relative( hwnd, GW_OWNER );
++        if (popup && ((retval && !is_window( retval )) || !is_current_thread_window( hwnd )))
++            retval = get_window_relative( hwnd, GW_OWNER );
+     }
+     return retval;
+ }
+@@ -864,9 +865,10 @@ HWND get_window_relative( HWND hwnd, UINT rel )
+         {
+             retval = win->owner;
+             release_win_ptr( win );
+-            /* an owner in another process that is destroyed clears the owner on the server
+-             * before this thread hears of it */
+-            if (!retval || is_window( retval )) return retval;
++            /* another process changes the owner on the server at once, and this process's copy
++             * when the window's thread hears of it: only that thread asks the copy, and even
++             * it not for an owner that is gone */
++            if (is_current_thread_window( hwnd ) && (!retval || is_window( retval ))) return retval;
+             retval = 0;
+         }
+         /* else fall through to server call */
+@@ -1607,6 +1609,10 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
+             RtlSetLastWin32Error( ERROR_INVALID_INDEX );
+             return 0;
+         }
++        /* the owner of a top-level window changes at once, whether or not its thread takes
++         * messages, as on Windows: no reason to wait for that thread */
++        if (offset == GWLP_HWNDPARENT && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
++            return (ULONG_PTR)set_window_owner( hwnd, (HWND)newval );
+         return send_message( hwnd, WM_WINE_SETWINDOWLONG, MAKEWPARAM( offset, size ), newval );
+     }
+ 

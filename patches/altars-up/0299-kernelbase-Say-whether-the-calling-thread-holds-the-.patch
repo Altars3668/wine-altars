@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 22:41:55 -0400
+Subject: [PATCH] kernelbase: Say whether the calling thread holds the loader
+ lock.
+
+PrivIsDllSynchronizationHeld() is what AuxUlibIsDLLSynchronizationHeld() asks: aux_ulib.lib, linked
+into Word, PowerPoint and fourteen other Office binaries, looks it up through
+api-ms-win-core-libraryloader-l1-1-0.dll and calls it as BOOL (WINAPI *)(BOOL *held).  Without it,
+AuxUlib compares the owner of PEB->LoaderLock with the calling thread itself; this answers the same,
+so nothing changes for Office but the failed lookup at every start.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/tests/loader.c b/dlls/kernel32/tests/loader.c
+index baf5a705fe2..8ab385b402e 100644
+--- a/dlls/kernel32/tests/loader.c
++++ b/dlls/kernel32/tests/loader.c
+@@ -75,6 +75,7 @@ static BOOL (WINAPI *pWow64RevertWow64FsRedirection)(void *);
+ static HMODULE (WINAPI *pLoadPackagedLibrary)(LPCWSTR lpwLibFileName, DWORD Reserved);
+ static NTSTATUS  (WINAPI *pLdrRegisterDllNotification)(ULONG, PLDR_DLL_NOTIFICATION_FUNCTION, void *, void **);
+ static NTSTATUS  (WINAPI *pLdrUnregisterDllNotification)(void *);
++static BOOL (WINAPI *pPrivIsDllSynchronizationHeld)(BOOL *);
+ 
+ #ifndef __arm__
+ static NTSTATUS (WINAPI *pNtAllocateVirtualMemory)(HANDLE, PVOID *, ULONG_PTR, SIZE_T *, ULONG, ULONG);
+@@ -3216,6 +3217,15 @@ static BOOL WINAPI dll_entry_point(HINSTANCE hinst, DWORD reason, LPVOID param)
+         ret = pRtlDllShutdownInProgress();
+         ok(!ret, "RtlDllShutdownInProgress returned %ld\n", ret);
+ 
++        if (pPrivIsDllSynchronizationHeld)
++        {
++            BOOL held = 0xdeadbeef;
++
++            ret = pPrivIsDllSynchronizationHeld(&held);
++            ok(ret == TRUE, "PrivIsDllSynchronizationHeld returned %ld\n", ret);
++            ok(held == TRUE, "got held %#x\n", held);
++        }
++
+         /* Set up the FLS slot, if FLS is available */
+         if (pFlsGetValue)
+         {
+@@ -4705,6 +4715,78 @@ static void test_ResolveDelayLoadedAPI(void)
+     DeleteFileA(dll_name);
+ }
+ 
++static DWORD WINAPI sync_held_thread(void *arg)
++{
++    HANDLE *events = arg;
++    BOOL held = 0xdeadbeef, ret;
++
++    SetEvent(events[2]);
++    WaitForSingleObject(events[0], INFINITE);
++    ret = pPrivIsDllSynchronizationHeld(&held);
++    ok(ret == TRUE, "got %d\n", ret);
++    ok(held == FALSE, "got held %#x while another thread holds the loader lock\n", held);
++    SetEvent(events[1]);
++    return 0;
++}
++
++static void test_PrivIsDllSynchronizationHeld(void)
++{
++    NTSTATUS (WINAPI *unlock)(ULONG, ULONG_PTR) = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrUnlockLoaderLock");
++    ULONG_PTR magic, magic2;
++    HANDLE events[3], thread;
++    NTSTATUS status;
++    BOOL held, ret;
++
++    if (!pPrivIsDllSynchronizationHeld)
++    {
++        win_skip("PrivIsDllSynchronizationHeld is not available\n");
++        return;
++    }
++
++    /* the thread has to be running before the lock is taken: starting a thread needs it */
++    events[0] = CreateEventW(NULL, FALSE, FALSE, NULL);
++    events[1] = CreateEventW(NULL, FALSE, FALSE, NULL);
++    events[2] = CreateEventW(NULL, FALSE, FALSE, NULL);
++    thread = CreateThread(NULL, 0, sync_held_thread, events, 0, NULL);
++    ok(thread != NULL, "CreateThread failed %lu\n", GetLastError());
++    WaitForSingleObject(events[2], 5000);
++
++    held = 0xdeadbeef;
++    ret = pPrivIsDllSynchronizationHeld(&held);
++    ok(ret == TRUE, "got %d\n", ret);
++    ok(held == FALSE, "got held %#x\n", held);
++
++    status = pLdrLockLoaderLock(0, NULL, &magic);
++    ok(!status, "LdrLockLoaderLock failed %#lx\n", status);
++    held = 0xdeadbeef;
++    ret = pPrivIsDllSynchronizationHeld(&held);
++    ok(ret == TRUE, "got %d\n", ret);
++    ok(held == TRUE, "got held %#x\n", held);
++
++    status = pLdrLockLoaderLock(0, NULL, &magic2);
++    ok(!status, "LdrLockLoaderLock failed %#lx\n", status);
++    unlock(0, magic2);
++    held = 0xdeadbeef;
++    ret = pPrivIsDllSynchronizationHeld(&held);
++    ok(ret == TRUE, "got %d\n", ret);
++    ok(held == TRUE, "got held %#x with the lock taken twice and let go of once\n", held);
++
++    SetEvent(events[0]);
++    ok(!WaitForSingleObject(events[1], 5000), "the other thread did not answer\n");
++    unlock(0, magic);
++
++    held = 0xdeadbeef;
++    ret = pPrivIsDllSynchronizationHeld(&held);
++    ok(ret == TRUE, "got %d\n", ret);
++    ok(held == FALSE, "got held %#x\n", held);
++
++    WaitForSingleObject(thread, 5000);
++    CloseHandle(thread);
++    CloseHandle(events[0]);
++    CloseHandle(events[1]);
++    CloseHandle(events[2]);
++}
++
+ static void test_InMemoryOrderModuleList(void)
+ {
+     PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->LdrData;
+@@ -4968,6 +5050,7 @@ START_TEST(loader)
+     pWow64RevertWow64FsRedirection = (void *)GetProcAddress(kernel32, "Wow64RevertWow64FsRedirection");
+     pResolveDelayLoadedAPI = (void *)GetProcAddress(kernel32, "ResolveDelayLoadedAPI");
+     pLoadPackagedLibrary = (void *)GetProcAddress(kernel32, "LoadPackagedLibrary");
++    pPrivIsDllSynchronizationHeld = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "PrivIsDllSynchronizationHeld");
+ 
+     if (pIsWow64Process) pIsWow64Process( GetCurrentProcess(), &is_wow64 );
+     GetSystemInfo( &si );
+@@ -5012,6 +5095,7 @@ START_TEST(loader)
+     test_export_forwarder_dep_chain();
+     test_ExitProcess();
+     test_InMemoryOrderModuleList();
++    test_PrivIsDllSynchronizationHeld();
+     test_LoadPackagedLibrary();
+     test_wow64_redirection();
+     test_dll_file( "ntdll.dll" );
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index c207ac1c257..2d6b5023db1 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -1207,6 +1207,7 @@
+ @ stdcall PostQueuedCompletionStatus(long long ptr ptr)
+ @ stdcall PrefetchVirtualMemory(ptr ptr ptr long)
+ @ stub PrivCopyFileExW
++@ stdcall PrivIsDllSynchronizationHeld(ptr)
+ @ stdcall PrivilegeCheck(ptr ptr ptr)
+ @ stdcall PrivilegedServiceAuditAlarmW(wstr wstr long ptr long)
+ @ stdcall ProcessIdToSessionId(long ptr)
+diff --git a/dlls/kernelbase/loader.c b/dlls/kernelbase/loader.c
+index 3efa2fcec2a..2057b1f41ad 100644
+--- a/dlls/kernelbase/loader.c
++++ b/dlls/kernelbase/loader.c
+@@ -607,6 +607,18 @@ void WINAPI LoadAppInitDlls(void)
+ }
+ 
+ 
++/***********************************************************************
++ *      PrivIsDllSynchronizationHeld    (kernelbase.@)
++ *
++ * Whether the calling thread holds the loader lock; AuxUlibIsDLLSynchronizationHeld() asks this.
++ */
++BOOL WINAPI PrivIsDllSynchronizationHeld( BOOL *held )
++{
++    *held = RtlIsCriticalSectionLockedByThread( NtCurrentTeb()->Peb->LoaderLock );
++    return TRUE;
++}
++
++
+ /****************************************************************************
+  *	RemoveDllDirectory   (kernelbase.@)
+  */

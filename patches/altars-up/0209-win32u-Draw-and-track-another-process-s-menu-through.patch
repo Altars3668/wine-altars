@@ -1,0 +1,705 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 10:48:09 -0400
+Subject: [PATCH] win32u: Draw and track another process's menu through a copy
+ kept up to date.
+
+A process may call on another's menus now, and a window takes such a menu
+for its menu bar, as Word's document window does with the shared menu
+Excel builds while a worksheet is active in place.  Laying that bar out,
+drawing it and tracking it, as tracking a popup of another process, needs
+the items here, and nothing showed.
+
+A menu of another process that this one shows is now shown through a
+copy made here: its items as they are over there, with the handles of
+their submenus as they are, so that the application still hears of the
+menus it knows (WM_INITMENU, WM_INITMENUPOPUP, WM_MENUSELECT,
+WM_MENUCOMMAND, WM_MENUCHAR, GetMenuBarInfo, MN_GETHMENU).  The copy is
+made when the menu becomes a window's menu or is first shown, brought up
+to date when the menu bar is laid out or DrawMenuBar is called and once
+the application has been told a menu is about to show, and goes when the
+menu does.
+
+With this Word shows Excel's menu groups in its menu bar while the
+worksheet is active in place, and makes room for them, which is what
+tells Excel where its toolbars go.  The test checks that a window takes
+another process's menu for its menu bar as on Windows, where
+tools/menuprobe in the outer tree measured it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7886337ea24d3084bbb709f2a16b44c82e4dd846)
+
+diff --git a/dlls/user32/tests/menu.c b/dlls/user32/tests/menu.c
+index 22af03c0248..0171fd1523b 100644
+--- a/dlls/user32/tests/menu.c
++++ b/dlls/user32/tests/menu.c
+@@ -4252,6 +4252,9 @@ static void test_menu_other_process_child( char **argv )
+     HMENU menu = (HMENU)(ULONG_PTR)strtoull( argv[3], NULL, 16 );
+     HMENU popup = (HMENU)(ULONG_PTR)strtoull( argv[4], NULL, 16 );
+     HMENU doomed = (HMENU)(ULONG_PTR)strtoull( argv[5], NULL, 16 );
++    RECT rect, plain_rect;
++    HWND hwnd, plain;
++    MENUBARINFO mbi;
+     HANDLE done, go;
+     MENUITEMINFOW info;
+     WCHAR text[32];
+@@ -4281,6 +4284,30 @@ static void test_menu_other_process_child( char **argv )
+     ok( GetMenuItemID( menu, 0 ) == 101, "got id %u\n", GetMenuItemID( menu, 0 ) );
+     ok( GetSubMenu( menu, 1 ) == popup, "got submenu %p\n", GetSubMenu( menu, 1 ) );
+ 
++    /* a window of this process takes it for its menu bar and makes room for it */
++    hwnd = CreateWindowA( "static", "menu bar", WS_OVERLAPPEDWINDOW, 0, 0, 300, 200, 0, 0, 0, NULL );
++    plain = CreateWindowA( "static", "no menu bar", WS_OVERLAPPEDWINDOW, 0, 0, 300, 200, 0, 0, 0, NULL );
++    ret = SetMenu( hwnd, menu );
++    ok( ret, "SetMenu failed, error %lu\n", GetLastError() );
++    ok( GetMenu( hwnd ) == menu, "got menu %p\n", GetMenu( hwnd ) );
++    GetClientRect( hwnd, &rect );
++    GetClientRect( plain, &plain_rect );
++    ok( rect.bottom < plain_rect.bottom, "client height %ld, %ld without a menu bar\n", rect.bottom, plain_rect.bottom );
++    memset( &mbi, 0, sizeof(mbi) );
++    mbi.cbSize = sizeof(mbi);
++    ret = GetMenuBarInfo( hwnd, OBJID_MENU, 0, &mbi );
++    ok( ret, "GetMenuBarInfo failed, error %lu\n", GetLastError() );
++    ok( mbi.hMenu == menu, "got menu %p\n", mbi.hMenu );
++    ok( mbi.rcBar.bottom > mbi.rcBar.top, "got bar %s\n", wine_dbgstr_rect( &mbi.rcBar ) );
++    ret = GetMenuItemRect( hwnd, menu, 0, &rect );
++    ok( ret, "GetMenuItemRect failed, error %lu\n", GetLastError() );
++    ok( rect.right > rect.left && rect.bottom > rect.top, "got item %s\n", wine_dbgstr_rect( &rect ) );
++    /* destroying the window would destroy its menu */
++    SetMenu( hwnd, 0 );
++    DestroyWindow( hwnd );
++    DestroyWindow( plain );
++    ok( IsMenu( menu ), "the menu is gone\n" );
++
+     mi.fMask = MIM_MENUDATA;
+     mi.dwMenuData = 0x5678;
+     ret = SetMenuInfo( menu, &mi );
+diff --git a/dlls/win32u/menu.c b/dlls/win32u/menu.c
+index f56a59b57f0..2a488af53db 100644
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -75,6 +75,7 @@ struct menu
+     ULONG_PTR   dwMenuData;     /* application defined value */
+     HMENU       hSysMenuOwner;  /* handle to the dummy sys menu holder */
+     WORD        textOffset;     /* offset of text when items have both bitmaps and text */
++    HMENU       remote;         /* for a copy made here of a menu of another process: that menu */
+ };
+ 
+ /* the accelerator user object */
+@@ -457,6 +458,187 @@ static BOOL call_other_process_menu_info( enum menu_call_func func, HMENU handle
+     return ret;
+ }
+ 
++static HMENU create_menu( BOOL is_popup );
++static BOOL set_menu_info( HMENU handle, const MENUINFO *info );
++
++/* A menu of another process that this one draws and tracks, as the menu bar of a window of its own or as a popup, is
++ * drawn and tracked through a copy made here: the items as they are over there, with the handles of their submenus
++ * as they are, so that what the application hears of are the menus it knows.  A copy is brought up to date when the
++ * menu becomes a window's menu, when the menu bar is laid out or DrawMenuBar is called, and when the application has
++ * been told the menu is about to be shown. */
++struct menu_copy
++{
++    struct list entry;
++    HMENU       remote;  /* the menu of the other process */
++    HMENU       local;   /* the copy made here */
++};
++
++static struct list menu_copies = LIST_INIT( menu_copies );
++static pthread_mutex_t menu_copies_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static HMENU find_menu_copy( HMENU remote )
++{
++    struct menu_copy *copy;
++    HMENU local = 0;
++
++    pthread_mutex_lock( &menu_copies_lock );
++    LIST_FOR_EACH_ENTRY( copy, &menu_copies, struct menu_copy, entry )
++    {
++        if (copy->remote != remote) continue;
++        local = copy->local;
++        break;
++    }
++    pthread_mutex_unlock( &menu_copies_lock );
++    return local;
++}
++
++/* forget the copy of a menu that is gone, and destroy it, which leaves its submenus alone */
++static void drop_menu_copy( HMENU remote )
++{
++    struct menu_copy *copy;
++    HMENU local = 0;
++
++    pthread_mutex_lock( &menu_copies_lock );
++    LIST_FOR_EACH_ENTRY( copy, &menu_copies, struct menu_copy, entry )
++    {
++        if (copy->remote != remote) continue;
++        local = copy->local;
++        list_remove( &copy->entry );
++        free( copy );
++        break;
++    }
++    pthread_mutex_unlock( &menu_copies_lock );
++    if (local) NtUserDestroyMenu( local );
++}
++
++/* bring a copy up to date with the menu of the other process */
++static BOOL refresh_menu_copy( HMENU local, HMENU remote, BOOL popup )
++{
++    MENUITEMINFOW info;
++    MENUINFO menu_info;
++    struct menu *menu;
++    WCHAR *text = NULL;
++    INT i, count;
++
++    if ((count = get_menu_item_count( remote )) < 0) return FALSE;
++    while (NtUserRemoveMenu( local, 0, MF_BYPOSITION )) ;  /* the submenus are not the copy's to destroy */
++
++    for (i = 0; i < count; i++)
++    {
++        memset( &info, 0, sizeof(info) );
++        info.cbSize = sizeof(info);
++        info.fMask = MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU | MIIM_CHECKMARKS | MIIM_DATA |
++                     MIIM_BITMAP | MIIM_STRING;
++        if (!NtUserThunkedMenuItemInfo( remote, i, MF_BYPOSITION, NtUserGetMenuItemInfoW, &info, NULL )) break;
++        if (info.cch)
++        {
++            UINT len = info.cch + 1;
++            WCHAR *new_text;
++
++            if (!(new_text = realloc( text, len * sizeof(WCHAR) ))) break;
++            text = new_text;
++            info.dwTypeData = text;
++            info.cch = len;
++            if (!NtUserThunkedMenuItemInfo( remote, i, MF_BYPOSITION, NtUserGetMenuItemInfoW, &info, NULL )) break;
++        }
++        else
++        {
++            info.fMask &= ~MIIM_STRING;
++            info.dwTypeData = NULL;
++        }
++        NtUserThunkedMenuItemInfo( local, i, MF_BYPOSITION, NtUserInsertMenuItem, &info, NULL );
++    }
++    free( text );
++
++    memset( &menu_info, 0, sizeof(menu_info) );
++    menu_info.cbSize = sizeof(menu_info);
++    menu_info.fMask = MIM_HELPID | MIM_MAXHEIGHT | MIM_MENUDATA | MIM_STYLE;  /* the brush is the other process's */
++    if (get_menu_info( remote, &menu_info )) set_menu_info( local, &menu_info );
++
++    if ((menu = grab_menu_ptr( local )))
++    {
++        if (popup) menu->wFlags |= MF_POPUP;
++        else menu->wFlags &= ~MF_POPUP;
++        menu->Height = 0;  /* laid out again */
++        release_menu_ptr( menu );
++    }
++    return TRUE;
++}
++
++/* the menu this process draws and tracks for one, itself or a copy of a menu of another process, made if needed
++ * and brought up to date if asked */
++static HMENU display_menu( HMENU handle, BOOL refresh, BOOL popup )
++{
++    struct menu_copy *copy, *other;
++    struct menu *menu;
++    HMENU local;
++
++    if (!handle || !is_other_process_menu( handle ))
++    {
++        if (handle && !is_menu( handle )) drop_menu_copy( handle );
++        return handle;
++    }
++    if (!(local = find_menu_copy( handle )))
++    {
++        if (!(local = create_menu( popup ))) return 0;
++        if ((menu = grab_menu_ptr( local )))
++        {
++            menu->remote = handle;
++            release_menu_ptr( menu );
++        }
++        if (!(copy = malloc( sizeof(*copy) )))
++        {
++            NtUserDestroyMenu( local );
++            return 0;
++        }
++        copy->remote = handle;
++        copy->local = local;
++        pthread_mutex_lock( &menu_copies_lock );
++        LIST_FOR_EACH_ENTRY( other, &menu_copies, struct menu_copy, entry )
++        {
++            if (other->remote != handle) continue;
++            free( copy );
++            copy = NULL;
++            break;
++        }
++        if (copy) list_add_tail( &menu_copies, &copy->entry );
++        pthread_mutex_unlock( &menu_copies_lock );
++        if (!copy)  /* another thread made one meanwhile */
++        {
++            NtUserDestroyMenu( local );
++            if (!(local = find_menu_copy( handle ))) return 0;
++        }
++        refresh = TRUE;
++    }
++    if (refresh && !refresh_menu_copy( local, handle, popup ))
++    {
++        drop_menu_copy( handle );
++        return 0;
++    }
++    return local;
++}
++
++/* the menu this process draws for one, without making a copy of a menu of another process */
++static HMENU shown_menu( HMENU handle )
++{
++    HMENU local;
++
++    if (handle && is_other_process_menu( handle ) && (local = find_menu_copy( handle ))) return local;
++    return handle;
++}
++
++/* the menu the application knows for one this process draws: a copy's menu of another process */
++static HMENU app_menu( HMENU handle )
++{
++    struct menu *menu;
++    HMENU ret = handle;
++
++    if (!handle || !(menu = grab_menu_ptr( handle ))) return handle;
++    if (menu->remote) ret = menu->remote;
++    release_menu_ptr( menu );
++    return ret;
++}
++
+ static void menu_item_to_call( struct menu_call *call, const MENUITEMINFOW *info )
+ {
+     call->item_mask       = info->fMask;
+@@ -681,14 +863,14 @@ static UINT find_submenu( HMENU *handle_ptr, HMENU target )
+     for (i = 0; i < menu->nItems; i++, item++)
+     {
+         if(!(item->fType & MF_POPUP)) continue;
+-        if (item->hSubMenu == target)
++        if (item->hSubMenu == target || (target && shown_menu( item->hSubMenu ) == target))
+         {
+             release_menu_ptr( menu );
+             return i;
+         }
+         else
+         {
+-            HMENU hsubmenu = item->hSubMenu;
++            HMENU hsubmenu = shown_menu( item->hSubMenu );
+             UINT pos = find_submenu( &hsubmenu, target );
+             if (pos != NO_SELECTED_ITEM)
+             {
+@@ -823,7 +1005,12 @@ BOOL WINAPI NtUserDestroyMenu( HMENU handle )
+     TRACE( "(%p)\n", handle );
+ 
+     if (!(menu = free_user_handle( handle, NTUSER_OBJ_MENU ))) return FALSE;
+-    if (menu == OBJ_OTHER_PROCESS) return call_other_process_menu_args( MENU_CALL_DESTROY, handle, 0, 0, 0, FALSE );
++    if (menu == OBJ_OTHER_PROCESS)
++    {
++        BOOL ret = call_other_process_menu_args( MENU_CALL_DESTROY, handle, 0, 0, 0, FALSE );
++        if (ret) drop_menu_copy( handle );
++        return ret;
++    }
+ 
+     /* DestroyMenu should not destroy system menu popup owner */
+     if ((menu->wFlags & (MF_POPUP | MF_SYSMENU)) == MF_POPUP && menu->hWnd)
+@@ -832,7 +1019,7 @@ BOOL WINAPI NtUserDestroyMenu( HMENU handle )
+         menu->hWnd = 0;
+     }
+ 
+-    /* recursively destroy submenus */
++    /* recursively destroy submenus, which are not a copy's own */
+     if (menu->items)
+     {
+         struct menu_item *item = menu->items;
+@@ -840,7 +1027,7 @@ BOOL WINAPI NtUserDestroyMenu( HMENU handle )
+ 
+         for (i = menu->nItems; i > 0; i--, item++)
+         {
+-            if (item->fType & MF_POPUP) NtUserDestroyMenu( item->hSubMenu );
++            if ((item->fType & MF_POPUP) && !menu->remote) NtUserDestroyMenu( item->hSubMenu );
+             free( item->text );
+         }
+         free( menu->items );
+@@ -872,14 +1059,20 @@ BOOL set_window_menu( HWND hwnd, HMENU handle )
+     if (get_capture() == hwnd)
+         set_capture_window( 0, GUI_INMENUMODE, NULL );  /* release the capture */
+ 
+-    if (handle && !is_other_process_menu( handle ))
++    if (handle)
+     {
+         struct menu *menu;
++        HMENU shown;
+ 
+-        if (!(menu = grab_menu_ptr( handle ))) return FALSE;
+-        menu->hWnd = hwnd;
+-        menu->Height = 0;  /* Make sure we recalculate the size */
+-        release_menu_ptr(menu);
++        /* a menu of another process is laid out and drawn through its copy, made once no lock is held */
++        shown = user_lock_held() ? shown_menu( handle ) : display_menu( handle, TRUE, FALSE );
++        if ((menu = grab_menu_ptr( shown )))
++        {
++            menu->hWnd = hwnd;
++            menu->Height = 0;  /* Make sure we recalculate the size */
++            release_menu_ptr(menu);
++        }
++        else if (!is_other_process_menu( handle )) return FALSE;
+     }
+ 
+     NtUserSetWindowLong( hwnd, GWLP_ID, (LONG_PTR)handle, FALSE );
+@@ -983,7 +1176,7 @@ BOOL WINAPI NtUserDrawMenuBar( HWND hwnd )
+ 
+     if ((handle = get_menu( hwnd )))
+     {
+-        struct menu *menu = grab_menu_ptr( handle );
++        struct menu *menu = grab_menu_ptr( display_menu( handle, TRUE, FALSE ));
+         if (menu)
+         {
+             menu->Height = 0; /* Make sure we call MENU_MenuBarCalcSize */
+@@ -1010,7 +1203,7 @@ BOOL WINAPI NtUserGetMenuItemRect( HWND hwnd, HMENU handle, UINT item, RECT *rec
+     if (!rect)
+         return FALSE;
+ 
+-    if (!(menu = find_menu_item( handle, item, MF_BYPOSITION, &pos )))
++    if (!(menu = find_menu_item( shown_menu( handle ), item, MF_BYPOSITION, &pos )))
+         return FALSE;
+ 
+     if (!hwnd) hwnd = menu->hWnd;
+@@ -1788,7 +1981,7 @@ INT WINAPI NtUserMenuItemFromPoint( HWND hwnd, HMENU handle, int x, int y )
+     struct menu *menu;
+     UINT pos;
+ 
+-    if (!(menu = grab_menu_ptr(handle))) return -1;
++    if (!(menu = grab_menu_ptr( shown_menu( handle )))) return -1;
+     if (find_item_by_coords( menu, pt, &pos ) != ht_item) pos = -1;
+     release_menu_ptr(menu);
+     return pos;
+@@ -2435,7 +2628,7 @@ UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
+ 
+     TRACE( "hwnd %p, width %d, at (%d, %d).\n", hwnd, width, org_x, org_y );
+ 
+-    if (!(menu = unsafe_menu_ptr( get_menu( hwnd )))) return 0;
++    if (!(menu = unsafe_menu_ptr( display_menu( get_menu( hwnd ), TRUE, FALSE )))) return 0;
+ 
+     hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
+     NtGdiSelectFont( hdc, get_menu_font(FALSE));
+@@ -2529,7 +2722,7 @@ static void draw_bitmap_item( HWND hwnd, HDC hdc, struct menu_item *item, const
+                 if (item->fState & MF_DISABLED) drawItem.itemState |= ODS_DISABLED;
+                 if (item->fState & MF_GRAYED)   drawItem.itemState |= ODS_GRAYED|ODS_DISABLED;
+                 if (item->fState & MF_HILITE)   drawItem.itemState |= ODS_SELECTED;
+-                drawItem.hwndItem = (HWND)menu->handle;
++                drawItem.hwndItem = (HWND)(menu->remote ? menu->remote : menu->handle);
+                 drawItem.hDC = hdc;
+                 drawItem.itemData = item->dwItemData;
+                 drawItem.rcItem = *rect;
+@@ -2691,7 +2884,7 @@ static void draw_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+         if (item->fState & MF_GRAYED)  dis.itemState |= ODS_GRAYED|ODS_DISABLED;
+         if (item->fState & MF_HILITE)  dis.itemState |= ODS_SELECTED;
+         dis.itemAction = odaction; /* ODA_DRAWENTIRE | ODA_SELECT | ODA_FOCUS; */
+-        dis.hwndItem   = (HWND)menu->handle;
++        dis.hwndItem   = (HWND)(menu->remote ? menu->remote : menu->handle);
+         dis.hDC        = hdc;
+         dis.rcItem     = rect;
+         TRACE( "Ownerdraw: owner=%p itemID=%d, itemState=%d, itemAction=%d, "
+@@ -2959,7 +3152,7 @@ DWORD WINAPI NtUserDrawMenuBarTemp( HWND hwnd, HDC hdc, RECT *rect, HMENU handle
+     if (!handle) handle = get_menu( hwnd );
+     if (!font) font = get_menu_font(FALSE);
+ 
+-    menu = unsafe_menu_ptr( handle );
++    menu = unsafe_menu_ptr( display_menu( handle, FALSE, FALSE ));
+     if (!menu || !rect) return get_system_metrics( SM_CYMENU );
+ 
+     TRACE( "(%p, %p, %p, %p, %p)\n", hwnd, hdc, rect, handle, font );
+@@ -3165,7 +3358,7 @@ LRESULT popup_menu_window_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM l
+         break;
+ 
+     case MN_GETHMENU:
+-        return (LRESULT)get_control_menu( hwnd );
++        return (LRESULT)app_menu( get_control_menu( hwnd ));
+ 
+     case WM_NCCREATE:
+         NtUserSetWindowFNID( hwnd, MAKE_FNID(NTUSER_WNDPROC_MENU) );
+@@ -3507,7 +3700,7 @@ static void select_item( HWND owner, HMENU hmenu, UINT index, BOOL send_select,
+             send_message( owner, WM_MENUSELECT,
+                           MAKEWPARAM( ip->fType & MF_POPUP ? index: ip->wID,
+                                       ip->fType | ip->fState | (menu->wFlags & MF_SYSMENU) ),
+-                          (LPARAM)hmenu );
++                          (LPARAM)(menu->remote ? menu->remote : hmenu) );
+         }
+     }
+     else if (send_select)
+@@ -3521,7 +3714,7 @@ static void select_item( HWND owner, HMENU hmenu, UINT index, BOOL send_select,
+                 struct menu_item *ip = &ptm->items[pos];
+                 send_message( owner, WM_MENUSELECT,
+                               MAKEWPARAM( pos, ip->fType | ip->fState | (ptm->wFlags & MF_SYSMENU) ),
+-                              (LPARAM)topmenu );
++                              (LPARAM)(ptm->remote ? ptm->remote : topmenu) );
+             }
+         }
+     }
+@@ -3583,9 +3776,9 @@ static void hide_sub_popups( HWND owner, HMENU hmenu, BOOL send_select, UINT fla
+         item->fState &= ~MF_MOUSESELECT;
+         hsubmenu = item->hSubMenu;
+ 
+-        if (!(submenu = unsafe_menu_ptr( hsubmenu ))) return;
+-        hide_sub_popups( owner, hsubmenu, FALSE, flags );
+-        select_item( owner, hsubmenu, NO_SELECTED_ITEM, send_select, 0 );
++        if (!(submenu = unsafe_menu_ptr( shown_menu( hsubmenu )))) return;
++        hide_sub_popups( owner, submenu->handle, FALSE, flags );
++        select_item( owner, submenu->handle, NO_SELECTED_ITEM, send_select, 0 );
+         NtUserDestroyWindow( submenu->hWnd );
+         submenu->hWnd = 0;
+ 
+@@ -3656,6 +3849,7 @@ static HMENU show_sub_popup( HWND owner, HMENU hmenu, BOOL select_first, UINT fl
+ {
+     struct menu *menu;
+     struct menu_item *item;
++    HMENU submenu;
+     RECT rect;
+     HDC hdc;
+ 
+@@ -3738,11 +3932,13 @@ static HMENU show_sub_popup( HWND owner, HMENU hmenu, BOOL select_first, UINT fl
+ 
+     /* use default alignment for submenus */
+     flags &= ~(TPM_CENTERALIGN | TPM_RIGHTALIGN | TPM_VCENTERALIGN | TPM_BOTTOMALIGN);
+-    init_popup( owner, item->hSubMenu, flags );
+-    show_popup( owner, item->hSubMenu, menu->FocusedItem, flags,
++    /* one of another process is shown as it is now that its owner has been told */
++    if (!(submenu = display_menu( item->hSubMenu, TRUE, TRUE ))) return hmenu;
++    init_popup( owner, submenu, flags );
++    show_popup( owner, submenu, menu->FocusedItem, flags,
+                 rect.left, rect.top, rect.right, rect.bottom );
+-    if (select_first) move_selection( owner, item->hSubMenu, ITEM_NEXT );
+-    return item->hSubMenu;
++    if (select_first) move_selection( owner, submenu, ITEM_NEXT );
++    return submenu;
+ }
+ 
+ /***********************************************************************
+@@ -3790,7 +3986,7 @@ static INT exec_focused_item( MTRACKER *pmt, HMENU handle, UINT flags )
+ 
+             if (style & MNS_NOTIFYBYPOS)
+                 NtUserPostMessage( pmt->hOwnerWnd, WM_MENUCOMMAND, menu->FocusedItem,
+-                                   (LPARAM)handle);
++                                   (LPARAM)(menu->remote ? menu->remote : handle) );
+             else
+                 NtUserPostMessage( pmt->hOwnerWnd, WM_COMMAND, item->wID, 0 );
+         }
+@@ -3996,7 +4192,7 @@ static LRESULT do_next_menu( MTRACKER *pmt, UINT vk, UINT flags )
+         HWND new_hwnd;
+         UINT id = 0;
+ 
+-        next_menu.hmenuIn = (IS_SYSTEM_MENU( menu )) ? get_sub_menu( pmt->hTopMenu, 0 ) : pmt->hTopMenu;
++        next_menu.hmenuIn = (IS_SYSTEM_MENU( menu )) ? get_sub_menu( pmt->hTopMenu, 0 ) : app_menu( pmt->hTopMenu );
+         next_menu.hmenuNext = 0;
+         next_menu.hwndNext = 0;
+         send_message( pmt->hOwnerWnd, WM_NEXTMENU, vk, (LPARAM)&next_menu );
+@@ -4011,7 +4207,8 @@ static LRESULT do_next_menu( MTRACKER *pmt, UINT vk, UINT flags )
+             if (IS_SYSTEM_MENU( menu ))
+             {
+                 /* switch to the menu bar */
+-                if ((style & WS_CHILD) || !(new_menu = get_menu( new_hwnd ))) return FALSE;
++                if ((style & WS_CHILD) || !(new_menu = display_menu( get_menu( new_hwnd ), FALSE, FALSE )))
++                    return FALSE;
+ 
+                 if (vk == VK_LEFT)
+                 {
+@@ -4052,6 +4249,7 @@ static LRESULT do_next_menu( MTRACKER *pmt, UINT vk, UINT flags )
+                     TRACE( " -- got confused.\n" );
+                     return FALSE;
+                 }
++                else new_menu = display_menu( new_menu, TRUE, FALSE );
+             }
+             else return FALSE;
+         }
+@@ -4093,7 +4291,7 @@ static HMENU get_sub_popup( HMENU hmenu )
+ 
+     item = &menu->items[menu->FocusedItem];
+     if ((item->fType & MF_POPUP) && (item->fState & MF_MOUSESELECT))
+-        return item->hSubMenu;
++        return shown_menu( item->hSubMenu );
+     return 0;
+ }
+ 
+@@ -4315,7 +4513,7 @@ static HMENU menu_from_point( HMENU handle, POINT pt )
+    /* try subpopup first (if any) */
+    if (item != NO_SELECTED_ITEM && (menu->items[item].fType & MF_POPUP) &&
+        (menu->items[item].fState & MF_MOUSESELECT))
+-       ret = menu_from_point( menu->items[item].hSubMenu, pt );
++       ret = menu_from_point( shown_menu( menu->items[item].hSubMenu ), pt );
+ 
+    if (!ret)  /* check the current window (avoiding WM_HITTEST) */
+    {
+@@ -4327,7 +4525,7 @@ static HMENU menu_from_point( HMENU handle, POINT pt )
+        else if (ht == HTSYSMENU)
+            ret = get_win_sys_menu( menu->hWnd );
+        else if (ht == HTMENU)
+-           ret = get_menu( menu->hWnd );
++           ret = shown_menu( get_menu( menu->hWnd ));
+    }
+    return ret;
+ }
+@@ -4372,7 +4570,7 @@ static UINT find_item_by_key( HWND owner, HMENU hmenu, WCHAR key, BOOL force_men
+              }
+         }
+         menuchar = send_message( owner, WM_MENUCHAR,
+-                                 MAKEWPARAM( key, menu->wFlags ), (LPARAM)hmenu );
++                                 MAKEWPARAM( key, menu->wFlags ), (LPARAM)(menu->remote ? menu->remote : hmenu) );
+         if (HIWORD(menuchar) == MNC_EXECUTE) return LOWORD( menuchar );
+         if (HIWORD(menuchar) == MNC_CLOSE) return (UINT)-2;
+     }
+@@ -4645,7 +4843,8 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const
+                 menu->hWnd = 0;
+ 
+                 if (!(flags & TPM_NONOTIFY))
+-                   send_message( mt.hOwnerWnd, WM_UNINITMENUPOPUP, (WPARAM)mt.hTopMenu,
++                   send_message( mt.hOwnerWnd, WM_UNINITMENUPOPUP,
++                                 (WPARAM)(menu->remote ? menu->remote : mt.hTopMenu),
+                                  MAKELPARAM( 0, IS_SYSTEM_MENU( menu )));
+             }
+             select_item( mt.hOwnerWnd, mt.hTopMenu, NO_SELECTED_ITEM, FALSE, 0 );
+@@ -4668,7 +4867,7 @@ static BOOL init_tracking( HWND hwnd, HMENU handle, BOOL is_popup, UINT flags )
+ 
+     NtUserHideCaret( 0 );
+ 
+-    if (!(menu = unsafe_menu_ptr( handle ))) return FALSE;
++    if (!(menu = unsafe_menu_ptr( display_menu( handle, FALSE, is_popup )))) return FALSE;
+ 
+     /* This makes the menus of applications built with Delphi work.
+      * It also enables menus to be displayed in more than one window,
+@@ -4678,7 +4877,7 @@ static BOOL init_tracking( HWND hwnd, HMENU handle, BOOL is_popup, UINT flags )
+     if (!top_popup)
+     {
+         top_popup = menu->hWnd;
+-        top_popup_hmenu = handle;
++        top_popup_hmenu = menu->handle;
+     }
+ 
+     exit_menu = FALSE;
+@@ -4691,7 +4890,7 @@ static BOOL init_tracking( HWND hwnd, HMENU handle, BOOL is_popup, UINT flags )
+ 
+     if (!(flags & TPM_NONOTIFY))
+     {
+-       send_message( hwnd, WM_INITMENU, (WPARAM)handle, 0 );
++       send_message( hwnd, WM_INITMENU, (WPARAM)app_menu( handle ), 0 );
+        /* If an app changed/recreated menu bar entries in WM_INITMENU
+         * menu sizes will be recalculated once the menu created/shown. */
+     }
+@@ -4723,7 +4922,7 @@ void track_mouse_menu_bar( HWND hwnd, INT ht, int x, int y )
+         init_tracking( hwnd, handle, FALSE, flags );
+ 
+         /* fetch the window menu again, it may have changed */
+-        handle = ht == HTSYSMENU ? get_win_sys_menu( hwnd ) : get_menu( hwnd );
++        handle = ht == HTSYSMENU ? get_win_sys_menu( hwnd ) : display_menu( get_menu( hwnd ), TRUE, FALSE );
+         track_menu( handle, flags, x, y, hwnd, NULL );
+         exit_tracking( hwnd, FALSE );
+     }
+@@ -4757,7 +4956,7 @@ void track_keyboard_menu_bar( HWND hwnd, UINT wparam, WCHAR ch )
+     init_tracking( hwnd, menu, FALSE, flags );
+ 
+     /* fetch the window menu again, it may have changed */
+-    menu = (wparam & HTSYSMENU) ? get_win_sys_menu( hwnd ) : get_menu( hwnd );
++    menu = (wparam & HTSYSMENU) ? get_win_sys_menu( hwnd ) : display_menu( get_menu( hwnd ), TRUE, FALSE );
+ 
+     if (ch && ch != ' ')
+     {
+@@ -4794,12 +4993,14 @@ BOOL WINAPI NtUserTrackPopupMenuEx( HMENU handle, UINT flags, INT x, INT y, HWND
+ {
+     struct menu *menu;
+     BOOL ret = FALSE;
++    HMENU shown;
+ 
+     TRACE( "hmenu %p flags %04x (%d,%d) hwnd %p params %p rect %s\n",
+            handle, flags, x, y, hwnd, params,
+            params ? wine_dbgstr_rect( &params->rcExclude ) : "-" );
+ 
+-    if (!(menu = unsafe_menu_ptr( handle )))
++    /* a menu of another process is shown through its copy */
++    if (!(shown = display_menu( handle, FALSE, TRUE )) || !(menu = unsafe_menu_ptr( shown )))
+     {
+         RtlSetLastWin32Error( ERROR_INVALID_MENU_HANDLE );
+         return FALSE;
+@@ -4811,20 +5012,22 @@ BOOL WINAPI NtUserTrackPopupMenuEx( HMENU handle, UINT flags, INT x, INT y, HWND
+         return FALSE;
+     }
+ 
+-    if (init_popup( hwnd, handle, flags ))
++    if (init_popup( hwnd, shown, flags ))
+     {
+         init_tracking( hwnd, handle, TRUE, flags );
+ 
+         /* Send WM_INITMENUPOPUP message only if TPM_NONOTIFY flag is not specified */
+         if (!(flags & TPM_NONOTIFY))
+             send_message( hwnd, WM_INITMENUPOPUP, (WPARAM)handle, 0 );
++        /* and show one of another process as it is now that its owner has been told */
++        if (shown != handle) display_menu( handle, TRUE, TRUE );
+ 
+         if (menu->wFlags & MF_SYSMENU)
+             init_sys_menu_popup( handle, get_window_long( hwnd, GWL_STYLE ),
+                                  get_class_long( hwnd, GCL_STYLE, FALSE ));
+ 
+-        if (show_popup( hwnd, handle, 0, flags, x, y, 0, 0 ))
+-            ret = track_menu( handle, flags | TPM_POPUPMENU, 0, 0, hwnd,
++        if (show_popup( hwnd, shown, 0, flags, x, y, 0, 0 ))
++            ret = track_menu( shown, flags | TPM_POPUPMENU, 0, 0, hwnd,
+                               params ? &params->rcExclude : NULL );
+         exit_tracking( hwnd, TRUE );
+ 
+@@ -4855,7 +5058,7 @@ BOOL WINAPI NtUserHiliteMenuItem( HWND hwnd, HMENU handle, UINT item, UINT hilit
+ 
+     TRACE( "(%p, %p, %04x, %04x);\n", hwnd, handle, item, hilite );
+ 
+-    if (!(menu = find_menu_item(handle, item, hilite, &pos))) return FALSE;
++    if (!(menu = find_menu_item( shown_menu( handle ), item, hilite, &pos ))) return FALSE;
+     handle_menu = menu->handle;
+     focused_item = menu->FocusedItem;
+     release_menu_ptr(menu);
+@@ -4914,6 +5117,9 @@ BOOL WINAPI NtUserGetMenuBarInfo( HWND hwnd, LONG id, LONG item, MENUBARINFO *in
+         return FALSE;
+     }
+ 
++    /* a menu of another process is laid out through its copy, and named as the application knows it */
++    info->hMenu = app_menu( hmenu );
++    hmenu = shown_menu( hmenu );
+     if (!(menu = grab_menu_ptr( hmenu ))) return FALSE;
+     if (item < 0 || item > menu->nItems)
+     {
+@@ -4936,7 +5142,6 @@ BOOL WINAPI NtUserGetMenuBarInfo( HWND hwnd, LONG id, LONG item, MENUBARINFO *in
+         NtUserGetMenuItemRect( hwnd, hmenu, item - 1, &info->rcBar );
+     }
+ 
+-    info->hMenu = hmenu;
+     info->hwndMenu = NULL;
+     info->fBarFocused = top_popup_hmenu == hmenu;
+     if (item)
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 43e414db34a..0bdc65a655d 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -347,6 +347,12 @@ void user_unlock(void)
+     pthread_mutex_unlock( &user_mutex );
+ }
+ 
++/* whether the current thread holds the USER lock, during which no message can be sent to another thread */
++BOOL user_lock_held(void)
++{
++    return user_lock_thread == GetCurrentThreadId();
++}
++
+ void user_check_not_lock(void)
+ {
+     if (user_lock_thread == GetCurrentThreadId())
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 11d640e9247..6c695003b3a 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -202,6 +202,7 @@ extern BOOL update_display_cache( BOOL force );
+ extern void reset_monitor_update_serial(void);
+ extern void user_lock(void);
+ extern void user_unlock(void);
++extern BOOL user_lock_held(void);
+ extern void user_check_not_lock(void);
+ extern BOOL get_gpu_uuid_from_luid( const LUID *luid, GUID *uuid );
+ extern BOOL get_gpu_info_from_uuid( const GUID *uuid, LUID *luid, UINT32 *node_mask, char *name );

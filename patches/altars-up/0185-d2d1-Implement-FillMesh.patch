@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:29:35 -0400
+Subject: [PATCH] d2d1: Implement FillMesh().
+
+FillMesh() recorded into command lists and otherwise did nothing.  Measured on Windows
+(build 29671), a mesh is its triangles drawn one after another: where two overlap the
+brush blends twice, an edge two share is drawn once by the top-left rule, either winding
+is drawn and a degenerate triangle is not; the world transform applies.  A target that is
+not aliased, or a mesh that was never closed, is D2DERR_WRONG_STATE, and an empty mesh
+draws nothing.  The triangles are already a vertex buffer, three points each.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ee62e2839b90b8cc9485404110b4467fc875d988)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 604e6a19a23..4fb636be7e4 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -637,6 +637,7 @@ struct d2d_mesh
+ };
+ 
+ HRESULT d2d_mesh_create(ID2D1Factory *factory, struct d2d_mesh **mesh);
++struct d2d_mesh *unsafe_impl_from_ID2D1Mesh(ID2D1Mesh *iface);
+ 
+ struct d2d_bitmap
+ {
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index e5285ecdb2a..4acd1fe4ad0 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1608,15 +1608,85 @@ static void STDMETHODCALLTYPE d2d_device_context_FillGeometry(ID2D1DeviceContext
+         d2d_device_context_fill_geometry(context, geometry_impl, brush_impl, opacity_brush_impl);
+ }
+ 
++/* A mesh is a list of triangles drawn one after another: where two overlap, the brush
++ * blends twice, and an edge two share is drawn once, by the rasteriser's top-left rule.
++ * Either winding is drawn. */
++static void d2d_device_context_fill_mesh(struct d2d_device_context *context,
++        const struct d2d_mesh *mesh, struct d2d_brush *brush)
++{
++    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    D3D11_SUBRESOURCE_DATA buffer_data;
++    D3D11_BUFFER_DESC buffer_desc;
++    ID3D11Buffer *vb;
++    HRESULT hr;
++
++    if (!mesh->count)
++        return;
++
++    if (mesh->count > UINT_MAX / sizeof(*mesh->triangles))
++    {
++        WARN("Mesh of %Iu triangles is too large.\n", mesh->count);
++        return;
++    }
++
++    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &identity, 0.0f, 0.0f, FALSE)))
++    {
++        WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
++        return;
++    }
++
++    if (FAILED(hr = d2d_device_context_update_ps_cb(context, brush, NULL, FALSE, FALSE, FALSE, NULL)))
++    {
++        WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
++        return;
++    }
++
++    buffer_desc.ByteWidth = mesh->count * sizeof(*mesh->triangles);
++    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
++    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
++    buffer_desc.CPUAccessFlags = 0;
++    buffer_desc.MiscFlags = 0;
++
++    buffer_data.pSysMem = mesh->triangles;
++    buffer_data.SysMemPitch = 0;
++    buffer_data.SysMemSlicePitch = 0;
++
++    if (FAILED(hr = ID3D11Device1_CreateBuffer(context->d3d_device, &buffer_desc, &buffer_data, &vb)))
++    {
++        ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
++        return;
++    }
++
++    d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, NULL, 3 * mesh->count, vb,
++            sizeof(mesh->triangles->point1), brush, NULL, NULL);
++
++    ID3D11Buffer_Release(vb);
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_FillMesh(ID2D1DeviceContext6 *iface,
+         ID2D1Mesh *mesh, ID2D1Brush *brush)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    const struct d2d_mesh *mesh_impl = unsafe_impl_from_ID2D1Mesh(mesh);
++
++    TRACE("iface %p, mesh %p, brush %p.\n", iface, mesh, brush);
+ 
+-    FIXME("iface %p, mesh %p, brush %p stub!\n", iface, mesh, brush);
++    if (FAILED(context->error.code))
++        return;
++
++    /* Only an aliased target fills a mesh, and only a closed one. */
++    if (context->target.type == D2D_TARGET_UNKNOWN || !context->drawing
++            || context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_ALIASED
++            || mesh_impl->state != D2D_MESH_STATE_CLOSED)
++    {
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
++        return;
++    }
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_fill_mesh(context->target.command_list, context, mesh, brush);
++    else
++        d2d_device_context_fill_mesh(context, mesh_impl, unsafe_impl_from_ID2D1Brush(brush));
+ }
+ 
+ /* Where DrawBitmap() and FillOpacityMask() put a bitmap: the source rectangle, taken in
+diff --git a/dlls/d2d1/mesh.c b/dlls/d2d1/mesh.c
+index a782e01a551..436efe004f7 100644
+--- a/dlls/d2d1/mesh.c
++++ b/dlls/d2d1/mesh.c
+@@ -191,6 +191,14 @@ static const ID2D1TessellationSinkVtbl d2d_mesh_sink_vtbl =
+     d2d_mesh_sink_Close,
+ };
+ 
++struct d2d_mesh *unsafe_impl_from_ID2D1Mesh(ID2D1Mesh *iface)
++{
++    if (!iface)
++        return NULL;
++    assert(iface->lpVtbl == &d2d_mesh_vtbl);
++    return CONTAINING_RECORD(iface, struct d2d_mesh, ID2D1Mesh_iface);
++}
++
+ HRESULT d2d_mesh_create(ID2D1Factory *factory, struct d2d_mesh **mesh)
+ {
+     if (!(*mesh = calloc(1, sizeof(**mesh))))
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+index ad48e28facd..b16567d1d6a 100644
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -20379,6 +20379,209 @@ static void test_mesh(BOOL d3d11)
+     release_test_context(&ctx);
+ }
+ 
++static ID2D1Mesh *create_mesh(ID2D1RenderTarget *rt, const D2D1_TRIANGLE *triangles, unsigned int count, BOOL close)
++{
++    ID2D1TessellationSink *sink;
++    ID2D1Mesh *mesh;
++    HRESULT hr;
++
++    hr = ID2D1RenderTarget_CreateMesh(rt, &mesh);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1Mesh_Open(mesh, &sink);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1TessellationSink_AddTriangles(sink, triangles, count);
++    if (close)
++    {
++        hr = ID2D1TessellationSink_Close(sink);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    }
++    ID2D1TessellationSink_Release(sink);
++
++    return mesh;
++}
++
++static void test_fill_mesh(BOOL d3d11)
++{
++    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    static const D2D1_MATRIX_3X2_F scale = {{{2.0f, 0.0f, 0.0f, 2.0f, 0.0f, 0.0f}}};
++    static const D2D1_ELLIPSE circle = {{48.0f, 48.0f}, 10.3f, 10.3f};
++    static const D2D1_TRIANGLE triangles[] =
++    {
++        /* A square split along its diagonal. */
++        {{ 4.0f,  4.0f}, {20.0f,  4.0f}, {20.0f, 20.0f}},
++        {{ 4.0f,  4.0f}, {20.0f, 20.0f}, { 4.0f, 20.0f}},
++        /* Two triangles crossing. */
++        {{24.0f,  4.0f}, {40.0f,  4.0f}, {32.0f, 20.0f}},
++        {{24.0f, 20.0f}, {40.0f, 20.0f}, {32.0f,  4.0f}},
++        /* Edges through pixel centres. */
++        {{44.5f,  4.5f}, {60.5f,  4.5f}, {44.5f, 20.5f}},
++        /* Either winding. */
++        {{ 4.0f, 24.0f}, { 4.0f, 40.0f}, {20.0f, 24.0f}},
++        {{24.0f, 24.0f}, {40.0f, 24.0f}, {24.0f, 40.0f}},
++        /* Degenerate. */
++        {{44.0f, 24.0f}, {52.0f, 32.0f}, {60.0f, 40.0f}},
++    };
++    static const D2D1_TRIANGLE scaled = {{2.0f, 22.0f}, {10.0f, 22.0f}, {2.0f, 30.0f}};
++    static const D2D1_TRIANGLE listed = {{44.0f, 44.0f}, {60.0f, 44.0f}, {44.0f, 60.0f}};
++    static const struct
++    {
++        unsigned int y, x0, x1, alpha;
++    }
++    runs[] =
++    {
++        /* A square split along its diagonal is filled once. */
++        { 4,  4, 19, 128}, {10,  4, 19, 128}, {19,  4, 19, 128}, { 4,  2,  3, 0}, {10, 20, 21, 0},
++        /* Where two triangles cross, the brush blends twice. */
++        {12, 22, 27,   0}, {12, 28, 35, 192}, {12, 36, 41,   0},
++        { 6, 24, 24,   0}, { 6, 25, 30, 128}, { 6, 31, 32, 192}, { 6, 33, 38, 128}, { 6, 39, 39, 0},
++        /* Centres on a top or left edge are in, on a bottom or right one out. */
++        { 4, 43, 43,   0}, { 4, 44, 59, 128}, { 4, 60, 60,   0},
++        {12, 43, 43,   0}, {12, 44, 51, 128}, {12, 52, 53,   0}, {20, 42, 61, 0},
++        /* Either winding is filled. */
++        {26,  4, 16, 128}, {26, 17, 23,   0}, {26, 24, 36, 128}, {26, 37, 38, 0},
++        /* A degenerate triangle is not. */
++        {32, 42, 61,   0},
++        /* The transform applies. */
++        {45,  4, 17, 128}, {45, 18, 21,   0}, {50,  4, 12, 128}, {50, 13, 14, 0},
++    };
++    ID2D1TessellationSink *sink;
++    ID2D1EllipseGeometry *ellipse;
++    ID2D1CommandList *command_list;
++    ID2D1SolidColorBrush *brush;
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    unsigned int i, x, y, count;
++    ID2D1Mesh *mesh, *mesh2, *mesh3;
++    D2D1_COLOR_F colour;
++    ID2D1Image *target;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++
++    set_color(&colour, 1.0f, 1.0f, 1.0f, 0.5f);
++    hr = ID2D1RenderTarget_CreateSolidColorBrush(ctx.rt, &colour, NULL, &brush);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    mesh = create_mesh(ctx.rt, triangles, ARRAY_SIZE(triangles), TRUE);
++    mesh2 = create_mesh(ctx.rt, &scaled, 1, TRUE);
++
++    command_list = NULL;
++    if (ctx.factory1)
++    {
++        hr = ID2D1DeviceContext_CreateCommandList(ctx.context, &command_list);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ID2D1DeviceContext_GetTarget(ctx.context, &target);
++        ID2D1DeviceContext_SetTarget(ctx.context, (ID2D1Image *)command_list);
++        ID2D1DeviceContext_BeginDraw(ctx.context);
++        ID2D1DeviceContext_SetAntialiasMode(ctx.context, D2D1_ANTIALIAS_MODE_ALIASED);
++        mesh3 = create_mesh(ctx.rt, &listed, 1, TRUE);
++        ID2D1DeviceContext_FillMesh(ctx.context, mesh3, (ID2D1Brush *)brush);
++        ID2D1Mesh_Release(mesh3);
++        hr = ID2D1DeviceContext_EndDraw(ctx.context, NULL, NULL);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        hr = ID2D1CommandList_Close(command_list);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ID2D1DeviceContext_SetTarget(ctx.context, target);
++        ID2D1Image_Release(target);
++    }
++
++    ID2D1RenderTarget_SetAntialiasMode(ctx.rt, D2D1_ANTIALIAS_MODE_ALIASED);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    set_color(&colour, 0.0f, 0.0f, 0.0f, 0.0f);
++    ID2D1RenderTarget_Clear(ctx.rt, &colour);
++    ID2D1RenderTarget_FillMesh(ctx.rt, mesh, (ID2D1Brush *)brush);
++    ID2D1RenderTarget_SetTransform(ctx.rt, &scale);
++    ID2D1RenderTarget_FillMesh(ctx.rt, mesh2, (ID2D1Brush *)brush);
++    ID2D1RenderTarget_SetTransform(ctx.rt, &identity);
++    if (command_list)
++        ID2D1DeviceContext_DrawImage(ctx.context, (ID2D1Image *)command_list, NULL, NULL,
++                D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1Mesh_Release(mesh2);
++    ID2D1Mesh_Release(mesh);
++
++    get_surface_readback(&ctx, &rb);
++#define alpha(x, y) ((unsigned int)(get_readback_colour(&rb, x, y) >> 24))
++    for (i = 0; i < ARRAY_SIZE(runs); ++i)
++    {
++        for (x = runs[i].x0; x <= runs[i].x1; ++x)
++            ok(compare_uint(alpha(x, runs[i].y), runs[i].alpha, 1), "Got unexpected alpha %u at (%u, %u).\n",
++                    alpha(x, runs[i].y), x, runs[i].y);
++    }
++    /* A list plays a mesh back. */
++    if (command_list)
++    {
++        for (x = 44; x <= 57; ++x)
++            ok(alpha(x, 45) == 128, "Got unexpected alpha %u at %u.\n", alpha(x, 45), x);
++        ok(!alpha(58, 45), "Got unexpected alpha %u.\n", alpha(58, 45));
++    }
++#undef alpha
++    release_resource_readback(&rb);
++    if (command_list)
++        ID2D1CommandList_Release(command_list);
++
++    /* A tessellated circle fills about as much as the circle. */
++    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &circle, &ellipse);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1RenderTarget_CreateMesh(ctx.rt, &mesh);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1Mesh_Open(mesh, &sink);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1EllipseGeometry_Tessellate(ellipse, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, sink);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = ID2D1TessellationSink_Close(sink);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1TessellationSink_Release(sink);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1RenderTarget_Clear(ctx.rt, &colour);
++    ID2D1RenderTarget_FillMesh(ctx.rt, mesh, (ID2D1Brush *)brush);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1Mesh_Release(mesh);
++    ID2D1EllipseGeometry_Release(ellipse);
++    get_surface_readback(&ctx, &rb);
++    for (y = 36, count = 0; y < 60; ++y)
++    {
++        for (x = 36; x < 60; ++x)
++        {
++            DWORD a = get_readback_colour(&rb, x, y) >> 24;
++
++            ok(!a || compare_uint(a, 128, 1), "Got unexpected alpha %lu at (%u, %u).\n", a, x, y);
++            count += !!a;
++        }
++    }
++    ok(compare_uint(count, 324, 4), "Got unexpected count %u.\n", count);
++    release_resource_readback(&rb);
++
++    /* An empty mesh draws nothing; one never closed, or on a target that is not aliased, is an error. */
++    mesh = create_mesh(ctx.rt, triangles, 0, TRUE);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1RenderTarget_FillMesh(ctx.rt, mesh, (ID2D1Brush *)brush);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ID2D1Mesh_Release(mesh);
++    mesh = create_mesh(ctx.rt, triangles, 1, FALSE);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1RenderTarget_FillMesh(ctx.rt, mesh, (ID2D1Brush *)brush);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
++    ID2D1Mesh_Release(mesh);
++    mesh = create_mesh(ctx.rt, triangles, 1, TRUE);
++    ID2D1RenderTarget_SetAntialiasMode(ctx.rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
++    ID2D1RenderTarget_BeginDraw(ctx.rt);
++    ID2D1RenderTarget_FillMesh(ctx.rt, mesh, (ID2D1Brush *)brush);
++    hr = ID2D1RenderTarget_EndDraw(ctx.rt, NULL, NULL);
++    ok(hr == D2DERR_WRONG_STATE, "Got unexpected hr %#lx.\n", hr);
++    ID2D1Mesh_Release(mesh);
++    get_surface_readback(&ctx, &rb);
++    ok(!(get_readback_colour(&rb, 10, 5) >> 24), "Got unexpected colour %#lx.\n", get_readback_colour(&rb, 10, 5));
++    release_resource_readback(&rb);
++
++    ID2D1SolidColorBrush_Release(brush);
++    release_test_context(&ctx);
++}
++
+ static void test_geometry_realization(BOOL d3d11)
+ {
+     ID2D1GeometryRealization *realization, *realization2;
+@@ -21137,6 +21340,7 @@ START_TEST(d2d1)
+     queue_test(test_get_dxgi_device);
+     queue_test(test_no_target);
+     queue_test(test_mesh);
++    queue_test(test_fill_mesh);
+     queue_test(test_geometry_realization);
+     queue_d3d10_test(test_path_geometry_stream);
+     queue_d3d10_test(test_transformed_geometry);

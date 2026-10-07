@@ -1,0 +1,1765 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 14:13:05 -0400
+Subject: [PATCH] windowscodecs: Write GIF metadata: block writers, the GIF
+ metadata writers and SetMetadataByName().
+
+PowerPoint's animated GIF export asks the GIF encoder for its metadata
+query writer, got E_NOTIMPL and gave up without a frame, and from then
+on rejected every automation call until it was killed.  Behind that
+stub the whole chain was missing: SetMetadataByName() returned S_OK for
+every format and wrote nothing, the frame encoder's block writer was
+E_NOTIMPL throughout, the five GIF blocks had readers only, and Commit
+wrote no extension.
+
+The encoder and each frame now keep a list of metadata writers behind
+IWICMetadataBlockWriter; the encoder's query writer is built on its
+list.  SetMetadataByName() sets the value on the writer that holds the
+item and, when a block on the path does not exist yet, creates a writer
+for its format and adds it to the parent.  There are writers for the
+logical screen and image descriptors, the graphic control, application
+and comment extensions, with the items and types the readers produce.
+Commit writes the descriptors' fields that were set, the file's
+application and comment extensions after the global colour table, and
+each frame's graphic control and comment extensions before its image.
+PowerPoint now writes a two-frame, looping GIF with the slide delays in
+two seconds and keeps answering; its sweep goes from 45 to 48 steps.
+
+The reference Windows machine was unreachable, so these are not
+measured yet (tools/gifencprobe will be run there): that new block
+lists start empty, that a frame without /grctlext gets no graphic
+control extension, the errors for a value of the wrong type, an unknown
+item and a block a GIF cannot hold, that the encoder answers QI for the
+block writer, and how a trailing zero in /appext/Data is written.
+Interlacing is refused, as the LZW writer only writes rows in order.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/dlls/windowscodecs/clsfactory.c b/dlls/windowscodecs/clsfactory.c
+index 4c366f45d7e..9dc142ae5b0 100644
+--- a/dlls/windowscodecs/clsfactory.c
++++ b/dlls/windowscodecs/clsfactory.c
+@@ -87,6 +87,11 @@ static const classinfo wic_classes[] = {
+     {&CLSID_WICGCEMetadataReader, GCEReader_CreateInstance},
+     {&CLSID_WICAPEMetadataReader, APEReader_CreateInstance},
+     {&CLSID_WICGifCommentMetadataReader, GifCommentReader_CreateInstance},
++    {&CLSID_WICLSDMetadataWriter, LSDWriter_CreateInstance},
++    {&CLSID_WICIMDMetadataWriter, IMDWriter_CreateInstance},
++    {&CLSID_WICGCEMetadataWriter, GCEWriter_CreateInstance},
++    {&CLSID_WICAPEMetadataWriter, APEWriter_CreateInstance},
++    {&CLSID_WICGifCommentMetadataWriter, GifCommentWriter_CreateInstance},
+     {0}};
+ 
+ typedef struct {
+diff --git a/dlls/windowscodecs/decoder.c b/dlls/windowscodecs/decoder.c
+index 9b4cede310d..a6669ea0ee1 100644
+--- a/dlls/windowscodecs/decoder.c
++++ b/dlls/windowscodecs/decoder.c
+@@ -138,7 +138,7 @@ static HRESULT WINAPI object_enumerator_Reset(IEnumUnknown *iface)
+     return S_OK;
+ }
+ 
+-static HRESULT create_object_enumerator(IUnknown **objects, unsigned int position,
++HRESULT create_object_enumerator(IUnknown **objects, unsigned int position,
+         unsigned int count, IEnumUnknown **ret);
+ 
+ static HRESULT WINAPI object_enumerator_Clone(IEnumUnknown *iface, IEnumUnknown **ret)
+@@ -164,7 +164,7 @@ static const IEnumUnknownVtbl object_enumerator_vtbl =
+     object_enumerator_Clone,
+ };
+ 
+-static HRESULT create_object_enumerator(IUnknown **objects, unsigned int position,
++HRESULT create_object_enumerator(IUnknown **objects, unsigned int position,
+         unsigned int count, IEnumUnknown **ret)
+ {
+     struct object_enumerator *object;
+@@ -175,7 +175,7 @@ static HRESULT create_object_enumerator(IUnknown **objects, unsigned int positio
+ 
+     object->IEnumUnknown_iface.lpVtbl = &object_enumerator_vtbl;
+     object->refcount = 1;
+-    if (!(object->objects = calloc(count, sizeof(*object->objects))))
++    if (count && !(object->objects = calloc(count, sizeof(*object->objects))))
+     {
+         free(object);
+         return E_OUTOFMEMORY;
+diff --git a/dlls/windowscodecs/gifformat.c b/dlls/windowscodecs/gifformat.c
+index 7672b9c80d0..042ec8f1570 100644
+--- a/dlls/windowscodecs/gifformat.c
++++ b/dlls/windowscodecs/gifformat.c
+@@ -496,6 +496,7 @@ static HRESULT load_GifComment_metadata(MetadataHandler *handler, IStream *strea
+         data_size += subblock_size;
+     }
+ 
++    if (!data && !(data = CoTaskMemAlloc(1))) return E_OUTOFMEMORY;
+     data[data_size] = 0;
+ 
+     if (FAILED(hr = create_gifcomment_item(data, &result)))
+@@ -545,6 +546,156 @@ HRESULT GifCommentReader_CreateInstance(REFIID iid, void **ppv)
+     return MetadataReader_Create(&GifCommentReader_Vtbl, iid, ppv);
+ }
+ 
++struct gif_metadata_field
++{
++    const WCHAR *name;
++    VARTYPE type;
++};
++
++static const struct gif_metadata_field lsd_fields[] =
++{
++    { L"Signature", VT_UI1 | VT_VECTOR }, { L"Width", VT_UI2 }, { L"Height", VT_UI2 },
++    { L"GlobalColorTableFlag", VT_BOOL }, { L"ColorResolution", VT_UI1 },
++    { L"SortFlag", VT_BOOL }, { L"GlobalColorTableSize", VT_UI1 },
++    { L"BackgroundColorIndex", VT_UI1 }, { L"PixelAspectRatio", VT_UI1 },
++};
++
++static const struct gif_metadata_field imd_fields[] =
++{
++    { L"Left", VT_UI2 }, { L"Top", VT_UI2 }, { L"Width", VT_UI2 }, { L"Height", VT_UI2 },
++    { L"LocalColorTableFlag", VT_BOOL }, { L"InterlaceFlag", VT_BOOL },
++    { L"SortFlag", VT_BOOL }, { L"LocalColorTableSize", VT_UI1 },
++};
++
++static const struct gif_metadata_field gce_fields[] =
++{
++    { L"Disposal", VT_UI1 }, { L"UserInputFlag", VT_BOOL }, { L"TransparencyFlag", VT_BOOL },
++    { L"Delay", VT_UI2 }, { L"TransparentColorIndex", VT_UI1 },
++};
++
++static const struct gif_metadata_field ape_fields[] =
++{
++    { L"Application", VT_UI1 | VT_VECTOR }, { L"Data", VT_UI1 | VT_VECTOR },
++};
++
++static const struct gif_metadata_field comment_fields[] = { { L"TextEntry", VT_LPSTR } };
++
++static void gif_metadata_fields(const GUID *clsid, const struct gif_metadata_field **fields, UINT *count)
++{
++    if (IsEqualGUID(clsid, &CLSID_WICLSDMetadataWriter))
++        *fields = lsd_fields, *count = ARRAY_SIZE(lsd_fields);
++    else if (IsEqualGUID(clsid, &CLSID_WICIMDMetadataWriter))
++        *fields = imd_fields, *count = ARRAY_SIZE(imd_fields);
++    else if (IsEqualGUID(clsid, &CLSID_WICGCEMetadataWriter))
++        *fields = gce_fields, *count = ARRAY_SIZE(gce_fields);
++    else if (IsEqualGUID(clsid, &CLSID_WICAPEMetadataWriter))
++        *fields = ape_fields, *count = ARRAY_SIZE(ape_fields);
++    else
++        *fields = comment_fields, *count = ARRAY_SIZE(comment_fields);
++}
++
++static HRESULT validate_gif_metadata(MetadataHandler *handler, const PROPVARIANT *id, const PROPVARIANT *value)
++{
++    const struct gif_metadata_field *fields;
++    UINT count, i;
++
++    gif_metadata_fields(handler->vtable->clsid, &fields, &count);
++    if (id->vt != VT_LPWSTR) return WINCODEC_ERR_PROPERTYNOTFOUND;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (lstrcmpiW(id->pwszVal, fields[i].name)) continue;
++        if (value->vt != fields[i].type) return WINCODEC_ERR_PROPERTYUNEXPECTEDTYPE;
++        if (value->vt == (VT_UI1 | VT_VECTOR) &&
++                ((IsEqualGUID(handler->vtable->clsid, &CLSID_WICAPEMetadataWriter) && !i &&
++                    value->caub.cElems != 11) ||
++                 (IsEqualGUID(handler->vtable->clsid, &CLSID_WICLSDMetadataWriter) && !i &&
++                    value->caub.cElems != 6)))
++            return E_INVALIDARG;
++        if (IsEqualGUID(handler->vtable->clsid, &CLSID_WICIMDMetadataWriter) && i == 5 && value->boolVal)
++            return WINCODEC_ERR_UNSUPPORTEDOPERATION; /* Interlaced LZW rows are not implemented. */
++        return S_OK;
++    }
++    return WINCODEC_ERR_PROPERTYNOTFOUND;
++}
++
++static HRESULT create_gif_writer_items(MetadataHandler *handler)
++{
++    const struct gif_metadata_field *fields;
++    UINT count, i;
++    HRESULT hr;
++
++    gif_metadata_fields(handler->vtable->clsid, &fields, &count);
++    if (IsEqualGUID(handler->vtable->clsid, &CLSID_WICLSDMetadataWriter) ||
++            IsEqualGUID(handler->vtable->clsid, &CLSID_WICIMDMetadataWriter))
++        return S_OK;
++    if (IsEqualGUID(handler->vtable->clsid, &CLSID_WICGifCommentMetadataWriter))
++        return CreateGifCommentHandler(handler);
++
++    if (!(handler->items = calloc(count, sizeof(*handler->items)))) return E_OUTOFMEMORY;
++    handler->item_count = count;
++    for (i = 0; i < count; ++i)
++    {
++        hr = init_propvar_from_string(fields[i].name, &handler->items[i].id);
++        if (FAILED(hr)) return hr;
++        handler->items[i].value.vt = fields[i].type;
++    }
++    if (IsEqualGUID(handler->vtable->clsid, &CLSID_WICAPEMetadataWriter))
++        handler->items[0].value.vt = VT_EMPTY;
++    return S_OK;
++}
++
++static const MetadataHandlerVtbl LSDWriter_Vtbl =
++{
++    METADATAHANDLER_IS_WRITER, &CLSID_WICLSDMetadataWriter, load_LSD_metadata,
++    create_gif_writer_items, validate_gif_metadata,
++};
++static const MetadataHandlerVtbl IMDWriter_Vtbl =
++{
++    METADATAHANDLER_IS_WRITER, &CLSID_WICIMDMetadataWriter, load_IMD_metadata,
++    create_gif_writer_items, validate_gif_metadata,
++};
++static const MetadataHandlerVtbl GCEWriter_Vtbl =
++{
++    METADATAHANDLER_IS_WRITER | METADATAHANDLER_FIXED_ITEMS, &CLSID_WICGCEMetadataWriter,
++    load_GCE_metadata, create_gif_writer_items, validate_gif_metadata,
++};
++static const MetadataHandlerVtbl APEWriter_Vtbl =
++{
++    METADATAHANDLER_IS_WRITER | METADATAHANDLER_FIXED_ITEMS, &CLSID_WICAPEMetadataWriter,
++    load_APE_metadata, create_gif_writer_items, validate_gif_metadata,
++};
++static const MetadataHandlerVtbl GifCommentWriter_Vtbl =
++{
++    METADATAHANDLER_IS_WRITER | METADATAHANDLER_FIXED_ITEMS, &CLSID_WICGifCommentMetadataWriter,
++    load_GifComment_metadata, create_gif_writer_items, validate_gif_metadata,
++};
++
++HRESULT LSDWriter_CreateInstance(REFIID iid, void **ppv)
++{
++    return MetadataReader_Create(&LSDWriter_Vtbl, iid, ppv);
++}
++
++HRESULT IMDWriter_CreateInstance(REFIID iid, void **ppv)
++{
++    return MetadataReader_Create(&IMDWriter_Vtbl, iid, ppv);
++}
++
++HRESULT GCEWriter_CreateInstance(REFIID iid, void **ppv)
++{
++    return MetadataReader_Create(&GCEWriter_Vtbl, iid, ppv);
++}
++
++HRESULT APEWriter_CreateInstance(REFIID iid, void **ppv)
++{
++    return MetadataReader_Create(&APEWriter_Vtbl, iid, ppv);
++}
++
++HRESULT GifCommentWriter_CreateInstance(REFIID iid, void **ppv)
++{
++    return MetadataReader_Create(&GifCommentWriter_Vtbl, iid, ppv);
++}
++
+ static void copy_palette(ColorMapObject *cm, Extensions *extensions, int count, WICColor *colors)
+ {
+     int i;
+@@ -949,9 +1100,34 @@ HRESULT GifDecoder_CreateInstance(REFIID iid, void **ppv)
+     return hr;
+ }
+ 
++struct gif_metadata_blocks
++{
++    IWICMetadataBlockWriter IWICMetadataBlockWriter_iface;
++    IUnknown *owner;
++    CRITICAL_SECTION *lock;
++    BOOL frame;
++    IWICMetadataWriter **writers;
++    size_t count, capacity;
++};
++
++static inline struct gif_metadata_blocks *impl_from_gif_block(IWICMetadataBlockWriter *iface)
++{
++    return CONTAINING_RECORD(iface, struct gif_metadata_blocks, IWICMetadataBlockWriter_iface);
++}
++
++static void gif_metadata_blocks_cleanup(struct gif_metadata_blocks *blocks)
++{
++    size_t i;
++
++    for (i = 0; i < blocks->count; ++i)
++        IWICMetadataWriter_Release(blocks->writers[i]);
++    free(blocks->writers);
++}
++
+ typedef struct GifEncoder
+ {
+     IWICBitmapEncoder IWICBitmapEncoder_iface;
++    struct gif_metadata_blocks blocks;
+     LONG ref;
+     IStream *stream;
+     CRITICAL_SECTION lock;
+@@ -969,7 +1145,7 @@ static inline GifEncoder *impl_from_IWICBitmapEncoder(IWICBitmapEncoder *iface)
+ typedef struct GifFrameEncode
+ {
+     IWICBitmapFrameEncode IWICBitmapFrameEncode_iface;
+-    IWICMetadataBlockWriter IWICMetadataBlockWriter_iface;
++    struct gif_metadata_blocks blocks;
+     LONG ref;
+     GifEncoder *encoder;
+     BOOL initialized, interlace, committed;
+@@ -985,11 +1161,6 @@ static inline GifFrameEncode *impl_from_IWICBitmapFrameEncode(IWICBitmapFrameEnc
+     return CONTAINING_RECORD(iface, GifFrameEncode, IWICBitmapFrameEncode_iface);
+ }
+ 
+-static inline GifFrameEncode *impl_from_IWICMetadataBlockWriter(IWICMetadataBlockWriter *iface)
+-{
+-    return CONTAINING_RECORD(iface, GifFrameEncode, IWICMetadataBlockWriter_iface);
+-}
+-
+ static HRESULT WINAPI GifFrameEncode_QueryInterface(IWICBitmapFrameEncode *iface, REFIID iid, void **ppv)
+ {
+     GifFrameEncode *encoder = impl_from_IWICBitmapFrameEncode(iface);
+@@ -1005,7 +1176,7 @@ static HRESULT WINAPI GifFrameEncode_QueryInterface(IWICBitmapFrameEncode *iface
+     }
+     else if (IsEqualIID(&IID_IWICMetadataBlockWriter, iid))
+     {
+-        *ppv = &encoder->IWICMetadataBlockWriter_iface;
++        *ppv = &encoder->blocks.IWICMetadataBlockWriter_iface;
+     }
+     else
+     {
+@@ -1036,6 +1207,7 @@ static ULONG WINAPI GifFrameEncode_Release(IWICBitmapFrameEncode *iface)
+     if (!ref)
+     {
+         IWICBitmapEncoder_Release(&This->encoder->IWICBitmapEncoder_iface);
++        gif_metadata_blocks_cleanup(&This->blocks);
+         free(This->image_data);
+         free(This);
+     }
+@@ -1506,6 +1678,177 @@ static HRESULT gif_compress(IStream *out_stream, const BYTE *in_data, ULONG in_s
+     return flush_output_data(&out) ? S_OK : E_FAIL;
+ }
+ 
++static IWICMetadataWriter *gif_get_writer(const struct gif_metadata_blocks *blocks, const GUID *format)
++{
++    GUID writer_format;
++    size_t i;
++
++    for (i = 0; i < blocks->count; ++i)
++    {
++        if (SUCCEEDED(IWICMetadataWriter_GetMetadataFormat(blocks->writers[i], &writer_format)) &&
++                IsEqualGUID(&writer_format, format))
++            return blocks->writers[i];
++    }
++    return NULL;
++}
++
++static HRESULT gif_get_value(IWICMetadataWriter *writer, const WCHAR *name, PROPVARIANT *value)
++{
++    PROPVARIANT id;
++
++    if (!writer) return WINCODEC_ERR_PROPERTYNOTFOUND;
++    PropVariantInit(value);
++    id.vt = VT_LPWSTR;
++    id.pwszVal = (WCHAR *)name;
++    return IWICMetadataWriter_GetValue(writer, NULL, &id, value);
++}
++
++static void gif_get_byte(IWICMetadataWriter *writer, const WCHAR *name, BYTE *byte)
++{
++    PROPVARIANT value;
++
++    if (SUCCEEDED(gif_get_value(writer, name, &value)))
++    {
++        if (value.vt == VT_UI1) *byte = value.bVal;
++        PropVariantClear(&value);
++    }
++}
++
++static void gif_get_word(IWICMetadataWriter *writer, const WCHAR *name, USHORT *word)
++{
++    PROPVARIANT value;
++
++    if (SUCCEEDED(gif_get_value(writer, name, &value)))
++    {
++        if (value.vt == VT_UI2) *word = value.uiVal;
++        PropVariantClear(&value);
++    }
++}
++
++static void gif_get_flag(IWICMetadataWriter *writer, const WCHAR *name, BYTE *packed, BYTE mask)
++{
++    PROPVARIANT value;
++
++    if (SUCCEEDED(gif_get_value(writer, name, &value)))
++    {
++        if (value.vt == VT_BOOL)
++            *packed = (*packed & ~mask) | (value.boolVal ? mask : 0);
++        PropVariantClear(&value);
++    }
++}
++
++static HRESULT gif_write_extension(IStream *stream, IWICMetadataWriter *writer, const GUID *format)
++{
++    static const BYTE ape_header[] = { 0x21, 0xff, 0x0b };
++    static const BYTE gce_header[] = { 0x21, 0xf9, 0x04 };
++    static const BYTE comment_header[] = { 0x21, 0xfe };
++    PROPVARIANT application, data, value;
++    BYTE gce[4] = { 0 }, terminator = 0;
++    USHORT delay = 0;
++    UINT offset, size, data_size;
++    HRESULT hr;
++
++    if (IsEqualGUID(format, &GUID_MetadataFormatGCE))
++    {
++        gif_get_byte(writer, L"Disposal", &gce[0]);
++        gce[0] = (gce[0] & 7) << 2;
++        gif_get_flag(writer, L"UserInputFlag", &gce[0], 2);
++        gif_get_flag(writer, L"TransparencyFlag", &gce[0], 1);
++        gif_get_word(writer, L"Delay", &delay);
++        gce[1] = delay & 0xff;
++        gce[2] = delay >> 8;
++        gif_get_byte(writer, L"TransparentColorIndex", &gce[3]);
++        if (FAILED(hr = IStream_Write(stream, gce_header, sizeof(gce_header), NULL))) return hr;
++        if (FAILED(hr = IStream_Write(stream, gce, sizeof(gce), NULL))) return hr;
++        return IStream_Write(stream, &terminator, 1, NULL);
++    }
++
++    if (IsEqualGUID(format, &GUID_MetadataFormatAPE))
++    {
++        hr = gif_get_value(writer, L"Application", &application);
++        if (FAILED(hr)) return hr;
++        if (application.vt != (VT_UI1 | VT_VECTOR) || application.caub.cElems != 11)
++        {
++            PropVariantClear(&application);
++            return WINCODEC_ERR_PROPERTYUNEXPECTEDTYPE;
++        }
++        hr = gif_get_value(writer, L"Data", &data);
++        if (FAILED(hr))
++        {
++            PropVariantClear(&application);
++            return hr;
++        }
++        data_size = data.caub.cElems;
++        if (data.vt != (VT_UI1 | VT_VECTOR)) hr = WINCODEC_ERR_PROPERTYUNEXPECTEDTYPE;
++        else
++        {
++            for (offset = 0; offset < data_size; offset += size + 1)
++            {
++                size = data.caub.pElems[offset];
++                if (!size && offset == data_size - 1)
++                {
++                    data_size = offset;
++                    break;
++                }
++                if (!size || size >= data_size - offset)
++                {
++                    hr = E_INVALIDARG;
++                    break;
++                }
++            }
++        }
++        if (SUCCEEDED(hr)) hr = IStream_Write(stream, ape_header, sizeof(ape_header), NULL);
++        if (SUCCEEDED(hr)) hr = IStream_Write(stream, application.caub.pElems, 11, NULL);
++        if (SUCCEEDED(hr))
++        {
++            if (data_size) hr = IStream_Write(stream, data.caub.pElems, data_size, NULL);
++        }
++        if (SUCCEEDED(hr)) hr = IStream_Write(stream, &terminator, 1, NULL);
++        PropVariantClear(&application);
++        PropVariantClear(&data);
++        return hr;
++    }
++
++    hr = gif_get_value(writer, L"TextEntry", &value);
++    if (FAILED(hr)) return hr;
++    if (value.vt != VT_LPSTR)
++    {
++        PropVariantClear(&value);
++        return WINCODEC_ERR_PROPERTYUNEXPECTEDTYPE;
++    }
++    hr = IStream_Write(stream, comment_header, sizeof(comment_header), NULL);
++    size = strlen(value.pszVal);
++    for (offset = 0; SUCCEEDED(hr) && offset < size; offset += 255)
++    {
++        BYTE length = min(size - offset, 255);
++        hr = IStream_Write(stream, &length, 1, NULL);
++        if (SUCCEEDED(hr)) hr = IStream_Write(stream, value.pszVal + offset, length, NULL);
++    }
++    if (SUCCEEDED(hr)) hr = IStream_Write(stream, &terminator, 1, NULL);
++    PropVariantClear(&value);
++    return hr;
++}
++
++static HRESULT gif_write_extensions(IStream *stream, const struct gif_metadata_blocks *blocks)
++{
++    const GUID *first = blocks->frame ? &GUID_MetadataFormatGCE : &GUID_MetadataFormatAPE;
++    GUID format;
++    UINT pass;
++    size_t i;
++    HRESULT hr;
++
++    for (pass = 0; pass < 2; ++pass)
++    {
++        for (i = 0; i < blocks->count; ++i)
++        {
++            if (FAILED(hr = IWICMetadataWriter_GetMetadataFormat(blocks->writers[i], &format))) return hr;
++            if (IsEqualGUID(&format, pass ? &GUID_MetadataFormatGifComment : first))
++                if (FAILED(hr = gif_write_extension(stream, blocks->writers[i], &format))) return hr;
++        }
++    }
++    return S_OK;
++}
++
+ static HRESULT WINAPI GifFrameEncode_Commit(IWICBitmapFrameEncode *iface)
+ {
+     GifFrameEncode *This = impl_from_IWICBitmapFrameEncode(iface);
+@@ -1524,6 +1867,9 @@ static HRESULT WINAPI GifFrameEncode_Commit(IWICBitmapFrameEncode *iface)
+         if (!This->encoder->info_written)
+         {
+             struct logical_screen_descriptor lsd;
++            IWICMetadataWriter *writer = gif_get_writer(&This->encoder->blocks, &GUID_MetadataFormatLSD);
++            PROPVARIANT value;
++            BYTE bits;
+ 
+             /* Logical Screen Descriptor */
+             memcpy(lsd.signature, "GIF89a", 6);
+@@ -1534,30 +1880,53 @@ static HRESULT WINAPI GifFrameEncode_Commit(IWICBitmapFrameEncode *iface)
+                 lsd.packed |= 0x80; /* global color table flag */
+             lsd.packed |= 0x07 << 4; /* color resolution */
+             lsd.packed |= 0x07; /* global color table size */
+-            lsd.background_color_index = 0; /* FIXME */
++            lsd.background_color_index = 0;
+             lsd.pixel_aspect_ratio = 0;
++            gif_get_word(writer, L"Width", &lsd.width);
++            gif_get_word(writer, L"Height", &lsd.height);
++            gif_get_flag(writer, L"GlobalColorTableFlag", &lsd.packed, 0x80);
++            gif_get_flag(writer, L"SortFlag", &lsd.packed, 0x08);
++            bits = lsd.packed >> 4 & 7;
++            gif_get_byte(writer, L"ColorResolution", &bits);
++            lsd.packed = (lsd.packed & ~0x70) | ((bits & 7) << 4);
++            bits = lsd.packed & 7;
++            gif_get_byte(writer, L"GlobalColorTableSize", &bits);
++            lsd.packed = (lsd.packed & ~7) | (bits & 7);
++            gif_get_byte(writer, L"BackgroundColorIndex", &lsd.background_color_index);
++            gif_get_byte(writer, L"PixelAspectRatio", &lsd.pixel_aspect_ratio);
++            if (SUCCEEDED(gif_get_value(writer, L"Signature", &value)))
++            {
++                if (value.vt == (VT_UI1 | VT_VECTOR) && value.caub.cElems == sizeof(lsd.signature))
++                    memcpy(lsd.signature, value.caub.pElems, sizeof(lsd.signature));
++                PropVariantClear(&value);
++            }
+             hr = IStream_Write(This->encoder->stream, &lsd, sizeof(lsd), NULL);
+-            if (hr == S_OK && This->encoder->colors)
++            if (hr == S_OK && (lsd.packed & 0x80))
+             {
+                 UINT i;
+ 
+                 /* Global Color Table */
+                 memset(gif_palette, 0, sizeof(gif_palette));
+-                for (i = 0; i < This->encoder->colors; i++)
++                for (i = 0; i < min(This->encoder->colors, 2u << (lsd.packed & 7)); i++)
+                 {
+                     gif_palette[i][0] = (This->encoder->palette[i] >> 16) & 0xff;
+                     gif_palette[i][1] = (This->encoder->palette[i] >> 8) & 0xff;
+                     gif_palette[i][2] = This->encoder->palette[i] & 0xff;
+                 }
+-                hr = IStream_Write(This->encoder->stream, gif_palette, sizeof(gif_palette), NULL);
++                hr = IStream_Write(This->encoder->stream, gif_palette,
++                        3 * (2u << (lsd.packed & 7)), NULL);
+             }
+ 
+-            /* FIXME: write GCE, APE, etc. GIF extensions */
++            if (hr == S_OK)
++                hr = gif_write_extensions(This->encoder->stream, &This->encoder->blocks);
+ 
+             if (hr == S_OK)
+                 This->encoder->info_written = TRUE;
+         }
+ 
++        if (hr == S_OK)
++            hr = gif_write_extensions(This->encoder->stream, &This->blocks);
++
+         if (hr == S_OK)
+         {
+             char image_separator = 0x2c;
+@@ -1566,6 +1935,8 @@ static HRESULT WINAPI GifFrameEncode_Commit(IWICBitmapFrameEncode *iface)
+             if (hr == S_OK)
+             {
+                 struct image_descriptor imd;
++                IWICMetadataWriter *writer = gif_get_writer(&This->blocks, &GUID_MetadataFormatIMD);
++                BYTE bits;
+                 int colors, color_bits = 1;
+ 
+                 /* Image Descriptor */
+@@ -1579,25 +1950,35 @@ static HRESULT WINAPI GifFrameEncode_Commit(IWICBitmapFrameEncode *iface)
+                     imd.packed |= 0x80; /* local color table flag */
+                     imd.packed |= 0x07; /* local color table size */
+                 }
+-                /* FIXME: interlace flag */
++                gif_get_word(writer, L"Left", &imd.left);
++                gif_get_word(writer, L"Top", &imd.top);
++                gif_get_word(writer, L"Width", &imd.width);
++                gif_get_word(writer, L"Height", &imd.height);
++                gif_get_flag(writer, L"LocalColorTableFlag", &imd.packed, 0x80);
++                gif_get_flag(writer, L"SortFlag", &imd.packed, 0x20);
++                bits = imd.packed & 7;
++                gif_get_byte(writer, L"LocalColorTableSize", &bits);
++                imd.packed = (imd.packed & ~7) | (bits & 7);
++                /* InterlaceFlag is refused when set: the LZW encoder only writes sequential rows. */
+                 hr = IStream_Write(This->encoder->stream, &imd, sizeof(imd), NULL);
+                 if (hr == S_OK)
+                 {
+-                    if (This->colors)
++                    if (imd.packed & 0x80)
+                     {
+                         UINT i;
+ 
+                         /* Local Color Table */
+                         memset(gif_palette, 0, sizeof(gif_palette));
+-                        for (i = 0; i < This->colors; i++)
++                        for (i = 0; i < min(This->colors, 2u << (imd.packed & 7)); i++)
+                         {
+                             gif_palette[i][0] = (This->palette[i] >> 16) & 0xff;
+                             gif_palette[i][1] = (This->palette[i] >> 8) & 0xff;
+                             gif_palette[i][2] = This->palette[i] & 0xff;
+                         }
+-                        hr = IStream_Write(This->encoder->stream, gif_palette, sizeof(gif_palette), NULL);
++                        hr = IStream_Write(This->encoder->stream, gif_palette,
++                                3 * (2u << (imd.packed & 7)), NULL);
+                         if (hr == S_OK)
+-                            colors = This->colors;
++                            colors = min(This->colors, 2u << (imd.packed & 7));
+                     }
+                     else
+                         colors = This->encoder->colors;
+@@ -1634,7 +2015,7 @@ static HRESULT WINAPI GifFrameEncode_GetMetadataQueryWriter(IWICBitmapFrameEncod
+     if (!encode->initialized)
+         return WINCODEC_ERR_NOTINITIALIZED;
+ 
+-    return MetadataQueryWriter_CreateInstanceFromBlockWriter(&encode->IWICMetadataBlockWriter_iface, writer);
++    return MetadataQueryWriter_CreateInstanceFromBlockWriter(&encode->blocks.IWICMetadataBlockWriter_iface, writer);
+ }
+ 
+ static const IWICBitmapFrameEncodeVtbl GifFrameEncode_Vtbl =
+@@ -1661,16 +2042,18 @@ static HRESULT WINAPI GifEncoder_QueryInterface(IWICBitmapEncoder *iface, REFIID
+ 
+     if (!ppv) return E_INVALIDARG;
+ 
+-    if (IsEqualIID(&IID_IUnknown, iid) ||
+-        IsEqualIID(&IID_IWICBitmapEncoder, iid))
+-    {
+-        IWICBitmapEncoder_AddRef(iface);
++    if (IsEqualIID(&IID_IUnknown, iid) || IsEqualIID(&IID_IWICBitmapEncoder, iid))
+         *ppv = iface;
+-        return S_OK;
++    else if (IsEqualIID(&IID_IWICMetadataBlockWriter, iid))
++        *ppv = &impl_from_IWICBitmapEncoder(iface)->blocks.IWICMetadataBlockWriter_iface;
++    else
++    {
++        *ppv = NULL;
++        return E_NOINTERFACE;
+     }
+ 
+-    *ppv = NULL;
+-    return E_NOINTERFACE;
++    IWICBitmapEncoder_AddRef(iface);
++    return S_OK;
+ }
+ 
+ static ULONG WINAPI GifEncoder_AddRef(IWICBitmapEncoder *iface)
+@@ -1692,6 +2075,7 @@ static ULONG WINAPI GifEncoder_Release(IWICBitmapEncoder *iface)
+     if (!ref)
+     {
+         if (This->stream) IStream_Release(This->stream);
++        gif_metadata_blocks_cleanup(&This->blocks);
+         This->lock.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->lock);
+         free(This);
+@@ -1792,90 +2176,206 @@ static HRESULT WINAPI GifEncoder_SetPreview(IWICBitmapEncoder *iface, IWICBitmap
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_QueryInterface(IWICMetadataBlockWriter *iface, REFIID iid, void **ppv)
+ {
+-    GifFrameEncode *frame_encoder = impl_from_IWICMetadataBlockWriter(iface);
+-
+-    return IWICBitmapFrameEncode_QueryInterface(&frame_encoder->IWICBitmapFrameEncode_iface, iid, ppv);
++    return IUnknown_QueryInterface(impl_from_gif_block(iface)->owner, iid, ppv);
+ }
+ 
+ static ULONG WINAPI GifEncoderFrame_Block_AddRef(IWICMetadataBlockWriter *iface)
+ {
+-    GifFrameEncode *frame_encoder = impl_from_IWICMetadataBlockWriter(iface);
+-
+-    return IWICBitmapFrameEncode_AddRef(&frame_encoder->IWICBitmapFrameEncode_iface);
++    return IUnknown_AddRef(impl_from_gif_block(iface)->owner);
+ }
+ 
+ static ULONG WINAPI GifEncoderFrame_Block_Release(IWICMetadataBlockWriter *iface)
+ {
+-    GifFrameEncode *frame_encoder = impl_from_IWICMetadataBlockWriter(iface);
+-
+-    return IWICBitmapFrameEncode_Release(&frame_encoder->IWICBitmapFrameEncode_iface);
++    return IUnknown_Release(impl_from_gif_block(iface)->owner);
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_GetContainerFormat(IWICMetadataBlockWriter *iface, GUID *container_format)
+ {
+-    FIXME("iface %p, container_format %p stub.\n", iface, container_format);
+-
+-    return E_NOTIMPL;
++    if (!container_format) return E_INVALIDARG;
++    *container_format = GUID_ContainerFormatGif;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_GetCount(IWICMetadataBlockWriter *iface, UINT *count)
+ {
+-    FIXME("iface %p, count %p stub.\n", iface, count);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
+ 
+-    return E_NOTIMPL;
++    if (!count) return E_INVALIDARG;
++    EnterCriticalSection(blocks->lock);
++    *count = blocks->count;
++    LeaveCriticalSection(blocks->lock);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_GetReaderByIndex(IWICMetadataBlockWriter *iface,
+         UINT index, IWICMetadataReader **metadata_reader)
+ {
+-    FIXME("iface %p, index %d, metadata_reader %p stub.\n", iface, index, metadata_reader);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    if (!metadata_reader) return E_INVALIDARG;
++    *metadata_reader = NULL;
++    EnterCriticalSection(blocks->lock);
++    if (index >= blocks->count)
++        hr = E_INVALIDARG;
++    else
++        hr = IWICMetadataWriter_QueryInterface(blocks->writers[index], &IID_IWICMetadataReader,
++                (void **)metadata_reader);
++    LeaveCriticalSection(blocks->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_GetEnumerator(IWICMetadataBlockWriter *iface, IEnumUnknown **enum_metadata)
+ {
+-    FIXME("iface %p, enum_metadata %p stub.\n", iface, enum_metadata);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    if (!enum_metadata) return E_INVALIDARG;
++    EnterCriticalSection(blocks->lock);
++    hr = create_object_enumerator((IUnknown **)blocks->writers, 0, blocks->count, enum_metadata);
++    LeaveCriticalSection(blocks->lock);
++    return hr;
+ }
+ 
+-static HRESULT WINAPI GifEncoderFrame_Block_InitializeFromBlockReader(IWICMetadataBlockWriter *iface,
+-        IWICMetadataBlockReader *block_reader)
++static HRESULT WINAPI GifEncoderFrame_Block_GetWriterByIndex(IWICMetadataBlockWriter *iface, UINT index,
++        IWICMetadataWriter **metadata_writer)
+ {
+-    FIXME("iface %p, block_reader %p stub.\n", iface, block_reader);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    if (!metadata_writer) return E_INVALIDARG;
++    *metadata_writer = NULL;
++    EnterCriticalSection(blocks->lock);
++    if (index >= blocks->count)
++        hr = E_INVALIDARG;
++    else
++    {
++        *metadata_writer = blocks->writers[index];
++        IWICMetadataWriter_AddRef(*metadata_writer);
++    }
++    LeaveCriticalSection(blocks->lock);
++    return hr;
+ }
+ 
+-static HRESULT WINAPI GifEncoderFrame_Block_GetWriterByIndex(IWICMetadataBlockWriter *iface, UINT index,
+-        IWICMetadataWriter **metadata_writer)
++static HRESULT gif_block_validate_writer(struct gif_metadata_blocks *blocks, IWICMetadataWriter *writer)
+ {
+-    FIXME("iface %p, index %u, metadata_writer %p stub.\n", iface, index, metadata_writer);
++    GUID format;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    if (!writer) return E_INVALIDARG;
++    hr = IWICMetadataWriter_GetMetadataFormat(writer, &format);
++    if (FAILED(hr)) return hr;
++
++    if (IsEqualGUID(&format, &GUID_MetadataFormatGifComment) ||
++            (blocks->frame && (IsEqualGUID(&format, &GUID_MetadataFormatIMD) ||
++                    IsEqualGUID(&format, &GUID_MetadataFormatGCE))) ||
++            (!blocks->frame && (IsEqualGUID(&format, &GUID_MetadataFormatLSD) ||
++                    IsEqualGUID(&format, &GUID_MetadataFormatAPE))))
++        return S_OK;
++    return WINCODEC_ERR_UNSUPPORTEDOPERATION;
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_AddWriter(IWICMetadataBlockWriter *iface, IWICMetadataWriter *metadata_writer)
+ {
+-    FIXME("iface %p, metadata_writer %p stub.\n", iface, metadata_writer);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    if (FAILED(hr = gif_block_validate_writer(blocks, metadata_writer))) return hr;
++    EnterCriticalSection(blocks->lock);
++    if (blocks->count >= UINT_MAX || !wincodecs_array_reserve((void **)&blocks->writers,
++            &blocks->capacity, blocks->count + 1, sizeof(*blocks->writers)))
++        hr = E_OUTOFMEMORY;
++    else
++    {
++        IWICMetadataWriter_AddRef(metadata_writer);
++        blocks->writers[blocks->count++] = metadata_writer;
++    }
++    LeaveCriticalSection(blocks->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_SetWriterByIndex(IWICMetadataBlockWriter *iface, UINT index,
+         IWICMetadataWriter *metadata_writer)
+ {
+-    FIXME("iface %p, index %u, metadata_writer %p stub.\n", iface, index, metadata_writer);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
++    IWICMetadataWriter *old;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    if (FAILED(hr = gif_block_validate_writer(blocks, metadata_writer))) return hr;
++    EnterCriticalSection(blocks->lock);
++    if (index >= blocks->count)
++        hr = E_INVALIDARG;
++    else
++    {
++        IWICMetadataWriter_AddRef(metadata_writer);
++        old = blocks->writers[index];
++        blocks->writers[index] = metadata_writer;
++        IWICMetadataWriter_Release(old);
++    }
++    LeaveCriticalSection(blocks->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI GifEncoderFrame_Block_RemoveWriterByIndex(IWICMetadataBlockWriter *iface, UINT index)
+ {
+-    FIXME("iface %p, index %u stub.\n", iface, index);
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface);
++    IWICMetadataWriter *old;
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    EnterCriticalSection(blocks->lock);
++    if (index >= blocks->count)
++        hr = E_INVALIDARG;
++    else
++    {
++        old = blocks->writers[index];
++        --blocks->count;
++        memmove(&blocks->writers[index], &blocks->writers[index + 1],
++                (blocks->count - index) * sizeof(*blocks->writers));
++        IWICMetadataWriter_Release(old);
++    }
++    LeaveCriticalSection(blocks->lock);
++    return hr;
++}
++
++static HRESULT WINAPI GifEncoderFrame_Block_InitializeFromBlockReader(IWICMetadataBlockWriter *iface,
++        IWICMetadataBlockReader *block_reader)
++{
++    struct gif_metadata_blocks *blocks = impl_from_gif_block(iface), copy = *blocks;
++    IWICMetadataReader *reader;
++    IWICMetadataWriter *writer;
++    GUID format;
++    UINT count, i;
++    HRESULT hr;
++
++    if (!block_reader) return E_INVALIDARG;
++    if (FAILED(hr = IWICMetadataBlockReader_GetContainerFormat(block_reader, &format))) return hr;
++    if (!IsEqualGUID(&format, &GUID_ContainerFormatGif)) return WINCODEC_ERR_UNSUPPORTEDOPERATION;
++    if (FAILED(hr = IWICMetadataBlockReader_GetCount(block_reader, &count))) return hr;
++
++    copy.writers = NULL;
++    copy.count = copy.capacity = 0;
++    for (i = 0; i < count; ++i)
++    {
++        if (FAILED(hr = IWICMetadataBlockReader_GetReaderByIndex(block_reader, i, &reader))) break;
++        hr = create_metadata_writer_from_reader(reader, &GUID_VendorMicrosoft, &writer);
++        IWICMetadataReader_Release(reader);
++        if (FAILED(hr)) break;
++        hr = GifEncoderFrame_Block_AddWriter(&copy.IWICMetadataBlockWriter_iface, writer);
++        IWICMetadataWriter_Release(writer);
++        if (FAILED(hr)) break;
++    }
++    if (SUCCEEDED(hr))
++    {
++        EnterCriticalSection(blocks->lock);
++        gif_metadata_blocks_cleanup(blocks);
++        blocks->writers = copy.writers;
++        blocks->count = copy.count;
++        blocks->capacity = copy.capacity;
++        LeaveCriticalSection(blocks->lock);
++    }
++    else
++        gif_metadata_blocks_cleanup(&copy);
++    return hr;
+ }
+ 
+ static const IWICMetadataBlockWriterVtbl GifFrameEncode_BlockVtbl = {
+@@ -1906,13 +2406,16 @@ static HRESULT WINAPI GifEncoder_CreateNewFrame(IWICBitmapEncoder *iface, IWICBi
+ 
+     if (This->initialized && !This->committed)
+     {
+-        GifFrameEncode *ret = malloc(sizeof(*ret));
++        GifFrameEncode *ret = calloc(1, sizeof(*ret));
+         if (ret)
+         {
+             This->n_frames++;
+ 
+             ret->IWICBitmapFrameEncode_iface.lpVtbl = &GifFrameEncode_Vtbl;
+-            ret->IWICMetadataBlockWriter_iface.lpVtbl = &GifFrameEncode_BlockVtbl;
++            ret->blocks.IWICMetadataBlockWriter_iface.lpVtbl = &GifFrameEncode_BlockVtbl;
++            ret->blocks.owner = (IUnknown *)&ret->IWICBitmapFrameEncode_iface;
++            ret->blocks.lock = &This->lock;
++            ret->blocks.frame = TRUE;
+ 
+             ret->ref = 1;
+             ret->encoder = This;
+@@ -1966,8 +2469,6 @@ static HRESULT WINAPI GifEncoder_Commit(IWICBitmapEncoder *iface)
+     {
+         char gif_trailer = 0x3b;
+ 
+-        /* FIXME: write text, comment GIF extensions */
+-
+         hr = IStream_Write(This->stream, &gif_trailer, sizeof(gif_trailer), NULL);
+         if (hr == S_OK)
+             This->committed = TRUE;
+@@ -1981,8 +2482,12 @@ static HRESULT WINAPI GifEncoder_Commit(IWICBitmapEncoder *iface)
+ 
+ static HRESULT WINAPI GifEncoder_GetMetadataQueryWriter(IWICBitmapEncoder *iface, IWICMetadataQueryWriter **writer)
+ {
+-    FIXME("%p,%p: stub\n", iface, writer);
+-    return E_NOTIMPL;
++    GifEncoder *encoder = impl_from_IWICBitmapEncoder(iface);
++
++    if (!writer) return E_INVALIDARG;
++    *writer = NULL;
++    if (!encoder->initialized) return WINCODEC_ERR_NOTINITIALIZED;
++    return MetadataQueryWriter_CreateInstanceFromBlockWriter(&encoder->blocks.IWICMetadataBlockWriter_iface, writer);
+ }
+ 
+ static const IWICBitmapEncoderVtbl GifEncoder_Vtbl =
+@@ -2011,10 +2516,13 @@ HRESULT GifEncoder_CreateInstance(REFIID iid, void **ppv)
+ 
+     *ppv = NULL;
+ 
+-    This = malloc(sizeof(*This));
++    This = calloc(1, sizeof(*This));
+     if (!This) return E_OUTOFMEMORY;
+ 
+     This->IWICBitmapEncoder_iface.lpVtbl = &GifEncoder_Vtbl;
++    This->blocks.IWICMetadataBlockWriter_iface.lpVtbl = &GifFrameEncode_BlockVtbl;
++    This->blocks.owner = (IUnknown *)&This->IWICBitmapEncoder_iface;
++    This->blocks.lock = &This->lock;
+     This->ref = 1;
+     This->stream = NULL;
+     InitializeCriticalSectionEx(&This->lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+diff --git a/dlls/windowscodecs/metadatahandler.c b/dlls/windowscodecs/metadatahandler.c
+index c27a055b60b..970c27d8b96 100644
+--- a/dlls/windowscodecs/metadatahandler.c
++++ b/dlls/windowscodecs/metadatahandler.c
+@@ -321,6 +321,9 @@ static HRESULT WINAPI MetadataHandler_SetValue(IWICMetadataWriter *iface,
+     if (!id || !value)
+         return E_INVALIDARG;
+ 
++    if (This->vtable->fnValidate && FAILED(hr = This->vtable->fnValidate(This, id, value)))
++        return hr;
++
+     /* Replace value of an existing item, or append a new one. */
+ 
+     EnterCriticalSection(&This->lock);
+diff --git a/dlls/windowscodecs/metadataquery.c b/dlls/windowscodecs/metadataquery.c
+index 39a788e1832..af14a911198 100644
+--- a/dlls/windowscodecs/metadataquery.c
++++ b/dlls/windowscodecs/metadataquery.c
+@@ -1216,9 +1216,80 @@ static HRESULT WINAPI query_handler_GetEnumerator(IWICMetadataQueryWriter *iface
+ 
+ static HRESULT WINAPI query_handler_SetMetadataByName(IWICMetadataQueryWriter *iface, LPCWSTR name, const PROPVARIANT *value)
+ {
+-    FIXME("iface %p, name %s, value %p stub.\n", iface, debugstr_w(name), value);
++    struct query_handler *handler = impl_from_IWICMetadataQueryWriter(iface);
++    struct query_parser parser;
++    IWICMetadataWriter *writer;
++    PROPVARIANT nested;
++    GUID vendor = GUID_VendorMicrosoft;
++    HRESULT hr;
++    size_t i, created = 0;
+ 
+-    return S_OK;
++    TRACE("iface %p, name %s, value %p.\n", iface, debugstr_w(name), value);
++
++    if (!name || !value) return E_INVALIDARG;
++
++    for (;;)
++    {
++        hr = parse_query(handler, name, &parser);
++        if (SUCCEEDED(hr))
++        {
++            if (parser.last->handler || !parser.prev || !parser.prev->writer)
++                hr = WINCODEC_ERR_INVALIDQUERYREQUEST;
++            else
++                hr = IWICMetadataWriter_SetValue(parser.prev->writer, &parser.last->schema,
++                        &parser.last->id, value);
++            parser_cleanup(&parser);
++            return hr;
++        }
++
++        if (hr != WINCODEC_ERR_PROPERTYNOTFOUND || !parser.count)
++        {
++            parser_cleanup(&parser);
++            return hr;
++        }
++
++        for (i = 0; i < parser.count && parser.components[i].handler; ++i);
++        if (i == parser.count)
++        {
++            parser_cleanup(&parser);
++            return hr;
++        }
++
++        if (i == parser.count - 1 && i && parser.components[i - 1].writer)
++        {
++            hr = IWICMetadataWriter_SetValue(parser.components[i - 1].writer,
++                    &parser.components[i].schema, &parser.components[i].id, value);
++            parser_cleanup(&parser);
++            return hr;
++        }
++
++        if (parser.components[i].id.vt != VT_CLSID || i == parser.count - 1 || created++ >= parser.count)
++        {
++            parser_cleanup(&parser);
++            return WINCODEC_ERR_UNSUPPORTEDOPERATION;
++        }
++
++        hr = create_metadata_writer(parser.components[i].id.puuid, &vendor,
++                WICMetadataCreationFailUnknown, &writer);
++        if (SUCCEEDED(hr))
++        {
++            if (!i && is_block_handler(handler))
++                hr = IWICMetadataBlockWriter_AddWriter(handler->object.block_writer, writer);
++            else if (i && parser.components[i - 1].writer)
++            {
++                nested.vt = VT_UNKNOWN;
++                nested.punkVal = (IUnknown *)writer;
++                hr = IWICMetadataWriter_SetValue(parser.components[i - 1].writer,
++                        &parser.components[i].schema, &parser.components[i].id, &nested);
++            }
++            else
++                hr = WINCODEC_ERR_UNSUPPORTEDOPERATION;
++            IWICMetadataWriter_Release(writer);
++        }
++        parser_cleanup(&parser);
++        if (FAILED(hr)) return hr == WINCODEC_ERR_COMPONENTNOTFOUND ?
++                WINCODEC_ERR_UNSUPPORTEDOPERATION : hr;
++    }
+ }
+ 
+ static HRESULT WINAPI query_handler_RemoveMetadataByName(IWICMetadataQueryWriter *iface, const WCHAR *query)
+diff --git a/dlls/windowscodecs/regsvr.c b/dlls/windowscodecs/regsvr.c
+index ed4897c71c0..0aaf9b21d59 100644
+--- a/dlls/windowscodecs/regsvr.c
++++ b/dlls/windowscodecs/regsvr.c
+@@ -2275,6 +2275,16 @@ static struct regsvr_metadatawriter const metadatawriters_list[] =
+         &GUID_MetadataFormatChunktIME,
+         0, 0, 1,
+     },
++    {   &CLSID_WICLSDMetadataWriter, "The Wine Project", "Logical Screen Descriptor Writer",
++        "1.0.0.0", "1.0.0.0", &GUID_VendorMicrosoft, &GUID_MetadataFormatLSD, 0, 0, 0 },
++    {   &CLSID_WICIMDMetadataWriter, "The Wine Project", "Image Descriptor Writer",
++        "1.0.0.0", "1.0.0.0", &GUID_VendorMicrosoft, &GUID_MetadataFormatIMD, 0, 0, 0 },
++    {   &CLSID_WICGCEMetadataWriter, "The Wine Project", "Graphic Control Extension Writer",
++        "1.0.0.0", "1.0.0.0", &GUID_VendorMicrosoft, &GUID_MetadataFormatGCE, 0, 0, 0 },
++    {   &CLSID_WICAPEMetadataWriter, "The Wine Project", "Application Extension Writer",
++        "1.0.0.0", "1.0.0.0", &GUID_VendorMicrosoft, &GUID_MetadataFormatAPE, 0, 0, 0 },
++    {   &CLSID_WICGifCommentMetadataWriter, "The Wine Project", "Comment Extension Writer",
++        "1.0.0.0", "1.0.0.0", &GUID_VendorMicrosoft, &GUID_MetadataFormatGifComment, 0, 0, 0 },
+     { NULL } /* list terminator */
+ };
+ 
+diff --git a/dlls/windowscodecs/tests/gifformat.c b/dlls/windowscodecs/tests/gifformat.c
+index 2be0e75da74..9187f12d3fe 100644
+--- a/dlls/windowscodecs/tests/gifformat.c
++++ b/dlls/windowscodecs/tests/gifformat.c
+@@ -23,6 +23,7 @@
+ 
+ #include "windef.h"
+ #include "wincodec.h"
++#include "wincodecsdk.h"
+ #include "wine/test.h"
+ 
+ HRESULT WINAPI WICCreateImagingFactory_Proxy(UINT, IWICImagingFactory**);
+@@ -1083,6 +1084,521 @@ static void test_gif_full_table(void)
+     IWICBitmapDecoder_Release(decoder);
+ }
+ 
++static void check_gif_query_byte(IWICMetadataQueryReader *reader, const WCHAR *name, BYTE expected)
++{
++    PROPVARIANT value;
++    HRESULT hr;
++
++    PropVariantInit(&value);
++    hr = IWICMetadataQueryReader_GetMetadataByName(reader, name, &value);
++    ok(hr == S_OK, "%s: GetMetadataByName failed %#lx\n", wine_dbgstr_w(name), hr);
++    if (SUCCEEDED(hr))
++    {
++        ok(value.vt == VT_UI1 && value.bVal == expected, "%s: got type %u, byte %u\n",
++                wine_dbgstr_w(name), value.vt, value.bVal);
++        PropVariantClear(&value);
++    }
++}
++
++static void check_gif_query_word(IWICMetadataQueryReader *reader, const WCHAR *name, USHORT expected)
++{
++    PROPVARIANT value;
++    HRESULT hr;
++
++    PropVariantInit(&value);
++    hr = IWICMetadataQueryReader_GetMetadataByName(reader, name, &value);
++    ok(hr == S_OK, "%s: GetMetadataByName failed %#lx\n", wine_dbgstr_w(name), hr);
++    if (SUCCEEDED(hr))
++    {
++        ok(value.vt == VT_UI2 && value.uiVal == expected, "%s: got type %u, word %u\n",
++                wine_dbgstr_w(name), value.vt, value.uiVal);
++        PropVariantClear(&value);
++    }
++}
++
++static void test_gif_metadata_writers(void)
++{
++    static const struct
++    {
++        const GUID *format;
++        const CLSID *clsid;
++        UINT count;
++    } writers[] =
++    {
++        { &GUID_MetadataFormatLSD, &CLSID_WICLSDMetadataWriter, 0 },
++        { &GUID_MetadataFormatIMD, &CLSID_WICIMDMetadataWriter, 0 },
++        { &GUID_MetadataFormatGCE, &CLSID_WICGCEMetadataWriter, 5 },
++        { &GUID_MetadataFormatAPE, &CLSID_WICAPEMetadataWriter, 2 },
++        { &GUID_MetadataFormatGifComment, &CLSID_WICGifCommentMetadataWriter, 1 },
++    };
++    IWICComponentFactory *component_factory;
++    IWICMetadataWriter *writer;
++    IWICMetadataQueryWriter *query;
++    PROPVARIANT value;
++    UINT count, i;
++    HRESULT hr;
++
++    hr = IWICImagingFactory_QueryInterface(factory, &IID_IWICComponentFactory, (void **)&component_factory);
++    ok(hr == S_OK, "QueryInterface failed %#lx\n", hr);
++    if (FAILED(hr)) return;
++    for (i = 0; i < ARRAY_SIZE(writers); ++i)
++    {
++        hr = IWICComponentFactory_CreateMetadataWriter(component_factory, writers[i].format, NULL, 0, &writer);
++        ok(hr == S_OK, "writer %u: CreateMetadataWriter failed %#lx\n", i, hr);
++        if (FAILED(hr)) continue;
++        hr = IWICMetadataWriter_GetCount(writer, &count);
++        /* UNMEASURED: new LSD/IMD writers start empty; GCE/APE/comment have default items. */
++        ok(hr == S_OK && count == writers[i].count, "writer %u: count %u, hr %#lx\n", i, count, hr);
++        IWICMetadataWriter_Release(writer);
++        hr = CoCreateInstance(writers[i].clsid, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IWICMetadataWriter, (void **)&writer);
++        ok(hr == S_OK, "writer %u: CoCreateInstance failed %#lx\n", i, hr);
++        if (SUCCEEDED(hr)) IWICMetadataWriter_Release(writer);
++    }
++
++    hr = IWICImagingFactory_CreateQueryWriter(factory, &GUID_MetadataFormatGCE, NULL, &query);
++    ok(hr == S_OK, "CreateQueryWriter failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        value.vt = VT_UI2;
++        value.uiVal = 41;
++        hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/Delay", &value);
++        ok(hr == S_OK, "generic SetMetadataByName failed %#lx\n", hr);
++        check_gif_query_word((IWICMetadataQueryReader *)query, L"/Delay", 41);
++        value.vt = VT_UI1;
++        /* UNMEASURED: wrong type is rejected on Set rather than on Commit. */
++        hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/Delay", &value);
++        ok(hr == WINCODEC_ERR_PROPERTYUNEXPECTEDTYPE, "wrong type: hr %#lx\n", hr);
++        /* UNMEASURED: unknown fields cannot be added to a GIF metadata block. */
++        hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/Missing", &value);
++        ok(hr == WINCODEC_ERR_PROPERTYNOTFOUND, "missing item: hr %#lx\n", hr);
++        IWICMetadataQueryWriter_Release(query);
++    }
++    IWICComponentFactory_Release(component_factory);
++}
++
++static void test_gif_encode_metadata(void)
++{
++    static BYTE application[] = "NETSCAPE2.0";
++    static BYTE loop_data[] = { 3, 1, 0, 0, 0 }; /* optional trailing terminator */
++    static const BYTE ape[] = { 0x21, 0xff, 0x0b, 'N','E','T','S','C','A','P','E','2','.','0', 3,1,0,0,0 };
++    static const BYTE comment[] = { 0x21, 0xfe, 3, 'g','i','f', 0 };
++    static const BYTE gce0[] = { 0x21, 0xf9, 4, 9, 50, 0, 1, 0 };
++    static const BYTE frame_comment[] = { 0x21, 0xfe, 3, 'o','n','e', 0 };
++    static const BYTE gce1[] = { 0x21, 0xf9, 4, 8, 75, 0, 0, 0 };
++    IWICBitmapEncoder *encoder;
++    IWICBitmapFrameEncode *frame;
++    IWICMetadataBlockWriter *blocks;
++    IWICMetadataBlockReader *reader_blocks;
++    IWICMetadataQueryWriter *query;
++    IWICMetadataQueryReader *reader_query;
++    IWICBitmapDecoder *decoder;
++    IWICBitmapFrameDecode *decoded_frame;
++    IWICMetadataWriter *block_writer;
++    IWICMetadataReader *block_reader;
++    IWICPalette *palette;
++    IEnumUnknown *enumerator;
++    IUnknown *unknown;
++    PROPVARIANT value;
++    LARGE_INTEGER zero = { 0 };
++    WICColor colors[] = { 0xff000000, 0xffffffff };
++    GUID format, container;
++    HGLOBAL hglobal;
++    IStream *stream;
++    BYTE pixel = 0, *bytes;
++    SIZE_T length, offset;
++    ULONG fetched;
++    UINT count, i;
++    HRESULT hr;
++
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    ok(hr == S_OK, "CreateStreamOnHGlobal failed %#lx\n", hr);
++    if (FAILED(hr)) return;
++    hr = IWICImagingFactory_CreateEncoder(factory, &GUID_ContainerFormatGif, NULL, &encoder);
++    ok(hr == S_OK, "CreateEncoder failed %#lx\n", hr);
++    if (FAILED(hr)) { IStream_Release(stream); return; }
++    hr = IWICBitmapEncoder_GetMetadataQueryWriter(encoder, &query);
++    ok(hr == WINCODEC_ERR_NOTINITIALIZED, "GetMetadataQueryWriter before Initialize: %#lx\n", hr);
++    hr = IWICBitmapEncoder_Initialize(encoder, stream, WICBitmapEncoderNoCache);
++    ok(hr == S_OK, "Initialize failed %#lx\n", hr);
++    hr = IWICBitmapEncoder_QueryInterface(encoder, &IID_IWICMetadataBlockWriter, (void **)&blocks);
++    /* UNMEASURED: GIF encoder exposes IWICMetadataBlockWriter. */
++    ok(hr == S_OK, "encoder block QueryInterface failed %#lx\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IWICMetadataBlockWriter_GetContainerFormat(blocks, &container);
++    ok(hr == S_OK && IsEqualGUID(&container, &GUID_ContainerFormatGif), "container format %#lx\n", hr);
++    hr = IWICMetadataBlockWriter_GetCount(blocks, &count);
++    /* UNMEASURED: the new encoder has no blocks until a metadata query creates one. */
++    ok(hr == S_OK && !count, "new encoder block count %u, hr %#lx\n", count, hr);
++    hr = IWICMetadataBlockWriter_GetEnumerator(blocks, &enumerator);
++    ok(hr == S_OK, "GetEnumerator failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IEnumUnknown_Next(enumerator, 1, &unknown, &fetched);
++        ok(hr == S_FALSE && !fetched, "empty enumerator: %#lx, count %lu\n", hr, fetched);
++        IEnumUnknown_Release(enumerator);
++    }
++    hr = IWICBitmapEncoder_GetMetadataQueryWriter(encoder, &query);
++    ok(hr == S_OK, "GetMetadataQueryWriter failed %#lx\n", hr);
++    if (FAILED(hr)) { IWICMetadataBlockWriter_Release(blocks); goto done; }
++
++    value.vt = VT_UI1 | VT_VECTOR;
++    value.caub.cElems = 11;
++    value.caub.pElems = application;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/appext/Application", &value);
++    ok(hr == S_OK, "Set Application failed %#lx\n", hr);
++    value.caub.cElems = sizeof(loop_data);
++    value.caub.pElems = loop_data;
++    /* UNMEASURED: accept an optional trailing zero without doubling the terminator. */
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/appext/Data", &value);
++    ok(hr == S_OK, "Set Data failed %#lx\n", hr);
++    value.caub.cElems = 6;
++    value.caub.pElems = (BYTE *)"GIF89a";
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/Signature", &value);
++    ok(hr == S_OK, "Set Signature failed %#lx\n", hr);
++    value.vt = VT_LPSTR;
++    value.pszVal = (char *)"gif";
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/commentext/TextEntry", &value);
++    ok(hr == S_OK, "Set comment failed %#lx\n", hr);
++    value.vt = VT_UI2;
++    value.uiVal = 2;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/Width", &value);
++    ok(hr == S_OK, "Set screen width failed %#lx\n", hr);
++    value.uiVal = 1;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/Height", &value);
++    ok(hr == S_OK, "Set screen height failed %#lx\n", hr);
++    value.vt = VT_UI1;
++    value.bVal = 1;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/BackgroundColorIndex", &value);
++    ok(hr == S_OK, "Set background failed %#lx\n", hr);
++    value.bVal = 27;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/PixelAspectRatio", &value);
++    ok(hr == S_OK, "Set aspect ratio failed %#lx\n", hr);
++    value.bVal = 6;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/ColorResolution", &value);
++    ok(hr == S_OK, "Set color resolution failed %#lx\n", hr);
++    value.bVal = 7;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/GlobalColorTableSize", &value);
++    ok(hr == S_OK, "Set global table size failed %#lx\n", hr);
++    value.vt = VT_BOOL;
++    value.boolVal = VARIANT_TRUE;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/SortFlag", &value);
++    ok(hr == S_OK, "Set sort flag failed %#lx\n", hr);
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/logscrdesc/GlobalColorTableFlag", &value);
++    ok(hr == S_OK, "Set global table flag failed %#lx\n", hr);
++    check_gif_query_word((IWICMetadataQueryReader *)query, L"/logscrdesc/Width", 2);
++    PropVariantInit(&value);
++    hr = IWICMetadataQueryWriter_GetMetadataByName(query, L"/appext/Data", &value);
++    ok(hr == S_OK && value.vt == (VT_UI1 | VT_VECTOR) && value.caub.cElems == sizeof(loop_data) &&
++            !memcmp(value.caub.pElems, loop_data, sizeof(loop_data)), "writer Data read-back %#lx\n", hr);
++    if (SUCCEEDED(hr)) PropVariantClear(&value);
++    IWICMetadataQueryWriter_Release(query);
++    hr = IWICMetadataBlockWriter_GetCount(blocks, &count);
++    ok(hr == S_OK && count == 3, "encoder blocks %u, hr %#lx\n", count, hr);
++    hr = IWICMetadataBlockWriter_GetWriterByIndex(blocks, 0, &block_writer);
++    ok(hr == S_OK, "GetWriterByIndex failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IWICMetadataBlockWriter_SetWriterByIndex(blocks, 0, block_writer);
++        ok(hr == S_OK, "SetWriterByIndex failed %#lx\n", hr);
++        IWICMetadataWriter_Release(block_writer);
++    }
++    hr = IWICMetadataBlockWriter_GetReaderByIndex(blocks, 0, &block_reader);
++    ok(hr == S_OK, "GetReaderByIndex failed %#lx\n", hr);
++    if (SUCCEEDED(hr)) IWICMetadataReader_Release(block_reader);
++    hr = IWICMetadataBlockWriter_GetEnumerator(blocks, &enumerator);
++    ok(hr == S_OK, "GetEnumerator failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IEnumUnknown_Next(enumerator, 1, &unknown, &fetched);
++        ok(hr == S_OK && fetched == 1, "enumerator Next failed %#lx, %lu\n", hr, fetched);
++        if (SUCCEEDED(hr)) IUnknown_Release(unknown);
++        IEnumUnknown_Release(enumerator);
++    }
++    IWICMetadataBlockWriter_Release(blocks);
++
++    hr = IWICImagingFactory_CreatePalette(factory, &palette);
++    ok(hr == S_OK, "CreatePalette failed %#lx\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IWICPalette_InitializeCustom(palette, colors, ARRAY_SIZE(colors));
++    ok(hr == S_OK, "InitializeCustom failed %#lx\n", hr);
++    hr = IWICBitmapEncoder_SetPalette(encoder, palette);
++    ok(hr == S_OK, "SetPalette failed %#lx\n", hr);
++    IWICPalette_Release(palette);
++
++    for (i = 0; i < 2; ++i)
++    {
++        hr = IWICBitmapEncoder_CreateNewFrame(encoder, &frame, NULL);
++        ok(hr == S_OK, "CreateNewFrame %u failed %#lx\n", i, hr);
++        if (FAILED(hr)) break;
++        hr = IWICBitmapFrameEncode_Initialize(frame, NULL);
++        ok(hr == S_OK, "frame Initialize failed %#lx\n", hr);
++        hr = IWICBitmapFrameEncode_SetSize(frame, 1, 1);
++        ok(hr == S_OK, "SetSize failed %#lx\n", hr);
++        format = GUID_WICPixelFormat8bppIndexed;
++        hr = IWICBitmapFrameEncode_SetPixelFormat(frame, &format);
++        ok(hr == S_OK, "SetPixelFormat failed %#lx\n", hr);
++        hr = IWICBitmapFrameEncode_QueryInterface(frame, &IID_IWICMetadataBlockWriter, (void **)&blocks);
++        ok(hr == S_OK, "frame block QI failed %#lx\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IWICMetadataBlockWriter_GetCount(blocks, &count);
++            /* UNMEASURED: an empty frame has no metadata blocks. */
++            ok(hr == S_OK && !count, "empty frame blocks %u, hr %#lx\n", count, hr);
++            IWICMetadataBlockWriter_Release(blocks);
++        }
++        hr = IWICBitmapFrameEncode_GetMetadataQueryWriter(frame, &query);
++        ok(hr == S_OK, "frame GetMetadataQueryWriter failed %#lx\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            value.vt = VT_LPWSTR;
++            value.pwszVal = (WCHAR *)L"bad";
++            /* UNMEASURED: an unsupported GIF block is rejected. */
++            hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/xmp/dc:title", &value);
++            ok(hr == WINCODEC_ERR_UNSUPPORTEDOPERATION, "unsupported frame block: hr %#lx\n", hr);
++            value.vt = VT_UI2;
++            value.uiVal = i ? 75 : 50;
++            hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/grctlext/Delay", &value);
++            ok(hr == S_OK, "Set Delay failed %#lx\n", hr);
++            value.vt = VT_UI1;
++            value.bVal = 2;
++            hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/grctlext/Disposal", &value);
++            ok(hr == S_OK, "Set Disposal failed %#lx\n", hr);
++            if (!i)
++            {
++                value.vt = VT_BOOL;
++                value.boolVal = VARIANT_TRUE;
++                hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/grctlext/TransparencyFlag", &value);
++                ok(hr == S_OK, "Set transparency failed %#lx\n", hr);
++                value.vt = VT_UI1;
++                value.bVal = 1;
++                hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/grctlext/TransparentColorIndex", &value);
++                ok(hr == S_OK, "Set transparent index failed %#lx\n", hr);
++                value.vt = VT_UI2;
++                value.uiVal = 1;
++                hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/imgdesc/Left", &value);
++                ok(hr == S_OK, "Set image Left failed %#lx\n", hr);
++                value.vt = VT_BOOL;
++                value.boolVal = VARIANT_TRUE;
++                hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/imgdesc/InterlaceFlag", &value);
++                /* UNMEASURED: refuse interlacing until GIF LZW row reordering is implemented. */
++                ok(hr == WINCODEC_ERR_UNSUPPORTEDOPERATION, "InterlaceFlag: hr %#lx\n", hr);
++                hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/imgdesc/SortFlag", &value);
++                ok(hr == S_OK, "Set image SortFlag failed %#lx\n", hr);
++            }
++            else
++            {
++                /* a comment before the first image is the file's, as the decoder reads it; this one is the
++                 * second frame's */
++                value.vt = VT_LPSTR;
++                value.pszVal = (char *)"one";
++                hr = IWICMetadataQueryWriter_SetMetadataByName(query, L"/commentext/TextEntry", &value);
++                ok(hr == S_OK, "Set frame comment failed %#lx\n", hr);
++            }
++            IWICMetadataQueryWriter_Release(query);
++        }
++        hr = IWICBitmapFrameEncode_WritePixels(frame, 1, 1, 1, &pixel);
++        ok(hr == S_OK, "WritePixels failed %#lx\n", hr);
++        hr = IWICBitmapFrameEncode_Commit(frame);
++        ok(hr == S_OK, "frame Commit failed %#lx\n", hr);
++        IWICBitmapFrameEncode_Release(frame);
++    }
++    hr = IWICBitmapEncoder_Commit(encoder);
++    ok(hr == S_OK, "encoder Commit failed %#lx\n", hr);
++    hr = GetHGlobalFromStream(stream, &hglobal);
++    ok(hr == S_OK, "GetHGlobalFromStream failed %#lx\n", hr);
++    if (FAILED(hr)) goto done;
++    bytes = GlobalLock(hglobal);
++    length = GlobalSize(hglobal);
++    ok(length > 13 + 768 + sizeof(ape) + sizeof(comment) + sizeof(gce0), "GIF too short: %Iu\n", length);
++    if (length > 13 + 768 + sizeof(ape) + sizeof(comment) + sizeof(gce0))
++    {
++        ok(!memcmp(bytes, "GIF89a", 6) && bytes[6] == 2 && bytes[8] == 1,
++                "wrong screen descriptor\n");
++        ok(bytes[10] == 0xef && bytes[11] == 1 && bytes[12] == 27,
++                "wrong flags/background/aspect: %#x/%u/%u\n", bytes[10], bytes[11], bytes[12]);
++        offset = 13 + 768;
++        ok(!memcmp(bytes + offset, ape, sizeof(ape)), "NETSCAPE2.0 extension bytes differ\n");
++        offset += sizeof(ape);
++        ok(!memcmp(bytes + offset, comment, sizeof(comment)), "comment extension bytes differ\n");
++        offset += sizeof(comment);
++        ok(!memcmp(bytes + offset, gce0, sizeof(gce0)), "frame 0 GCE bytes differ\n");
++        offset += sizeof(gce0);
++        ok(bytes[offset] == 0x2c && bytes[offset + 1] == 1 && bytes[offset + 9] == 0x20,
++                "frame 0 image position/flags differ\n");
++        offset += 10 + 1; /* image descriptor and LZW minimum code size */
++        while (offset < length && bytes[offset]) offset += 1 + bytes[offset];
++        ++offset; /* image data terminator */
++        ok(offset + sizeof(gce1) < length && !memcmp(bytes + offset, gce1, sizeof(gce1)),
++                "frame 1 GCE bytes differ at %Iu\n", offset);
++        offset += sizeof(gce1);
++        ok(offset + sizeof(frame_comment) < length && !memcmp(bytes + offset, frame_comment, sizeof(frame_comment)),
++                "frame comment bytes differ at %Iu\n", offset);
++        ok(bytes[length - 1] == 0x3b, "GIF trailer missing\n");
++    }
++    GlobalUnlock(hglobal);
++
++    IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++    hr = IWICImagingFactory_CreateDecoderFromStream(factory, stream, NULL, WICDecodeMetadataCacheOnDemand, &decoder);
++    ok(hr == S_OK, "decode encoded GIF failed %#lx\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IWICBitmapDecoder_GetFrameCount(decoder, &count);
++    ok(hr == S_OK && count == 2, "decoded frames %u, hr %#lx\n", count, hr);
++    hr = IWICBitmapDecoder_GetMetadataQueryReader(decoder, &reader_query);
++    ok(hr == S_OK, "file query reader failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        check_gif_query_word(reader_query, L"/logscrdesc/Width", 2);
++        check_gif_query_byte(reader_query, L"/logscrdesc/BackgroundColorIndex", 1);
++        check_gif_query_byte(reader_query, L"/logscrdesc/PixelAspectRatio", 27);
++        check_gif_query_byte(reader_query, L"/logscrdesc/ColorResolution", 6);
++        check_gif_query_byte(reader_query, L"/logscrdesc/GlobalColorTableSize", 7);
++        PropVariantInit(&value);
++        hr = IWICMetadataQueryReader_GetMetadataByName(reader_query, L"/appext/Data", &value);
++        ok(hr == S_OK && value.vt == (VT_UI1 | VT_VECTOR) && value.caub.cElems == 4 &&
++                !memcmp(value.caub.pElems, loop_data, 4), "loop data read-back hr %#lx, type %u\n", hr, value.vt);
++        if (SUCCEEDED(hr)) PropVariantClear(&value);
++        PropVariantInit(&value);
++        hr = IWICMetadataQueryReader_GetMetadataByName(reader_query, L"/commentext/TextEntry", &value);
++        ok(hr == S_OK && value.vt == VT_LPSTR && !strcmp(value.pszVal, "gif"), "comment read-back %#lx\n", hr);
++        if (SUCCEEDED(hr)) PropVariantClear(&value);
++        IWICMetadataQueryReader_Release(reader_query);
++    }
++    for (i = 0; i < 2; ++i)
++    {
++        hr = IWICBitmapDecoder_GetFrame(decoder, i, &decoded_frame);
++        ok(hr == S_OK, "GetFrame %u failed %#lx\n", i, hr);
++        if (FAILED(hr)) break;
++        hr = IWICBitmapFrameDecode_GetMetadataQueryReader(decoded_frame, &reader_query);
++        ok(hr == S_OK, "frame query reader failed %#lx\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            check_gif_query_word(reader_query, L"/grctlext/Delay", i ? 75 : 50);
++            check_gif_query_byte(reader_query, L"/grctlext/Disposal", 2);
++            check_gif_query_word(reader_query, L"/imgdesc/Left", i ? 0 : 1);
++            if (i)
++            {
++                PropVariantInit(&value);
++                hr = IWICMetadataQueryReader_GetMetadataByName(reader_query, L"/commentext/TextEntry", &value);
++                ok(hr == S_OK && value.vt == VT_LPSTR && !strcmp(value.pszVal, "one"),
++                        "frame comment read-back %#lx\n", hr);
++                if (SUCCEEDED(hr)) PropVariantClear(&value);
++            }
++            IWICMetadataQueryReader_Release(reader_query);
++        }
++        IWICBitmapFrameDecode_Release(decoded_frame);
++    }
++    hr = IWICBitmapDecoder_QueryInterface(decoder, &IID_IWICMetadataBlockReader, (void **)&reader_blocks);
++    ok(hr == S_OK, "decoder block reader QI failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        IWICBitmapEncoder *copy_encoder;
++        IWICMetadataBlockWriter *copy_blocks;
++        IStream *copy_stream;
++
++        hr = CreateStreamOnHGlobal(NULL, TRUE, &copy_stream);
++        ok(hr == S_OK, "CreateStreamOnHGlobal failed %#lx\n", hr);
++        hr = IWICImagingFactory_CreateEncoder(factory, &GUID_ContainerFormatGif, NULL, &copy_encoder);
++        ok(hr == S_OK, "CreateEncoder failed %#lx\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IWICBitmapEncoder_Initialize(copy_encoder, copy_stream, WICBitmapEncoderNoCache);
++            ok(hr == S_OK, "copy Initialize failed %#lx\n", hr);
++            hr = IWICBitmapEncoder_QueryInterface(copy_encoder, &IID_IWICMetadataBlockWriter, (void **)&copy_blocks);
++            ok(hr == S_OK, "copy block QI failed %#lx\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                hr = IWICMetadataBlockWriter_InitializeFromBlockReader(copy_blocks, reader_blocks);
++                ok(hr == S_OK, "InitializeFromBlockReader failed %#lx\n", hr);
++                hr = IWICMetadataBlockWriter_GetCount(copy_blocks, &count);
++                ok(hr == S_OK && count == 3, "copied block count %u, hr %#lx\n", count, hr);
++                hr = IWICMetadataBlockWriter_RemoveWriterByIndex(copy_blocks, 1);
++                ok(hr == S_OK, "RemoveWriterByIndex failed %#lx\n", hr);
++                hr = IWICMetadataBlockWriter_GetCount(copy_blocks, &count);
++                ok(hr == S_OK && count == 2, "remaining block count %u, hr %#lx\n", count, hr);
++                IWICMetadataBlockWriter_Release(copy_blocks);
++            }
++            IWICBitmapEncoder_Release(copy_encoder);
++        }
++        IStream_Release(copy_stream);
++        IWICMetadataBlockReader_Release(reader_blocks);
++    }
++    IWICBitmapDecoder_Release(decoder);
++
++done:
++    IWICBitmapEncoder_Release(encoder);
++    IStream_Release(stream);
++}
++
++static void test_gif_encode_without_metadata(void)
++{
++    IWICBitmapEncoder *encoder;
++    IWICBitmapFrameEncode *frame;
++    IWICMetadataQueryWriter *query;
++    IWICMetadataBlockWriter *blocks;
++    IWICPalette *palette;
++    WICColor colors[] = { 0xff000000, 0xffffffff };
++    GUID format = GUID_WICPixelFormat8bppIndexed;
++    HGLOBAL hglobal;
++    IStream *stream;
++    BYTE pixel = 0, *bytes;
++    UINT count;
++    HRESULT hr;
++
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    ok(hr == S_OK, "CreateStreamOnHGlobal failed %#lx\n", hr);
++    if (FAILED(hr)) return;
++    hr = IWICImagingFactory_CreateEncoder(factory, &GUID_ContainerFormatGif, NULL, &encoder);
++    ok(hr == S_OK, "CreateEncoder failed %#lx\n", hr);
++    if (FAILED(hr)) { IStream_Release(stream); return; }
++    hr = IWICBitmapEncoder_Initialize(encoder, stream, WICBitmapEncoderNoCache);
++    ok(hr == S_OK, "Initialize failed %#lx\n", hr);
++    hr = IWICBitmapEncoder_GetMetadataQueryWriter(encoder, &query);
++    ok(hr == S_OK, "empty file query writer failed %#lx\n", hr);
++    if (SUCCEEDED(hr)) IWICMetadataQueryWriter_Release(query);
++    hr = IWICImagingFactory_CreatePalette(factory, &palette);
++    ok(hr == S_OK, "CreatePalette failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        IWICPalette_InitializeCustom(palette, colors, ARRAY_SIZE(colors));
++        IWICBitmapEncoder_SetPalette(encoder, palette);
++        IWICPalette_Release(palette);
++    }
++    hr = IWICBitmapEncoder_CreateNewFrame(encoder, &frame, NULL);
++    ok(hr == S_OK, "CreateNewFrame failed %#lx\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IWICBitmapFrameEncode_Initialize(frame, NULL);
++        ok(hr == S_OK, "frame Initialize failed %#lx\n", hr);
++        IWICBitmapFrameEncode_SetSize(frame, 1, 1);
++        IWICBitmapFrameEncode_SetPixelFormat(frame, &format);
++        hr = IWICBitmapFrameEncode_GetMetadataQueryWriter(frame, &query);
++        ok(hr == S_OK, "empty frame query writer failed %#lx\n", hr);
++        if (SUCCEEDED(hr)) IWICMetadataQueryWriter_Release(query);
++        hr = IWICBitmapFrameEncode_QueryInterface(frame, &IID_IWICMetadataBlockWriter, (void **)&blocks);
++        ok(hr == S_OK, "frame block QI failed %#lx\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IWICMetadataBlockWriter_GetCount(blocks, &count);
++            ok(hr == S_OK && !count, "empty frame has %u blocks, hr %#lx\n", count, hr);
++            IWICMetadataBlockWriter_Release(blocks);
++        }
++        IWICBitmapFrameEncode_WritePixels(frame, 1, 1, 1, &pixel);
++        hr = IWICBitmapFrameEncode_Commit(frame);
++        ok(hr == S_OK, "Commit failed %#lx\n", hr);
++        IWICBitmapFrameEncode_Release(frame);
++        hr = IWICBitmapEncoder_Commit(encoder);
++        ok(hr == S_OK, "encoder Commit failed %#lx\n", hr);
++        GetHGlobalFromStream(stream, &hglobal);
++        bytes = GlobalLock(hglobal);
++        /* UNMEASURED: no GCE is emitted for a frame without /grctlext metadata. */
++        ok(bytes[13 + 768] == 0x2c, "unexpected extension before metadata-free image: %#x\n", bytes[13 + 768]);
++        GlobalUnlock(hglobal);
++    }
++    IWICBitmapEncoder_Release(encoder);
++    IStream_Release(stream);
++}
++
+ START_TEST(gifformat)
+ {
+     HRESULT hr;
+@@ -1100,6 +1616,9 @@ START_TEST(gifformat)
+     test_gif_frame_sizes();
+     test_gif_full_table();
+     test_gif_notrailer();
++    test_gif_metadata_writers();
++    test_gif_encode_metadata();
++    test_gif_encode_without_metadata();
+ 
+     IWICImagingFactory_Release(factory);
+     CoUninitialize();
+diff --git a/dlls/windowscodecs/tests/metadata.c b/dlls/windowscodecs/tests/metadata.c
+index fa52763e570..adf1f3c1dd3 100644
+--- a/dlls/windowscodecs/tests/metadata.c
++++ b/dlls/windowscodecs/tests/metadata.c
+@@ -3473,7 +3473,6 @@ static void test_metadata_LSD(void)
+ 
+     hr = CoCreateInstance(&CLSID_WICLSDMetadataWriter, NULL, CLSCTX_INPROC_SERVER,
+             &IID_IWICMetadataWriter, (void **)&writer);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (FAILED(hr)) return;
+ 
+@@ -3598,7 +3597,6 @@ static void test_metadata_IMD(void)
+ 
+     hr = CoCreateInstance(&CLSID_WICIMDMetadataWriter, NULL, CLSCTX_INPROC_SERVER,
+             &IID_IWICMetadataWriter, (void **)&writer);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (FAILED(hr)) return;
+ 
+@@ -3731,7 +3729,6 @@ static void test_metadata_GCE(void)
+ 
+     hr = CoCreateInstance(&CLSID_WICGCEMetadataWriter, NULL, CLSCTX_INPROC_SERVER,
+             &IID_IWICMetadataWriter, (void **)&writer);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (FAILED(hr)) return;
+ 
+@@ -3879,7 +3876,6 @@ static void test_metadata_APE(void)
+ 
+     hr = CoCreateInstance(&CLSID_WICAPEMetadataWriter, NULL, CLSCTX_INPROC_SERVER,
+             &IID_IWICMetadataWriter, (void **)&writer);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (FAILED(hr)) return;
+ 
+@@ -4047,7 +4043,6 @@ static void test_metadata_GIF_comment(void)
+ 
+     hr = CoCreateInstance(&CLSID_WICGifCommentMetadataWriter, NULL, CLSCTX_INPROC_SERVER,
+         &IID_IWICMetadataWriter, (void **)&writer);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (FAILED(hr)) return;
+ 
+@@ -6806,6 +6801,16 @@ static void test_CreateQueryWriter(void)
+     ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
+     IEnumString_Release(enum_string);
+ 
++    value.vt = VT_UI2;
++    value.uiVal = 42;
++    hr = IWICMetadataQueryWriter_SetMetadataByName(query_writer, L"/ifd/exif/{ushort=512}", &value);
++    ok(hr == S_OK, "Nested SetMetadataByName failed %#lx.\n", hr);
++    PropVariantInit(&value);
++    hr = IWICMetadataQueryWriter_GetMetadataByName(query_writer, L"/ifd/exif/{ushort=512}", &value);
++    ok(hr == S_OK && value.vt == VT_UI2 && value.uiVal == 42,
++            "Nested GetMetadataByName failed %#lx, type %u.\n", hr, value.vt);
++    if (SUCCEEDED(hr)) PropVariantClear(&value);
++
+     IWICMetadataQueryWriter_Release(query_writer);
+ 
+     IWICImagingFactory_Release(factory);
+diff --git a/dlls/windowscodecs/wincodecs_private.h b/dlls/windowscodecs/wincodecs_private.h
+index c667e4b5c4a..e1690912433 100644
+--- a/dlls/windowscodecs/wincodecs_private.h
++++ b/dlls/windowscodecs/wincodecs_private.h
+@@ -238,6 +238,7 @@ typedef struct _MetadataHandlerVtbl
+     HRESULT (*fnLoad)(MetadataHandler *handler, IStream *stream, const GUID *preferred_vendor,
+         DWORD persist_options);
+     HRESULT (*fnCreate)(MetadataHandler *handler);
++    HRESULT (*fnValidate)(MetadataHandler *handler, const PROPVARIANT *id, const PROPVARIANT *value);
+ } MetadataHandlerVtbl;
+ 
+ typedef struct MetadataHandler
+@@ -282,6 +283,11 @@ extern HRESULT IMDReader_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT GCEReader_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT APEReader_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT GifCommentReader_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT LSDWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT IMDWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT GCEWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT APEWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT GifCommentWriter_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT MetadataQueryReader_CreateInstanceFromBlockReader(IWICMetadataBlockReader *, IWICMetadataQueryReader **);
+ extern HRESULT MetadataQueryWriter_CreateInstanceFromBlockWriter(IWICMetadataBlockWriter *, IWICMetadataQueryWriter **);
+ extern HRESULT MetadataQueryReader_CreateInstance(IWICMetadataReader *, IWICMetadataQueryReader **);
+@@ -289,6 +295,7 @@ extern HRESULT MetadataQueryWriter_CreateInstance(IWICMetadataWriter *, IWICMeta
+ extern HRESULT stream_initialize_from_filehandle(IWICStream *iface, HANDLE hfile);
+ 
+ extern bool wincodecs_array_reserve(void **elements, size_t *capacity, size_t count, size_t size);
++extern HRESULT create_object_enumerator(IUnknown **objects, unsigned int position, unsigned int count, IEnumUnknown **ret);
+ 
+ static inline const char *debug_wic_rect(const WICRect *rect)
+ {
+diff --git a/dlls/windowscodecs/windowscodecs_wincodec.idl b/dlls/windowscodecs/windowscodecs_wincodec.idl
+index d02bad1461e..333ceeb8f40 100644
+--- a/dlls/windowscodecs/windowscodecs_wincodec.idl
++++ b/dlls/windowscodecs/windowscodecs_wincodec.idl
+@@ -314,3 +314,38 @@ coclass WICAPEMetadataReader { interface IWICMetadataReader; }
+     uuid(32557d3b-69dc-4f95-836e-f5972b2f6159)
+ ]
+ coclass WICGifCommentMetadataReader { interface IWICMetadataReader; }
++
++[
++    helpstring("WIC LSD Metadata Writer"),
++    threading(both),
++    uuid(73c037e7-e5d9-4954-876a-6da81d6e5768)
++]
++coclass WICLSDMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC IMD Metadata Writer"),
++    threading(both),
++    uuid(8c89071f-452e-4e95-9682-9d1024627172)
++]
++coclass WICIMDMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC GCE Metadata Writer"),
++    threading(both),
++    uuid(af95dc76-16b2-47f4-b3ea-3c31796693e7)
++]
++coclass WICGCEMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC Application Extension Writer"),
++    threading(both),
++    uuid(bd6edfca-2890-482f-b233-8d7339a1cf8d)
++]
++coclass WICAPEMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC Comment Extension Writer"),
++    threading(both),
++    uuid(a02797fc-c4ae-418c-af95-e637c7ead2a1)
++]
++coclass WICGifCommentMetadataWriter { interface IWICMetadataWriter; }

@@ -1,0 +1,2619 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 09:34:18 -0400
+Subject: [PATCH] rtscom: Take a window's mouse input as a stylus, and build
+ strokes from it.
+
+PowerPoint's slide show pen drew nothing and a click with it moved to
+the next slide.  Office Art's ink tool creates a RealTimeStylus, adds a
+sync plugin, then makes a StrokeBuilder and adds it as an async plugin;
+AddStylusSyncPlugin failed (the stylus was a stub) and StrokeBuilder was
+not registered, so the tool threw and PowerPoint went without ink.
+
+The RealTimeStylus now keeps its sync and async plugins, each with the
+data interest it gives when added, its window and input rectangle, the
+desired packet description (X, Y and normal pressure) and the tablet
+mode.  Enabled, it takes the mouse input of its window through a mouse
+hook on the window's thread, one hook for all styluses there: a button
+press is StylusDown, moves while pressed are Packets, the release is
+StylusUp, and moves over the window are in-air packets between
+StylusInRange and StylusOutOfRange.  Packets are X and Y in HIMETRIC
+from the client origin (and the packet status when asked for), for the
+mouse as tablet context 1 and stylus 1.  Sync plugins are called on the
+window's thread as the input comes, each seeing packets the ones before
+it changed; async plugins are called afterwards from that thread's
+queue.  GetPacketDescriptionData gives the mouse's metrics and the
+scale from ink to device.  IRealTimeStylus2 and 3 keep their flick and
+multitouch settings, and IRealTimeStylusSynchronization's locks are the
+stylus's own lock.
+
+StrokeBuilder makes strokes in its ink, a new one unless given one:
+CreateStroke from all packets at once, or BeginStroke with the first,
+AppendPackets and EndStroke, which gives the stroke's bounds as the
+dirty rectangle.  As a sync or async plugin it builds a stroke of every
+press of a stylus.  PowerPoint's pen now draws while dragged and keeps
+the stroke, and View.DrawLine draws too.
+
+Not measured on Windows yet: the tablet context and stylus numbers, the
+default desired description, whether the mouse is a tablet by default,
+the errors for enabling without a window or changing it while enabled,
+and what EndStroke's dirty rectangle is in.  Tablets and cursors as
+objects, child styluses, pen and touch input and pressure are not done.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/configure b/configure
+index 1a31ab6919b..ff684c8be1e 100755
+--- a/configure
++++ b/configure
+@@ -22733,6 +22733,7 @@ wine_fn_config_makefile dlls/rsaenh enable_rsaenh
+ wine_fn_config_makefile dlls/rsaenh/tests enable_tests
+ wine_fn_config_makefile dlls/rstrtmgr enable_rstrtmgr
+ wine_fn_config_makefile dlls/rtscom enable_rtscom
++wine_fn_config_makefile dlls/rtscom/tests enable_tests
+ wine_fn_config_makefile dlls/rtutils enable_rtutils
+ wine_fn_config_makefile dlls/rtworkq enable_rtworkq
+ wine_fn_config_makefile dlls/rtworkq/tests enable_tests
+diff --git a/configure.ac b/configure.ac
+index e65d32b309e..5a3a33d6b58 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3162,6 +3162,7 @@ WINE_CONFIG_MAKEFILE(dlls/rsaenh)
+ WINE_CONFIG_MAKEFILE(dlls/rsaenh/tests)
+ WINE_CONFIG_MAKEFILE(dlls/rstrtmgr)
+ WINE_CONFIG_MAKEFILE(dlls/rtscom)
++WINE_CONFIG_MAKEFILE(dlls/rtscom/tests)
+ WINE_CONFIG_MAKEFILE(dlls/rtutils)
+ WINE_CONFIG_MAKEFILE(dlls/rtworkq)
+ WINE_CONFIG_MAKEFILE(dlls/rtworkq/tests)
+diff --git a/dlls/rtscom/Makefile.in b/dlls/rtscom/Makefile.in
+index e4ea85cc387..63dd3ec6ef9 100644
+--- a/dlls/rtscom/Makefile.in
++++ b/dlls/rtscom/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = rtscom.dll
++IMPORTS   = uuid oleaut32 ole32 user32 gdi32
+ 
+ SOURCES = \
+ 	rtscom_main.c \
+diff --git a/dlls/rtscom/rtscom_main.c b/dlls/rtscom/rtscom_main.c
+index c51799328e8..04d81728687 100644
+--- a/dlls/rtscom/rtscom_main.c
++++ b/dlls/rtscom/rtscom_main.c
+@@ -1,5 +1,6 @@
+ /*
+-* Copyright 2026 Alistair Leslie-Hughes
++ * Copyright 2026 Alistair Leslie-Hughes
++ * Copyright 2026 AltarsCN
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -18,340 +19,1829 @@
+ #include <stdarg.h>
+ 
+ #define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
++#include "ole2.h"
++#include "ocidl.h"
++#include <initguid.h>
++#include "oleidl.h"
++#include "rpcproxy.h"
++#include "rtscom.h"
++#include "wine/inkobj.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(rtscom);
++
++DEFINE_GUID(GUID_PACKETPROPERTY_GUID_X, 0x598a6a8f, 0x52c0, 0x4ba0, 0x93, 0xaf, 0xaf, 0x35, 0x74, 0x11, 0xa5, 0x61);
++DEFINE_GUID(GUID_PACKETPROPERTY_GUID_Y, 0xb53f9f75, 0x04e0, 0x4498, 0xa7, 0xee, 0xc3, 0x0d, 0xbb, 0x5a, 0x90, 0x11);
++DEFINE_GUID(GUID_PACKETPROPERTY_GUID_NORMAL_PRESSURE, 0x7307502d, 0xf9f4, 0x4e18, 0xb3, 0xf2, 0x2c, 0xe1, 0xb1, 0xa3, 0x61, 0x0c);
++DEFINE_GUID(GUID_PACKETPROPERTY_GUID_PACKET_STATUS, 0x6e0e07bf, 0xafe7, 0x4cf7, 0x87, 0xd1, 0xaf, 0x64, 0x46, 0x20, 0x84, 0x18);
++
++/* the mouse is the one tablet there is, with one stylus: not measured what numbers Windows gives them */
++#define MOUSE_TABLET_CONTEXT 1
++#define MOUSE_STYLUS 1
++
++/* packet status bits */
++#define IP_CURSOR_DOWN 0x1
++
++#define HIMETRIC_PER_INCH 2540
++
++#define WM_RTS_ASYNC (WM_USER + 1)
++
++struct plugin
++{
++    IStylusPlugin *plugin;
++    RealTimeStylusDataInterest interest;
++};
++
++struct rtstylus
++{
++    IRealTimeStylus IRealTimeStylus_iface;
++    IRealTimeStylus2 IRealTimeStylus2_iface;
++    IRealTimeStylus3 IRealTimeStylus3_iface;
++    IRealTimeStylusSynchronization IRealTimeStylusSynchronization_iface;
++    LONG ref;
++
++    CRITICAL_SECTION cs;
++    BOOL enabled;
++    HWND hwnd;
++    RECT input_rect;
++    struct plugin *sync_plugins;
++    ULONG sync_count;
++    struct plugin *async_plugins;
++    ULONG async_count;
++    IRealTimeStylus *child;
++    BOOL use_mouse;
++    IInkTablet *single_tablet;
++    GUID *desired;
++    ULONG desired_count;
++    BOOL flicks;
++    BOOL multi_touch;
++
++    /* input, taken on the window's thread */
++    struct list entry;
++    DWORD thread;
++    BOOL hooked;
++    HWND async_window;
++    BOOL down;
++    BOOL in_range;
++};
++
++static CRITICAL_SECTION styluses_cs;
++static CRITICAL_SECTION_DEBUG styluses_cs_debug =
++{
++    0, 0, &styluses_cs,
++    { &styluses_cs_debug.ProcessLocksList, &styluses_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": styluses_cs") }
++};
++static CRITICAL_SECTION styluses_cs = { &styluses_cs_debug, -1, 0, 0, 0, 0 };
++static struct list enabled_styluses = LIST_INIT(enabled_styluses);
++
++/* one mouse hook for each thread with windows that give input to styluses */
++struct thread_hook
++{
++    struct list entry;
++    DWORD thread;
++    HHOOK hook;
++    unsigned int count;
++};
++
++static struct list thread_hooks = LIST_INIT(thread_hooks);
++
++static HINSTANCE rtscom_instance;
++
++static struct rtstylus *impl_from_IRealTimeStylus( IRealTimeStylus *iface )
++{
++    return CONTAINING_RECORD( iface, struct rtstylus, IRealTimeStylus_iface );
++}
++
++static struct rtstylus *impl_from_IRealTimeStylus2( IRealTimeStylus2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct rtstylus, IRealTimeStylus2_iface );
++}
++
++static struct rtstylus *impl_from_IRealTimeStylus3( IRealTimeStylus3 *iface )
++{
++    return CONTAINING_RECORD( iface, struct rtstylus, IRealTimeStylus3_iface );
++}
++
++static struct rtstylus *impl_from_IRealTimeStylusSynchronization( IRealTimeStylusSynchronization *iface )
++{
++    return CONTAINING_RECORD( iface, struct rtstylus, IRealTimeStylusSynchronization_iface );
++}
++
++/* the packet description the mouse gives: X and Y always, and its status when asked for */
++static ULONG mouse_description( struct rtstylus *This, GUID *guids )
++{
++    ULONG count = 0, i;
++
++    guids[count++] = GUID_PACKETPROPERTY_GUID_X;
++    guids[count++] = GUID_PACKETPROPERTY_GUID_Y;
++    for (i = 0; i < This->desired_count; i++)
++        if (IsEqualGUID( &This->desired[i], &GUID_PACKETPROPERTY_GUID_PACKET_STATUS ))
++            guids[count++] = GUID_PACKETPROPERTY_GUID_PACKET_STATUS;
++    return count;
++}
++
++/* a mouse position in HIMETRIC from the window's client origin */
++static ULONG mouse_packet( struct rtstylus *This, POINT pt, BOOL down, LONG *packet )
++{
++    GUID guids[3];
++    ULONG count = mouse_description( This, guids ), i;
++    HDC hdc = GetDC( This->hwnd );
++    int dpi_x = GetDeviceCaps( hdc, LOGPIXELSX ), dpi_y = GetDeviceCaps( hdc, LOGPIXELSY );
++
++    ReleaseDC( This->hwnd, hdc );
++    ScreenToClient( This->hwnd, &pt );
++    for (i = 0; i < count; i++)
++    {
++        if (IsEqualGUID( &guids[i], &GUID_PACKETPROPERTY_GUID_X ))
++            packet[i] = MulDiv( pt.x, HIMETRIC_PER_INCH, dpi_x );
++        else if (IsEqualGUID( &guids[i], &GUID_PACKETPROPERTY_GUID_Y ))
++            packet[i] = MulDiv( pt.y, HIMETRIC_PER_INCH, dpi_y );
++        else
++            packet[i] = down ? IP_CURSOR_DOWN : 0;
++    }
++    return count;
++}
++
++enum notification
++{
++    NOTIFY_ENABLED,
++    NOTIFY_DISABLED,
++    NOTIFY_IN_RANGE,
++    NOTIFY_OUT_OF_RANGE,
++    NOTIFY_DOWN,
++    NOTIFY_PACKETS,
++    NOTIFY_UP,
++    NOTIFY_IN_AIR,
++    NOTIFY_CUSTOM,
++};
++
++struct event
++{
++    enum notification type;
++    ULONG count;
++    LONG packet[32];
++    GUID guid;
++    ULONG size;
++    BYTE data[];
++};
++
++static const RealTimeStylusDataInterest event_interest[] =
++{
++    [NOTIFY_ENABLED] = RTSDI_RealTimeStylusEnabled,
++    [NOTIFY_DISABLED] = RTSDI_RealTimeStylusDisabled,
++    [NOTIFY_IN_RANGE] = RTSDI_StylusInRange,
++    [NOTIFY_OUT_OF_RANGE] = RTSDI_StylusOutOfRange,
++    [NOTIFY_DOWN] = RTSDI_StylusDown,
++    [NOTIFY_PACKETS] = RTSDI_Packets,
++    [NOTIFY_UP] = RTSDI_StylusUp,
++    [NOTIFY_IN_AIR] = RTSDI_InAirPackets,
++    [NOTIFY_CUSTOM] = RTSDI_CustomStylusDataAdded,
++};
++
++/* each plugin sees the packets the ones before it passed on */
++static void notify_plugin( struct rtstylus *This, IStylusPlugin *plugin, struct event *event )
++{
++    IRealTimeStylus *rts = &This->IRealTimeStylus_iface;
++    StylusInfo info = {MOUSE_TABLET_CONTEXT, MOUSE_STYLUS, FALSE};
++    TABLET_CONTEXT_ID tcid = MOUSE_TABLET_CONTEXT;
++    LONG *changed = NULL;
++    ULONG changed_count = 0;
++    HRESULT hr = S_OK;
++
++    switch (event->type)
++    {
++    case NOTIFY_ENABLED:
++        hr = IStylusPlugin_RealTimeStylusEnabled( plugin, rts, 1, &tcid );
++        break;
++    case NOTIFY_DISABLED:
++        hr = IStylusPlugin_RealTimeStylusDisabled( plugin, rts, 1, &tcid );
++        break;
++    case NOTIFY_IN_RANGE:
++        hr = IStylusPlugin_StylusInRange( plugin, rts, MOUSE_TABLET_CONTEXT, MOUSE_STYLUS );
++        break;
++    case NOTIFY_OUT_OF_RANGE:
++        hr = IStylusPlugin_StylusOutOfRange( plugin, rts, MOUSE_TABLET_CONTEXT, MOUSE_STYLUS );
++        break;
++    case NOTIFY_DOWN:
++        hr = IStylusPlugin_StylusDown( plugin, rts, &info, event->count, event->packet, &changed );
++        break;
++    case NOTIFY_UP:
++        hr = IStylusPlugin_StylusUp( plugin, rts, &info, event->count, event->packet, &changed );
++        break;
++    case NOTIFY_PACKETS:
++        hr = IStylusPlugin_Packets( plugin, rts, &info, 1, event->count, event->packet, &changed_count, &changed );
++        break;
++    case NOTIFY_IN_AIR:
++        hr = IStylusPlugin_InAirPackets( plugin, rts, &info, 1, event->count, event->packet, &changed_count, &changed );
++        break;
++    case NOTIFY_CUSTOM:
++        hr = IStylusPlugin_CustomStylusDataAdded( plugin, rts, &event->guid, event->size, event->size ? event->data : NULL );
++        break;
++    }
++    if (FAILED(hr))
++        WARN( "Plugin %p failed notification %d, hr %#lx.\n", plugin, event->type, hr );
++    if (changed && changed != event->packet)
++        memcpy( event->packet, changed, event->count * sizeof(*changed) );
++}
++
++/* the plugins are called without the lock held, as they may call back */
++static void notify( struct rtstylus *This, struct event *event, BOOL async )
++{
++    RealTimeStylusDataInterest interest = event_interest[event->type];
++    struct plugin *plugins;
++    ULONG count, i;
++
++    EnterCriticalSection( &This->cs );
++    count = async ? This->async_count : This->sync_count;
++    if (!(plugins = malloc( max( 1, count ) * sizeof(*plugins) )))
++    {
++        LeaveCriticalSection( &This->cs );
++        return;
++    }
++    memcpy( plugins, async ? This->async_plugins : This->sync_plugins, count * sizeof(*plugins) );
++    for (i = 0; i < count; i++) IStylusPlugin_AddRef( plugins[i].plugin );
++    LeaveCriticalSection( &This->cs );
++
++    for (i = 0; i < count; i++)
++    {
++        if (plugins[i].interest & interest)
++            notify_plugin( This, plugins[i].plugin, event );
++        IStylusPlugin_Release( plugins[i].plugin );
++    }
++    free( plugins );
++}
++
++static LRESULT CALLBACK async_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    if (msg == WM_RTS_ASYNC)
++    {
++        struct rtstylus *This = (struct rtstylus *)wparam;
++        struct event *event = (struct event *)lparam;
++
++        notify( This, event, TRUE );
++        free( event );
++        IRealTimeStylus_Release( &This->IRealTimeStylus_iface );
++        return 0;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static HWND create_async_window(void)
++{
++    static const WCHAR class_name[] = L"__wine_rtscom_async";
++    WNDCLASSW class = {0};
++
++    class.lpfnWndProc = async_window_proc;
++    class.hInstance = rtscom_instance;
++    class.lpszClassName = class_name;
++    RegisterClassW( &class );
++    return CreateWindowW( class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, rtscom_instance, NULL );
++}
++
++/* sync plugins now, on the window's thread; async plugins after, from its message queue */
++static void dispatch_event( struct rtstylus *This, struct event *event, size_t size )
++{
++    struct event *copy;
++
++    notify( This, event, FALSE );
++
++    if (!This->async_count) return;
++    if (!This->async_window && !(This->async_window = create_async_window()))
++    {
++        notify( This, event, TRUE );
++        return;
++    }
++    if (!(copy = malloc( size ))) return;
++    memcpy( copy, event, size );
++    IRealTimeStylus_AddRef( &This->IRealTimeStylus_iface );
++    if (!PostMessageW( This->async_window, WM_RTS_ASYNC, (WPARAM)This, (LPARAM)copy ))
++    {
++        free( copy );
++        IRealTimeStylus_Release( &This->IRealTimeStylus_iface );
++    }
++}
++
++static BOOL point_in_input( struct rtstylus *This, POINT pt )
++{
++    RECT rect;
++
++    if (IsRectEmpty( &This->input_rect ))
++    {
++        GetClientRect( This->hwnd, &rect );
++        MapWindowPoints( This->hwnd, HWND_DESKTOP, (POINT *)&rect, 2 );
++    }
++    else
++    {
++        rect = This->input_rect;
++        MapWindowPoints( This->hwnd, HWND_DESKTOP, (POINT *)&rect, 2 );
++    }
++    return PtInRect( &rect, pt );
++}
++
++static void handle_mouse( struct rtstylus *This, UINT msg, POINT pt )
++{
++    struct event event = {0};
++    BOOL inside = point_in_input( This, pt );
++
++    switch (msg)
++    {
++    case WM_LBUTTONDOWN:
++        if (!inside || This->down) return;
++        This->down = TRUE;
++        event.type = NOTIFY_DOWN;
++        break;
++    case WM_LBUTTONUP:
++        if (!This->down) return;
++        This->down = FALSE;
++        event.type = NOTIFY_UP;
++        break;
++    case WM_MOUSEMOVE:
++        if (This->down) event.type = NOTIFY_PACKETS;
++        else if (inside)
++        {
++            if (!This->in_range)
++            {
++                struct event range = {NOTIFY_IN_RANGE};
++
++                This->in_range = TRUE;
++                dispatch_event( This, &range, sizeof(range) );
++            }
++            event.type = NOTIFY_IN_AIR;
++        }
++        else
++        {
++            if (This->in_range)
++            {
++                struct event range = {NOTIFY_OUT_OF_RANGE};
++
++                This->in_range = FALSE;
++                dispatch_event( This, &range, sizeof(range) );
++            }
++            return;
++        }
++        break;
++    default:
++        return;
++    }
++
++    event.count = mouse_packet( This, pt, This->down || msg == WM_LBUTTONUP, event.packet );
++    TRACE( "%p, event %d at %ld, %ld.\n", This, event.type, event.packet[0], event.packet[1] );
++    dispatch_event( This, &event, sizeof(event) );
++}
++
++static LRESULT CALLBACK mouse_hook( int code, WPARAM wparam, LPARAM lparam )
++{
++    MOUSEHOOKSTRUCT *info = (MOUSEHOOKSTRUCT *)lparam;
++    struct rtstylus *This, *targets[8];
++    struct thread_hook *thread_hook;
++    unsigned int count = 0, i;
++    HHOOK hook = NULL;
++
++    EnterCriticalSection( &styluses_cs );
++    LIST_FOR_EACH_ENTRY( thread_hook, &thread_hooks, struct thread_hook, entry )
++        if (thread_hook->thread == GetCurrentThreadId()) hook = thread_hook->hook;
++    LIST_FOR_EACH_ENTRY( This, &enabled_styluses, struct rtstylus, entry )
++    {
++        if (This->thread != GetCurrentThreadId()) continue;
++        if (code != HC_ACTION || !This->use_mouse) continue;
++        if (info->hwnd != This->hwnd && !IsChild( This->hwnd, info->hwnd ) && !This->down) continue;
++        if (count == ARRAY_SIZE(targets)) break;
++        IRealTimeStylus_AddRef( &This->IRealTimeStylus_iface );
++        targets[count++] = This;
++    }
++    LeaveCriticalSection( &styluses_cs );
++
++    for (i = 0; i < count; i++)
++    {
++        handle_mouse( targets[i], wparam, info->pt );
++        IRealTimeStylus_Release( &targets[i]->IRealTimeStylus_iface );
++    }
++    return CallNextHookEx( hook, code, wparam, lparam );
++}
++
++static HRESULT start_input( struct rtstylus *This )
++{
++    struct thread_hook *thread_hook;
++    HRESULT hr = S_OK;
++
++    This->thread = GetWindowThreadProcessId( This->hwnd, NULL );
++
++    EnterCriticalSection( &styluses_cs );
++    LIST_FOR_EACH_ENTRY( thread_hook, &thread_hooks, struct thread_hook, entry )
++        if (thread_hook->thread == This->thread) break;
++    if (&thread_hook->entry == &thread_hooks)
++    {
++        if (!(thread_hook = calloc( 1, sizeof(*thread_hook) )))
++            hr = E_OUTOFMEMORY;
++        else if (!(thread_hook->hook = SetWindowsHookExW( WH_MOUSE, mouse_hook, NULL, This->thread )))
++        {
++            hr = HRESULT_FROM_WIN32( GetLastError() );
++            free( thread_hook );
++        }
++        else
++        {
++            thread_hook->thread = This->thread;
++            list_add_tail( &thread_hooks, &thread_hook->entry );
++        }
++    }
++    if (SUCCEEDED(hr))
++    {
++        thread_hook->count++;
++        list_add_tail( &enabled_styluses, &This->entry );
++        This->hooked = TRUE;
++    }
++    LeaveCriticalSection( &styluses_cs );
++    return hr;
++}
++
++static void stop_input( struct rtstylus *This )
++{
++    struct thread_hook *thread_hook;
++
++    EnterCriticalSection( &styluses_cs );
++    list_remove( &This->entry );
++    LIST_FOR_EACH_ENTRY( thread_hook, &thread_hooks, struct thread_hook, entry )
++    {
++        if (thread_hook->thread != This->thread) continue;
++        if (!--thread_hook->count)
++        {
++            UnhookWindowsHookEx( thread_hook->hook );
++            list_remove( &thread_hook->entry );
++            free( thread_hook );
++        }
++        break;
++    }
++    LeaveCriticalSection( &styluses_cs );
++    This->hooked = FALSE;
++    This->down = This->in_range = FALSE;
++}
++
++static HRESULT WINAPI rtstylus_QueryInterface(IRealTimeStylus *iface, REFIID iid, void **obj)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "(%p)->(%s %p)\n", This, debugstr_guid( iid ), obj );
++
++    if (IsEqualIID( iid, &IID_IUnknown ) ||
++        IsEqualIID( iid, &IID_IRealTimeStylus ))
++        *obj = &This->IRealTimeStylus_iface;
++    else if (IsEqualIID( iid, &IID_IRealTimeStylus2 ))
++        *obj = &This->IRealTimeStylus2_iface;
++    else if (IsEqualIID( iid, &IID_IRealTimeStylus3 ))
++        *obj = &This->IRealTimeStylus3_iface;
++    else if (IsEqualIID( iid, &IID_IRealTimeStylusSynchronization ))
++        *obj = &This->IRealTimeStylusSynchronization_iface;
++    else
++    {
++        WARN( "interface %s not implemented\n", debugstr_guid( iid ) );
++        *obj = NULL;
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef( (IUnknown *)*obj );
++    return S_OK;
++}
++
++static ULONG WINAPI rtstylus_AddRef(IRealTimeStylus *iface)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    ULONG ref = InterlockedIncrement( &This->ref );
++
++    TRACE( "(%p) ref = %lu\n", This, ref );
++    return ref;
++}
++
++static void release_plugins( struct plugin *plugins, ULONG count )
++{
++    ULONG i;
++
++    for (i = 0; i < count; i++)
++        IStylusPlugin_Release( plugins[i].plugin );
++}
++
++static ULONG WINAPI rtstylus_Release(IRealTimeStylus *iface)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++
++    TRACE( "(%p) ref = %lu\n", This, ref );
++
++    if (!ref)
++    {
++        if (This->hooked) stop_input( This );
++        if (This->async_window) PostMessageW( This->async_window, WM_CLOSE, 0, 0 );
++        release_plugins( This->sync_plugins, This->sync_count );
++        release_plugins( This->async_plugins, This->async_count );
++        free( This->sync_plugins );
++        free( This->async_plugins );
++        if (This->child) IRealTimeStylus_Release( This->child );
++        if (This->single_tablet) IInkTablet_Release( This->single_tablet );
++        free( This->desired );
++        This->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &This->cs );
++        free( This );
++    }
++
++    return ref;
++}
++
++static HRESULT WINAPI rtstylus_get_Enabled(IRealTimeStylus *iface, BOOL *pfEnable)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, pfEnable );
++
++    if (!pfEnable) return E_POINTER;
++    *pfEnable = This->enabled;
++    return S_OK;
++}
++
++/* the window's mouse input is taken from its own thread, by a hook there */
++static HRESULT WINAPI rtstylus_put_Enabled(IRealTimeStylus *iface, BOOL fEnable)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    struct event event = {0};
++    HRESULT hr = S_OK;
++
++    TRACE( "%p, %d\n", This, fEnable );
++
++    EnterCriticalSection( &This->cs );
++    if (!fEnable == !This->enabled)
++    {
++        LeaveCriticalSection( &This->cs );
++        return S_OK;
++    }
++    if (fEnable)
++    {
++        if (!This->hwnd || !IsWindow( This->hwnd ))
++            hr = HRESULT_FROM_WIN32( ERROR_INVALID_WINDOW_HANDLE );
++        else if (SUCCEEDED(hr = start_input( This )))
++            This->enabled = TRUE;
++    }
++    else
++    {
++        stop_input( This );
++        This->enabled = FALSE;
++    }
++    LeaveCriticalSection( &This->cs );
++
++    if (SUCCEEDED(hr))
++    {
++        event.type = fEnable ? NOTIFY_ENABLED : NOTIFY_DISABLED;
++        notify( This, &event, FALSE );
++        notify( This, &event, TRUE );
++    }
++    return hr;
++}
++
++static HRESULT WINAPI rtstylus_get_HWND(IRealTimeStylus *iface, HANDLE_PTR *phwnd)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, phwnd );
++
++    if (!phwnd) return E_POINTER;
++    *phwnd = (HANDLE_PTR)This->hwnd;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_put_HWND(IRealTimeStylus *iface, HANDLE_PTR hwnd)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    HRESULT hr = S_OK;
++
++    TRACE( "%p, %Ix\n", This, hwnd );
++
++    EnterCriticalSection( &This->cs );
++    /* the window can't change under enabled input (what Windows answers is not measured) */
++    if (This->enabled)
++        hr = E_UNEXPECTED;
++    else if (hwnd && !IsWindow( (HWND)hwnd ))
++        hr = HRESULT_FROM_WIN32( ERROR_INVALID_WINDOW_HANDLE );
++    else
++        This->hwnd = (HWND)hwnd;
++    LeaveCriticalSection( &This->cs );
++    return hr;
++}
++
++static HRESULT WINAPI rtstylus_get_WindowInputRectangle(IRealTimeStylus *iface, RECT *prcWndInputRect)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, prcWndInputRect );
++
++    if (!prcWndInputRect) return E_POINTER;
++    *prcWndInputRect = This->input_rect;
++    return S_OK;
++}
++
++/* an empty rectangle is the whole window */
++static HRESULT WINAPI rtstylus_put_WindowInputRectangle(IRealTimeStylus *iface, const RECT *prcWndInputRect)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %s\n", This, wine_dbgstr_rect( prcWndInputRect ) );
++
++    if (!prcWndInputRect) return E_POINTER;
++    EnterCriticalSection( &This->cs );
++    This->input_rect = *prcWndInputRect;
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
++}
++
++static HRESULT add_plugin( struct rtstylus *This, struct plugin **plugins, ULONG *count, ULONG index,
++        IStylusPlugin *plugin )
++{
++    RealTimeStylusDataInterest interest = RTSDI_DefaultEvents;
++    struct plugin *array;
++    HRESULT hr;
++
++    if (!plugin) return E_POINTER;
++    if (index > *count) return E_INVALIDARG;
++    if (FAILED(hr = IStylusPlugin_DataInterest( plugin, &interest )))
++        WARN( "Plugin %p gives no data interest, hr %#lx.\n", plugin, hr );
++    TRACE( "Plugin %p wants %#x.\n", plugin, interest );
++
++    EnterCriticalSection( &This->cs );
++    if (index > *count)
++    {
++        LeaveCriticalSection( &This->cs );
++        return E_INVALIDARG;
++    }
++    if (!(array = realloc( *plugins, (*count + 1) * sizeof(*array) )))
++    {
++        LeaveCriticalSection( &This->cs );
++        return E_OUTOFMEMORY;
++    }
++    memmove( array + index + 1, array + index, (*count - index) * sizeof(*array) );
++    array[index].plugin = plugin;
++    array[index].interest = interest;
++    IStylusPlugin_AddRef( plugin );
++    *plugins = array;
++    (*count)++;
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
++}
++
++static HRESULT remove_plugin( struct rtstylus *This, struct plugin *plugins, ULONG *count, ULONG index,
++        IStylusPlugin **removed )
++{
++    IStylusPlugin *plugin;
++
++    EnterCriticalSection( &This->cs );
++    if (index >= *count)
++    {
++        LeaveCriticalSection( &This->cs );
++        return E_INVALIDARG;
++    }
++    plugin = plugins[index].plugin;
++    memmove( plugins + index, plugins + index + 1, (*count - index - 1) * sizeof(*plugins) );
++    (*count)--;
++    LeaveCriticalSection( &This->cs );
++
++    if (removed) *removed = plugin;
++    else IStylusPlugin_Release( plugin );
++    return S_OK;
++}
++
++static HRESULT get_plugin( struct rtstylus *This, struct plugin *plugins, ULONG count, ULONG index,
++        REFIID iid, void **out )
++{
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    EnterCriticalSection( &This->cs );
++    if (index >= count) hr = E_INVALIDARG;
++    else hr = IStylusPlugin_QueryInterface( plugins[index].plugin, iid, out );
++    LeaveCriticalSection( &This->cs );
++    return hr;
++}
++
++static HRESULT WINAPI rtstylus_AddStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin *piPlugin)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %lu, %p\n", This, iIndex, piPlugin );
++
++    return add_plugin( This, &This->sync_plugins, &This->sync_count, iIndex, (IStylusPlugin *)piPlugin );
++}
++
++static HRESULT WINAPI rtstylus_RemoveStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin **ppiPlugin)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %lu, %p\n", This, iIndex, ppiPlugin );
++
++    return remove_plugin( This, This->sync_plugins, &This->sync_count, iIndex, (IStylusPlugin **)ppiPlugin );
++}
++
++static HRESULT WINAPI rtstylus_RemoveAllStylusSyncPlugins(IRealTimeStylus *iface)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    struct plugin *plugins;
++    ULONG count;
++
++    TRACE( "%p\n", This );
++
++    EnterCriticalSection( &This->cs );
++    plugins = This->sync_plugins;
++    count = This->sync_count;
++    This->sync_plugins = NULL;
++    This->sync_count = 0;
++    LeaveCriticalSection( &This->cs );
++    release_plugins( plugins, count );
++    free( plugins );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_GetStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin **ppiPlugin)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %lu, %p\n", This, iIndex, ppiPlugin );
++
++    return get_plugin( This, This->sync_plugins, This->sync_count, iIndex, &IID_IStylusSyncPlugin, (void **)ppiPlugin );
++}
++
++static HRESULT WINAPI rtstylus_GetStylusSyncPluginCount(IRealTimeStylus *iface, ULONG *pcPlugins)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, pcPlugins );
++
++    if (!pcPlugins) return E_POINTER;
++    *pcPlugins = This->sync_count;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_AddStylusAsyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusAsyncPlugin *piPlugin)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %lu, %p\n", This, iIndex, piPlugin );
++
++    return add_plugin( This, &This->async_plugins, &This->async_count, iIndex, (IStylusPlugin *)piPlugin );
++}
++
++static HRESULT WINAPI rtstylus_RemoveStylusAsyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusAsyncPlugin **ppiPlugin)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %lu, %p\n", This, iIndex, ppiPlugin );
++
++    return remove_plugin( This, This->async_plugins, &This->async_count, iIndex, (IStylusPlugin **)ppiPlugin );
++}
++
++static HRESULT WINAPI rtstylus_RemoveAllStylusAsyncPlugins(IRealTimeStylus *iface)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    struct plugin *plugins;
++    ULONG count;
++
++    TRACE( "%p\n", This );
++
++    EnterCriticalSection( &This->cs );
++    plugins = This->async_plugins;
++    count = This->async_count;
++    This->async_plugins = NULL;
++    This->async_count = 0;
++    LeaveCriticalSection( &This->cs );
++    release_plugins( plugins, count );
++    free( plugins );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_GetStylusAsyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusAsyncPlugin **ppiPlugin)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %lu, %p\n", This, iIndex, ppiPlugin );
++
++    return get_plugin( This, This->async_plugins, This->async_count, iIndex, &IID_IStylusAsyncPlugin, (void **)ppiPlugin );
++}
++
++static HRESULT WINAPI rtstylus_GetStylusAsyncPluginCount(IRealTimeStylus *iface, ULONG *pcPlugins)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, pcPlugins );
++
++    if (!pcPlugins) return E_POINTER;
++    *pcPlugins = This->async_count;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_get_ChildRealTimeStylusPlugin(IRealTimeStylus *iface, IRealTimeStylus **ppiRTS)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, ppiRTS );
++
++    if (!ppiRTS) return E_POINTER;
++    EnterCriticalSection( &This->cs );
++    if ((*ppiRTS = This->child)) IRealTimeStylus_AddRef( *ppiRTS );
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_putref_ChildRealTimeStylusPlugin(IRealTimeStylus *iface, IRealTimeStylus *piRTS)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    IRealTimeStylus *old;
++
++    TRACE( "%p, %p\n", This, piRTS );
++
++    if (piRTS) FIXME( "Input is not passed on to child %p.\n", piRTS );
++    if (piRTS) IRealTimeStylus_AddRef( piRTS );
++    EnterCriticalSection( &This->cs );
++    old = This->child;
++    This->child = piRTS;
++    LeaveCriticalSection( &This->cs );
++    if (old) IRealTimeStylus_Release( old );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_AddCustomStylusDataToQueue(IRealTimeStylus *iface, StylusQueue sq, const GUID *pGuidId,
++                                                          ULONG cbData, BYTE *pbData)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    struct event *event;
++    size_t size = offsetof( struct event, data[cbData] );
++
++    TRACE( "%p, %d, %s, %lu, %p\n", This, sq, debugstr_guid( pGuidId ), cbData, pbData );
++
++    if (!pGuidId || (cbData && !pbData)) return E_INVALIDARG;
++    if (sq != SyncStylusQueue && sq != AsyncStylusQueueImmediate && sq != AsyncStylusQueue) return E_INVALIDARG;
++    if (!(event = calloc( 1, size ))) return E_OUTOFMEMORY;
++    event->type = NOTIFY_CUSTOM;
++    event->guid = *pGuidId;
++    event->size = cbData;
++    memcpy( event->data, pbData, cbData );
++
++    /* the sync queue reaches every plugin in order; the async ones only the async plugins */
++    if (sq == SyncStylusQueue)
++        dispatch_event( This, event, size );
++    else
++        notify( This, event, TRUE );
++    free( event );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_ClearStylusQueues(IRealTimeStylus *iface)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    MSG msg;
++
++    TRACE( "%p\n", This );
++
++    if (This->async_window && GetCurrentThreadId() == This->thread)
++    {
++        while (PeekMessageW( &msg, This->async_window, WM_RTS_ASYNC, WM_RTS_ASYNC, PM_REMOVE ))
++        {
++            free( (void *)msg.lParam );
++            IRealTimeStylus_Release( &This->IRealTimeStylus_iface );
++        }
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_SetAllTabletsMode(IRealTimeStylus *iface, BOOL fUseMouseForInput)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %d\n", This, fUseMouseForInput );
++
++    EnterCriticalSection( &This->cs );
++    This->use_mouse = fUseMouseForInput;
++    if (This->single_tablet) IInkTablet_Release( This->single_tablet );
++    This->single_tablet = NULL;
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_SetSingleTabletMode(IRealTimeStylus *iface, IInkTablet *piTablet)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p\n", This, piTablet );
++
++    if (!piTablet) return E_INVALIDARG;
++    FIXME( "Only the mouse is a tablet here.\n" );
++    IInkTablet_AddRef( piTablet );
++    EnterCriticalSection( &This->cs );
++    if (This->single_tablet) IInkTablet_Release( This->single_tablet );
++    This->single_tablet = piTablet;
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_GetTablet(IRealTimeStylus *iface, IInkTablet **ppiSingleTablet)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    HRESULT hr = S_OK;
++
++    TRACE( "%p, %p\n", This, ppiSingleTablet );
++
++    if (!ppiSingleTablet) return E_POINTER;
++    EnterCriticalSection( &This->cs );
++    if (!(*ppiSingleTablet = This->single_tablet)) hr = E_FAIL;
++    else IInkTablet_AddRef( *ppiSingleTablet );
++    LeaveCriticalSection( &This->cs );
++    return hr;
++}
++
++static HRESULT WINAPI rtstylus_GetTabletContextIdFromTablet(IRealTimeStylus *iface, IInkTablet *piTablet, TABLET_CONTEXT_ID *ptcid)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    FIXME( "%p, %p, %p, no tablet objects\n", This, piTablet, ptcid );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtstylus_GetTabletFromTabletContextId(IRealTimeStylus *iface, TABLET_CONTEXT_ID tcid, IInkTablet **ppiTablet)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    FIXME( "%p, %lu, %p, no tablet objects\n", This, tcid, ppiTablet );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtstylus_GetAllTabletContextIds(IRealTimeStylus *iface, ULONG *pcTcidCount, TABLET_CONTEXT_ID **ppTcids)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    TRACE( "%p, %p, %p\n", This, pcTcidCount, ppTcids );
++
++    if (!pcTcidCount || !ppTcids) return E_POINTER;
++    if (!This->use_mouse)
++    {
++        *pcTcidCount = 0;
++        *ppTcids = NULL;
++        return S_OK;
++    }
++    if (!(*ppTcids = CoTaskMemAlloc( sizeof(**ppTcids) ))) return E_OUTOFMEMORY;
++    (*ppTcids)[0] = MOUSE_TABLET_CONTEXT;
++    *pcTcidCount = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_GetStyluses(IRealTimeStylus *iface, IInkCursors **ppiInkCursors)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    FIXME( "%p, %p, no cursor objects\n", This, ppiInkCursors );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtstylus_GetStylusForId(IRealTimeStylus *iface, STYLUS_ID sid, IInkCursor **ppiInkCursor)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++
++    FIXME( "%p, %ld, %p, no cursor objects\n", This, sid, ppiInkCursor );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtstylus_SetDesiredPacketDescription(IRealTimeStylus *iface, ULONG cProperties, const GUID *pPropertyGuids)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    GUID *guids;
++
++    TRACE( "%p, %lu, %p\n", This, cProperties, pPropertyGuids );
++
++    if (cProperties > 32 || (cProperties && !pPropertyGuids)) return E_INVALIDARG;
++    if (!(guids = malloc( max( 1, cProperties ) * sizeof(*guids) ))) return E_OUTOFMEMORY;
++    memcpy( guids, pPropertyGuids, cProperties * sizeof(*guids) );
++
++    EnterCriticalSection( &This->cs );
++    free( This->desired );
++    This->desired = guids;
++    This->desired_count = cProperties;
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus_GetDesiredPacketDescription(IRealTimeStylus *iface, ULONG *pcProperties, GUID **ppPropertyGuids)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    HRESULT hr = S_OK;
++
++    TRACE( "%p, %p, %p\n", This, pcProperties, ppPropertyGuids );
++
++    if (!pcProperties || !ppPropertyGuids) return E_POINTER;
++    EnterCriticalSection( &This->cs );
++    if (!(*ppPropertyGuids = CoTaskMemAlloc( max( 1, This->desired_count ) * sizeof(GUID) )))
++        hr = E_OUTOFMEMORY;
++    else
++    {
++        memcpy( *ppPropertyGuids, This->desired, This->desired_count * sizeof(GUID) );
++        *pcProperties = This->desired_count;
++    }
++    LeaveCriticalSection( &This->cs );
++    return hr;
++}
++
++/* X and Y in HIMETRIC over the virtual screen, a thousand to the centimetre */
++static HRESULT WINAPI rtstylus_GetPacketDescriptionData(IRealTimeStylus *iface, TABLET_CONTEXT_ID tcid, FLOAT *pfInkToDeviceScaleX,
++                                                        FLOAT *pfInkToDeviceScaleY, ULONG *pcPacketProperties, PACKET_PROPERTY **ppPacketProperties)
++{
++    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    int dpi_x, dpi_y, width, height;
++    PACKET_PROPERTY *properties;
++    GUID guids[3];
++    ULONG count, i;
++    HDC hdc;
++
++    TRACE( "%p, %lu, %p, %p, %p, %p\n", This, tcid, pfInkToDeviceScaleX, pfInkToDeviceScaleY, pcPacketProperties, ppPacketProperties );
++
++    if (!pcPacketProperties || !ppPacketProperties) return E_POINTER;
++    if (tcid != MOUSE_TABLET_CONTEXT) return E_INVALIDARG;
++
++    hdc = GetDC( 0 );
++    dpi_x = GetDeviceCaps( hdc, LOGPIXELSX );
++    dpi_y = GetDeviceCaps( hdc, LOGPIXELSY );
++    ReleaseDC( 0, hdc );
++    width = GetSystemMetrics( SM_CXVIRTUALSCREEN );
++    height = GetSystemMetrics( SM_CYVIRTUALSCREEN );
++
++    EnterCriticalSection( &This->cs );
++    count = mouse_description( This, guids );
++    LeaveCriticalSection( &This->cs );
++    if (!(properties = CoTaskMemAlloc( count * sizeof(*properties) ))) return E_OUTOFMEMORY;
++    for (i = 0; i < count; i++)
++    {
++        properties[i].guid = guids[i];
++        if (IsEqualGUID( &guids[i], &GUID_PACKETPROPERTY_GUID_X ))
++        {
++            properties[i].PropertyMetrics.nLogicalMin = 0;
++            properties[i].PropertyMetrics.nLogicalMax = MulDiv( width, HIMETRIC_PER_INCH, dpi_x );
++            properties[i].PropertyMetrics.Units = PROPERTY_UNITS_CENTIMETERS;
++            properties[i].PropertyMetrics.fResolution = 1000.0f;
++        }
++        else if (IsEqualGUID( &guids[i], &GUID_PACKETPROPERTY_GUID_Y ))
++        {
++            properties[i].PropertyMetrics.nLogicalMin = 0;
++            properties[i].PropertyMetrics.nLogicalMax = MulDiv( height, HIMETRIC_PER_INCH, dpi_y );
++            properties[i].PropertyMetrics.Units = PROPERTY_UNITS_CENTIMETERS;
++            properties[i].PropertyMetrics.fResolution = 1000.0f;
++        }
++        else
++        {
++            properties[i].PropertyMetrics.nLogicalMin = 0;
++            properties[i].PropertyMetrics.nLogicalMax = IP_CURSOR_DOWN;
++            properties[i].PropertyMetrics.Units = PROPERTY_UNITS_DEFAULT;
++            properties[i].PropertyMetrics.fResolution = 1.0f;
++        }
++    }
++
++    if (pfInkToDeviceScaleX) *pfInkToDeviceScaleX = dpi_x / (float)HIMETRIC_PER_INCH;
++    if (pfInkToDeviceScaleY) *pfInkToDeviceScaleY = dpi_y / (float)HIMETRIC_PER_INCH;
++    *pcPacketProperties = count;
++    *ppPacketProperties = properties;
++    return S_OK;
++}
++
++static const struct IRealTimeStylusVtbl realtime_stylus_vtbl =
++{
++    rtstylus_QueryInterface,
++    rtstylus_AddRef,
++    rtstylus_Release,
++    rtstylus_get_Enabled,
++    rtstylus_put_Enabled,
++    rtstylus_get_HWND,
++    rtstylus_put_HWND,
++    rtstylus_get_WindowInputRectangle,
++    rtstylus_put_WindowInputRectangle,
++    rtstylus_AddStylusSyncPlugin,
++    rtstylus_RemoveStylusSyncPlugin,
++    rtstylus_RemoveAllStylusSyncPlugins,
++    rtstylus_GetStylusSyncPlugin,
++    rtstylus_GetStylusSyncPluginCount,
++    rtstylus_AddStylusAsyncPlugin,
++    rtstylus_RemoveStylusAsyncPlugin,
++    rtstylus_RemoveAllStylusAsyncPlugins,
++    rtstylus_GetStylusAsyncPlugin,
++    rtstylus_GetStylusAsyncPluginCount,
++    rtstylus_get_ChildRealTimeStylusPlugin,
++    rtstylus_putref_ChildRealTimeStylusPlugin,
++    rtstylus_AddCustomStylusDataToQueue,
++    rtstylus_ClearStylusQueues,
++    rtstylus_SetAllTabletsMode,
++    rtstylus_SetSingleTabletMode,
++    rtstylus_GetTablet,
++    rtstylus_GetTabletContextIdFromTablet,
++    rtstylus_GetTabletFromTabletContextId,
++    rtstylus_GetAllTabletContextIds,
++    rtstylus_GetStyluses,
++    rtstylus_GetStylusForId,
++    rtstylus_SetDesiredPacketDescription,
++    rtstylus_GetDesiredPacketDescription,
++    rtstylus_GetPacketDescriptionData
++};
++
++static HRESULT WINAPI rtstylus2_QueryInterface(IRealTimeStylus2 *iface, REFIID iid, void **obj)
++{
++    return rtstylus_QueryInterface( &impl_from_IRealTimeStylus2(iface)->IRealTimeStylus_iface, iid, obj );
++}
++
++static ULONG WINAPI rtstylus2_AddRef(IRealTimeStylus2 *iface)
++{
++    return rtstylus_AddRef( &impl_from_IRealTimeStylus2(iface)->IRealTimeStylus_iface );
++}
++
++static ULONG WINAPI rtstylus2_Release(IRealTimeStylus2 *iface)
++{
++    return rtstylus_Release( &impl_from_IRealTimeStylus2(iface)->IRealTimeStylus_iface );
++}
++
++/* there are no flicks without a pen; the setting is kept */
++static HRESULT WINAPI rtstylus2_get_FlicksEnabled(IRealTimeStylus2 *iface, BOOL *enabled)
++{
++    TRACE( "%p, %p\n", iface, enabled );
++
++    if (!enabled) return E_POINTER;
++    *enabled = impl_from_IRealTimeStylus2(iface)->flicks;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus2_put_FlicksEnabled(IRealTimeStylus2 *iface, BOOL enabled)
++{
++    TRACE( "%p, %d\n", iface, enabled );
++
++    impl_from_IRealTimeStylus2(iface)->flicks = enabled;
++    return S_OK;
++}
++
++static const struct IRealTimeStylus2Vtbl realtime_stylus2_vtbl =
++{
++    rtstylus2_QueryInterface,
++    rtstylus2_AddRef,
++    rtstylus2_Release,
++    rtstylus2_get_FlicksEnabled,
++    rtstylus2_put_FlicksEnabled,
++};
++
++static HRESULT WINAPI rtstylus3_QueryInterface(IRealTimeStylus3 *iface, REFIID iid, void **obj)
++{
++    return rtstylus_QueryInterface( &impl_from_IRealTimeStylus3(iface)->IRealTimeStylus_iface, iid, obj );
++}
++
++static ULONG WINAPI rtstylus3_AddRef(IRealTimeStylus3 *iface)
++{
++    return rtstylus_AddRef( &impl_from_IRealTimeStylus3(iface)->IRealTimeStylus_iface );
++}
++
++static ULONG WINAPI rtstylus3_Release(IRealTimeStylus3 *iface)
++{
++    return rtstylus_Release( &impl_from_IRealTimeStylus3(iface)->IRealTimeStylus_iface );
++}
++
++/* touch input does not reach this stylus; the setting is kept */
++static HRESULT WINAPI rtstylus3_get_MultiTouchEnabled(IRealTimeStylus3 *iface, BOOL *enabled)
++{
++    TRACE( "%p, %p\n", iface, enabled );
++
++    if (!enabled) return E_POINTER;
++    *enabled = impl_from_IRealTimeStylus3(iface)->multi_touch;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtstylus3_put_MultiTouchEnabled(IRealTimeStylus3 *iface, BOOL enabled)
++{
++    TRACE( "%p, %d\n", iface, enabled );
++
++    impl_from_IRealTimeStylus3(iface)->multi_touch = enabled;
++    return S_OK;
++}
++
++static const struct IRealTimeStylus3Vtbl realtime_stylus3_vtbl =
++{
++    rtstylus3_QueryInterface,
++    rtstylus3_AddRef,
++    rtstylus3_Release,
++    rtstylus3_get_MultiTouchEnabled,
++    rtstylus3_put_MultiTouchEnabled,
++};
++
++static HRESULT WINAPI rtstylus_sync_QueryInterface(IRealTimeStylusSynchronization *iface, REFIID iid, void **obj)
++{
++    return rtstylus_QueryInterface( &impl_from_IRealTimeStylusSynchronization(iface)->IRealTimeStylus_iface, iid, obj );
++}
++
++static ULONG WINAPI rtstylus_sync_AddRef(IRealTimeStylusSynchronization *iface)
++{
++    return rtstylus_AddRef( &impl_from_IRealTimeStylusSynchronization(iface)->IRealTimeStylus_iface );
++}
++
++static ULONG WINAPI rtstylus_sync_Release(IRealTimeStylusSynchronization *iface)
++{
++    return rtstylus_Release( &impl_from_IRealTimeStylusSynchronization(iface)->IRealTimeStylus_iface );
++}
++
++/* every kind of lock is the stylus's own lock, which the events do not hold while plugins run */
++static HRESULT WINAPI rtstylus_sync_AcquireLock(IRealTimeStylusSynchronization *iface, RealTimeStylusLockType lock)
++{
++    TRACE( "%p, %#x\n", iface, lock );
++
++    if (!lock || (lock & ~(RTSLT_ObjLock | RTSLT_SyncEventLock | RTSLT_AsyncEventLock | RTSLT_ExcludeCallback)))
++        return E_INVALIDARG;
++    EnterCriticalSection( &impl_from_IRealTimeStylusSynchronization(iface)->cs );
++    return S_OK;
++}
+ 
+-#include "windef.h"
+-#include <initguid.h>
+-#include "oleidl.h"
+-#include "rpcproxy.h"
+-#include "rtscom.h"
++static HRESULT WINAPI rtstylus_sync_ReleaseLock(IRealTimeStylusSynchronization *iface, RealTimeStylusLockType lock)
++{
++    TRACE( "%p, %#x\n", iface, lock );
+ 
+-#include "wine/debug.h"
++    if (!lock || (lock & ~(RTSLT_ObjLock | RTSLT_SyncEventLock | RTSLT_AsyncEventLock | RTSLT_ExcludeCallback)))
++        return E_INVALIDARG;
++    LeaveCriticalSection( &impl_from_IRealTimeStylusSynchronization(iface)->cs );
++    return S_OK;
++}
+ 
+-WINE_DEFAULT_DEBUG_CHANNEL(rtscom);
++static const struct IRealTimeStylusSynchronizationVtbl realtime_stylus_sync_vtbl =
++{
++    rtstylus_sync_QueryInterface,
++    rtstylus_sync_AddRef,
++    rtstylus_sync_Release,
++    rtstylus_sync_AcquireLock,
++    rtstylus_sync_ReleaseLock,
++};
++
++static HRESULT realtime_stylus_create( IUnknown *outer, REFIID iid, void **obj )
++{
++    static const GUID default_description[] =
++    {
++        {0x598a6a8f, 0x52c0, 0x4ba0, {0x93, 0xaf, 0xaf, 0x35, 0x74, 0x11, 0xa5, 0x61}},
++        {0xb53f9f75, 0x04e0, 0x4498, {0xa7, 0xee, 0xc3, 0x0d, 0xbb, 0x5a, 0x90, 0x11}},
++        {0x7307502d, 0xf9f4, 0x4e18, {0xb3, 0xf2, 0x2c, 0xe1, 0xb1, 0xa3, 0x61, 0x0c}},
++    };
++    struct rtstylus *This;
++    HRESULT hr;
++
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(This = calloc( 1, sizeof(*This) ))) return E_OUTOFMEMORY;
++    This->IRealTimeStylus_iface.lpVtbl = &realtime_stylus_vtbl;
++    This->IRealTimeStylus2_iface.lpVtbl = &realtime_stylus2_vtbl;
++    This->IRealTimeStylus3_iface.lpVtbl = &realtime_stylus3_vtbl;
++    This->IRealTimeStylusSynchronization_iface.lpVtbl = &realtime_stylus_sync_vtbl;
++    This->ref = 1;
++    InitializeCriticalSectionEx( &This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": rtstylus.cs");
++    /* the mouse counts as a tablet unless asked otherwise (not measured) */
++    This->use_mouse = TRUE;
++    if (!(This->desired = malloc( sizeof(default_description) )))
++    {
++        rtstylus_Release( &This->IRealTimeStylus_iface );
++        return E_OUTOFMEMORY;
++    }
++    memcpy( This->desired, default_description, sizeof(default_description) );
++    This->desired_count = ARRAY_SIZE(default_description);
++
++    hr = IRealTimeStylus_QueryInterface( &This->IRealTimeStylus_iface, iid, obj );
++    IRealTimeStylus_Release( &This->IRealTimeStylus_iface );
++    return hr;
++}
+ 
++/* a stroke being built, by the tablet context and stylus that draw it */
++struct built_stroke
++{
++    struct list entry;
++    TABLET_CONTEXT_ID tcid;
++    STYLUS_ID sid;
++    IInkStrokeDisp *stroke;
++    IWineInkStroke *grow;
++    ULONG packet_size;
++};
+ 
+-struct rtstylus
++struct stroke_builder
+ {
+-    IRealTimeStylus IRealTimeStylus_iface;
++    IStrokeBuilder IStrokeBuilder_iface;
++    IStylusSyncPlugin IStylusSyncPlugin_iface;
++    IStylusAsyncPlugin IStylusAsyncPlugin_iface;
+     LONG ref;
++
++    CRITICAL_SECTION cs;
++    IInkDisp *ink;
++    struct list strokes;
+ };
+ 
+-static struct rtstylus *impl_from_IRealTimeStylus( IRealTimeStylus *iface )
++static struct stroke_builder *impl_from_IStrokeBuilder( IStrokeBuilder *iface )
+ {
+-    return CONTAINING_RECORD( iface, struct rtstylus, IRealTimeStylus_iface );
++    return CONTAINING_RECORD( iface, struct stroke_builder, IStrokeBuilder_iface );
+ }
+ 
+-static HRESULT WINAPI rtstylus_QueryInterface(IRealTimeStylus *iface, REFIID iid, void **obj)
++static HRESULT WINAPI stroke_builder_QueryInterface( IStrokeBuilder *iface, REFIID iid, void **obj )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
+ 
+     TRACE( "(%p)->(%s %p)\n", This, debugstr_guid( iid ), obj );
+ 
+-    if (IsEqualIID( iid, &IID_IUnknown ) ||
+-        IsEqualIID( iid, &IID_IRealTimeStylus ))
++    if (IsEqualIID( iid, &IID_IUnknown ) || IsEqualIID( iid, &IID_IStrokeBuilder ))
++        *obj = iface;
++    else if (IsEqualIID( iid, &IID_IStylusSyncPlugin ))
++        *obj = &This->IStylusSyncPlugin_iface;
++    else if (IsEqualIID( iid, &IID_IStylusAsyncPlugin ) || IsEqualIID( iid, &IID_IStylusPlugin ))
++        *obj = &This->IStylusAsyncPlugin_iface;
++    else
++        *obj = NULL;
++    if (*obj)
+     {
+-        IRealTimeStylus_AddRef( iface );
+-        *obj = &This->IRealTimeStylus_iface;
++        IStrokeBuilder_AddRef( iface );
+         return S_OK;
+     }
+ 
+-    FIXME( "interface %s not implemented\n", debugstr_guid( iid ) );
+-    *obj = NULL;
++    WARN( "interface %s not implemented\n", debugstr_guid( iid ) );
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI rtstylus_AddRef(IRealTimeStylus *iface)
++static ULONG WINAPI stroke_builder_AddRef( IStrokeBuilder *iface )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
+     ULONG ref = InterlockedIncrement( &This->ref );
+ 
+     TRACE( "(%p) ref = %lu\n", This, ref );
+     return ref;
+ }
+ 
+-static ULONG WINAPI rtstylus_Release(IRealTimeStylus *iface)
++static void built_stroke_free( struct built_stroke *built )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
++    IWineInkStroke_Release( built->grow );
++    IInkStrokeDisp_Release( built->stroke );
++    free( built );
++}
++
++static ULONG WINAPI stroke_builder_Release( IStrokeBuilder *iface )
++{
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++    struct built_stroke *built, *next;
+ 
+     TRACE( "(%p) ref = %lu\n", This, ref );
+ 
+     if (!ref)
+     {
++        LIST_FOR_EACH_ENTRY_SAFE( built, next, &This->strokes, struct built_stroke, entry )
++            built_stroke_free( built );
++        if (This->ink) IInkDisp_Release( This->ink );
++        This->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &This->cs );
+         free( This );
+     }
+-
+     return ref;
+ }
+ 
+-static HRESULT WINAPI rtstylus_get_Enabled(IRealTimeStylus *iface, BOOL *pfEnable)
++/* the ink the strokes go into; a new one when none was given (not measured) */
++static HRESULT stroke_builder_ink( struct stroke_builder *This, IInkDisp **ink )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, pfEnable);
+-    return E_NOTIMPL;
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &This->cs );
++    if (!This->ink)
++        hr = CoCreateInstance( &CLSID_InkDisp, NULL, CLSCTX_INPROC_SERVER, &IID_IInkDisp, (void **)&This->ink );
++    if (SUCCEEDED(hr))
++    {
++        *ink = This->ink;
++        IInkDisp_AddRef( *ink );
++    }
++    LeaveCriticalSection( &This->cs );
++    return hr;
+ }
+ 
+-static HRESULT WINAPI rtstylus_put_Enabled(IRealTimeStylus *iface, BOOL fEnable)
++/* a stroke of the ink from packets laid out as the properties say, X and Y first */
++static HRESULT create_ink_stroke( struct stroke_builder *This, ULONG count, const LONG *packets,
++        ULONG property_count, const PACKET_PROPERTY *properties, IInkStrokeDisp **stroke )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %d\n", This, fEnable);
+-    return E_NOTIMPL;
++    VARIANT data, description;
++    SAFEARRAY *array;
++    IInkDisp *ink;
++    BSTR *names;
++    LONG *values;
++    ULONG i;
++    HRESULT hr;
++
++    if (!packets || !properties || property_count < 2 || !count || count % property_count)
++        return E_INVALIDARG;
++    if (FAILED(hr = stroke_builder_ink( This, &ink ))) return hr;
++
++    VariantInit( &data );
++    VariantInit( &description );
++    if (!(array = SafeArrayCreateVector( VT_I4, 0, count ))) hr = E_OUTOFMEMORY;
++    else
++    {
++        SafeArrayAccessData( array, (void **)&values );
++        memcpy( values, packets, count * sizeof(*values) );
++        SafeArrayUnaccessData( array );
++        V_VT( &data ) = VT_ARRAY | VT_I4;
++        V_ARRAY( &data ) = array;
++    }
++    if (SUCCEEDED(hr) && !(array = SafeArrayCreateVector( VT_BSTR, 0, property_count ))) hr = E_OUTOFMEMORY;
++    else if (SUCCEEDED(hr))
++    {
++        SafeArrayAccessData( array, (void **)&names );
++        for (i = 0; i < property_count; i++)
++        {
++            WCHAR buffer[39];
++
++            StringFromGUID2( &properties[i].guid, buffer, ARRAY_SIZE(buffer) );
++            names[i] = SysAllocString( buffer );
++        }
++        SafeArrayUnaccessData( array );
++        V_VT( &description ) = VT_ARRAY | VT_BSTR;
++        V_ARRAY( &description ) = array;
++    }
++    if (SUCCEEDED(hr))
++        hr = IInkDisp_CreateStroke( ink, data, description, stroke );
++
++    VariantClear( &description );
++    VariantClear( &data );
++    IInkDisp_Release( ink );
++    return hr;
+ }
+ 
+-static HRESULT WINAPI rtstylus_get_HWND(IRealTimeStylus *iface, HANDLE_PTR *phwnd)
++static HRESULT WINAPI stroke_builder_CreateStroke( IStrokeBuilder *iface, ULONG cPktBuffLength, const LONG *pPackets,
++        ULONG cPacketProperties, const PACKET_PROPERTY *pPacketProperties, FLOAT fInkToDeviceScaleX,
++        FLOAT fInkToDeviceScaleY, IInkStrokeDisp **ppIInkStroke )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, phwnd);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++    IInkStrokeDisp *stroke;
++    HRESULT hr;
++
++    TRACE( "%p, %lu, %p, %lu, %p, %f, %f, %p\n", This, cPktBuffLength, pPackets, cPacketProperties,
++            pPacketProperties, fInkToDeviceScaleX, fInkToDeviceScaleY, ppIInkStroke );
++
++    if (FAILED(hr = create_ink_stroke( This, cPktBuffLength, pPackets, cPacketProperties, pPacketProperties, &stroke )))
++        return hr;
++    if (ppIInkStroke) *ppIInkStroke = stroke;
++    else IInkStrokeDisp_Release( stroke );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_put_HWND(IRealTimeStylus *iface, HANDLE_PTR hwnd)
++static struct built_stroke *find_built_stroke( struct stroke_builder *This, TABLET_CONTEXT_ID tcid, STYLUS_ID sid )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %Ix\n", This, hwnd);
+-    return E_NOTIMPL;
++    struct built_stroke *built;
++
++    LIST_FOR_EACH_ENTRY( built, &This->strokes, struct built_stroke, entry )
++        if (built->tcid == tcid && built->sid == sid) return built;
++    return NULL;
+ }
+ 
+-static HRESULT WINAPI rtstylus_get_WindowInputRectangle(IRealTimeStylus *iface, RECT *prcWndInputRect)
++/* the stroke is in the ink from its first packet on, and grows as packets come */
++static HRESULT WINAPI stroke_builder_BeginStroke( IStrokeBuilder *iface, TABLET_CONTEXT_ID tcid, STYLUS_ID sid,
++        const LONG *pPacket, ULONG cPacketProperties, PACKET_PROPERTY *pPacketProperties, FLOAT fInkToDeviceScaleX,
++        FLOAT fInkToDeviceScaleY, IInkStrokeDisp **ppIInkStroke )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, prcWndInputRect);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++    struct built_stroke *built, *old;
++    HRESULT hr;
++
++    TRACE( "%p, %lu, %lu, %p, %lu, %p, %f, %f, %p\n", This, tcid, sid, pPacket, cPacketProperties,
++            pPacketProperties, fInkToDeviceScaleX, fInkToDeviceScaleY, ppIInkStroke );
++
++    if (!(built = calloc( 1, sizeof(*built) ))) return E_OUTOFMEMORY;
++    if (FAILED(hr = create_ink_stroke( This, cPacketProperties, pPacket, cPacketProperties, pPacketProperties, &built->stroke )))
++    {
++        free( built );
++        return hr;
++    }
++    if (FAILED(hr = IInkStrokeDisp_QueryInterface( built->stroke, &IID_IWineInkStroke, (void **)&built->grow )))
++    {
++        ERR( "Stroke %p can't grow, hr %#lx.\n", built->stroke, hr );
++        IInkStrokeDisp_Release( built->stroke );
++        free( built );
++        return hr;
++    }
++    built->tcid = tcid;
++    built->sid = sid;
++    built->packet_size = cPacketProperties;
++
++    EnterCriticalSection( &This->cs );
++    /* a stylus that begins again ends what it drew before */
++    if ((old = find_built_stroke( This, tcid, sid )))
++    {
++        list_remove( &old->entry );
++        built_stroke_free( old );
++    }
++    list_add_tail( &This->strokes, &built->entry );
++    LeaveCriticalSection( &This->cs );
++
++    if (ppIInkStroke)
++    {
++        *ppIInkStroke = built->stroke;
++        IInkStrokeDisp_AddRef( *ppIInkStroke );
++    }
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_put_WindowInputRectangle(IRealTimeStylus *iface, const RECT *prcWndInputRect)
++static HRESULT WINAPI stroke_builder_AppendPackets( IStrokeBuilder *iface, TABLET_CONTEXT_ID tcid, STYLUS_ID sid,
++        ULONG cPktBuffLength, const LONG *pPackets )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, prcWndInputRect);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++    struct built_stroke *built;
++    HRESULT hr;
++
++    TRACE( "%p, %lu, %lu, %lu, %p\n", This, tcid, sid, cPktBuffLength, pPackets );
++
++    EnterCriticalSection( &This->cs );
++    if (!(built = find_built_stroke( This, tcid, sid ))) hr = E_INVALIDARG;
++    else if (cPktBuffLength % built->packet_size) hr = E_INVALIDARG;
++    else hr = IWineInkStroke_AppendPackets( built->grow, cPktBuffLength / built->packet_size, pPackets );
++    LeaveCriticalSection( &This->cs );
++    return hr;
+ }
+ 
+-static HRESULT WINAPI rtstylus_AddStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin *piPlugin)
++/* the dirty rectangle is what the stroke covers, in ink space (not measured) */
++static HRESULT WINAPI stroke_builder_EndStroke( IStrokeBuilder *iface, TABLET_CONTEXT_ID tcid, STYLUS_ID sid,
++        IInkStrokeDisp **ppIInkStroke, RECT *pDirtyRect )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, iIndex, piPlugin);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++    struct built_stroke *built;
++    IInkRectangle *bounds;
++
++    TRACE( "%p, %lu, %lu, %p, %p\n", This, tcid, sid, ppIInkStroke, pDirtyRect );
++
++    EnterCriticalSection( &This->cs );
++    if ((built = find_built_stroke( This, tcid, sid ))) list_remove( &built->entry );
++    LeaveCriticalSection( &This->cs );
++    if (!built) return E_INVALIDARG;
++
++    if (pDirtyRect)
++    {
++        SetRectEmpty( pDirtyRect );
++        if (SUCCEEDED(IInkStrokeDisp_GetBoundingBox( built->stroke, IBBM_Default, &bounds )))
++        {
++            IInkRectangle_get_Data( bounds, pDirtyRect );
++            IInkRectangle_Release( bounds );
++        }
++    }
++    if (ppIInkStroke)
++    {
++        *ppIInkStroke = built->stroke;
++        IInkStrokeDisp_AddRef( *ppIInkStroke );
++    }
++    built_stroke_free( built );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_RemoveStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin **ppiPlugin)
++static HRESULT WINAPI stroke_builder_get_Ink( IStrokeBuilder *iface, IInkDisp **ppiInkObj )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, iIndex, ppiPlugin);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++
++    TRACE( "%p, %p\n", This, ppiInkObj );
++
++    if (!ppiInkObj) return E_POINTER;
++    return stroke_builder_ink( This, ppiInkObj );
+ }
+ 
+-static HRESULT WINAPI rtstylus_RemoveAllStylusSyncPlugins(IRealTimeStylus *iface)
++static HRESULT WINAPI stroke_builder_putref_Ink( IStrokeBuilder *iface, IInkDisp *piInkObj )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_IStrokeBuilder( iface );
++    IInkDisp *old;
++
++    TRACE( "%p, %p\n", This, piInkObj );
++
++    if (!piInkObj) return E_INVALIDARG;
++    IInkDisp_AddRef( piInkObj );
++    EnterCriticalSection( &This->cs );
++    old = This->ink;
++    This->ink = piInkObj;
++    LeaveCriticalSection( &This->cs );
++    if (old) IInkDisp_Release( old );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetStylusSyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusSyncPlugin **ppiPlugin)
++static const struct IStrokeBuilderVtbl stroke_builder_vtbl =
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, iIndex, ppiPlugin);
+-    return E_NOTIMPL;
+-}
++    stroke_builder_QueryInterface,
++    stroke_builder_AddRef,
++    stroke_builder_Release,
++    stroke_builder_CreateStroke,
++    stroke_builder_BeginStroke,
++    stroke_builder_AppendPackets,
++    stroke_builder_EndStroke,
++    stroke_builder_get_Ink,
++    stroke_builder_putref_Ink,
++};
+ 
+-static HRESULT WINAPI rtstylus_GetStylusSyncPluginCount(IRealTimeStylus *iface, ULONG *pcPlugins)
++static const IStylusPluginVtbl stroke_builder_sync_vtbl;
++
++/* as a plugin of a stylus, the builder makes a stroke of every touch of the stylus */
++static struct stroke_builder *impl_from_plugin( IStylusPlugin *iface )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, pcPlugins);
+-    return E_NOTIMPL;
++    if (iface->lpVtbl == (const IStylusPluginVtbl *)&stroke_builder_sync_vtbl)
++        return CONTAINING_RECORD( iface, struct stroke_builder, IStylusSyncPlugin_iface );
++    return CONTAINING_RECORD( iface, struct stroke_builder, IStylusAsyncPlugin_iface );
+ }
+ 
+-static HRESULT WINAPI rtstylus_AddStylusAsyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusAsyncPlugin *piPlugin)
++static HRESULT WINAPI builder_plugin_QueryInterface( IStylusPlugin *iface, REFIID iid, void **obj )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, iIndex, piPlugin);
+-    return E_NOTIMPL;
++    return IStrokeBuilder_QueryInterface( &impl_from_plugin( iface )->IStrokeBuilder_iface, iid, obj );
+ }
+ 
+-static HRESULT WINAPI rtstylus_RemoveStylusAsyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusAsyncPlugin **ppiPlugin)
++static ULONG WINAPI builder_plugin_AddRef( IStylusPlugin *iface )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, iIndex, ppiPlugin);
+-    return E_NOTIMPL;
++    return IStrokeBuilder_AddRef( &impl_from_plugin( iface )->IStrokeBuilder_iface );
+ }
+ 
+-static HRESULT WINAPI rtstylus_RemoveAllStylusAsyncPlugins(IRealTimeStylus *iface)
++static ULONG WINAPI builder_plugin_Release( IStylusPlugin *iface )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
++    return IStrokeBuilder_Release( &impl_from_plugin( iface )->IStrokeBuilder_iface );
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetStylusAsyncPlugin(IRealTimeStylus *iface, ULONG iIndex, IStylusAsyncPlugin **ppiPlugin)
++static HRESULT WINAPI builder_plugin_RealTimeStylusEnabled( IStylusPlugin *iface, IRealTimeStylus *rts, ULONG count,
++        const TABLET_CONTEXT_ID *tcids )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, iIndex, ppiPlugin);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetStylusAsyncPluginCount(IRealTimeStylus *iface, ULONG *pcPlugins)
++static HRESULT WINAPI builder_plugin_RealTimeStylusDisabled( IStylusPlugin *iface, IRealTimeStylus *rts, ULONG count,
++        const TABLET_CONTEXT_ID *tcids )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, pcPlugins);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_get_ChildRealTimeStylusPlugin(IRealTimeStylus *iface, IRealTimeStylus **ppiRTS)
++static HRESULT WINAPI builder_plugin_StylusInRange( IStylusPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
++        STYLUS_ID sid )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, ppiRTS);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_putref_ChildRealTimeStylusPlugin(IRealTimeStylus *iface, IRealTimeStylus *piRTS)
++static HRESULT WINAPI builder_plugin_StylusOutOfRange( IStylusPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
++        STYLUS_ID sid )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, piRTS);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_AddCustomStylusDataToQueue(IRealTimeStylus *iface, StylusQueue sq, const GUID *pGuidId,
+-                ULONG cbData, BYTE *pbData)
++static HRESULT WINAPI builder_plugin_StylusDown( IStylusPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, LONG *packet, LONG **changed )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %d, %p, %lu, %p\n", This, sq, pGuidId, cbData, pbData);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_plugin( iface );
++    PACKET_PROPERTY *properties;
++    FLOAT scale_x, scale_y;
++    ULONG property_count;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %p, %lu, %p, %p\n", This, rts, info, count, packet, changed );
++
++    if (!rts || !info) return E_INVALIDARG;
++    if (FAILED(hr = IRealTimeStylus_GetPacketDescriptionData( rts, info->tcid, &scale_x, &scale_y,
++            &property_count, &properties )))
++        return hr;
++    if (property_count != count)
++        hr = E_INVALIDARG;
++    else
++        hr = IStrokeBuilder_BeginStroke( &This->IStrokeBuilder_iface, info->tcid, info->cid, packet,
++                property_count, properties, scale_x, scale_y, NULL );
++    CoTaskMemFree( properties );
++    return hr;
+ }
+ 
+-static HRESULT WINAPI rtstylus_ClearStylusQueues(IRealTimeStylus *iface)
++static HRESULT WINAPI builder_plugin_StylusUp( IStylusPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, LONG *packet, LONG **changed )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_plugin( iface );
++    IInkStrokeDisp *stroke;
++    RECT dirty;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %p, %lu, %p, %p\n", This, rts, info, count, packet, changed );
++
++    if (!info) return E_INVALIDARG;
++    IStrokeBuilder_AppendPackets( &This->IStrokeBuilder_iface, info->tcid, info->cid, count, packet );
++    if (SUCCEEDED(hr = IStrokeBuilder_EndStroke( &This->IStrokeBuilder_iface, info->tcid, info->cid, &stroke, &dirty )))
++        IInkStrokeDisp_Release( stroke );
++    return hr;
+ }
+ 
+-static HRESULT WINAPI rtstylus_SetAllTabletsMode(IRealTimeStylus *iface, BOOL fUseMouseForInput)
++static HRESULT WINAPI builder_plugin_StylusButtonDown( IStylusPlugin *iface, IRealTimeStylus *rts, STYLUS_ID sid,
++        const GUID *button, POINT *pos )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %d\n", This, fUseMouseForInput);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_SetSingleTabletMode(IRealTimeStylus *iface, IInkTablet *piTablet)
++static HRESULT WINAPI builder_plugin_StylusButtonUp( IStylusPlugin *iface, IRealTimeStylus *rts, STYLUS_ID sid,
++        const GUID *button, POINT *pos )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, piTablet);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetTablet(IRealTimeStylus *iface, IInkTablet **ppiSingleTablet)
++static HRESULT WINAPI builder_plugin_InAirPackets( IStylusPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, ULONG length, LONG *packets, ULONG *changed_count, LONG **changed )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, ppiSingleTablet);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetTabletContextIdFromTablet(IRealTimeStylus *iface, IInkTablet *piTablet, TABLET_CONTEXT_ID *ptcid)
++static HRESULT WINAPI builder_plugin_Packets( IStylusPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, ULONG length, LONG *packets, ULONG *changed_count, LONG **changed )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p, %p\n", This, piTablet, ptcid);
+-    return E_NOTIMPL;
++    struct stroke_builder *This = impl_from_plugin( iface );
++
++    TRACE( "%p, %p, %p, %lu, %lu, %p\n", This, rts, info, count, length, packets );
++
++    if (!info) return E_INVALIDARG;
++    return IStrokeBuilder_AppendPackets( &This->IStrokeBuilder_iface, info->tcid, info->cid, length, packets );
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetTabletFromTabletContextId(IRealTimeStylus *iface, TABLET_CONTEXT_ID tcid, IInkTablet **ppiTablet)
++static HRESULT WINAPI builder_plugin_CustomStylusDataAdded( IStylusPlugin *iface, IRealTimeStylus *rts, const GUID *guid,
++        ULONG size, const BYTE *data )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %ld, %p\n", This, tcid, ppiTablet);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetAllTabletContextIds(IRealTimeStylus *iface, ULONG *pcTcidCount, TABLET_CONTEXT_ID **ppTcids)
++static HRESULT WINAPI builder_plugin_SystemEvent( IStylusPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
++        STYLUS_ID sid, SYSTEM_EVENT event, SYSTEM_EVENT_DATA data )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p, %p\n", This, pcTcidCount, ppTcids);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetStyluses(IRealTimeStylus *iface, IInkCursors **ppiInkCursors)
++static HRESULT WINAPI builder_plugin_TabletAdded( IStylusPlugin *iface, IRealTimeStylus *rts, IInkTablet *tablet )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p\n", This, ppiInkCursors);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetStylusForId(IRealTimeStylus *iface, STYLUS_ID sid, IInkCursor **ppiInkCursor)
++static HRESULT WINAPI builder_plugin_TabletRemoved( IStylusPlugin *iface, IRealTimeStylus *rts, LONG index )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %ld, %p\n", This, sid, ppiInkCursor);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_SetDesiredPacketDescription(IRealTimeStylus *iface, ULONG cProperties, const GUID *pPropertyGuids)
++static HRESULT WINAPI builder_plugin_Error( IStylusPlugin *iface, IRealTimeStylus *rts, IStylusPlugin *plugin,
++        RealTimeStylusDataInterest interest, HRESULT error, LONG_PTR *key )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p\n", This, cProperties, pPropertyGuids);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetDesiredPacketDescription(IRealTimeStylus *iface, ULONG *pcProperties, GUID **ppPropertyGuids)
++static HRESULT WINAPI builder_plugin_UpdateMapping( IStylusPlugin *iface, IRealTimeStylus *rts )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %p, %p\n", This, pcProperties, ppPropertyGuids);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI rtstylus_GetPacketDescriptionData(IRealTimeStylus *iface, TABLET_CONTEXT_ID tcid, FLOAT *pfInkToDeviceScaleX,
+-    FLOAT *pfInkToDeviceScaleY, ULONG *pcPacketProperties, PACKET_PROPERTY **ppPacketProperties)
++static HRESULT WINAPI builder_plugin_DataInterest( IStylusPlugin *iface, RealTimeStylusDataInterest *interest )
+ {
+-    struct rtstylus *This = impl_from_IRealTimeStylus(iface);
+-    FIXME("%p, %lu, %p, %p, %p, %p\n", This, tcid, pfInkToDeviceScaleX, pfInkToDeviceScaleY, pcPacketProperties, ppPacketProperties);
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", iface, interest );
++
++    if (!interest) return E_POINTER;
++    *interest = RTSDI_StylusDown | RTSDI_Packets | RTSDI_StylusUp;
++    return S_OK;
+ }
+ 
+-static const struct IRealTimeStylusVtbl realtime_stylus_vtbl =
++#define BUILDER_PLUGIN_METHODS \
++    builder_plugin_RealTimeStylusEnabled, \
++    builder_plugin_RealTimeStylusDisabled, \
++    builder_plugin_StylusInRange, \
++    builder_plugin_StylusOutOfRange, \
++    builder_plugin_StylusDown, \
++    builder_plugin_StylusUp, \
++    builder_plugin_StylusButtonDown, \
++    builder_plugin_StylusButtonUp, \
++    builder_plugin_InAirPackets, \
++    builder_plugin_Packets, \
++    builder_plugin_CustomStylusDataAdded, \
++    builder_plugin_SystemEvent, \
++    builder_plugin_TabletAdded, \
++    builder_plugin_TabletRemoved, \
++    builder_plugin_Error, \
++    builder_plugin_UpdateMapping, \
++    builder_plugin_DataInterest
++
++static const IStylusPluginVtbl stroke_builder_sync_vtbl =
+ {
+-    rtstylus_QueryInterface,
+-    rtstylus_AddRef,
+-    rtstylus_Release,
+-    rtstylus_get_Enabled,
+-    rtstylus_put_Enabled,
+-    rtstylus_get_HWND,
+-    rtstylus_put_HWND,
+-    rtstylus_get_WindowInputRectangle,
+-    rtstylus_put_WindowInputRectangle,
+-    rtstylus_AddStylusSyncPlugin,
+-    rtstylus_RemoveStylusSyncPlugin,
+-    rtstylus_RemoveAllStylusSyncPlugins,
+-    rtstylus_GetStylusSyncPlugin,
+-    rtstylus_GetStylusSyncPluginCount,
+-    rtstylus_AddStylusAsyncPlugin,
+-    rtstylus_RemoveStylusAsyncPlugin,
+-    rtstylus_RemoveAllStylusAsyncPlugins,
+-    rtstylus_GetStylusAsyncPlugin,
+-    rtstylus_GetStylusAsyncPluginCount,
+-    rtstylus_get_ChildRealTimeStylusPlugin,
+-    rtstylus_putref_ChildRealTimeStylusPlugin,
+-    rtstylus_AddCustomStylusDataToQueue,
+-    rtstylus_ClearStylusQueues,
+-    rtstylus_SetAllTabletsMode,
+-    rtstylus_SetSingleTabletMode,
+-    rtstylus_GetTablet,
+-    rtstylus_GetTabletContextIdFromTablet,
+-    rtstylus_GetTabletFromTabletContextId,
+-    rtstylus_GetAllTabletContextIds,
+-    rtstylus_GetStyluses,
+-    rtstylus_GetStylusForId,
+-    rtstylus_SetDesiredPacketDescription,
+-    rtstylus_GetDesiredPacketDescription,
+-    rtstylus_GetPacketDescriptionData
++    builder_plugin_QueryInterface,
++    builder_plugin_AddRef,
++    builder_plugin_Release,
++    BUILDER_PLUGIN_METHODS
+ };
+ 
+-static HRESULT realtime_stylus_create( IUnknown *outer, REFIID iid, void **obj )
++static const IStylusPluginVtbl stroke_builder_async_vtbl =
+ {
+-    struct rtstylus *This = malloc( sizeof(*This) );
+-    HRESULT hr = E_FAIL;
++    builder_plugin_QueryInterface,
++    builder_plugin_AddRef,
++    builder_plugin_Release,
++    BUILDER_PLUGIN_METHODS
++};
+ 
+-    if (!This) return E_OUTOFMEMORY;
+-    This->IRealTimeStylus_iface.lpVtbl = &realtime_stylus_vtbl;
++static HRESULT stroke_builder_create( IUnknown *outer, REFIID iid, void **obj )
++{
++    struct stroke_builder *This;
++    HRESULT hr;
++
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(This = calloc( 1, sizeof(*This) ))) return E_OUTOFMEMORY;
++    This->IStrokeBuilder_iface.lpVtbl = &stroke_builder_vtbl;
++    This->IStylusSyncPlugin_iface.lpVtbl = (const IStylusSyncPluginVtbl *)&stroke_builder_sync_vtbl;
++    This->IStylusAsyncPlugin_iface.lpVtbl = (const IStylusAsyncPluginVtbl *)&stroke_builder_async_vtbl;
+     This->ref = 1;
++    InitializeCriticalSectionEx( &This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": stroke_builder.cs");
++    list_init( &This->strokes );
+ 
+-    hr = IRealTimeStylus_QueryInterface( &This->IRealTimeStylus_iface, iid, obj );
+-    IRealTimeStylus_Release( &This->IRealTimeStylus_iface );
++    hr = IStrokeBuilder_QueryInterface( &This->IStrokeBuilder_iface, iid, obj );
++    IStrokeBuilder_Release( &This->IStrokeBuilder_iface );
+     return hr;
+ }
+ 
+@@ -420,6 +1910,17 @@ static const struct IClassFactoryVtbl class_factory_vtbl =
+ };
+ 
+ static struct class_factory runtime_styus_cf = { { &class_factory_vtbl }, realtime_stylus_create };
++static struct class_factory stroke_builder_cf = { { &class_factory_vtbl }, stroke_builder_create };
++
++BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
++{
++    if (reason == DLL_PROCESS_ATTACH)
++    {
++        rtscom_instance = instance;
++        DisableThreadLibraryCalls( instance );
++    }
++    return TRUE;
++}
+ 
+ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *obj)
+ {
+@@ -429,6 +1930,8 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *obj)
+ 
+     if (IsEqualCLSID( clsid, &CLSID_RealTimeStylus ))
+         cf = &runtime_styus_cf.IClassFactory_iface;
++    else if (IsEqualCLSID( clsid, &CLSID_StrokeBuilder ))
++        cf = &stroke_builder_cf.IClassFactory_iface;
+     else
+         FIXME( "(%s %s %p) unsupported interface\n", debugstr_guid( clsid ), debugstr_guid( iid ), obj );
+ 
+diff --git a/dlls/rtscom/rtscom_reg.idl b/dlls/rtscom/rtscom_reg.idl
+index 296cf4ee1bc..6e932802f8b 100644
+--- a/dlls/rtscom/rtscom_reg.idl
++++ b/dlls/rtscom/rtscom_reg.idl
+@@ -30,3 +30,12 @@ coclass RealTimeStylus
+ {
+     [default] interface IRealTimeStylus;
+ }
++
++[
++    uuid(e810cee7-6e51-4cb0-aa3a-0b985b70daf7),
++    threading(both)
++]
++coclass StrokeBuilder
++{
++    [default] interface IStrokeBuilder;
++}
+diff --git a/dlls/rtscom/tests/Makefile.in b/dlls/rtscom/tests/Makefile.in
+new file mode 100644
+index 00000000000..590c958402b
+--- /dev/null
++++ b/dlls/rtscom/tests/Makefile.in
+@@ -0,0 +1,5 @@
++TESTDLL   = rtscom.dll
++IMPORTS   = oleaut32 ole32 user32 uuid
++
++SOURCES = \
++	rtscom.c
+diff --git a/dlls/rtscom/tests/rtscom.c b/dlls/rtscom/tests/rtscom.c
+new file mode 100644
+index 00000000000..259464fa5ba
+--- /dev/null
++++ b/dlls/rtscom/tests/rtscom.c
+@@ -0,0 +1,356 @@
++/*
++ * RealTimeStylus and StrokeBuilder
++ *
++ * Copyright 2026 AltarsCN
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++
++#include "windef.h"
++#include "winbase.h"
++#include "winuser.h"
++#include "ole2.h"
++#include "ocidl.h"
++#include "initguid.h"
++#include "rtscom.h"
++
++#include "wine/test.h"
++
++DEFINE_GUID(GUID_X, 0x598a6a8f, 0x52c0, 0x4ba0, 0x93, 0xaf, 0xaf, 0x35, 0x74, 0x11, 0xa5, 0x61);
++DEFINE_GUID(GUID_Y, 0xb53f9f75, 0x04e0, 0x4498, 0xa7, 0xee, 0xc3, 0x0d, 0xbb, 0x5a, 0x90, 0x11);
++
++struct plugin
++{
++    IStylusSyncPlugin IStylusSyncPlugin_iface;
++    LONG refcount;
++    LONG interest_calls;
++    LONG enabled_calls;
++    RealTimeStylusDataInterest interest;
++};
++
++static struct plugin *impl_from_IStylusSyncPlugin(IStylusSyncPlugin *iface)
++{
++    return CONTAINING_RECORD(iface, struct plugin, IStylusSyncPlugin_iface);
++}
++
++static HRESULT WINAPI plugin_QueryInterface(IStylusSyncPlugin *iface, REFIID riid, void **out)
++{
++    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IStylusPlugin)
++            || IsEqualGUID(riid, &IID_IStylusSyncPlugin))
++    {
++        *out = iface;
++        IStylusSyncPlugin_AddRef(iface);
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI plugin_AddRef(IStylusSyncPlugin *iface)
++{
++    return InterlockedIncrement(&impl_from_IStylusSyncPlugin(iface)->refcount);
++}
++
++static ULONG WINAPI plugin_Release(IStylusSyncPlugin *iface)
++{
++    return InterlockedDecrement(&impl_from_IStylusSyncPlugin(iface)->refcount);
++}
++
++static HRESULT WINAPI plugin_RealTimeStylusEnabled(IStylusSyncPlugin *iface, IRealTimeStylus *rts, ULONG count,
++        const TABLET_CONTEXT_ID *tcids)
++{
++    InterlockedIncrement(&impl_from_IStylusSyncPlugin(iface)->enabled_calls);
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_RealTimeStylusDisabled(IStylusSyncPlugin *iface, IRealTimeStylus *rts, ULONG count,
++        const TABLET_CONTEXT_ID *tcids)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_StylusInRange(IStylusSyncPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid, STYLUS_ID sid)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_StylusOutOfRange(IStylusSyncPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid, STYLUS_ID sid)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_StylusDown(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, LONG *packet, LONG **changed)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_StylusUp(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, LONG *packet, LONG **changed)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_StylusButtonDown(IStylusSyncPlugin *iface, IRealTimeStylus *rts, STYLUS_ID sid,
++        const GUID *button, POINT *pos)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_StylusButtonUp(IStylusSyncPlugin *iface, IRealTimeStylus *rts, STYLUS_ID sid,
++        const GUID *button, POINT *pos)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_InAirPackets(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, ULONG length, LONG *packets, ULONG *changed_count, LONG **changed)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_Packets(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const StylusInfo *info,
++        ULONG count, ULONG length, LONG *packets, ULONG *changed_count, LONG **changed)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_CustomStylusDataAdded(IStylusSyncPlugin *iface, IRealTimeStylus *rts, const GUID *guid,
++        ULONG size, const BYTE *data)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_SystemEvent(IStylusSyncPlugin *iface, IRealTimeStylus *rts, TABLET_CONTEXT_ID tcid,
++        STYLUS_ID sid, SYSTEM_EVENT event, SYSTEM_EVENT_DATA data)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_TabletAdded(IStylusSyncPlugin *iface, IRealTimeStylus *rts, IInkTablet *tablet)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_TabletRemoved(IStylusSyncPlugin *iface, IRealTimeStylus *rts, LONG index)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_Error(IStylusSyncPlugin *iface, IRealTimeStylus *rts, IStylusPlugin *plugin,
++        RealTimeStylusDataInterest interest, HRESULT error, LONG_PTR *key)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_UpdateMapping(IStylusSyncPlugin *iface, IRealTimeStylus *rts)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI plugin_DataInterest(IStylusSyncPlugin *iface, RealTimeStylusDataInterest *interest)
++{
++    struct plugin *plugin = impl_from_IStylusSyncPlugin(iface);
++
++    InterlockedIncrement(&plugin->interest_calls);
++    *interest = plugin->interest;
++    return S_OK;
++}
++
++static const IStylusSyncPluginVtbl plugin_vtbl =
++{
++    plugin_QueryInterface,
++    plugin_AddRef,
++    plugin_Release,
++    plugin_RealTimeStylusEnabled,
++    plugin_RealTimeStylusDisabled,
++    plugin_StylusInRange,
++    plugin_StylusOutOfRange,
++    plugin_StylusDown,
++    plugin_StylusUp,
++    plugin_StylusButtonDown,
++    plugin_StylusButtonUp,
++    plugin_InAirPackets,
++    plugin_Packets,
++    plugin_CustomStylusDataAdded,
++    plugin_SystemEvent,
++    plugin_TabletAdded,
++    plugin_TabletRemoved,
++    plugin_Error,
++    plugin_UpdateMapping,
++    plugin_DataInterest,
++};
++
++static void test_realtime_stylus(void)
++{
++    struct plugin plugin = {{&plugin_vtbl}, 1, 0, 0, RTSDI_AllData};
++    IStylusSyncPlugin *out;
++    IRealTimeStylus *rts;
++    IUnknown *unk;
++    ULONG count, i;
++    GUID *guids;
++    HANDLE_PTR hwnd_value;
++    BOOL enabled;
++    HWND hwnd;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&CLSID_RealTimeStylus, NULL, CLSCTX_INPROC_SERVER, &IID_IRealTimeStylus, (void **)&rts);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr != S_OK) return;
++
++    hr = IRealTimeStylus_QueryInterface(rts, &IID_IRealTimeStylus3, (void **)&unk);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr == S_OK) IUnknown_Release(unk);
++    hr = IRealTimeStylus_QueryInterface(rts, &IID_IRealTimeStylusSynchronization, (void **)&unk);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr == S_OK) IUnknown_Release(unk);
++
++    hr = IRealTimeStylus_get_Enabled(rts, &enabled);
++    ok(hr == S_OK && !enabled, "Got hr %#lx, enabled %d.\n", hr, enabled);
++    hr = IRealTimeStylus_get_HWND(rts, &hwnd_value);
++    ok(hr == S_OK && !hwnd_value, "Got hr %#lx, hwnd %#Ix.\n", hr, hwnd_value);
++
++    hr = IRealTimeStylus_GetDesiredPacketDescription(rts, &count, &guids);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(count >= 2 && IsEqualGUID(&guids[0], &GUID_X) && IsEqualGUID(&guids[1], &GUID_Y), "Got %lu properties.\n", count);
++    for (i = 0; i < count; ++i) trace("desired %lu: %s\n", i, wine_dbgstr_guid(&guids[i]));
++    CoTaskMemFree(guids);
++
++    hr = IRealTimeStylus_GetStylusSyncPluginCount(rts, &count);
++    ok(hr == S_OK && !count, "Got hr %#lx, count %lu.\n", hr, count);
++    hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 1, &plugin.IStylusSyncPlugin_iface);
++    ok(FAILED(hr), "Got hr %#lx.\n", hr);
++    hr = IRealTimeStylus_AddStylusSyncPlugin(rts, 0, &plugin.IStylusSyncPlugin_iface);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(plugin.interest_calls == 1, "Got %ld calls.\n", plugin.interest_calls);
++    ok(plugin.refcount == 2, "Got refcount %ld.\n", plugin.refcount);
++    hr = IRealTimeStylus_GetStylusSyncPluginCount(rts, &count);
++    ok(hr == S_OK && count == 1, "Got hr %#lx, count %lu.\n", hr, count);
++    hr = IRealTimeStylus_GetStylusSyncPlugin(rts, 0, &out);
++    ok(hr == S_OK && out == &plugin.IStylusSyncPlugin_iface, "Got hr %#lx, plugin %p.\n", hr, out);
++    if (hr == S_OK) IStylusSyncPlugin_Release(out);
++
++    hwnd = CreateWindowA("static", "rtscom", WS_POPUP, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
++    hr = IRealTimeStylus_put_HWND(rts, (HANDLE_PTR)hwnd);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IRealTimeStylus_put_Enabled(rts, TRUE);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(plugin.enabled_calls == 1, "Got %ld calls.\n", plugin.enabled_calls);
++    hr = IRealTimeStylus_get_Enabled(rts, &enabled);
++    ok(hr == S_OK && enabled, "Got hr %#lx, enabled %d.\n", hr, enabled);
++    hr = IRealTimeStylus_put_Enabled(rts, FALSE);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    out = NULL;
++    hr = IRealTimeStylus_RemoveStylusSyncPlugin(rts, 0, &out);
++    ok(hr == S_OK && out == &plugin.IStylusSyncPlugin_iface, "Got hr %#lx, plugin %p.\n", hr, out);
++    if (out) IStylusSyncPlugin_Release(out);
++    ok(plugin.refcount == 1, "Got refcount %ld.\n", plugin.refcount);
++
++    IRealTimeStylus_Release(rts);
++    DestroyWindow(hwnd);
++}
++
++static void test_stroke_builder(void)
++{
++    static const LONG packets[] = {100, 200, 300, 400, 500, 600};
++    PACKET_PROPERTY properties[2] = {{GUID_X}, {GUID_Y}};
++    IInkStrokeDisp *stroke, *ended;
++    IStrokeBuilder *builder;
++    IInkStrokes *strokes;
++    IInkDisp *ink, *got;
++    IUnknown *unk;
++    LONG count;
++    RECT dirty;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&CLSID_StrokeBuilder, NULL, CLSCTX_INPROC_SERVER, &IID_IStrokeBuilder, (void **)&builder);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr != S_OK) return;
++
++    hr = IStrokeBuilder_QueryInterface(builder, &IID_IStylusAsyncPlugin, (void **)&unk);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr == S_OK) IUnknown_Release(unk);
++    hr = IStrokeBuilder_QueryInterface(builder, &IID_IStylusSyncPlugin, (void **)&unk);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr == S_OK) IUnknown_Release(unk);
++
++    hr = CoCreateInstance(&CLSID_InkDisp, NULL, CLSCTX_INPROC_SERVER, &IID_IInkDisp, (void **)&ink);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr != S_OK)
++    {
++        IStrokeBuilder_Release(builder);
++        return;
++    }
++    hr = IStrokeBuilder_putref_Ink(builder, ink);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IStrokeBuilder_get_Ink(builder, &got);
++    ok(hr == S_OK && got == ink, "Got hr %#lx, ink %p.\n", hr, got);
++    if (hr == S_OK) IInkDisp_Release(got);
++
++    hr = IStrokeBuilder_CreateStroke(builder, ARRAY_SIZE(packets), packets, 2, properties, 1.0f, 1.0f, &stroke);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IInkStrokeDisp_get_PacketCount(stroke, &count);
++    ok(hr == S_OK && count == 3, "Got hr %#lx, count %ld.\n", hr, count);
++    IInkStrokeDisp_Release(stroke);
++
++    stroke = NULL;
++    hr = IStrokeBuilder_BeginStroke(builder, 1, 1, packets, 2, properties, 1.0f, 1.0f, &stroke);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IStrokeBuilder_AppendPackets(builder, 1, 1, 4, packets + 2);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IStrokeBuilder_AppendPackets(builder, 1, 2, 2, packets);
++    ok(FAILED(hr), "Got hr %#lx.\n", hr);
++    hr = IStrokeBuilder_EndStroke(builder, 1, 1, &ended, &dirty);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr == S_OK)
++    {
++        LONG id1, id2;
++
++        IInkStrokeDisp_get_ID(ended, &id1);
++        IInkStrokeDisp_get_ID(stroke, &id2);
++        ok(id1 == id2, "Got ids %ld, %ld.\n", id1, id2);
++        hr = IInkStrokeDisp_get_PacketCount(ended, &count);
++        ok(hr == S_OK && count == 3, "Got hr %#lx, count %ld.\n", hr, count);
++        ok(dirty.left <= 100 && dirty.right >= 500, "Got %s.\n", wine_dbgstr_rect(&dirty));
++        IInkStrokeDisp_Release(ended);
++    }
++    if (stroke) IInkStrokeDisp_Release(stroke);
++    hr = IStrokeBuilder_EndStroke(builder, 1, 1, &ended, &dirty);
++    ok(FAILED(hr), "Got hr %#lx.\n", hr);
++
++    hr = IInkDisp_get_Strokes(ink, &strokes);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IInkStrokes_get_Count(strokes, &count);
++    ok(hr == S_OK && count == 2, "Got hr %#lx, count %ld.\n", hr, count);
++    IInkStrokes_Release(strokes);
++
++    IInkDisp_Release(ink);
++    IStrokeBuilder_Release(builder);
++}
++
++START_TEST(rtscom)
++{
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++
++    test_realtime_stylus();
++    test_stroke_builder();
++
++    CoUninitialize();
++}
+diff --git a/include/rtscom.idl b/include/rtscom.idl
+index e8a1b9e1485..c3dae192430 100644
+--- a/include/rtscom.idl
++++ b/include/rtscom.idl
+@@ -186,6 +186,83 @@ interface IRealTimeStylus : IUnknown
+                 [size_is(*pcPacketProperties), out] PACKET_PROPERTY **ppPacketProperties);
+ };
+ 
++[
++    object,
++    uuid(b5f2a6cd-3179-4a3e-b9c4-bb5865962be2)
++]
++interface IRealTimeStylus2 : IUnknown
++{
++    [propget]
++    HRESULT FlicksEnabled( [retval, out] BOOL *pfEnable );
++    [propput]
++    HRESULT FlicksEnabled( [in] BOOL fEnable );
++}
++
++[
++    object,
++    uuid(d70230a3-6986-4051-b57a-1cf69f4d9db5)
++]
++interface IRealTimeStylus3 : IUnknown
++{
++    [propget]
++    HRESULT MultiTouchEnabled( [retval, out] BOOL *pfEnable );
++    [propput]
++    HRESULT MultiTouchEnabled( [in] BOOL fEnable );
++}
++
++typedef enum RealTimeStylusLockType
++{
++    RTSLT_ObjLock          = 0x1,
++    RTSLT_SyncEventLock    = 0x2,
++    RTSLT_AsyncEventLock   = 0x4,
++    RTSLT_ExcludeCallback  = 0x8,
++    RTSLT_SyncObjLock      = 0xb,
++    RTSLT_AsyncObjLock     = 0xd
++} RealTimeStylusLockType;
++
++[
++    object,
++    uuid(aa87eab8-ab4a-4cea-b5cb-46d84c6a2509)
++]
++interface IRealTimeStylusSynchronization : IUnknown
++{
++    HRESULT AcquireLock( [in] RealTimeStylusLockType lock );
++    HRESULT ReleaseLock( [in] RealTimeStylusLockType lock );
++}
++
++[
++    object,
++    uuid(a5fd4e2d-c44b-4092-9177-260905eb672b)
++]
++interface IStrokeBuilder : IUnknown
++{
++    HRESULT CreateStroke( [in] ULONG cPktBuffLength, [in, size_is(cPktBuffLength)] const LONG *pPackets,
++                [in] ULONG cPacketProperties, [in, size_is(cPacketProperties)] const PACKET_PROPERTY *pPacketProperties,
++                [in] FLOAT fInkToDeviceScaleX, [in] FLOAT fInkToDeviceScaleY,
++                [out, unique] IInkStrokeDisp **ppIInkStroke );
++    HRESULT BeginStroke( [in] TABLET_CONTEXT_ID tcid, [in] STYLUS_ID sid, [in] const LONG *pPacket,
++                [in] ULONG cPacketProperties, [in, size_is(cPacketProperties)] PACKET_PROPERTY *pPacketProperties,
++                [in] FLOAT fInkToDeviceScaleX, [in] FLOAT fInkToDeviceScaleY,
++                [out, in, unique] IInkStrokeDisp **ppIInkStroke );
++    HRESULT AppendPackets( [in] TABLET_CONTEXT_ID tcid, [in] STYLUS_ID sid, [in] ULONG cPktBuffLength,
++                [in, size_is(cPktBuffLength)] const LONG *pPackets );
++    HRESULT EndStroke( [in] TABLET_CONTEXT_ID tcid, [in] STYLUS_ID sid, [out] IInkStrokeDisp **ppIInkStroke,
++                [out] RECT *pDirtyRect );
++    [propget]
++    HRESULT Ink( [retval, out] IInkDisp **ppiInkObj );
++    [propputref]
++    HRESULT Ink( [in] IInkDisp *piInkObj );
++}
++
++[
++    uuid(e810cee7-6e51-4cb0-aa3a-0b985b70daf7),
++    threading(both)
++]
++coclass StrokeBuilder
++{
++    [default] interface IStrokeBuilder;
++}
++
+ [
+     uuid(e26b366d-f998-43ce-836f-cb6d904432b0),
+     threading(both)

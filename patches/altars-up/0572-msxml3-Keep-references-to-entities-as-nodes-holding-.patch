@@ -1,0 +1,2481 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AltarsCN <337293323+Altars3668@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 13:32:21 -0400
+Subject: [PATCH] msxml3: Keep references to entities as nodes holding those of
+ the entity's declaration, as Windows does.
+
+MSXML reads the replacement text of each internal entity on its own when
+the DTD ends and gives the entity's declaration the nodes of it; errors in
+it are reported where they are in that text, even for an entity nothing
+refers to.  A reference, in content or in an attribute value, is an
+entity reference node holding a copy of those nodes, so xml:space around
+it does not count and an entity of spaces holds nothing.  The reader now
+reads those texts for the DOM and keeps the references in attribute
+values, and the DOM builder makes the nodes.
+
+What a reference holds may not change, nor what it is made of; a copy of
+it may in MSXML 3, which copies none of it shallowly, not in MSXML 6.  Its
+text is that of its nodes, an attribute's value goes through them, and a
+reference breaks lines when written as an element does.  Validation sees
+what references stand for, at the reference.  A '<' an entity brings into
+an attribute value fails where the start tag ends.
+
+Entity and notation declarations write themselves out and give their
+identifiers as declared; external entities get a node.  MSXML 3 resolves
+externals unless told not to, and loads every external entity when the
+DTD ends, used or not.  The value of a text node is all of it; the text
+of an attribute leaves out the spaces around it unless spaces are kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/msxml3/domdoc.c b/dlls/msxml3/domdoc.c
+index 08b31e510cf..9547efa22bf 100644
+--- a/dlls/msxml3/domdoc.c
++++ b/dlls/msxml3/domdoc.c
+@@ -118,7 +118,6 @@ struct domdoc
+     BOOL free_threaded;         /* created as one of the FreeThreadedDOMDocument classes */
+     IMoniker *moniker;          /* what IPersistMoniker::Load was given */
+     VARIANT_BOOL async;
+-    VARIANT_BOOL resolving;
+     HRESULT error;
+     struct parse_error parse_error;
+     LONG ready_state;
+@@ -309,13 +308,14 @@ static void domdoc_set_parse_error(domdoc *doc, struct parse_error *error)
+     doc->parse_error = *error;
+ }
+ 
+-/* the line an error is on and where in the text it is, from the text parsed */
+-static void parse_error_set_source(struct parse_error *error, const WCHAR *text, size_t len)
++/* the line an error is on and where in the text it is, from the text parsed; an error in the text of
++   an entity has that already */
++void parse_error_set_source(struct parse_error *error, const WCHAR *text, size_t len)
+ {
+     size_t start = 0, end, i;
+     LONG line = 1;
+ 
+-    if (!error->code || error->line <= 0 || !text || error->nosource) return;
++    if (!error->code || error->line <= 0 || !text || error->nosource || error->srctext) return;
+     for (i = 0; i < len && line < error->line; i++)
+     {
+         if (text[i] == '\r' && i + 1 < len && text[i + 1] == '\n') i++;
+@@ -337,7 +337,7 @@ static void parse_error_set_source_bytes(struct parse_error *error, const BYTE *
+     WCHAR *text;
+     int len;
+ 
+-    if (!error->code || error->line <= 0 || !data || !size || error->nosource) return;
++    if (!error->code || error->line <= 0 || !data || !size || error->nosource || error->srctext) return;
+     if (size >= 2 && data[0] == 0xff && data[1] == 0xfe)
+         return parse_error_set_source(error, (const WCHAR *)(data + 2), (size - 2) / sizeof(WCHAR));
+     if (size >= 2 && data[0] && !data[1])
+@@ -1347,6 +1347,13 @@ static HRESULT WINAPI domdoc_createNode(IXMLDOMDocument3 *iface, VARIANT type, B
+         return hr;
+     }
+ 
++    /* a reference has the nodes of the entity's declaration, which may not change */
++    if (node_type == NODE_ENTITY_REFERENCE && FAILED(hr = domnode_fill_entity_reference(domnode)))
++    {
++        domnode_destroy_tree(domnode);
++        return hr;
++    }
++
+     return create_node(domnode, node);
+ }
+ 
+@@ -1826,7 +1833,7 @@ static HRESULT WINAPI domdoc_get_resolveExternals(IXMLDOMDocument3 *iface, VARIA
+ 
+     TRACE("%p, %p.\n", iface, v);
+ 
+-    *v = doc->resolving;
++    *v = doc->node->properties->resolve_externals ? VARIANT_TRUE : VARIANT_FALSE;
+     return S_OK;
+ }
+ 
+@@ -1836,7 +1843,6 @@ static HRESULT WINAPI domdoc_put_resolveExternals(IXMLDOMDocument3 *iface, VARIA
+ 
+     TRACE("%p, %d.\n", iface, v);
+ 
+-    doc->resolving = v;
+     doc->node->properties->resolve_externals = v != VARIANT_FALSE;
+     return S_OK;
+ }
+@@ -2090,7 +2096,6 @@ static HRESULT WINAPI domdoc_setProperty(IXMLDOMDocument3 *iface, BSTR p, VARIAN
+         else if (!wcsicmp(p, L"AllowDocumentFunction")) flag = &properties->allow_document_function;
+         else flag = &properties->use_inline_schema;
+         *flag = b == VARIANT_TRUE;
+-        if (flag == &properties->resolve_externals) doc->resolving = b;
+         if (flag == &properties->use_inline_schema && *flag)
+             FIXME("UseInlineSchema is kept, but not enforced.\n");
+         return S_OK;
+diff --git a/dlls/msxml3/entity.c b/dlls/msxml3/entity.c
+index b0ecc0d5655..1c51af10855 100644
+--- a/dlls/msxml3/entity.c
++++ b/dlls/msxml3/entity.c
+@@ -155,16 +155,16 @@ static HRESULT WINAPI domentity_get_nodeName(IXMLDOMEntity *iface, BSTR *p)
+ 
+ static HRESULT WINAPI domentity_get_nodeValue(IXMLDOMEntity *iface, VARIANT *v)
+ {
+-    FIXME("%p, %p: stub\n", iface, v);
++    TRACE("%p, %p.\n", iface, v);
+ 
+-    return E_NOTIMPL;
++    return return_null_var(v);
+ }
+ 
+ static HRESULT WINAPI domentity_put_nodeValue(IXMLDOMEntity *iface, VARIANT v)
+ {
+-    FIXME("%p, %s: stub\n", iface, debugstr_variant(&v));
++    TRACE("%p, %s.\n", iface, debugstr_variant(&v));
+ 
+-    return E_NOTIMPL;
++    return E_FAIL;
+ }
+ 
+ static HRESULT WINAPI domentity_get_nodeType(IXMLDOMEntity *iface, DOMNodeType *type)
+@@ -184,25 +184,32 @@ static HRESULT WINAPI domentity_get_parentNode(IXMLDOMEntity *iface, IXMLDOMNode
+     return node_get_parent(entity->node, parent);
+ }
+ 
++/* the nodes of an internal entity's replacement text, which may not change */
+ static HRESULT WINAPI domentity_get_childNodes(IXMLDOMEntity *iface, IXMLDOMNodeList **list)
+ {
+-    FIXME("%p, %p: stub\n", iface, list);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, list);
++
++    return node_get_child_nodes(entity->node, list);
+ }
+ 
+ static HRESULT WINAPI domentity_get_firstChild(IXMLDOMEntity *iface, IXMLDOMNode **node)
+ {
+-    FIXME("%p, %p: stub\n", iface, node);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, node);
++
++    return node_get_first_child(entity->node, node);
+ }
+ 
+ static HRESULT WINAPI domentity_get_lastChild(IXMLDOMEntity *iface, IXMLDOMNode **node)
+ {
+-    FIXME("%p, %p: stub\n", iface, node);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, node);
++
++    return node_get_last_child(entity->node, node);
+ }
+ 
+ static HRESULT WINAPI domentity_get_previousSibling(IXMLDOMEntity *iface, IXMLDOMNode **node)
+@@ -235,40 +242,50 @@ static HRESULT WINAPI domentity_get_attributes(IXMLDOMEntity *iface, IXMLDOMName
+ static HRESULT WINAPI domentity_insertBefore(IXMLDOMEntity *iface, IXMLDOMNode *node,
+         VARIANT refChild, IXMLDOMNode **out_node)
+ {
+-    FIXME("%p, %p, %s, %p: stub\n", iface, node, debugstr_variant(&refChild), out_node);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %s, %p.\n", iface, node, debugstr_variant(&refChild), out_node);
++
++    return node_insert_before(entity->node, node, &refChild, out_node);
+ }
+ 
+ static HRESULT WINAPI domentity_replaceChild(IXMLDOMEntity *iface, IXMLDOMNode *newNode,
+         IXMLDOMNode *oldNode, IXMLDOMNode **outOldNode)
+ {
+-    FIXME("%p, %p, %p, %p: stub\n", iface, newNode, oldNode, outOldNode);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %p, %p.\n", iface, newNode, oldNode, outOldNode);
++
++    return node_replace_child(entity->node, newNode, oldNode, outOldNode);
+ }
+ 
+ static HRESULT WINAPI domentity_removeChild(IXMLDOMEntity *iface, IXMLDOMNode *node,
+         IXMLDOMNode **oldNode)
+ {
+-    FIXME("%p, %p, %p: stub\n", iface, node, oldNode);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %p.\n", iface, node, oldNode);
++
++    return node_remove_child(entity->node, node, oldNode);
+ }
+ 
+ static HRESULT WINAPI domentity_appendChild(IXMLDOMEntity *iface, IXMLDOMNode *newNode,
+         IXMLDOMNode **outNewNode)
+ {
+-    FIXME("%p, %p, %p: stub\n", iface, newNode, outNewNode);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %p.\n", iface, newNode, outNewNode);
++
++    return node_append_child(entity->node, newNode, outNewNode);
+ }
+ 
+ static HRESULT WINAPI domentity_hasChildNodes(IXMLDOMEntity *iface, VARIANT_BOOL *v)
+ {
+-    FIXME("%p, %p: stub\n", iface, v);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, v);
++
++    return node_has_childnodes(entity->node, v);
+ }
+ 
+ static HRESULT WINAPI domentity_get_ownerDocument(IXMLDOMEntity *iface, IXMLDOMDocument **doc)
+@@ -354,9 +371,11 @@ static HRESULT WINAPI domentity_put_dataType(IXMLDOMEntity *iface, BSTR p)
+ 
+ static HRESULT WINAPI domentity_get_xml(IXMLDOMEntity *iface, BSTR *p)
+ {
+-    FIXME("%p, %p.\n", iface, p);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, p);
++
++    return node_get_xml(entity->node, p);
+ }
+ 
+ static HRESULT WINAPI domentity_transformNode(IXMLDOMEntity *iface, IXMLDOMNode *node, BSTR *p)
+@@ -419,23 +438,33 @@ static HRESULT WINAPI domentity_transformNodeToObject(IXMLDOMEntity *iface, IXML
+ 
+ static HRESULT WINAPI domentity_get_publicId(IXMLDOMEntity *iface, VARIANT *id)
+ {
+-    FIXME("%p, %p: stub\n", iface, id);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, id);
++
++    if (!id) return E_INVALIDARG;
++    V_VT(id) = VT_BSTR;
++    return node_get_declaration_id(entity->node, L"PUBLIC", &V_BSTR(id));
+ }
+ 
+ static HRESULT WINAPI domentity_get_systemId(IXMLDOMEntity *iface, VARIANT *id)
+ {
+-    FIXME("%p, %p: stub\n", iface, id);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, id);
++
++    if (!id) return E_INVALIDARG;
++    V_VT(id) = VT_BSTR;
++    return node_get_declaration_id(entity->node, L"SYSTEM", &V_BSTR(id));
+ }
+ 
+ static HRESULT WINAPI domentity_get_notationName(IXMLDOMEntity *iface, BSTR *p)
+ {
+-    FIXME("%p, %p: stub\n", iface, p);
++    struct domentity *entity = impl_from_IXMLDOMEntity(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, p);
++
++    return node_get_declaration_id(entity->node, L"NDATA", p);
+ }
+ 
+ static const struct IXMLDOMEntityVtbl domentity_vtbl =
+diff --git a/dlls/msxml3/entityref.c b/dlls/msxml3/entityref.c
+index abfff07d55f..225e3729ef2 100644
+--- a/dlls/msxml3/entityref.c
++++ b/dlls/msxml3/entityref.c
+@@ -239,7 +239,7 @@ static HRESULT WINAPI entityref_insertBefore(IXMLDOMEntityReference *iface,
+ {
+     entityref *ref = impl_from_IXMLDOMEntityReference(iface);
+ 
+-    FIXME("%p, %p, %s, %p needs test\n", iface, newNode, debugstr_variant(&refChild), outOldNode);
++    TRACE("%p, %p, %s, %p.\n", iface, newNode, debugstr_variant(&refChild), outOldNode);
+ 
+     return node_insert_before(ref->node, newNode, &refChild, outOldNode);
+ }
+@@ -249,7 +249,7 @@ static HRESULT WINAPI entityref_replaceChild(IXMLDOMEntityReference *iface,
+ {
+     entityref *ref = impl_from_IXMLDOMEntityReference(iface);
+ 
+-    FIXME("%p, %p, %p, %p needs test\n", iface, newNode, oldNode, outOldNode);
++    TRACE("%p, %p, %p, %p.\n", iface, newNode, oldNode, outOldNode);
+ 
+     return node_replace_child(ref->node, newNode, oldNode, outOldNode);
+ }
+@@ -319,11 +319,10 @@ static HRESULT WINAPI entityref_get_text(IXMLDOMEntityReference *iface, BSTR *p)
+ 
+ static HRESULT WINAPI entityref_put_text(IXMLDOMEntityReference *iface, BSTR p)
+ {
+-    entityref *ref = impl_from_IXMLDOMEntityReference(iface);
+-
+     TRACE("%p, %s.\n", iface, debugstr_w(p));
+ 
+-    return node_put_data(ref->node, p);
++    /* its nodes are those of the entity (Windows 11) */
++    return E_FAIL;
+ }
+ 
+ static HRESULT WINAPI entityref_get_specified(IXMLDOMEntityReference *iface, VARIANT_BOOL *v)
+diff --git a/dlls/msxml3/msxml_private.h b/dlls/msxml3/msxml_private.h
+index 72b9082e5b1..34fc6e4d15b 100644
+--- a/dlls/msxml3/msxml_private.h
++++ b/dlls/msxml3/msxml_private.h
+@@ -207,6 +207,8 @@ enum domnode_flags
+     DOMNODE_PARSED_VALUE = 0x8,
+     DOMNODE_NS_DECL = 0x10,
+     DOMNODE_NO_PARENT = 0x20,
++    DOMNODE_READONLY = 0x40,            /* in an entity reference or declaration: it may not change */
++    DOMNODE_ENTITY_PARSED = 0x80,       /* an entity declaration whose text was read for its nodes */
+ };
+ 
+ struct domdoc_properties
+@@ -306,6 +308,10 @@ extern HRESULT node_clone_domnode(struct domnode *, bool, struct domnode **);
+ extern HRESULT node_import_domnode(struct domnode *, bool, struct domnode *, struct domnode **);
+ extern HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_properties *properties,
+         struct domnode **tree, struct parse_error *error);
++extern void parse_error_set_source(struct parse_error *error, const WCHAR *text, size_t len);
++extern struct domnode *domnode_get_entity_decl(struct domnode *node, const WCHAR *name);
++extern HRESULT domnode_fill_entity_reference(struct domnode *ref);
++extern BSTR saxattributes_get_parts(ISAXAttributes *iface, int index);
+ extern void dump_doc_refcounts(struct domnode *node);
+ 
+ struct parsed_name
+@@ -438,6 +444,7 @@ extern HRESULT node_insert_before(struct domnode*,IXMLDOMNode*,const VARIANT*,IX
+ extern HRESULT node_replace_child(struct domnode*,IXMLDOMNode*,IXMLDOMNode*,IXMLDOMNode**);
+ extern HRESULT node_get_xml(struct domnode *, BSTR*);
+ extern HRESULT node_normalize(struct domnode *);
++extern HRESULT node_get_declaration_id(struct domnode *, const WCHAR *, BSTR *);
+ extern HRESULT node_clone(struct domnode*,VARIANT_BOOL,IXMLDOMNode**);
+ extern HRESULT node_get_prefix(struct domnode*,BSTR*);
+ extern HRESULT node_get_base_name(struct domnode*,BSTR*);
+@@ -597,6 +604,7 @@ extern HRESULT XMLView_create(void**);
+ extern HRESULT stream_wrapper_create(const void *, DWORD, ISequentialStream **);
+ 
+ /* Error Codes - not defined anywhere in the public headers */
++#define E_XML_ENTITY_LOAD                   0xC00CE009  /* an external entity could not be loaded */
+ #define E_XML_ELEMENT_UNDECLARED            0xC00CE00D
+ #define E_XML_ELEMENT_ID_NOT_FOUND          0xC00CE00E
+ /* ... */
+diff --git a/dlls/msxml3/node.c b/dlls/msxml3/node.c
+index f3d51a33b34..bab6eadeef8 100644
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -256,11 +256,26 @@ HRESULT node_get_name(struct domnode *node, BSTR *name)
+     return return_bstr(node->qname, name);
+ }
+ 
++/* What is in an entity reference or declaration may not change, nor may what an entity reference
++ * holds (Windows 11). */
++static bool domnode_is_readonly(const struct domnode *node)
++{
++    return node->flags & DOMNODE_READONLY;
++}
++
++static bool domnode_children_readonly(const struct domnode *node)
++{
++    return node->type == NODE_ENTITY_REFERENCE || node->type == NODE_ENTITY || domnode_is_readonly(node);
++}
++
+ HRESULT node_append_data(struct domnode *node, BSTR data)
+ {
+     UINT len, current;
+     BSTR str;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     if (!(len = SysStringLen(data)))
+         return S_OK;
+ 
+@@ -633,6 +648,9 @@ HRESULT node_insert_before(struct domnode *node, IXMLDOMNode *new_child, const V
+     if (!(child_node = get_node_obj(new_child)))
+         return E_FAIL;
+ 
++    if (domnode_children_readonly(node))
++        return E_FAIL;
++
+     switch (V_VT(ref_child))
+     {
+         case VT_EMPTY:
+@@ -691,6 +709,9 @@ HRESULT node_replace_child(struct domnode *node, IXMLDOMNode *newChild, IXMLDOMN
+     if (!(new_child = get_node_obj(newChild)))
+         return E_FAIL;
+ 
++    if (domnode_children_readonly(node))
++        return E_FAIL;
++
+     if (!(old_child = get_node_obj(oldChild)))
+         return E_FAIL;
+ 
+@@ -745,7 +766,7 @@ HRESULT node_put_data(struct domnode *node, const WCHAR *data)
+     const WCHAR *p = data;
+     struct domnode *child;
+ 
+-    if (node->flags & DOMNODE_READONLY_VALUE)
++    if (node->flags & (DOMNODE_READONLY_VALUE | DOMNODE_READONLY))
+         return E_FAIL;
+ 
+     /* Markup is checked and rejected. */
+@@ -953,6 +974,9 @@ HRESULT node_remove_child(struct domnode *node, IXMLDOMNode *child, IXMLDOMNode
+     if (!child_node)
+         return E_FAIL;
+ 
++    if (domnode_children_readonly(node))
++        return E_FAIL;
++
+     if (child_node->parent != node)
+     {
+         WARN("Node %p is not a child of %p.\n", child, node);
+@@ -1015,6 +1039,9 @@ HRESULT node_remove_attribute_node(struct domnode *node, IXMLDOMAttribute *attr,
+     if (!attr_node)
+         return E_FAIL;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     if (attr_node->parent != node)
+     {
+         WARN("Node %p is not an attribute of %p.\n", attr, node);
+@@ -1093,6 +1120,9 @@ HRESULT node_remove_attribute(struct domnode *node, const WCHAR *name, IXMLDOMNo
+     if ((hr = domnode_get_attribute(node, name, &attr)) != S_OK)
+         return hr;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     if (ret)
+         hr = create_node(attr, ret);
+ 
+@@ -1347,6 +1377,8 @@ struct domdoc_properties *domdoc_create_properties(MSXML_VERSION version)
+     properties->allow_xslt_script = version != MSXML6;
+     properties->allow_document_function = version != MSXML6;
+     properties->max_element_depth = version > MSXML3 ? 256 : 5000;
++    /* MSXML 3 resolves external entities unless told not to (Windows 11) */
++    properties->resolve_externals = version < MSXML4;
+ 
+     return properties;
+ }
+@@ -1509,6 +1541,15 @@ static HRESULT clone_domnode(struct domnode *node, bool deep, struct domnode *ow
+     if (node->data)
+         object->data = SysAllocStringLen(node->data, SysStringLen(node->data));
+ 
++    /* MSXML 6 keeps what was in an entity reference from changing in a copy too, and gives a shallow
++       copy of a reference the entity's nodes again; MSXML 3 copies them as they are, or not at all */
++    if (node->type != NODE_DOCUMENT && domdoc_version(node_get_doc(object)) >= MSXML6)
++    {
++        object->flags |= node->flags & DOMNODE_READONLY;
++        if (node->type == NODE_ENTITY_REFERENCE && !deep)
++            domnode_fill_entity_reference(object);
++    }
++
+     *cloned = object;
+ 
+     return hr;
+@@ -1519,6 +1560,93 @@ HRESULT node_clone_domnode(struct domnode *node, bool deep, struct domnode **clo
+     return clone_domnode(node, deep, NULL, cloned);
+ }
+ 
++/* the declaration of a general entity in the DTD of the document a node is in */
++struct domnode *domnode_get_entity_decl(struct domnode *node, const WCHAR *name)
++{
++    struct domnode *doc = node_get_doc(node), *child, *decl;
++
++    if (!name) return NULL;
++    LIST_FOR_EACH_ENTRY(child, &doc->children, struct domnode, entry)
++    {
++        if (child->type != NODE_DOCUMENT_TYPE) continue;
++        LIST_FOR_EACH_ENTRY(decl, &child->children, struct domnode, entry)
++        {
++            if (decl->type == NODE_ENTITY && decl->name && !wcscmp(decl->name, name))
++                return decl;
++        }
++    }
++    return NULL;
++}
++
++/* A copy of a node of an entity's declaration for a reference to it, which may not change either,
++ * with the spaces left out of it; for validation it is where the reference is. */
++static HRESULT domnode_copy_entity_node(const struct domnode *node, const struct domnode *ref, struct domnode **copy)
++{
++    struct domnode *object, *n, *child;
++    HRESULT hr;
++
++    *copy = NULL;
++    if (FAILED(hr = domnode_create(node->type, node->qname, SysStringLen(node->qname), node->uri,
++            SysStringLen(node->uri), ref->owner, &object)))
++        return hr;
++
++    object->flags = (node->flags & (DOMNODE_READONLY_VALUE | DOMNODE_IGNORED_WS_AFTER_STARTTAG | DOMNODE_IGNORED_WS
++            | DOMNODE_PARSED_VALUE | DOMNODE_NS_DECL)) | DOMNODE_READONLY;
++    object->parse_line = ref->parse_line;
++    object->parse_end_column = ref->parse_end_column;
++    object->parse_start_line = ref->parse_start_line;
++    object->parse_start_column = ref->parse_start_column;
++    if (node->data && !(object->data = SysAllocStringLen(node->data, SysStringLen(node->data))))
++        hr = E_OUTOFMEMORY;
++
++    LIST_FOR_EACH_ENTRY(n, &node->attributes, struct domnode, entry)
++    {
++        if (FAILED(hr) || FAILED(hr = domnode_copy_entity_node(n, ref, &child))) break;
++        domnode_insert_attribute(object, child, NULL);
++    }
++    LIST_FOR_EACH_ENTRY(n, &node->children, struct domnode, entry)
++    {
++        if (FAILED(hr) || FAILED(hr = domnode_copy_entity_node(n, ref, &child))) break;
++        domnode_append_child(object, child);
++    }
++
++    if (FAILED(hr))
++    {
++        domnode_destroy_tree(object);
++        return hr;
++    }
++    *copy = object;
++    return S_OK;
++}
++
++/* The nodes of a reference to an entity are those of the entity's declaration, copied; it has none
++ * when the entity is not declared. */
++HRESULT domnode_fill_entity_reference(struct domnode *ref)
++{
++    struct domnode *decl = domnode_get_entity_decl(ref, ref->name), *n, *copy;
++    HRESULT hr;
++
++    if (!decl) return S_OK;
++    ref->flags |= decl->flags & DOMNODE_IGNORED_WS_AFTER_STARTTAG;
++    LIST_FOR_EACH_ENTRY(n, &decl->children, struct domnode, entry)
++    {
++        if (FAILED(hr = domnode_copy_entity_node(n, ref, &copy))) return hr;
++        domnode_append_child(ref, copy);
++    }
++    return S_OK;
++}
++
++static void domnode_set_readonly(struct domnode *node)
++{
++    struct domnode *n;
++
++    node->flags |= DOMNODE_READONLY;
++    LIST_FOR_EACH_ENTRY(n, &node->attributes, struct domnode, entry)
++        domnode_set_readonly(n);
++    LIST_FOR_EACH_ENTRY(n, &node->children, struct domnode, entry)
++        domnode_set_readonly(n);
++}
++
+ /* A clone owned by another document, not in its tree yet. */
+ HRESULT node_import_domnode(struct domnode *node, bool deep, struct domnode *doc, struct domnode **cloned)
+ {
+@@ -1567,7 +1695,11 @@ static bool is_preserving_whitespace(const struct domnode *node)
+     if (doc->properties->preserving == VARIANT_TRUE)
+         return true;
+ 
+-    if (node->type != NODE_ELEMENT)
++    /* an entity reference keeps spaces as the element it is in does; the text of a declaration is
++       read on its own */
++    while (node && node->type == NODE_ENTITY_REFERENCE)
++        node = node->parent;
++    if (!node || node->type != NODE_ELEMENT)
+         return false;
+ 
+     while (node)
+@@ -1661,10 +1793,10 @@ static void domnode_append_ignored_pre(struct domnode *node, struct node_get_tex
+ 
+     if (sibling)
+     {
+-        if (sibling->type == NODE_ELEMENT)
++        if (sibling->type == NODE_ELEMENT || sibling->type == NODE_ENTITY_REFERENCE)
+             return domnode_append_ignored(sibling, DOMNODE_IGNORED_WS, context);
+     }
+-    else if (node->parent && node->parent->type == NODE_ELEMENT)
++    else if (node->parent && (node->parent->type == NODE_ELEMENT || node->parent->type == NODE_ENTITY_REFERENCE))
+     {
+         domnode_append_ignored(node, DOMNODE_IGNORED_WS_AFTER_STARTTAG, context);
+     }
+@@ -1715,6 +1847,15 @@ static void domnode_get_text(const struct domnode *node, struct node_get_text_co
+             context->ignored_ws = false;
+             break;
+ 
++        case NODE_ENTITY_REFERENCE:
++        case NODE_ENTITY:
++            /* the spaces of an entity's text that were left out stand between the text around it */
++            if (list_empty(&node->children))
++            {
++                domnode_append_ignored(node, DOMNODE_IGNORED_WS_AFTER_STARTTAG, context);
++                break;
++            }
++            /* fall through */
+         case NODE_ELEMENT:
+             LIST_FOR_EACH_ENTRY(child, &node->children, struct domnode, entry)
+             {
+@@ -1730,38 +1871,39 @@ static void domnode_get_text(const struct domnode *node, struct node_get_text_co
+     }
+ }
+ 
+-static void domnode_get_attribute_value(struct domnode *attr, struct string_buffer *buffer)
++/* the text an attribute holds, through the entity references in it */
++static void domnode_append_attribute_text(const struct domnode *node, bool normalize, struct string_buffer *buffer)
+ {
+-    struct domnode *doc = node_get_doc(attr);
+-    const struct domdoc_properties *properties = doc->properties;
+     struct domnode *child;
+     const WCHAR *p;
+ 
+-    if (properties->normalize_attribute_values && (attr->flags & DOMNODE_PARSED_VALUE))
++    LIST_FOR_EACH_ENTRY(child, &node->children, struct domnode, entry)
+     {
+-        LIST_FOR_EACH_ENTRY(child, &attr->children, struct domnode, entry)
++        if (child->type == NODE_ENTITY_REFERENCE)
+         {
+-            p = child->data;
+-
+-            while (*p)
+-            {
+-                if (*p == '\n' || *p == '\t')
+-                    string_append(buffer, L" ", 1);
+-                else
+-                    string_append(buffer, p, 1);
+-                ++p;
+-            }
++            domnode_append_attribute_text(child, normalize, buffer);
++            continue;
+         }
+-    }
+-    else
+-    {
+-        LIST_FOR_EACH_ENTRY(child, &attr->children, struct domnode, entry)
++        if (!(p = child->data)) continue;
++        if (!normalize)
+         {
+-            string_append(buffer, child->data, SysStringLen(child->data));
++            string_append(buffer, p, SysStringLen(child->data));
++            continue;
+         }
++        for (; *p; ++p)
++            string_append(buffer, *p == '\n' || *p == '\t' ? L" " : p, 1);
+     }
+ }
+ 
++static void domnode_get_attribute_value(struct domnode *attr, struct string_buffer *buffer)
++{
++    struct domnode *doc = node_get_doc(attr);
++    const struct domdoc_properties *properties = doc->properties;
++
++    domnode_append_attribute_text(attr, properties->normalize_attribute_values && (attr->flags & DOMNODE_PARSED_VALUE),
++            buffer);
++}
++
+ HRESULT node_get_text(struct domnode *node, BSTR *text)
+ {
+     struct node_get_text_context context = { 0 };
+@@ -1774,9 +1916,7 @@ HRESULT node_get_text(struct domnode *node, BSTR *text)
+     switch (node->type)
+     {
+         case NODE_COMMENT:
+-        case NODE_ENTITY_REFERENCE:
+         case NODE_CDATA_SECTION:
+-        case NODE_ENTITY:
+             return return_bstr(node->data, text);
+ 
+         case NODE_PROCESSING_INSTRUCTION:
+@@ -1796,7 +1936,17 @@ HRESULT node_get_text(struct domnode *node, BSTR *text)
+             return string_to_bstr(&context.buffer, text);
+ 
+         case NODE_ATTRIBUTE:
++            /* its value, without the spaces around it unless spaces are kept, as for text (Windows 11) */
+             domnode_get_attribute_value(node, &context.buffer);
++            if (context.preserve)
++                return string_to_bstr(&context.buffer, text);
++            for (start = context.buffer.data, length = context.buffer.count; length && xml_is_space(*start); --length)
++                ++start;
++            while (length && xml_is_space(start[length - 1]))
++                --length;
++            if (length && start != context.buffer.data)
++                memmove(context.buffer.data, start, length * sizeof(WCHAR));
++            context.buffer.count = length;
+             return string_to_bstr(&context.buffer, text);
+ 
+         case NODE_DOCUMENT:
+@@ -1812,6 +1962,8 @@ HRESULT node_get_text(struct domnode *node, BSTR *text)
+             return string_to_bstr(&context.buffer, text);
+ 
+         case NODE_ELEMENT:
++        case NODE_ENTITY_REFERENCE:
++        case NODE_ENTITY:
+ 
+             /* Trim leading spaces of the first textual node. Append everything else as is,
+                then trim trailing spaces. */
+@@ -1855,8 +2007,20 @@ HRESULT node_get_value(struct domnode *node, VARIANT *value)
+     switch (node->type)
+     {
+         case NODE_TEXT:
+-        case NODE_CDATA_SECTION:
++            /* all of it, where its text leaves out spaces around it (Windows 11) */
++            V_VT(value) = VT_BSTR;
++            return return_bstr(node->data, &V_BSTR(value));
+         case NODE_ATTRIBUTE:
++        {
++            /* the text of its entity references in full, where its text leaves out their spaces */
++            struct string_buffer buffer;
++
++            string_buffer_init(&buffer);
++            domnode_get_attribute_value(node, &buffer);
++            V_VT(value) = VT_BSTR;
++            return string_to_bstr(&buffer, &V_BSTR(value));
++        }
++        case NODE_CDATA_SECTION:
+         case NODE_PROCESSING_INSTRUCTION:
+         case NODE_COMMENT:
+             V_VT(value) = VT_BSTR;
+@@ -2072,6 +2236,89 @@ static void node_dump_element_attributes(struct node_dump_context *context, stru
+     }
+ }
+ 
++static void node_dump_entity_reference(struct domnode *node, struct node_dump_context *context)
++{
++    node_dump_append(context, L"&", 1);
++    node_dump_append(context, node->name, SysStringLen(node->name));
++    node_dump_append(context, L";", 1);
++}
++
++/* the identifiers of an external entity or a notation, as declared */
++static void node_dump_external_ids(struct domnode *node, struct node_dump_context *context)
++{
++    bool public = false;
++    struct domnode *n;
++    BSTR value;
++
++    LIST_FOR_EACH_ENTRY(n, &node->attributes, struct domnode, entry)
++    {
++        if (FAILED(node_get_text(n, &value))) continue;
++        if (!wcscmp(n->name, L"NDATA"))
++        {
++            node_dump_append(context, L" NDATA ", 7);
++            node_dump_append(context, value, SysStringLen(value));
++        }
++        else
++        {
++            if (!wcscmp(n->name, L"PUBLIC")) public = true;
++            if (!public || wcscmp(n->name, L"SYSTEM"))
++            {
++                node_dump_append(context, L" ", 1);
++                node_dump_append(context, n->name, SysStringLen(n->name));
++            }
++            node_dump_append(context, L" \"", 2);
++            node_dump_append(context, value, SysStringLen(value));
++            node_dump_append(context, L"\"", 1);
++        }
++        SysFreeString(value);
++    }
++}
++
++/* An internal entity's declaration has the text of its nodes and the references among them, as
++ * Windows writes it; an external one its identifiers. */
++static void node_dump_entity_decl(struct domnode *node, struct node_dump_context *context)
++{
++    struct domnode *n;
++
++    node_dump_append(context, L"<!ENTITY ", 9);
++    node_dump_append(context, node->name, SysStringLen(node->name));
++    if (list_empty(&node->attributes))
++    {
++        node_dump_append(context, L" \"", 2);
++        LIST_FOR_EACH_ENTRY(n, &node->children, struct domnode, entry)
++        {
++            if (n->type == NODE_TEXT)
++                node_dump_append(context, n->data, SysStringLen(n->data));
++            else if (n->type == NODE_ENTITY_REFERENCE)
++                node_dump_entity_reference(n, context);
++        }
++        node_dump_append(context, L"\"", 1);
++    }
++    node_dump_external_ids(node, context);
++    node_dump_append(context, L">", 1);
++}
++
++/* an identifier of the declaration of an entity or a notation: S_FALSE and no string for one it
++   has not (Windows 11) */
++HRESULT node_get_declaration_id(struct domnode *node, const WCHAR *name, BSTR *id)
++{
++    struct string_buffer buffer;
++    struct domnode *attr;
++
++    if (!id)
++        return E_INVALIDARG;
++    *id = NULL;
++
++    LIST_FOR_EACH_ENTRY(attr, &node->attributes, struct domnode, entry)
++    {
++        if (!attr->name || wcscmp(attr->name, name)) continue;
++        string_buffer_init(&buffer);
++        domnode_get_attribute_value(attr, &buffer);
++        return string_to_bstr(&buffer, id);
++    }
++    return S_FALSE;
++}
++
+ static void node_dump(struct domnode *node, struct node_dump_context *context)
+ {
+     struct domnode *n;
+@@ -2151,15 +2398,30 @@ static void node_dump(struct domnode *node, struct node_dump_context *context)
+             node_dump_append(context, L"=\"", 2);
+             LIST_FOR_EACH_ENTRY(n, &node->children, struct domnode, entry)
+             {
+-                node_dump_xml_attr(n, context);
++                if (n->type == NODE_ENTITY_REFERENCE)
++                    node_dump_entity_reference(n, context);
++                else
++                    node_dump_xml_attr(n, context);
+             }
+             node_dump_append(context, L"\"", 1);
+             break;
+ 
+         case NODE_ENTITY_REFERENCE:
+-            node_dump_append(context, L"&", 1);
++            /* lines are broken around it as around an element, where spaces were left out */
++            node_dump_format(context);
++            node_dump_entity_reference(node, context);
++            context->needs_formatting = node->flags & DOMNODE_IGNORED_WS;
++            break;
++
++        case NODE_ENTITY:
++            node_dump_entity_decl(node, context);
++            break;
++
++        case NODE_NOTATION:
++            node_dump_append(context, L"<!NOTATION ", 11);
+             node_dump_append(context, node->name, SysStringLen(node->name));
+-            node_dump_append(context, L";", 1);
++            node_dump_external_ids(node, context);
++            node_dump_append(context, L">", 1);
+             break;
+ 
+         case NODE_DOCUMENT_TYPE:
+@@ -3604,6 +3866,9 @@ HRESULT node_remove_qualified_attribute(struct domnode *node, const WCHAR *name,
+     if ((hr = domnode_get_qualified_attribute(node, name, uri, &attr)) != S_OK)
+         return hr;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     if (ret)
+         hr = create_node(attr, ret);
+ 
+@@ -3681,7 +3946,7 @@ HRESULT node_set_attribute(struct domnode *node, IXMLDOMNode *attribute, IXMLDOM
+     if (!(attr = get_node_obj(attribute)))
+         return E_FAIL;
+ 
+-    if (attr->type != NODE_ATTRIBUTE)
++    if (attr->type != NODE_ATTRIBUTE || domnode_is_readonly(node))
+         return E_FAIL;
+ 
+     if (attr->parent)
+@@ -3721,7 +3986,7 @@ HRESULT node_set_named_attribute(struct domnode *node, IXMLDOMNode *attribute, I
+     if (!(attr = get_node_obj(attribute)))
+         return E_FAIL;
+ 
+-    if (attr->type != NODE_ATTRIBUTE)
++    if (attr->type != NODE_ATTRIBUTE || domnode_is_readonly(node))
+         return E_FAIL;
+ 
+     if (attr->parent)
+@@ -3762,7 +4027,7 @@ HRESULT node_set_attribute_value(struct domnode *node, const WCHAR *name, const
+     HRESULT hr;
+     VARIANT v;
+ 
+-    if (FAILED(parse_qualified_name(name, &attr_name)))
++    if (domnode_is_readonly(node) || FAILED(parse_qualified_name(name, &attr_name)))
+         return E_FAIL;
+ 
+     if (FAILED(hr = variant_get_str_value(value, &v, &attr_value)))
+@@ -3898,6 +4163,12 @@ struct parse_context
+     LONG space_line, space_column;  /* the first space left out of an element declared EMPTY */
+     BSTR *empty;                    /* the elements declared EMPTY */
+     size_t empty_count, empty_size;
++
++    /* MSXML gives each internal entity's declaration the nodes of its replacement text when the DTD
++       ends, and each reference to it a copy of them, so the reader's events for its text are left out */
++    struct domnode *entity;         /* the declaration whose text is being read */
++    BSTR entity_text;               /* that text, where an error in it is reported */
++    unsigned int skip;              /* depth of references whose nodes are copies */
+ };
+ 
+ static void parse_context_get_position(struct parse_context *c, LONG *line, LONG *column)
+@@ -4141,6 +4412,58 @@ static HRESULT WINAPI parse_content_handler_endPrefixMapping(ISAXContentHandler
+     return S_OK;
+ }
+ 
++/* a reference to an entity where the reader is: a copy of the nodes of its declaration, once the
++   text of that is read */
++static struct domnode *parse_context_create_entity_reference(struct parse_context *c, struct domnode *parent,
++        const WCHAR *name, int name_len, bool *copied)
++{
++    struct domnode *ref, *decl;
++
++    *copied = false;
++    parse_context_node_create(c, NODE_ENTITY_REFERENCE, name, name_len, NULL, 0, c->root, &ref);
++    if (!ref) return NULL;
++    if (parent->type == NODE_ATTRIBUTE)
++        domnode_append_child(parent, ref);
++    else
++        parse_context_append_child(c, parent, ref);
++    parse_context_get_position(c, &ref->parse_start_line, &ref->parse_start_column);
++    ref->parse_line = ref->parse_start_line;
++    ref->parse_end_column = ref->parse_start_column;
++
++    if (!c->entity && (decl = domnode_get_entity_decl(c->root, ref->name)) && (decl->flags & DOMNODE_ENTITY_PARSED))
++    {
++        if (FAILED(c->status = domnode_fill_entity_reference(ref))) return NULL;
++        *copied = true;
++    }
++    return ref;
++}
++
++/* an attribute value with references to entities, as saxattributes_get_parts() gives it */
++static void parse_context_put_attribute_parts(struct parse_context *c, struct domnode *attr, const WCHAR *parts)
++{
++    const WCHAR *p = parts, *end = parts + SysStringLen((BSTR)parts), *start;
++    struct domnode *ref, *text;
++    bool copied;
++
++    while (p < end && c->status == S_OK)
++    {
++        start = p;
++        if (*p == 0xffff)
++        {
++            for (start = ++p; p < end && *p != 0xfffe; ++p);
++            ref = parse_context_create_entity_reference(c, attr, start, p - start, &copied);
++            if (ref && !copied) domnode_set_readonly(ref);
++            if (p < end) ++p;
++            continue;
++        }
++        while (p < end && *p != 0xffff) ++p;
++        parse_context_node_create(c, NODE_TEXT, NULL, 0, NULL, 0, c->root, &text);
++        if (!text) break;
++        domnode_append_child(attr, text);
++        if (!(text->data = SysAllocStringLen(start, p - start))) c->status = E_OUTOFMEMORY;
++    }
++}
++
+ static HRESULT WINAPI parse_content_handler_startElement(ISAXContentHandler *iface, const WCHAR *uri, int uri_len,
+         const WCHAR *name, int name_len, const WCHAR *qname, int qname_len, ISAXAttributes *attrs)
+ {
+@@ -4148,7 +4471,9 @@ static HRESULT WINAPI parse_content_handler_startElement(ISAXContentHandler *ifa
+     struct domnode *element, *attr;
+     int count, length;
+     const WCHAR *str;
++    BSTR parts;
+ 
++    if (c->skip) return S_OK;
+     parse_context_create_text_node(c, NODE_TEXT);
+     parse_context_node_create(c, NODE_ELEMENT, qname, qname_len, uri, uri_len, c->root, &element);
+     parse_context_append_child(c, c->node, element);
+@@ -4169,8 +4494,15 @@ static HRESULT WINAPI parse_content_handler_startElement(ISAXContentHandler *ifa
+             parse_context_node_create(c, NODE_ATTRIBUTE, str, length, uri, uri_len, c->root, &attr);
+             parse_context_append_attribute(c, element, attr);
+ 
+-            ISAXAttributes_getValue(attrs, i, &str, &length);
+-            parse_context_node_put_data(c, attr, str, length);
++            if (attr && (parts = saxattributes_get_parts(attrs, i)))
++            {
++                parse_context_put_attribute_parts(c, attr, parts);
++            }
++            else
++            {
++                ISAXAttributes_getValue(attrs, i, &str, &length);
++                parse_context_node_put_data(c, attr, str, length);
++            }
+ 
+             if (attr)
+             {
+@@ -4189,6 +4521,7 @@ static HRESULT WINAPI parse_content_handler_endElement(ISAXContentHandler *iface
+ {
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+ 
++    if (c->skip) return S_OK;
+     parse_context_create_text_node(c, NODE_TEXT);
+     if (c->node && c->locator)
+     {
+@@ -4208,6 +4541,7 @@ static HRESULT WINAPI parse_content_handler_characters(ISAXContentHandler *iface
+ {
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+ 
++    if (c->skip) return S_OK;
+     if (!c->buffer.count) parse_context_get_position(c, &c->text_line, &c->text_column);
+     string_append(&c->buffer, chars, count);
+ 
+@@ -4225,6 +4559,7 @@ static HRESULT WINAPI parse_content_handler_processingInstruction(ISAXContentHan
+     struct parse_context *c = impl_from_ISAXContentHandler(iface);
+     struct domnode *pi;
+ 
++    if (c->skip) return S_OK;
+     parse_context_create_text_node(c, NODE_TEXT);
+     parse_context_node_create(c, NODE_PROCESSING_INSTRUCTION, target, target_len, NULL, 0, c->root, &pi);
+     parse_context_append_child(c, c->node, pi);
+@@ -4233,9 +4568,20 @@ static HRESULT WINAPI parse_content_handler_processingInstruction(ISAXContentHan
+     return c->status;
+ }
+ 
++/* an entity with no text, or one whose declaration was not read: a reference with no nodes */
+ static HRESULT WINAPI parse_content_handler_skippedEntity(ISAXContentHandler *iface, const WCHAR *name, int name_len)
+ {
+-    return S_OK;
++    struct parse_context *c = impl_from_ISAXContentHandler(iface);
++    bool copied;
++
++    /* "[dtd]" for the external subset, parameter entities in the DTD */
++    if (c->skip || !name_len || name[0] == '[' || name[0] == '%') return S_OK;
++    if (!c->node || (c->node->type != NODE_ELEMENT && c->node->type != NODE_ENTITY_REFERENCE
++            && c->node->type != NODE_ENTITY)) return S_OK;
++
++    parse_context_create_text_node(c, NODE_TEXT);
++    parse_context_create_entity_reference(c, c->node, name, name_len, &copied);
++    return c->status;
+ }
+ 
+ static const ISAXContentHandlerVtbl parse_content_handler_vtbl =
+@@ -4415,7 +4761,27 @@ static HRESULT WINAPI parse_decl_handler_internalEntityDecl(ISAXDeclHandler *ifa
+ static HRESULT WINAPI parse_decl_handler_externalEntityDecl(ISAXDeclHandler *iface, const WCHAR *name,
+         int name_len, const WCHAR *pubid, int pubid_len, const WCHAR *sysid, int sysid_len)
+ {
+-    return S_OK;
++    struct parse_context *c = impl_from_ISAXDeclHandler(iface);
++    struct domnode *node, *attr;
++
++    if (!name_len || name[0] == '%') return S_OK;
++
++    parse_context_node_create(c, NODE_ENTITY, name, name_len, NULL, 0, c->root, &node);
++    if (pubid)
++    {
++        parse_context_node_create(c, NODE_ATTRIBUTE, L"PUBLIC", 6, NULL, 0, c->root, &attr);
++        parse_context_append_attribute(c, node, attr);
++        parse_context_node_put_data(c, attr, pubid, pubid_len);
++    }
++    if (sysid)
++    {
++        parse_context_node_create(c, NODE_ATTRIBUTE, L"SYSTEM", 6, NULL, 0, c->root, &attr);
++        parse_context_append_attribute(c, node, attr);
++        parse_context_node_put_data(c, attr, sysid, sysid_len);
++    }
++    parse_context_append_child(c, c->node, node);
++
++    return c->status;
+ }
+ 
+ static const ISAXDeclHandlerVtbl parse_decl_handler_vtbl =
+@@ -4468,6 +4834,9 @@ static HRESULT WINAPI parse_error_handler_fatalError(ISAXErrorHandler *iface, IS
+     struct parse_context *c = CONTAINING_RECORD(iface, struct parse_context, error_handler);
+ 
+     parse_context_set_error(c, locator, code, message);
++    /* in the replacement text of an entity, read on its own: the line of that text */
++    if (c->entity_text && !c->error.srctext)
++        parse_error_set_source(&c->error, c->entity_text, SysStringLen(c->entity_text));
+     return S_OK;
+ }
+ 
+@@ -4557,6 +4926,48 @@ static HRESULT WINAPI parse_extension_handler_dtd(ISAXExtensionHandler *iface,
+     return c->status;
+ }
+ 
++static HRESULT WINAPI parse_extension_handler_startEntityContent(ISAXExtensionHandler *iface, BSTR name, BSTR text)
++{
++    struct parse_context *c = impl_from_ISAXExtensionHandler(iface);
++    struct domnode *decl, *child;
++
++    if (!c->node || c->node->type != NODE_DOCUMENT_TYPE) return S_OK;
++    LIST_FOR_EACH_ENTRY(child, &c->node->children, struct domnode, entry)
++    {
++        if (child->type != NODE_ENTITY || !child->name || wcscmp(child->name, name)) continue;
++        decl = child;
++        /* the first declaration of an entity is the one that counts */
++        if (decl->flags & DOMNODE_ENTITY_PARSED) break;
++        c->entity = decl;
++        if (!(c->entity_text = SysAllocStringLen(text, SysStringLen(text))))
++            return c->status = E_OUTOFMEMORY;
++        c->node = decl;
++        return S_OK;
++    }
++    /* nothing to make: leave the events out */
++    c->skip = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI parse_extension_handler_endEntityContent(ISAXExtensionHandler *iface)
++{
++    struct parse_context *c = impl_from_ISAXExtensionHandler(iface);
++
++    if (!c->entity)
++    {
++        c->skip = 0;
++        return S_OK;
++    }
++    parse_context_create_text_node(c, NODE_TEXT);
++    domnode_set_readonly(c->entity);
++    c->entity->flags |= DOMNODE_ENTITY_PARSED;
++    c->node = c->entity->parent;
++    c->entity = NULL;
++    SysFreeString(c->entity_text);
++    c->entity_text = NULL;
++    return c->status;
++}
++
+ static const ISAXExtensionHandlerVtbl parse_extension_handler_vtbl =
+ {
+     parse_extension_handler_QueryInterface,
+@@ -4564,6 +4975,8 @@ static const ISAXExtensionHandlerVtbl parse_extension_handler_vtbl =
+     parse_extension_handler_Release,
+     parse_extension_handler_xmldecl,
+     parse_extension_handler_dtd,
++    parse_extension_handler_startEntityContent,
++    parse_extension_handler_endEntityContent,
+ };
+ 
+ static struct parse_context *impl_from_ISAXLexicalHandler(ISAXLexicalHandler *iface)
+@@ -4625,27 +5038,68 @@ static HRESULT WINAPI parse_lexical_handler_endDTD(ISAXLexicalHandler *iface)
+     return S_OK;
+ }
+ 
++/* A reference to an entity in content.  Its nodes are a copy of those of the entity's declaration,
++ * so the events for the entity's text are left out; within the text of a declaration, and for an
++ * entity whose text was not read, they make them. */
+ static HRESULT WINAPI parse_lexical_handler_startEntity(ISAXLexicalHandler *iface,
+         const WCHAR *name, int name_len)
+ {
+-    return S_OK;
++    struct parse_context *c = impl_from_ISAXLexicalHandler(iface);
++    struct domnode *ref;
++    bool copied;
++
++    /* parameter entities in the DTD */
++    if (!name_len || name[0] == '%') return S_OK;
++    if (c->skip)
++    {
++        ++c->skip;
++        return S_OK;
++    }
++
++    parse_context_create_text_node(c, NODE_TEXT);
++    if (!(ref = parse_context_create_entity_reference(c, c->node, name, name_len, &copied)))
++        return c->status;
++    if (copied)
++        c->skip = 1;
++    else
++        c->node = ref;
++    return c->status;
+ }
+ 
+ static HRESULT WINAPI parse_lexical_handler_endEntity(ISAXLexicalHandler *iface,
+         const WCHAR *name, int name_len)
+ {
+-    return S_OK;
++    struct parse_context *c = impl_from_ISAXLexicalHandler(iface);
++
++    if (!name_len || name[0] == '%') return S_OK;
++    if (c->skip)
++    {
++        --c->skip;
++        return S_OK;
++    }
++
++    parse_context_create_text_node(c, NODE_TEXT);
++    if (c->node && c->node->type == NODE_ENTITY_REFERENCE)
++    {
++        if (!c->entity) domnode_set_readonly(c->node);
++        c->node = c->node->parent;
++    }
++    return c->status;
+ }
+ 
+ static HRESULT WINAPI parse_lexical_handler_startCDATA(ISAXLexicalHandler *iface)
+ {
+     struct parse_context *c = impl_from_ISAXLexicalHandler(iface);
++
++    if (c->skip) return S_OK;
+     return parse_context_create_text_node(c, NODE_TEXT);
+ }
+ 
+ static HRESULT WINAPI parse_lexical_handler_endCDATA(ISAXLexicalHandler *iface)
+ {
+     struct parse_context *c = impl_from_ISAXLexicalHandler(iface);
++
++    if (c->skip) return S_OK;
+     return parse_context_create_text_node(c, NODE_CDATA_SECTION);
+ }
+ 
+@@ -4654,6 +5108,7 @@ static HRESULT WINAPI parse_lexical_handler_comment(ISAXLexicalHandler *iface, c
+     struct parse_context *c = impl_from_ISAXLexicalHandler(iface);
+     struct domnode *comment;
+ 
++    if (c->skip) return S_OK;
+     parse_context_create_text_node(c, NODE_TEXT);
+     parse_context_node_create(c, NODE_COMMENT, NULL, 0, NULL, 0, c->root, &comment);
+     parse_context_append_child(c, c->node, comment);
+@@ -4757,7 +5212,9 @@ static void parse_context_cleanup(struct parse_context *c)
+ 
+     for (i = 0; i < c->empty_count; i++) SysFreeString(c->empty[i]);
+     free(c->empty);
++    SysFreeString(c->entity_text);
+     SysFreeString(c->error.reason);
++    SysFreeString(c->error.srctext);
+     free(c->buffer.data);
+     if (c->root) domnode_destroy_tree(c->root);
+     if (c->locator) ISAXLocator_Release(c->locator);
+@@ -4846,6 +5303,7 @@ HRESULT parse_stream(ISequentialStream *stream, bool utf16, const struct domdoc_
+     {
+         *error = context.error;
+         context.error.reason = NULL;
++        context.error.srctext = NULL;
+         if (!error->code) error->code = hr;
+     }
+ 
+@@ -5048,6 +5506,11 @@ static xmlNodePtr create_xmlnode_from_domnode(struct xmldoc_context *context, st
+                 xmlSetTreeDoc((xmlNodePtr)dtd, context->xmldoc);
+             }
+             break;
++        case NODE_ENTITY_REFERENCE:
++            /* what it stands for, in its place */
++            LIST_FOR_EACH_ENTRY(n, &node->children, struct domnode, entry)
++                create_xmlnode_from_domnode(context, n);
++            break;
+         default:
+             FIXME("Not supported for node type %d.\n", node->type);
+             break;
+@@ -5589,7 +6052,8 @@ void node_move_children(struct domnode *dest, struct domnode *src)
+     }
+ }
+ 
+-/* Adjacent text nodes in an element and in the elements below it become one. */
++/* Adjacent text nodes in an element and in the elements below it become one; what an entity reference
++ * holds stays as it is. */
+ HRESULT node_normalize(struct domnode *node)
+ {
+     struct domnode *child, *next, *after;
+@@ -5597,6 +6061,9 @@ HRESULT node_normalize(struct domnode *node)
+     BSTR str;
+     HRESULT hr;
+ 
++    if (domnode_is_readonly(node))
++        return S_OK;
++
+     for (child = domnode_get_first_child(node); child; child = next)
+     {
+         next = domnode_get_next_sibling(child);
+@@ -5640,6 +6107,9 @@ HRESULT node_split_text(struct domnode *node, LONG offset, IXMLDOMText **out)
+ 
+     *out = NULL;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     length = SysStringLen(node->data);
+     if (offset > length)
+         return E_INVALIDARG;
+@@ -5676,6 +6146,9 @@ HRESULT node_delete_data(struct domnode *node, LONG offset, LONG count)
+     ULONG length = SysStringLen(node->data);
+     BSTR str = NULL;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     if (offset < 0 || count < 0 || offset > length)
+         return E_INVALIDARG;
+ 
+@@ -5742,6 +6215,9 @@ HRESULT node_insert_data(struct domnode *node, LONG offset, BSTR data)
+     LONG data_length = SysStringLen(data);
+     BSTR str;
+ 
++    if (domnode_is_readonly(node))
++        return E_FAIL;
++
+     if (data_length == 0)
+         return S_OK;
+ 
+diff --git a/dlls/msxml3/notation.c b/dlls/msxml3/notation.c
+index 1936c568657..c6d283505fa 100644
+--- a/dlls/msxml3/notation.c
++++ b/dlls/msxml3/notation.c
+@@ -352,9 +352,11 @@ static HRESULT WINAPI domnotation_put_dataType(IXMLDOMNotation *iface, BSTR p)
+ 
+ static HRESULT WINAPI domnotation_get_xml(IXMLDOMNotation *iface, BSTR *p)
+ {
+-    FIXME("%p, %p.\n", iface, p);
++    struct domnotation *notation = impl_from_IXMLDOMNotation(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, p);
++
++    return node_get_xml(notation->node, p);
+ }
+ 
+ static HRESULT WINAPI domnotation_transformNode(IXMLDOMNotation *iface, IXMLDOMNode *node, BSTR *p)
+@@ -417,16 +419,24 @@ static HRESULT WINAPI domnotation_transformNodeToObject(IXMLDOMNotation *iface,
+ 
+ static HRESULT WINAPI domnotation_get_publicId(IXMLDOMNotation *iface, VARIANT *id)
+ {
+-    FIXME("%p, %p: stub\n", iface, id);
++    struct domnotation *notation = impl_from_IXMLDOMNotation(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, id);
++
++    if (!id) return E_INVALIDARG;
++    V_VT(id) = VT_BSTR;
++    return node_get_declaration_id(notation->node, L"PUBLIC", &V_BSTR(id));
+ }
+ 
+ static HRESULT WINAPI domnotation_get_systemId(IXMLDOMNotation *iface, VARIANT *id)
+ {
+-    FIXME("%p, %p: stub\n", iface, id);
++    struct domnotation *notation = impl_from_IXMLDOMNotation(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, id);
++
++    if (!id) return E_INVALIDARG;
++    V_VT(id) = VT_BSTR;
++    return node_get_declaration_id(notation->node, L"SYSTEM", &V_BSTR(id));
+ }
+ 
+ static const struct IXMLDOMNotationVtbl domnotation_vtbl =
+diff --git a/dlls/msxml3/saxreader.c b/dlls/msxml3/saxreader.c
+index 39473351c4e..f651e209970 100644
+--- a/dlls/msxml3/saxreader.c
++++ b/dlls/msxml3/saxreader.c
+@@ -190,6 +190,7 @@ struct attribute
+     BSTR value;
+     BSTR type;
+     BSTR prefix;
++    BSTR parts;                 /* the value as written, for the DOM; see saxattributes_get_parts() */
+     bool nsdef;
+ };
+ 
+@@ -279,6 +280,7 @@ struct entity_decl
+     struct list entry;
+     BSTR name;
+     BSTR sysid;
++    BSTR sysid_literal;     /* the system identifier as declared, for the DOM */
+     BSTR value;
+     struct
+     {
+@@ -950,6 +952,8 @@ struct saxlocator
+     bool dtd_pe_references;     /* the internal subset refers to parameter entities */
+     const WCHAR *limit_name;
+     bool string_input;
++    bool entity_content;        /* reads the replacement text of an entity on its own, for the DOM */
++    bool attr_markup;           /* a value in the start tag being read takes a '<' from an entity */
+ 
+     struct
+     {
+@@ -1102,6 +1106,7 @@ static void saxreader_free_entity(struct entity_decl *entity)
+     free(entity->content.parts);
+     SysFreeString(entity->name);
+     SysFreeString(entity->sysid);
++    SysFreeString(entity->sysid_literal);
+     SysFreeString(entity->value);
+     free(entity);
+ }
+@@ -1857,6 +1862,18 @@ static const struct ISAXAttributesVtbl isaxattributes_vtbl =
+     isaxattributes_getValueFromQName
+ };
+ 
++/* The value of an attribute of the element being started as the document writes it, for the DOM,
++ * which keeps a node for each reference to an entity in it: each is U+FFFF, the entity's name and
++ * U+FFFE, characters a document cannot hold; NULL when the value refers to no entity. */
++BSTR saxattributes_get_parts(ISAXAttributes *iface, int index)
++{
++    const struct attribute *attr;
++
++    if (iface->lpVtbl != &isaxattributes_vtbl) return NULL;
++    if (!(attr = saxlocator_get_attribute(impl_from_ISAXAttributes(iface), index))) return NULL;
++    return attr->parts;
++}
++
+ static void saxreader_free_bstr(BSTR *str)
+ {
+     if (str)
+@@ -1877,6 +1894,7 @@ static void saxreader_clear_attributes(struct saxlocator *locator)
+         saxreader_free_bstr(&attr->qname);
+         saxreader_free_bstr(&attr->type);
+         saxreader_free_bstr(&attr->prefix);
++        saxreader_free_bstr(&attr->parts);
+     }
+ 
+     free(locator->attributes.map);
+@@ -3975,7 +3993,7 @@ static BSTR saxreader_get_attribute_type(struct saxlocator *locator, struct elem
+ }
+ 
+ static void saxreader_add_attribute(struct saxlocator *locator, struct element *element,
+-        const struct parsed_name *name, BSTR value, bool nsdef)
++        const struct parsed_name *name, BSTR value, BSTR parts, bool nsdef)
+ {
+     struct attribute *attr;
+ 
+@@ -3999,6 +4017,7 @@ static void saxreader_add_attribute(struct saxlocator *locator, struct element *
+     attr->local = saxreader_alloc_string(locator, nsdef ? L"" : name->local);
+     attr->qname = saxreader_alloc_string(locator, name->qname);
+     attr->value = saxreader_alloc_string(locator, value);
++    attr->parts = parts ? saxreader_alloc_stringlen(locator, parts, SysStringLen(parts)) : NULL;
+     attr->type = saxreader_get_attribute_type(locator, element, name->qname);
+     attr->nsdef = nsdef;
+ }
+@@ -4022,7 +4041,7 @@ static void saxreader_add_default_attributes(struct saxlocator *locator, struct
+                     continue;
+ 
+                 if (!saxreader_has_attribute(locator, attr->name.qname))
+-                    saxreader_add_attribute(locator, element, &attr->name, attr->value, false);
++                    saxreader_add_attribute(locator, element, &attr->name, attr->value, NULL, false);
+             }
+         }
+     }
+@@ -4199,6 +4218,8 @@ static void saxreader_stringify_entity(struct saxlocator *locator, struct string
+         }
+         else
+         {
++            /* [WFC: No < in Attribute Values] */
++            if (wcschr(part->value, '<')) locator->attr_markup = true;
+             saxreader_string_append(locator, buffer, part->value, SysStringLen(part->value));
+         }
+     }
+@@ -4206,14 +4227,21 @@ static void saxreader_stringify_entity(struct saxlocator *locator, struct string
+ 
+ /* [10] AttValue ::= '"' ([^<&"] | Reference)* '"'
+         |  "'" ([^<&'] | Reference)* "'" */
+-static BSTR saxreader_parse_attvalue(struct saxlocator *locator)
++static BSTR saxreader_parse_attvalue(struct saxlocator *locator, BSTR *parts)
+ {
+-    struct string_buffer buffer = { 0 };
++    static const WCHAR ref_start = 0xffff, ref_end = 0xfffe;
++    struct string_buffer buffer = { 0 }, written = { 0 };
++    bool references = false, keep;
+     struct text_position position;
+     WCHAR quote[2] = { 0 }, ch;
+     bool normalized;
++    size_t count;
+     BSTR name;
+ 
++    /* the DOM keeps a node for each reference to an entity in an element's attribute */
++    if (parts) *parts = NULL;
++    keep = parts && (locator->saxreader->features & DOMReader);
++
+     if (!(quote[0] = saxreader_is_quote(locator)))
+     {
+         saxreader_set_error_here(locator, E_SAX_MISSINGQUOTE);
+@@ -4234,6 +4262,7 @@ static BSTR saxreader_parse_attvalue(struct saxlocator *locator)
+             break;
+         }
+ 
++        count = buffer.count;
+         if (saxreader_peek(locator, L"&#", 2))
+         {
+             saxreader_parse_charref(locator, &buffer, &position);
+@@ -4245,7 +4274,17 @@ static BSTR saxreader_parse_attvalue(struct saxlocator *locator)
+ 
+             saxreader_parse_name(locator, &name);
+             if (saxreader_cmp(locator, L";"))
++            {
+                 saxreader_stringify_entity(locator, &buffer, name);
++                if (keep && name && !saxreader_get_predefined_entity(name))
++                {
++                    saxreader_string_append(locator, &written, &ref_start, 1);
++                    saxreader_string_append(locator, &written, name, SysStringLen(name));
++                    saxreader_string_append(locator, &written, &ref_end, 1);
++                    references = true;
++                    count = buffer.count;
++                }
++            }
+             else
+                 saxreader_set_error(locator, E_SAX_INVALID_UNICODE);
+             SysFreeString(name);
+@@ -4286,10 +4325,19 @@ static BSTR saxreader_parse_attvalue(struct saxlocator *locator)
+                 saxreader_skip(locator, 1);
+             }
+         }
++        if (keep && buffer.count > count)
++            saxreader_string_append(locator, &written, buffer.data + count, buffer.count - count);
+     }
+ 
+-    if (locator->status != S_OK) return NULL;
++    if (locator->status != S_OK)
++    {
++        free(written.data);
++        free(buffer.data);
++        return NULL;
++    }
+ 
++    if (references) *parts = saxreader_string_to_bstr(locator, &written);
++    else free(written.data);
+     return saxreader_string_to_bstr(locator, &buffer);
+ }
+ 
+@@ -4310,7 +4358,7 @@ static bool saxreader_add_namespace_attribute(struct saxlocator *locator, struct
+ static void saxreader_parse_attribute(struct saxlocator *locator, struct element *element)
+ {
+     struct parsed_name name;
+-    BSTR value;
++    BSTR value, parts;
+     bool ns;
+ 
+     saxreader_parse_qname(locator, &name);
+@@ -4318,13 +4366,14 @@ static void saxreader_parse_attribute(struct saxlocator *locator, struct element
+     if (!saxreader_cmp(locator, L"="))
+         saxreader_set_error(locator, E_SAX_MISSINGEQUALS);
+     saxreader_skipspaces(locator);
+-    value = saxreader_parse_attvalue(locator);
++    value = saxreader_parse_attvalue(locator, &parts);
+ 
+     ns = saxreader_add_namespace_attribute(locator, element, &name, value);
+-    saxreader_add_attribute(locator, element, &name, value, ns);
++    saxreader_add_attribute(locator, element, &name, value, parts, ns);
+ 
+     saxreader_free_name(&name);
+     SysFreeString(value);
++    SysFreeString(parts);
+ }
+ 
+ static BSTR saxreader_parse_xmldecl_attribute(struct saxlocator *locator, struct parsed_name *name)
+@@ -4339,7 +4388,7 @@ static BSTR saxreader_parse_xmldecl_attribute(struct saxlocator *locator, struct
+     /* after the quote, where errors in the value are */
+     locator->value_position = locator->buffer.position;
+     locator->value_position.column++;
+-    value = saxreader_parse_attvalue(locator);
++    value = saxreader_parse_attvalue(locator, NULL);
+ 
+     return value;
+ }
+@@ -4506,6 +4555,19 @@ static void saxreader_parse_starttag(struct saxlocator *locator)
+         saxreader_set_error_here(locator, E_SAX_DUPLICATEATTRIBUTE);
+     }
+ 
++    /* the DOM finds a '<' that an entity brings into an attribute value when it makes the value's
++       nodes, after the start tag */
++    if (locator->attr_markup)
++    {
++        locator->attr_markup = false;
++        if (locator->status == S_OK && (locator->saxreader->features & DOMReader))
++        {
++            locator->line = position.line;
++            locator->column = position.column;
++            saxreader_set_error(locator, E_SAX_BADCHARINSTRING);
++        }
++    }
++
+     /* Append default attributes from DTD. */
+     saxreader_add_default_attributes(locator, element);
+ 
+@@ -5097,6 +5159,19 @@ static void saxreader_parse_chardata(struct saxlocator *locator)
+         }
+     }
+ 
++    /* the end of an entity's replacement text, read on its own, ends its content */
++    if (locator->entity_content && locator->status == S_OK)
++    {
++        if (context.buffer.count)
++        {
++            chars = saxreader_string_to_bstr(locator, &context.buffer);
++            saxlocator_characters(locator, &context.position, chars);
++            SysFreeString(chars);
++        }
++        else free(context.buffer.data);
++        return;
++    }
++
+     free(context.buffer.data);
+     /* the input ran out inside an element: Windows gives that no position */
+     if (locator->status == S_OK)
+@@ -5624,9 +5699,11 @@ static void saxreader_resolve_system_id(struct saxlocator *locator, BSTR *system
+ /* [75] ExternalID ::= 'SYSTEM' S SystemLiteral
+                      | 'PUBLIC' S PubidLiteral S SystemLiteral
+    [83] PublicID ::= 'PUBLIC' S PubidLiteral */
+-static void saxreader_parse_externalid(struct saxlocator *locator, BSTR *systemid, BSTR *publicid, bool is_notation)
++static void saxreader_parse_externalid(struct saxlocator *locator, BSTR *systemid, BSTR *publicid, bool is_notation,
++        BSTR *literal)
+ {
+     *systemid = *publicid = NULL;
++    if (literal) *literal = NULL;
+ 
+     if (saxreader_cmp(locator, L"SYSTEM"))
+     {
+@@ -5662,9 +5739,18 @@ static void saxreader_parse_externalid(struct saxlocator *locator, BSTR *systemi
+         *systemid = saxreader_parse_systemliteral(locator);
+     }
+ 
++    /* the DOM has the identifier as declared, and loads the resolved one */
++    if (literal && *systemid)
++        *literal = saxreader_alloc_stringlen(locator, *systemid, SysStringLen(*systemid));
+     saxreader_resolve_system_id(locator, systemid);
+ }
+ 
++/* the system identifier of an entity as the handlers are told it: the DOM has it as declared */
++static BSTR saxreader_reported_sysid(const struct saxlocator *locator, const struct entity_decl *decl)
++{
++    return (locator->saxreader->features & DOMReader) ? decl->sysid_literal : decl->sysid;
++}
++
+ /* Read EntityRef without much validation */
+ static void saxreader_parse_entityvalue_entityref(struct saxlocator *locator, struct string_buffer *buffer)
+ {
+@@ -5827,12 +5913,12 @@ static void saxreader_parse_entitydecl(struct saxlocator *locator)
+         }
+         else
+         {
+-            saxreader_parse_externalid(locator, &decl->sysid, &pubid, false);
++            saxreader_parse_externalid(locator, &decl->sysid, &pubid, false, &decl->sysid_literal);
+             saxreader_skipspaces(locator);
+             if (saxreader_cmp(locator, L">"))
+             {
+                 if (undeclared)
+-                    saxlocator_external_entitydecl(locator, decl->name, pubid, decl->sysid);
++                    saxlocator_external_entitydecl(locator, decl->name, pubid, saxreader_reported_sysid(locator, decl));
+             }
+             else
+             {
+@@ -5860,7 +5946,7 @@ static void saxreader_parse_entitydecl(struct saxlocator *locator)
+         }
+         else
+         {
+-            saxreader_parse_externalid(locator, &decl->sysid, &pubid, false);
++            saxreader_parse_externalid(locator, &decl->sysid, &pubid, false, &decl->sysid_literal);
+ 
+             saxreader_more(locator);
+             if (!saxreader_peek(locator, L">", 1))
+@@ -5875,7 +5961,8 @@ static void saxreader_parse_entitydecl(struct saxlocator *locator)
+                 if (saxreader_cmp(locator, L">"))
+                 {
+                     if (undeclared)
+-                        saxlocator_unparsed_entitydecl(locator, decl->name, pubid, decl->sysid, notation);
++                        saxlocator_unparsed_entitydecl(locator, decl->name, pubid,
++                                saxreader_reported_sysid(locator, decl), notation);
+                 }
+                 else
+                 {
+@@ -5888,7 +5975,8 @@ static void saxreader_parse_entitydecl(struct saxlocator *locator)
+                 if (saxreader_cmp(locator, L">"))
+                 {
+                     if (undeclared)
+-                        saxlocator_external_entitydecl(locator, decl->name, pubid, decl->sysid);
++                        saxlocator_external_entitydecl(locator, decl->name, pubid,
++                                saxreader_reported_sysid(locator, decl));
+                 }
+                 else
+                 {
+@@ -6046,7 +6134,7 @@ static enum attribute_default_type saxreader_parse_defaultdecl(struct saxlocator
+         ret = ATTR_DEF_TYPE_FIXED;
+         saxreader_skip_required_spaces(locator);
+     }
+-    *value = saxreader_parse_attvalue(locator);
++    *value = saxreader_parse_attvalue(locator, NULL);
+ 
+     return ret;
+ }
+@@ -6100,7 +6188,7 @@ static void saxreader_parse_attlistdecl(struct saxlocator *locator)
+ /* [82] NotationDecl ::= '<!NOTATION' S Name S (ExternalID | PublicID) S? '>' */
+ static void saxreader_parse_notationdecl(struct saxlocator *locator)
+ {
+-    BSTR name = NULL, sysid = NULL, pubid = NULL;
++    BSTR name = NULL, sysid = NULL, pubid = NULL, literal = NULL;
+ 
+     /* Skip <!NOTATION */
+     saxreader_skip(locator, 10);
+@@ -6109,16 +6197,18 @@ static void saxreader_parse_notationdecl(struct saxlocator *locator)
+     saxreader_shrink(locator);
+ 
+     saxreader_skip_required_spaces(locator);
+-    saxreader_parse_externalid(locator, &sysid, &pubid, true);
++    saxreader_parse_externalid(locator, &sysid, &pubid, true, &literal);
+     saxreader_skipspaces(locator);
+ 
+     if (!saxreader_cmp(locator, L">"))
+         saxreader_set_error(locator, E_SAX_EXPECTINGTAGEND);
+ 
+-    saxlocator_notationdecl(locator, &locator->buffer.position, name, pubid, sysid);
++    saxlocator_notationdecl(locator, &locator->buffer.position, name, pubid,
++            (locator->saxreader->features & DOMReader) ? literal : sysid);
+ 
+     SysFreeString(name);
+     SysFreeString(sysid);
++    SysFreeString(literal);
+     SysFreeString(pubid);
+ }
+ 
+@@ -6207,6 +6297,131 @@ static void saxreader_parse_intsubset(struct saxlocator *locator)
+ }
+ 
+ /* [28] doctypedecl ::= '<!DOCTYPE' S Name (S ExternalID)? S? ('[' intSubset ']' S?)? '>' */
++static void saxreader_detect_encoding(struct saxlocator *locator, bool force_utf16);
++
++/* [43] content ::= CharData? ((element | Reference | CDSect | PI | Comment) CharData?)*, to the end
++   of the input, for the replacement text of an entity */
++static void saxreader_parse_content(struct saxlocator *locator)
++{
++    struct entity_decl *entity;
++
++    while (locator->status == S_OK)
++    {
++        saxreader_more(locator);
++        if (!*saxreader_get_ptr(locator)) break;
++
++        if (saxreader_peek(locator, L"<", 1))
++        {
++            if (saxreader_peek(locator, L"</", 2))
++                saxreader_parse_endtag(locator);
++            else if (saxreader_peek(locator, L"<?", 2))
++                saxreader_parse_pi(locator);
++            else if (saxreader_peek(locator, L"<!--", 4))
++                saxreader_parse_comment(locator);
++            else if (saxreader_peek(locator, L"<![CDATA[", 9))
++                saxreader_parse_cdata(locator);
++            else
++                saxreader_parse_starttag(locator);
++        }
++        else if (saxreader_peek(locator, L"&", 1))
++        {
++            saxreader_parse_reference(locator);
++        }
++        else
++        {
++            saxreader_parse_chardata(locator);
++        }
++    }
++
++    /* the entities whose text ended it */
++    while (locator->status == S_OK && !list_empty(&locator->buffer.entities))
++    {
++        entity = LIST_ENTRY(list_head(&locator->buffer.entities), struct entity_decl, input_entry);
++        if (entity->remaining) break;
++        saxreader_pop_entity(locator);
++    }
++
++    if (locator->status == S_OK && !list_empty(&locator->elements))
++    {
++        locator->line = locator->column = 0;
++        saxreader_set_error(locator, locator->saxreader->version >= MSXML4 ? E_SAX_INPUTEND : E_SAX_UNCLOSEDTAG);
++    }
++}
++
++/* MSXML reads the replacement text of each internal entity on its own when the DTD ends, for the
++ * nodes of its declaration, and finds what is wrong in it even when nothing refers to the entity:
++ * where it is in that text.  The DOM is told which entity the events between belong to. */
++static void saxreader_parse_entity_content(struct saxlocator *locator, struct entity_decl *entity)
++{
++    struct saxextensionhandler_iface *handler = saxreader_get_extensionhandler(locator->saxreader);
++    ISequentialStream *stream;
++    struct saxlocator *text;
++    HRESULT hr;
++
++    if (FAILED(hr = stream_wrapper_create(entity->value, SysStringByteLen(entity->value), &stream)))
++        return saxreader_set_error(locator, hr);
++    hr = saxlocator_create(locator->saxreader, stream, locator->vbInterface, &text);
++    ISequentialStream_Release(stream);
++    if (FAILED(hr))
++        return saxreader_set_error(locator, hr);
++
++    text->dtd = parser_dtd_addref(locator->dtd);
++    text->dtd_external = locator->dtd_external;
++    text->dtd_pe_references = locator->dtd_pe_references;
++    text->string_input = true;
++    text->entity_content = true;
++    text->state = SAX_PARSER_CONTENT;
++    saxreader_detect_encoding(text, true);
++
++    if (text->status == S_OK && FAILED(hr = ISAXExtensionHandler_startEntityContent(handler->handler,
++            entity->name, entity->value)))
++        saxreader_set_error(text, hr);
++    entity->visited = true;
++    saxreader_parse_content(text);
++    entity->visited = false;
++    if (text->status == S_OK && FAILED(hr = ISAXExtensionHandler_endEntityContent(handler->handler)))
++        saxreader_set_error(text, hr);
++
++    if (text->status != S_OK)
++    {
++        saxreader_fatal_error(text);
++        saxreader_set_error(locator, text->status);
++    }
++    ISAXLocator_Release(&text->ISAXLocator_iface);
++}
++
++static void saxreader_parse_entity_contents(struct saxlocator *locator)
++{
++    struct entity_decl *entity;
++
++    if (!(locator->saxreader->features & DOMReader) || !locator->dtd || locator->vbInterface
++            || !saxreader_has_handler(locator, SAXExtensionHandler))
++        return;
++
++    LIST_FOR_EACH_ENTRY(entity, &locator->dtd->entities, struct entity_decl, entry)
++    {
++        HRESULT hr;
++
++        if (locator->status != S_OK) break;
++        if (entity->unparsed || entity->name[0] == '%') continue;
++        /* resolving externals, the external ones are loaded too, used or not: what fails, fails
++           where the DTD ends */
++        if (!entity->value && entity->sysid && (locator->saxreader->features & ExternalGeneralEntities)
++                && FAILED(hr = saxreader_load_external_entity(locator, entity)))
++        {
++            /* MSXML 3 gives the error of the download, a file not there as an object not found;
++               MSXML 6 its own (Windows 11) */
++            if (hr == INET_E_RESOURCE_NOT_FOUND) hr = INET_E_OBJECT_NOT_FOUND;
++            locator->line = locator->buffer.position.line;
++            locator->column = locator->buffer.position.column;
++            saxreader_set_error(locator, (locator->saxreader->features & DOMVersion6) ? E_XML_ENTITY_LOAD : hr);
++            break;
++        }
++        if (!entity->value || !*entity->value) continue;
++        saxreader_parse_entity_content(locator, entity);
++    }
++}
++
+ static void saxreader_parse_doctype(struct saxlocator *locator)
+ {
+     BSTR name, sysid, pubid;
+@@ -6239,7 +6454,7 @@ static void saxreader_parse_doctype(struct saxlocator *locator)
+     saxreader_parse_name(locator, &name);
+ 
+     saxreader_skipspaces(locator);
+-    saxreader_parse_externalid(locator, &sysid, &pubid, false);
++    saxreader_parse_externalid(locator, &sysid, &pubid, false, NULL);
+     if (sysid) locator->dtd_external = true;
+ 
+     saxreader_skipspaces(locator);
+@@ -6266,6 +6481,7 @@ static void saxreader_parse_doctype(struct saxlocator *locator)
+     }
+ 
+     saxlocator_extension_dtd(locator);
++    saxreader_parse_entity_contents(locator);
+     saxlocator_enddtd(locator);
+ 
+     SysFreeString(name);
+diff --git a/dlls/msxml3/saxreader_extensions.idl b/dlls/msxml3/saxreader_extensions.idl
+index a341e44df71..c4efe70fc10 100644
+--- a/dlls/msxml3/saxreader_extensions.idl
++++ b/dlls/msxml3/saxreader_extensions.idl
+@@ -33,6 +33,10 @@ interface ISAXExtensionHandler : IUnknown
+ {
+     HRESULT xmldecl([in] BSTR version, [in] BSTR encoding,[in] BSTR standalone);
+     HRESULT dtd([in] BSTR data, [in] struct dtd *dtd);
++    /* the content of an internal entity, read on its own when the DTD ends: the events between
++       these two build its nodes */
++    HRESULT startEntityContent([in] BSTR name, [in] BSTR text);
++    HRESULT endEntityContent();
+ }
+ 
+ [
+diff --git a/dlls/msxml3/tests/domdoc.c b/dlls/msxml3/tests/domdoc.c
+index 498a8d92069..129304e413b 100644
+--- a/dlls/msxml3/tests/domdoc.c
++++ b/dlls/msxml3/tests/domdoc.c
+@@ -19402,13 +19402,9 @@ static void test_dtd_notation(void)
+     hr = IXMLDOMDocumentType_get_firstChild(doctype, &node);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     hr = IXMLDOMNode_get_xml(node, &str);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-if (hr == S_OK)
+-{
+     ok(!wcscmp(str, L"<!NOTATION notation0 PUBLIC \"pub-id-0\" \"sys-id-0\">"), "Unexpected type %s.\n", debugstr_w(str));
+     SysFreeString(str);
+-}
+ 
+     /* Notation attributes */
+     hr = IXMLDOMNode_get_attributes(node, &map);
+@@ -19447,13 +19443,9 @@ if (hr == S_OK)
+     hr = IXMLDOMDocumentType_get_lastChild(doctype, &node);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     hr = IXMLDOMNode_get_xml(node, &str);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-if (hr == S_OK)
+-{
+     ok(!wcscmp(str, L"<!NOTATION notation1 PUBLIC \"pub-id-1\">"), "Unexpected type %s.\n", debugstr_w(str));
+     SysFreeString(str);
+-}
+     IXMLDOMNode_Release(node);
+ 
+     IXMLDOMDocumentType_Release(doctype);
+@@ -19533,13 +19525,9 @@ static void test_dtd_entity(void)
+     ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IXMLDOMNode_get_xml(node, &str);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-if (hr == S_OK)
+-{
+     ok(!wcscmp(str, L"<!ENTITY ent1 SYSTEM \"sys-id\" NDATA notation0>"), "Unexpected type %s.\n", debugstr_w(str));
+     SysFreeString(str);
+-}
+     /* Entity attributes */
+     hr = IXMLDOMNode_get_attributes(node, &map);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -20704,6 +20692,14 @@ static void test_dtd_validation_errors(void)
+         { "<!DOCTYPE r [\n<!ELEMENT r (a)>\n<!ELEMENT a EMPTY>\n]>\n<r>\n  <b/>\n</r>", 0xc00ce014, 6, 7, 63,
+           L"  <b/>", .validate_code = { 0xc00ce014, 0xc00ce014 } },
+         { "<!DOCTYPE r [<!ELEMENT r (a)><!ELEMENT a EMPTY>]><r><a/></r>" },
++        /* through entity references, at the reference */
++        { "<!DOCTYPE r [<!ELEMENT r (c)><!ELEMENT b (#PCDATA)><!ELEMENT c EMPTY><!ENTITY m \"<b>y</b>\">]><r>&m;</r>",
++          0xc00ce014, 1, 98, 97, .validate_code = { 0xc00ce014, 0xc00ce014 } },
++        { "<!DOCTYPE r [\n<!ELEMENT r (b)>\n<!ELEMENT b EMPTY>\n<!ENTITY m \"<b>y</b>\">\n]>\n<r>\n&m;</r>", 0xc00ce018,
++          7, 2, 81, L"&m;</r>", .validate_code = { 0xc00ce018, 0xc00ce018 } },
++        { "<!DOCTYPE r [<!ELEMENT r (b)><!ELEMENT b (#PCDATA)><!ENTITY m \"<b>y</b>\">]><r>&m;</r>" },
++        /* the space an entity has is left out of it */
++        { "<!DOCTYPE r [<!ELEMENT r EMPTY><!ENTITY w \" \">]><r>&w;</r>" },
+         /* nothing to validate against */
+         { "<r><x/></r>", .validate_code = { 0xc00ce224 /* E_XML_NODTD */, 0xc00ce224 } },
+     };
+@@ -20783,6 +20779,543 @@ static void test_dtd_validation_errors(void)
+     }
+ }
+ 
++/* the nodes below one: T(text), M for a comment, P(target), E(name)[...], R(name)[...] for an entity reference */
++static void dump_children(IXMLDOMNode *node, char *buf, size_t size)
++{
++    IXMLDOMNode *child = NULL, *next;
++    char str[64];
++    DOMNodeType type;
++    VARIANT value;
++    size_t len;
++    BSTR name;
++
++    IXMLDOMNode_get_firstChild(node, &child);
++    while (child)
++    {
++        len = strlen(buf);
++        if (len && buf[len - 1] != '[') strcat(buf, " ");
++        len = strlen(buf);
++        IXMLDOMNode_get_nodeType(child, &type);
++        IXMLDOMNode_get_nodeName(child, &name);
++        WideCharToMultiByte(CP_ACP, 0, name, -1, str, sizeof(str), NULL, NULL);
++        SysFreeString(name);
++        switch (type)
++        {
++        case NODE_TEXT:
++            VariantInit(&value);
++            IXMLDOMNode_get_nodeValue(child, &value);
++            WideCharToMultiByte(CP_ACP, 0, V_BSTR(&value), -1, str, sizeof(str), NULL, NULL);
++            VariantClear(&value);
++            snprintf(buf + len, size - len, "T(%s)", str);
++            break;
++        case NODE_COMMENT:
++            snprintf(buf + len, size - len, "M");
++            break;
++        case NODE_PROCESSING_INSTRUCTION:
++            snprintf(buf + len, size - len, "P(%s)", str);
++            break;
++        default:
++            snprintf(buf + len, size - len, "%c(%s)", type == NODE_ENTITY_REFERENCE ? 'R' : 'E', str);
++            next = NULL;
++            IXMLDOMNode_get_firstChild(child, &next);
++            if (next)
++            {
++                IXMLDOMNode_Release(next);
++                strcat(buf, "[");
++                dump_children(child, buf, size);
++                strcat(buf, "]");
++            }
++        }
++        next = NULL;
++        IXMLDOMNode_get_nextSibling(child, &next);
++        IXMLDOMNode_Release(child);
++        child = next;
++    }
++}
++
++#define check_children(a, b) check_children_(__LINE__, (IXMLDOMNode *)(a), b)
++static void check_children_(unsigned int line, IXMLDOMNode *node, const char *expect)
++{
++    char buf[512] = "";
++
++    dump_children(node, buf, sizeof(buf));
++    ok_(__FILE__, line)(!strcmp(buf, expect), "Unexpected nodes %s.\n", buf);
++}
++
++#define check_xml_text(a, b, c) check_xml_text_(__LINE__, (IXMLDOMNode *)(a), b, c)
++static void check_xml_text_(unsigned int line, IXMLDOMNode *node, const WCHAR *xml, const WCHAR *text)
++{
++    BSTR str;
++    HRESULT hr;
++
++    hr = IXMLDOMNode_get_xml(node, &str);
++    ok_(__FILE__, line)(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok_(__FILE__, line)(!wcscmp(str, xml), "Unexpected xml %s.\n", debugstr_w(str));
++    SysFreeString(str);
++    if (!text) return;
++    hr = IXMLDOMNode_get_text(node, &str);
++    ok_(__FILE__, line)(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok_(__FILE__, line)(str && !wcscmp(str, text), "Unexpected text %s.\n", debugstr_w(str));
++    SysFreeString(str);
++}
++
++static IXMLDOMNode *get_child(IXMLDOMNode *node, LONG index)
++{
++    IXMLDOMNodeList *list = NULL;
++    IXMLDOMNode *child = NULL;
++
++    IXMLDOMNode_get_childNodes(node, &list);
++    if (!list) return NULL;
++    IXMLDOMNodeList_get_item(list, index, &child);
++    IXMLDOMNodeList_Release(list);
++    return child;
++}
++
++static LONG get_child_count(IXMLDOMNode *node)
++{
++    IXMLDOMNodeList *list = NULL;
++    LONG length = -1;
++
++    IXMLDOMNode_get_childNodes(node, &list);
++    if (!list) return -1;
++    IXMLDOMNodeList_get_length(list, &length);
++    IXMLDOMNodeList_Release(list);
++    return length;
++}
++
++
++static IXMLDOMDocument2 *load_entity_document(const GUID *clsid, const char *name, const char *xml,
++        BOOL validate, BOOL preserve)
++{
++    IXMLDOMDocument2 *doc = _create_object(clsid, name, &IID_IXMLDOMDocument2, __LINE__);
++    VARIANT_BOOL loaded = 0x55;
++    HRESULT hr;
++    VARIANT v;
++
++    V_VT(&v) = VT_BOOL;
++    V_BOOL(&v) = VARIANT_FALSE;
++    IXMLDOMDocument2_setProperty(doc, _bstr_("ProhibitDTD"), v);
++    IXMLDOMDocument2_put_validateOnParse(doc, validate ? VARIANT_TRUE : VARIANT_FALSE);
++    IXMLDOMDocument2_put_preserveWhiteSpace(doc, preserve ? VARIANT_TRUE : VARIANT_FALSE);
++    hr = IXMLDOMDocument2_loadXML(doc, _bstr_(xml), &loaded);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(loaded == VARIANT_TRUE, "Unexpected result %d.\n", loaded);
++    return doc;
++}
++
++static IXMLDOMNode *get_root(IXMLDOMDocument2 *doc)
++{
++    IXMLDOMElement *root = NULL;
++
++    IXMLDOMDocument2_get_documentElement(doc, &root);
++    return (IXMLDOMNode *)root;
++}
++
++#define check_parse_error_at(a, b, c, d, e, f) check_parse_error_at_(__LINE__, a, b, c, d, e, f)
++static void check_parse_error_at_(unsigned int line, IXMLDOMDocument2 *doc, LONG code, LONG eline, LONG linepos,
++        LONG filepos, const WCHAR *src)
++{
++    LONG value, pos, epos, fpos;
++    IXMLDOMParseError *error;
++    BSTR text = NULL;
++
++    IXMLDOMDocument2_get_parseError(doc, &error);
++    value = pos = epos = fpos = -1;
++    IXMLDOMParseError_get_errorCode(error, &value);
++    IXMLDOMParseError_get_line(error, &pos);
++    IXMLDOMParseError_get_linepos(error, &epos);
++    IXMLDOMParseError_get_filepos(error, &fpos);
++    IXMLDOMParseError_get_srcText(error, &text);
++    ok_(__FILE__, line)(value == code, "Unexpected error code %#lx.\n", value);
++    ok_(__FILE__, line)(pos == eline && epos == linepos && fpos == filepos, "Unexpected position %ld:%ld, %ld.\n",
++            pos, epos, fpos);
++    if (src) ok_(__FILE__, line)(text && !wcscmp(text, src), "Unexpected source %s.\n", debugstr_w(text));
++    SysFreeString(text);
++    IXMLDOMParseError_Release(error);
++}
++
++/* references to entities declared in the DTD, as Windows 11 keeps them */
++static void test_entity_reference_nodes(void)
++{
++    static const char dtd[] = "<!DOCTYPE r [<!ENTITY e \"x\"><!ENTITY m \"<b>y</b>\"><!ENTITY n \"a&e;b\"><!ENTITY s \"\">"
++            "<!ENTITY w \" \"><!ENTITY k \"<!--c-->x<?p d?>\"><!ENTITY c \"&#65;B\"><!ENTITY t \"  x  \">]>";
++    static const struct { const char *name; const WCHAR *xml; const char *nodes; const WCHAR *text; } decls[] =
++    {
++        { "e", L"<!ENTITY e \"x\">", "T(x)", L"x" },
++        { "m", L"<!ENTITY m \"\">", "E(b)[T(y)]", L"y" },
++        { "n", L"<!ENTITY n \"a&e;b\">", "T(a) R(e)[T(x)] T(b)", L"axb" },
++        { "s", L"<!ENTITY s \"\">", "", L"" },
++        { "w", L"<!ENTITY w \"\">", "", L"" },
++        { "k", L"<!ENTITY k \"x\">", "M T(x) P(p)", L"x" },
++        { "c", L"<!ENTITY c \"AB\">", "T(AB)", L"AB" },
++        { "t", L"<!ENTITY t \"  x  \">", "T(  x  )", L"x" },
++    };
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++        BOOL v6;
++    }
++    documents[] =
++    {
++        { &_create(CLSID_DOMDocument30) },
++        { &_create(CLSID_DOMDocument60), TRUE },
++    };
++    IXMLDOMNode *root, *ref, *child, *clone, *node, *other, *attr;
++    IXMLDOMEntityReference *created;
++    IXMLDOMDocumentType *doctype;
++    IXMLDOMElement *element;
++    IXMLDOMDocument2 *doc;
++    VARIANT_BOOL loaded;
++    char xml[512];
++    unsigned int i, j;
++    HRESULT hr;
++    VARIANT v;
++
++    for (i = 0; i < ARRAY_SIZE(documents); i++)
++    {
++        BOOL v6 = documents[i].v6;
++
++        winetest_push_context("%s", documents[i].name);
++
++        /* the nodes: those of the declaration, also in attributes */
++        sprintf(xml, "%s<r a=\"1&e;2\" c=\"&n;\">p&e;q&m;s&n;&s;&#65;&amp;</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, FALSE);
++        root = get_root(doc);
++        check_children(root, "T(p) R(e)[T(x)] T(q) R(m)[E(b)[T(y)]] T(s) R(n)[T(a) R(e)[T(x)] T(b)] R(s) T(A&)");
++        check_xml_text(root, L"<r a=\"1&e;2\" c=\"&n;\">p&e;q&m;s&n;&s;A&amp;</r>", L"pxqysaxbA&");
++        IXMLDOMNode_QueryInterface(root, &IID_IXMLDOMElement, (void **)&element);
++        IXMLDOMElement_getAttributeNode(element, _bstr_("a"), (IXMLDOMAttribute **)&attr);
++        check_children(attr, "T(1) R(e)[T(x)] T(2)");
++        check_xml_text(attr, L"a=\"1&e;2\"", L"1x2");
++        IXMLDOMNode_Release(attr);
++        IXMLDOMElement_getAttributeNode(element, _bstr_("c"), (IXMLDOMAttribute **)&attr);
++        check_children(attr, "R(n)[T(a) R(e)[T(x)] T(b)]");
++        IXMLDOMNode_Release(attr);
++        IXMLDOMElement_Release(element);
++
++        IXMLDOMNode_Release(root);
++
++        /* the declarations */
++        IXMLDOMDocument2_get_doctype(doc, &doctype);
++        for (j = 0; j < ARRAY_SIZE(decls); j++)
++        {
++            winetest_push_context("%s", decls[j].name);
++            node = get_child((IXMLDOMNode *)doctype, j);
++            check_children(node, decls[j].nodes);
++            check_xml_text(node, decls[j].xml, decls[j].text);
++            IXMLDOMNode_Release(node);
++            winetest_pop_context();
++        }
++        IXMLDOMDocumentType_Release(doctype);
++        IXMLDOMDocument2_Release(doc);
++
++        /* spaces: those of an entity are left out as in an element, and its reference breaks lines */
++        sprintf(xml, "%s<r>\n  &e;\n  <b/>\n</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, FALSE);
++        root = get_root(doc);
++        check_xml_text(root, L"<r>\r\n\t&e;\r\n\t<b/>\r\n</r>", L"x");
++        IXMLDOMNode_Release(root);
++        IXMLDOMDocument2_Release(doc);
++
++        sprintf(xml, "%s<r a=\"&w;\" b=\"&t;\">a&w;b</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, FALSE);
++        root = get_root(doc);
++        check_children(root, "T(a) R(w) T(b)");
++        check_xml_text(root, L"<r a=\"&w;\" b=\"&t;\">a&w;b</r>", L"a b");
++        IXMLDOMNode_QueryInterface(root, &IID_IXMLDOMElement, (void **)&element);
++        IXMLDOMElement_getAttributeNode(element, _bstr_("a"), (IXMLDOMAttribute **)&attr);
++        check_children(attr, "R(w)");
++        check_xml_text(attr, L"a=\"&w;\"", L"");
++        IXMLDOMNode_Release(attr);
++        IXMLDOMElement_getAttributeNode(element, _bstr_("b"), (IXMLDOMAttribute **)&attr);
++        hr = IXMLDOMNode_get_nodeValue(attr, &v);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(!wcscmp(V_BSTR(&v), L"  x  "), "Unexpected value %s.\n", debugstr_w(V_BSTR(&v)));
++        VariantClear(&v);
++        check_xml_text(attr, L"b=\"&t;\"", L"x");
++        IXMLDOMNode_Release(attr);
++        IXMLDOMElement_Release(element);
++        IXMLDOMNode_Release(root);
++        IXMLDOMDocument2_Release(doc);
++
++        /* the text of a declaration is read on its own: the document's spaces count, not xml:space */
++        sprintf(xml, "%s<r xml:space=\"preserve\">&w;<b/>&t;</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, FALSE);
++        root = get_root(doc);
++        check_children(root, "R(w) E(b) R(t)[T(  x  )]");
++        check_xml_text(root, L"<r xml:space=\"preserve\">&w;<b/>&t;</r>", L"  x  ");
++        IXMLDOMNode_Release(root);
++        IXMLDOMDocument2_Release(doc);
++
++        sprintf(xml, "%s<r>&w;<b/>&t;</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, TRUE);
++        root = get_root(doc);
++        check_children(root, "R(w)[T( )] E(b) R(t)[T(  x  )]");
++        check_xml_text(root, L"<r>&w;<b/>&t;</r>", L"   x  ");
++        IXMLDOMNode_Release(root);
++        IXMLDOMDocument2_Release(doc);
++
++        /* what a reference holds may not change; MSXML 6 keeps copies of it from changing too */
++        sprintf(xml, "%s<r a=\"1&e;2\">p&e;q&m;</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, FALSE);
++        root = get_root(doc);
++        ref = get_child(root, 1);
++        child = get_child(ref, 0);
++        IXMLDOMDocument2_createTextNode(doc, _bstr_("z"), (IXMLDOMText **)&node);
++        other = NULL;
++        hr = IXMLDOMNode_appendChild(ref, node, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        V_VT(&v) = VT_UNKNOWN;
++        V_UNKNOWN(&v) = (IUnknown *)child;
++        hr = IXMLDOMNode_insertBefore(ref, node, v, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        hr = IXMLDOMNode_replaceChild(ref, node, child, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        hr = IXMLDOMNode_removeChild(ref, child, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        hr = IXMLDOMNode_put_text(ref, _bstr_("z"));
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        hr = IXMLDOMNode_put_text(child, _bstr_("z"));
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        hr = IXMLDOMText_appendData((IXMLDOMText *)child, _bstr_("z"));
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        check_xml_text(ref, L"&e;", L"x");
++        IXMLDOMNode_Release(child);
++
++        other = get_child(root, 3);
++        child = get_child(other, 0);
++        IXMLDOMNode_Release(other);
++        IXMLDOMNode_QueryInterface(child, &IID_IXMLDOMElement, (void **)&element);
++        V_VT(&v) = VT_BSTR;
++        V_BSTR(&v) = _bstr_("1");
++        hr = IXMLDOMElement_setAttribute(element, _bstr_("x"), v);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        other = NULL;
++        hr = IXMLDOMElement_appendChild(element, node, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        IXMLDOMElement_Release(element);
++        IXMLDOMNode_Release(child);
++
++        hr = IXMLDOMNode_cloneNode(ref, VARIANT_TRUE, &clone);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(get_child_count(clone) == 1, "Unexpected count %ld.\n", get_child_count(clone));
++        hr = IXMLDOMNode_appendChild(clone, node, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        child = get_child(clone, 0);
++        hr = IXMLDOMNode_put_nodeValue(child, v);
++        ok(hr == (v6 ? E_FAIL : S_OK), "Unexpected hr %#lx.\n", hr);
++        IXMLDOMNode_Release(child);
++        IXMLDOMNode_Release(clone);
++        hr = IXMLDOMNode_cloneNode(ref, VARIANT_FALSE, &clone);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(get_child_count(clone) == (v6 ? 1 : 0), "Unexpected count %ld.\n", get_child_count(clone));
++        IXMLDOMNode_Release(clone);
++
++        IXMLDOMNode_QueryInterface(root, &IID_IXMLDOMElement, (void **)&element);
++        IXMLDOMElement_getAttributeNode(element, _bstr_("a"), (IXMLDOMAttribute **)&attr);
++        V_BSTR(&v) = _bstr_("new");
++        hr = IXMLDOMNode_put_nodeValue(attr, v);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        check_xml_text(attr, L"a=\"new\"", L"new");
++        IXMLDOMNode_Release(attr);
++        IXMLDOMElement_Release(element);
++
++        /* the reference itself may move */
++        hr = IXMLDOMNode_removeChild(root, ref, &other);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        IXMLDOMNode_Release(other);
++        check_xml_text(root, L"<r a=\"new\">pq&m;</r>", L"pqy");
++        IXMLDOMDocument2_createElement(doc, _bstr_("h"), &element);
++        hr = IXMLDOMElement_appendChild(element, ref, &other);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        IXMLDOMNode_Release(other);
++        check_xml_text(element, L"<h>&e;</h>", L"x");
++        hr = IXMLDOMNode_appendChild(ref, node, &other);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        IXMLDOMElement_Release(element);
++        IXMLDOMNode_Release(ref);
++
++        hr = IXMLDOMDocument2_createEntityReference(doc, _bstr_("e"), &created);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        check_children(created, "T(x)");
++        child = get_child((IXMLDOMNode *)created, 0);
++        hr = IXMLDOMNode_put_nodeValue(child, v);
++        ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
++        IXMLDOMNode_Release(child);
++        IXMLDOMEntityReference_Release(created);
++        hr = IXMLDOMDocument2_createEntityReference(doc, _bstr_("zz"), &created);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        check_xml_text(created, L"&zz;", L"");
++        IXMLDOMEntityReference_Release(created);
++
++        hr = IXMLDOMNode_put_text(root, _bstr_("z"));
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        check_xml_text(root, L"<r a=\"new\">z</r>", L"z");
++        IXMLDOMNode_Release(node);
++        IXMLDOMNode_Release(root);
++        IXMLDOMDocument2_Release(doc);
++
++        /* normalize joins text, not across references */
++        sprintf(xml, "%s<r>x&e;&e;y</r>", dtd);
++        doc = load_entity_document(documents[i].clsid, documents[i].name, xml, FALSE, FALSE);
++        root = get_root(doc);
++        IXMLDOMNode_QueryInterface(root, &IID_IXMLDOMElement, (void **)&element);
++        hr = IXMLDOMElement_normalize(element);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        check_children(root, "T(x) R(e)[T(x)] R(e)[T(x)] T(y)");
++        IXMLDOMElement_Release(element);
++        IXMLDOMNode_Release(root);
++        IXMLDOMDocument2_Release(doc);
++
++        /* the text of every declaration is read when the DTD ends, where errors in it are */
++        doc = _create_object(documents[i].clsid, documents[i].name, &IID_IXMLDOMDocument2, __LINE__);
++        V_VT(&v) = VT_BOOL;
++        V_BOOL(&v) = VARIANT_FALSE;
++        IXMLDOMDocument2_setProperty(doc, _bstr_("ProhibitDTD"), v);
++        IXMLDOMDocument2_put_validateOnParse(doc, VARIANT_FALSE);
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_("<!DOCTYPE r [<!ENTITY u \"&zz;\">]><r/>"), &loaded);
++        ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++        check_parse_error_at(doc, 0xc00ce002 /* XML_ENTITY_UNDEFINED */, 1, 2, 1, L"&zz;");
++        sprintf(xml, "%s<r a=\"&m;\"/>", dtd);
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_(xml), &loaded);
++        ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++        check_parse_error_at(doc, 0xc00ce506 /* XML_BADCHARINSTRING */, 1, 182, 181, NULL);
++
++        /* external entities are loaded when the DTD ends, used or not, when resolving them */
++        hr = IXMLDOMDocument2_get_resolveExternals(doc, &loaded);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        ok(loaded == (v6 ? VARIANT_FALSE : VARIANT_TRUE), "Unexpected value %d.\n", loaded);
++        IXMLDOMDocument2_put_resolveExternals(doc, VARIANT_TRUE);
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_("<!DOCTYPE r [<!ENTITY x SYSTEM \"wine-missing-x\">]><r/>"), &loaded);
++        ok(hr == S_FALSE, "Unexpected hr %#lx.\n", hr);
++        check_parse_error_at(doc, v6 ? 0xc00ce009 : 0x800c0006 /* INET_E_OBJECT_NOT_FOUND */, 1, 51, 50, NULL);
++        IXMLDOMDocument2_put_resolveExternals(doc, VARIANT_FALSE);
++        hr = IXMLDOMDocument2_loadXML(doc, _bstr_("<!DOCTYPE r [<!ENTITY x SYSTEM \"wine-missing-x\">]><r/>"), &loaded);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        IXMLDOMDocument2_Release(doc);
++
++        free_bstrs();
++        winetest_pop_context();
++    }
++}
++
++/* the DTD among node(), the spaces of values, the identifiers of declarations (Windows 11) */
++static void test_values_and_declarations(void)
++{
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++        BOOL v6;
++    }
++    documents[] =
++    {
++        { &_create(CLSID_DOMDocument30) },
++        { &_create(CLSID_DOMDocument60), TRUE },
++    };
++    IXMLDOMNode *root, *node;
++    IXMLDOMElement *r;
++    IXMLDOMDocument2 *doc;
++    IXMLDOMEntity *entity;
++    IXMLDOMNotation *notation;
++    unsigned int i, j;
++    HRESULT hr;
++    VARIANT v;
++    BSTR str;
++
++    for (i = 0; i < ARRAY_SIZE(documents); i++)
++    {
++        BOOL v6 = documents[i].v6;
++
++        winetest_push_context("%s", documents[i].name);
++
++
++        /* the text of an attribute leaves out the spaces around it, as that of text does */
++        for (j = 0; j < 2; j++)
++        {
++            doc = load_entity_document(documents[i].clsid, documents[i].name, "<r b=\"  x  \">  x  </r>", FALSE, j);
++            root = get_root(doc);
++            IXMLDOMNode_QueryInterface(root, &IID_IXMLDOMElement, (void **)&r);
++            IXMLDOMElement_getAttributeNode(r, _bstr_("b"), (IXMLDOMAttribute **)&node);
++            check_xml_text(node, L"b=\"  x  \"", j ? L"  x  " : L"x");
++            IXMLDOMNode_Release(node);
++            node = get_child(root, 0);
++            hr = IXMLDOMNode_get_nodeValue(node, &v);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ok(!wcscmp(V_BSTR(&v), L"  x  "), "Unexpected value %s.\n", debugstr_w(V_BSTR(&v)));
++            VariantClear(&v);
++            check_xml_text(node, L"  x  ", j ? L"  x  " : L"x");
++            IXMLDOMNode_Release(node);
++            IXMLDOMElement_Release(r);
++            IXMLDOMNode_Release(root);
++            IXMLDOMDocument2_Release(doc);
++        }
++
++        /* identifiers as declared */
++        if (v6)
++        {
++            IXMLDOMDocumentType *doctype;
++
++            doc = load_entity_document(documents[i].clsid, documents[i].name,
++                    "<!DOCTYPE r [<!NOTATION n PUBLIC \"pub-id\" \"sys-id\"><!NOTATION n2 SYSTEM \"sys-2\">"
++                    "<!ENTITY u SYSTEM \"sys-u\" NDATA n><!ENTITY x PUBLIC \"pub-x\" \"sys-x\">]><r/>", FALSE, FALSE);
++            IXMLDOMDocument2_get_doctype(doc, &doctype);
++
++            node = get_child((IXMLDOMNode *)doctype, 0);
++            check_xml_text(node, L"<!NOTATION n PUBLIC \"pub-id\" \"sys-id\">", NULL);
++            IXMLDOMNode_QueryInterface(node, &IID_IXMLDOMNotation, (void **)&notation);
++            hr = IXMLDOMNotation_get_publicId(notation, &v);
++            ok(hr == S_OK && V_VT(&v) == VT_BSTR && !wcscmp(V_BSTR(&v), L"pub-id"), "Unexpected hr %#lx, id %s.\n",
++                    hr, debugstr_variant(&v));
++            VariantClear(&v);
++            hr = IXMLDOMNotation_get_systemId(notation, &v);
++            ok(hr == S_OK && V_VT(&v) == VT_BSTR && !wcscmp(V_BSTR(&v), L"sys-id"), "Unexpected hr %#lx, id %s.\n",
++                    hr, debugstr_variant(&v));
++            VariantClear(&v);
++            IXMLDOMNotation_Release(notation);
++            IXMLDOMNode_Release(node);
++
++            node = get_child((IXMLDOMNode *)doctype, 1);
++            check_xml_text(node, L"<!NOTATION n2 SYSTEM \"sys-2\">", NULL);
++            IXMLDOMNode_QueryInterface(node, &IID_IXMLDOMNotation, (void **)&notation);
++            hr = IXMLDOMNotation_get_publicId(notation, &v);
++            ok(hr == S_FALSE && V_VT(&v) == VT_BSTR && !V_BSTR(&v), "Unexpected hr %#lx, id %s.\n",
++                    hr, debugstr_variant(&v));
++            IXMLDOMNotation_Release(notation);
++            IXMLDOMNode_Release(node);
++
++            node = get_child((IXMLDOMNode *)doctype, 2);
++            check_xml_text(node, L"<!ENTITY u SYSTEM \"sys-u\" NDATA n>", NULL);
++            IXMLDOMNode_QueryInterface(node, &IID_IXMLDOMEntity, (void **)&entity);
++            hr = IXMLDOMEntity_get_systemId(entity, &v);
++            ok(hr == S_OK && V_VT(&v) == VT_BSTR && !wcscmp(V_BSTR(&v), L"sys-u"), "Unexpected hr %#lx, id %s.\n",
++                    hr, debugstr_variant(&v));
++            VariantClear(&v);
++            hr = IXMLDOMEntity_get_notationName(entity, &str);
++            ok(hr == S_OK && !wcscmp(str, L"n"), "Unexpected hr %#lx, name %s.\n", hr, debugstr_w(str));
++            SysFreeString(str);
++            IXMLDOMEntity_Release(entity);
++            IXMLDOMNode_Release(node);
++
++            node = get_child((IXMLDOMNode *)doctype, 3);
++            check_xml_text(node, L"<!ENTITY x PUBLIC \"pub-x\" \"sys-x\">", NULL);
++            IXMLDOMNode_QueryInterface(node, &IID_IXMLDOMEntity, (void **)&entity);
++            str = (BSTR)0xdeadbeef;
++            hr = IXMLDOMEntity_get_notationName(entity, &str);
++            ok(hr == S_FALSE && !str, "Unexpected hr %#lx, name %s.\n", hr, debugstr_w(str));
++            IXMLDOMEntity_Release(entity);
++            IXMLDOMNode_Release(node);
++
++            IXMLDOMDocumentType_Release(doctype);
++            IXMLDOMDocument2_Release(doc);
++        }
++
++        free_bstrs();
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(domdoc)
+ {
+     HRESULT hr;
+@@ -20925,6 +21458,8 @@ START_TEST(domdoc)
+     test_load_failing_stream();
+     test_load_pending_stream();
+     test_dtd_validation_errors();
++    test_entity_reference_nodes();
++    test_values_and_declarations();
+ 
+     if (is_clsid_supported(&CLSID_MXNamespaceManager40, &IID_IMXNamespaceManager))
+     {
