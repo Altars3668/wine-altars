@@ -4,6 +4,22 @@ Everything below is either something a tool printed or a file that exists.
 Where something is inferred it says so. The document is chronological and later
 sections correct earlier ones where they were wrong; the corrections are marked.
 
+> **Read this first.** This is a lab notebook, in the order things were found, and it is long.
+> The section directly below is the state on 2026-09-02 and is **out of date**: the licence
+> problem it ends on was solved on 2026-09-18 — Office signs in through its own WebView2 window
+> and licenses itself against the account's subscription (see the README and
+> [`getting-started.md`](getting-started.md)). Search it by symptom rather than reading it through.
+>
+> * Commit ids (`altars-up 1b0ac62bb2f`, `wine-src 048eaaf`, …) are commits of the author's Wine
+>   tree, which is not published; [`../patches/altars-up/SERIES.tsv`](../patches/altars-up/SERIES.tsv)
+>   maps them to patch files. Ids from before the move to upstream Wine master belong to a
+>   retired CrossOver-based tree.
+> * Scripts and routes it names that are not in this repository were retired: importing an
+>   installed Office from a Windows drive, minting tokens on a Windows machine, a stand-in
+>   module for App-V. They were dead ends or stopgaps, and the notes say why.
+> * `winref` is the reference machine: a Windows 11 PC with a real subscription, on which the
+>   probes in `tools/` were run.
+
 ## Where it stands (2026-09-02)
 
 Word starts, builds its whole UI, reaches its Start screen, and renders Office's
