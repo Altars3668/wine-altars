@@ -18,10 +18,10 @@
 # own sign-in implementations runs.  The names must carry their full prefix --
 # "TestGate.DisableBrokerForOneAuth" without it is silently ignored.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The caller usually resolved which wine runs this prefix; don't second-guess it.
-WINE="${WINE:-${DIST:-$ROOT/dist-cx}/bin/wine}"
-export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
+# Default: the wine on PATH (or $DIST/bin/wine) and ~/.wine-office.
+WINE="${WINE:-${DIST:+$DIST/bin/}wine}"
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-office}"
 
 # The gates are read per application: with them set for Word only, Outlook still signed in through
 # mshtml when adding an account and failed with code 0x80090013 (2026-10-01).

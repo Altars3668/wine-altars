@@ -12,6 +12,7 @@
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 B="${WINE_BUILD:-$ROOT/wine-src/build-wow64}"
+[ -d "$B" ] || B="$ROOT/build/wine-src/build-wow64"     # the tree scripts/build-from-series.sh makes
 dll=$1; O=$(realpath -m "$2"); mkdir -p "$O"
 cd $B
 # upstream moved winecrt0 from dlls/ to libs/, and links PE modules with the bundled compiler-rt;
