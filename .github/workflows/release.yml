@@ -1,0 +1,230 @@
+name: Release
+
+# Builds Wine from upstream + patches/altars-up (scripts/build-from-series.sh) and publishes
+# the result as a GitHub release.
+#
+#   push a tag  v*                  -> a release named after the tag
+#   push to main that changes the   -> the rolling "nightly" pre-release is rebuilt
+#   series or the build recipe
+#   Actions -> Release -> Run       -> the same, or a release for a tag you type in
+#
+# Release tags look like  v11.19-altars.1  (upstream Wine version, then our revision).
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths:
+      - 'patches/altars-up/**'
+      - 'scripts/build-from-series.sh'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v11.19-altars.2 (created if it does not exist). Empty: rebuild the rolling 'nightly' pre-release."
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: '1'
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Decide what is being released
+        id: rel
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          . patches/altars-up/BASE
+          wine_ver="${BASE_TAG#wine-}"
+          n_patches=$(find patches/altars-up -maxdepth 1 -name '0*.patch' | wc -l)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              tag="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+              tag="$INPUT_TAG"
+          else
+              tag=nightly
+          fi
+          if [ "$tag" = nightly ]; then
+              version="${wine_ver}-altars-nightly.$(date -u +%Y%m%d).${GITHUB_SHA::7}"
+              prerelease=true
+              title="Nightly: Wine ${wine_ver} + ${n_patches} patches (${GITHUB_SHA::7})"
+          else
+              version="${tag#v}"
+              case "$tag" in *-rc*|*-beta*|*-alpha*) prerelease=true ;; *) prerelease=false ;; esac
+              title="wine-altars ${version}"
+          fi
+          {
+              echo "tag=$tag"
+              echo "version=$version"
+              echo "prerelease=$prerelease"
+              echo "title=$title"
+              echo "wine_ver=$wine_ver"
+              echo "n_patches=$n_patches"
+              echo "base_commit=$BASE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+          echo "releasing $tag as $version (pre-release: $prerelease)"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison ccache flex gettext pkg-config xvfb xz-utils \
+            gcc-mingw-w64 g++-mingw-w64 libwayland-bin wayland-protocols \
+            libasound2-dev libavcodec-dev libavformat-dev libavutil-dev libcups2-dev libdbus-1-dev \
+            libegl-dev libfontconfig-dev libfreetype-dev libgl-dev libgnutls28-dev \
+            libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libkrb5-dev libpulse-dev \
+            libudev-dev libunwind-dev libusb-1.0-0-dev libv4l-dev libvulkan-dev libwayland-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxfixes-dev libxi-dev \
+            libxinerama-dev libxkbcommon-dev libxkbregistry-dev libxrandr-dev libxrender-dev \
+            libxxf86vm-dev
+          # Wine wants the win32 thread model of mingw-w64, not the posix one Ubuntu picks by default
+          for t in x86_64 i686; do
+              for l in gcc g++; do
+                  sudo update-alternatives --set "$t-w64-mingw32-$l" "/usr/bin/$t-w64-mingw32-$l-win32"
+              done
+          done
+          x86_64-w64-mingw32-gcc -v 2>&1 | tail -2
+
+      - name: Restore the compiler cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('patches/altars-up/*.patch') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Fetch, patch, configure, build, install
+        env:
+          WORK: ${{ runner.temp }}/work
+          PREFIX: /opt/wine-altars
+          DESTDIR: ${{ runner.temp }}/stage
+          USE_CCACHE: '1'
+        run: |
+          ccache --zero-stats
+          scripts/build-from-series.sh
+          ccache --show-stats
+
+      - name: Save the compiler cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('patches/altars-up/*.patch') }}-${{ github.run_id }}
+
+      - name: Smoke test the staged build
+        env:
+          STAGE: ${{ runner.temp }}/stage/opt/wine-altars
+        run: |
+          set -euo pipefail
+          export WINE="$STAGE/bin/wine"
+          export WINEPREFIX="$RUNNER_TEMP/smoke-prefix"
+          export WINEDEBUG=-all
+          # no Mono / Gecko download prompts, no desktop menu entries
+          export WINEDLLOVERRIDES='mscoree,mshtml=;winemenubuilder.exe=d'
+          "$WINE" --version
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
+          set -e
+          "$WINE" wineboot -u
+          "$WINE" cmd /c ver
+          "$WINE" 'C:\windows\syswow64\cmd.exe' /c ver
+          "$WINE" reg query 'HKLM\Software\Microsoft\Windows NT\CurrentVersion' /v CurrentBuildNumber
+          "$WINE" wineboot -s
+          SMOKE
+          xvfb-run -a -s '-screen 0 1280x800x24' bash "$RUNNER_TEMP/smoke.sh"
+          # what the series adds has to be in the install, not only in the source tree
+          for f in srpapi secur32 sppc windows.networking.sockets dcomp; do
+              test -e "$STAGE/lib/wine/x86_64-windows/$f.dll" || { echo "missing $f.dll"; exit 1; }
+          done
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          WINE_VER: ${{ steps.rel.outputs.wine_ver }}
+          N_PATCHES: ${{ steps.rel.outputs.n_patches }}
+          BASE_COMMIT: ${{ steps.rel.outputs.base_commit }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          cat > "$RUNNER_TEMP/stage/opt/wine-altars/RELEASE.txt" <<EOF
+          wine-altars ${VERSION}
+          upstream Wine ${WINE_VER} (${BASE_COMMIT}) plus ${N_PATCHES} patches from patches/altars-up
+          built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}
+          EOF
+          # file names carry no version, so ".../releases/latest/download/<name>" is a stable link;
+          # the version is in RELEASE.txt and in the release itself
+          tar -C "$RUNNER_TEMP/stage/opt" -cf - wine-altars | xz -T0 -6 > "$out/wine-altars-linux-x86_64.tar.xz"
+          tar -C patches -cf - altars-up | xz -T0 -6 > "$out/wine-altars-patches.tar.xz"
+          ( cd "$out" && sha256sum ./*.tar.xz | sed 's, \./, ,' > SHA256SUMS && cat SHA256SUMS && ls -l )
+
+      - name: Write the release notes
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          WINE_VER: ${{ steps.rel.outputs.wine_ver }}
+          N_PATCHES: ${{ steps.rel.outputs.n_patches }}
+          BASE_COMMIT: ${{ steps.rel.outputs.base_commit }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Upstream Wine **${WINE_VER}** (\`${BASE_COMMIT:0:12}\`) plus **${N_PATCHES}** patches from
+          [\`patches/altars-up\`](https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}/patches/altars-up),
+          built from commit \`${GITHUB_SHA:0:12}\` on Ubuntu 24.04 (needs glibc 2.39 or newer).
+
+          | file | what it is |
+          |---|---|
+          | \`wine-altars-linux-x86_64.tar.xz\` | the build: 64-bit host, 64- and 32-bit Windows half (new WoW64 mode) |
+          | \`wine-altars-patches.tar.xz\` | only the patch series, for building somewhere else |
+          | \`SHA256SUMS\` | checksums of the two files above |
+
+          **Use it**
+
+          \`\`\`sh
+          sudo tar -C /opt -xf wine-altars-linux-x86_64.tar.xz
+          export PATH=/opt/wine-altars/bin:\$PATH
+          wine --version
+          \`\`\`
+
+          Then follow [Getting Microsoft 365 running](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/getting-started.md).
+          The build needs the usual Wine runtime libraries (X11 or Wayland, OpenGL/Vulkan, FreeType, fontconfig,
+          GnuTLS, CUPS, PulseAudio/ALSA); installing your distribution's \`wine\` package is the easiest way to get them.
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          TITLE: ${{ steps.rel.outputs.title }}
+          PRERELEASE: ${{ steps.rel.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          args=(--title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md" --target "$GITHUB_SHA")
+          [ "$PRERELEASE" = true ] && args+=(--prerelease)
+          if [ "$TAG" = nightly ]; then
+              # the rolling release: drop the old one so the tag moves to this commit
+              gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          else
+              args+=(--generate-notes)
+              if gh release view "$TAG" >/dev/null 2>&1; then
+                  # re-run of an existing release: replace its files, keep its text
+                  gh release upload "$TAG" "$out"/*.tar.xz "$out"/SHA256SUMS --clobber
+                  exit 0
+              fi
+          fi
+          gh release create "$TAG" "${args[@]}" "$out"/*.tar.xz "$out"/SHA256SUMS
