@@ -23,8 +23,8 @@
 # there is no session to use.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="${DIST:-$ROOT/dist-cx}"
-export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
+DIST="${DIST:-$ROOT/dist-up}"
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-c2r-up}"
 N="${1:-5}"
 SETTLE="${SETTLE:-12}"
 

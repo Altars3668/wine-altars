@@ -6,7 +6,7 @@
 # each (scripts/winrun.sh for Windows) and diff the two outputs.
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-B="${WINE_BUILD:-$ROOT/wine-src/build-wow64}"
+B="${WINE_BUILD:-$ROOT/wine-src-up/build-wow64}"
 [ -d "$B" ] || B="$ROOT/build/wine-src/build-wow64"     # the tree scripts/build-from-series.sh makes
 src=$(realpath "$1"); out=$(realpath -m "$2"); shift 2
 cd "$B"

@@ -17,7 +17,7 @@
 # happened must be reported as a failure.
 set -euo pipefail
 
-WINE="${WINE:-$(dirname "$0")/../dist-cx/bin/wine}"
+WINE="${WINE:-$(dirname "$0")/../dist-up/bin/wine}"
 : "${WINEPREFIX:?set WINEPREFIX}"
 export WINEPREFIX
 

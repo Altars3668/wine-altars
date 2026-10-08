@@ -22,8 +22,8 @@
 # automated run sit there indefinitely looking like a hang.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="${DIST:-$ROOT/dist-cx}"
-export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
+DIST="${DIST:-$ROOT/dist-up}"
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-c2r-up}"
 export PATH="$DIST/bin:$PATH"
 LOG="${LOG:-/tmp/word.log}"
 APP="${APP:-C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE}"

@@ -29,11 +29,11 @@ including the zh-CN ones -- and --all is there for when something is missing.
 """
 import io, os, re, subprocess, sys, tempfile
 
-PREFIX = os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-altars-office"))
+PREFIX = os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-c2r-up"))
 FONTDIR = os.path.join(PREFIX, "drive_c", "windows", "Fonts")
 KEY = r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Fonts"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WINE = os.environ.get("WINE", os.path.join(ROOT, "dist-cx", "bin", "wine"))
+WINE = os.environ.get("WINE", os.path.join(ROOT, "dist-up", "bin", "wine"))
 
 
 def names_of(path):

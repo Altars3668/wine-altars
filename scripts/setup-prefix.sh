@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
-export PATH="$ROOT/dist/bin:$PATH"
+export PATH="$ROOT/dist-up/bin:$PATH"
 export WINEARCH=win64
 # Mono and Gecko dialogs have nothing to do with Office and block a script.
 export WINEDLLOVERRIDES="mscoree=d;mshtml=d"

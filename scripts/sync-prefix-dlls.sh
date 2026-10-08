@@ -3,7 +3,7 @@
 #
 # Since Wine 9 a prefix's C:\windows\system32 holds real copies of the builtin
 # PE dlls rather than placeholders, and the loader takes them from there. So
-# "make install" updates dist-cx and changes nothing about what Word loads --
+# "make install" updates dist-up and changes nothing about what Word loads --
 # silently, with no error and no missing file, which is the expensive kind of
 # wrong: a measurement then describes whichever build the prefix was made from.
 # One dll here was four hours and two edits behind its source, and the log it
@@ -14,8 +14,8 @@
 # system32 with native overrides, and those must survive.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="${DIST:-$ROOT/dist-cx}"
-WINEPREFIX="${WINEPREFIX:-$HOME/.wine-altars-office}"
+DIST="${DIST:-$ROOT/dist-up}"
+WINEPREFIX="${WINEPREFIX:-$HOME/.wine-c2r-up}"
 SYS="$WINEPREFIX/drive_c/windows/system32"
 
 [ -d "$SYS" ]  || { echo "no prefix at $WINEPREFIX" >&2; exit 1; }
@@ -25,7 +25,7 @@ n=0 kept=0
 # winex11.drv is a builtin PE module too, just one of the handful Wine names
 # without a .dll suffix -- the plain *.dll glob below silently never saw it,
 # so its system32 copy sat two days stale while every renderer patch tested
-# against dist-cx's fresher one instead. Named explicitly rather than
+# against dist-up's fresher one instead. Named explicitly rather than
 # widening the glob to *, which would also try to sync .exe/.sys/.a files
 # that do not belong in this mechanism at all.
 for built in "$DIST"/lib/wine/x86_64-windows/*.dll "$DIST"/lib/wine/x86_64-windows/winex11.drv; do

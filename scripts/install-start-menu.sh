@@ -23,7 +23,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST="${DIST:-$ROOT/dist-wow64}"
+DIST="${DIST:-$ROOT/dist-up}"
 WINE="${WINE:-$DIST/bin/wine}"
 : "${WINEPREFIX:?set WINEPREFIX}"
 export WINEPREFIX WINEDEBUG=-all

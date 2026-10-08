@@ -76,8 +76,8 @@ def exports(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--prefix', default=os.environ.get('WINEPREFIX', str(Path.home()/'.wine-altars-office')))
-    ap.add_argument('--dist', default=str(Path(__file__).resolve().parent.parent/'dist-cx'))
+    ap.add_argument('--prefix', default=os.environ.get('WINEPREFIX', str(Path.home()/'.wine-c2r-up')))
+    ap.add_argument('--dist', default=str(Path(__file__).resolve().parent.parent/'dist-up'))
     ap.add_argument('--apply', action='store_true', help='set the overrides in the prefix')
     a = ap.parse_args()
 

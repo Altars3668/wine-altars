@@ -22,7 +22,7 @@ class SppcContextIntegration(unittest.TestCase):
         default_server = wine.parent / 'server/wineserver' if (wine.parent / 'server/wineserver').is_file() else wine.parent / 'wineserver'
         server = Path(os.environ.get('SPPC_TEST_WINESERVER', default_server)).resolve()
         self.assertTrue(server.is_file(), 'matching wineserver is required')
-        build = Path(os.environ.get('SPPC_TEST_BUILD', ROOT / 'wine-src/build64-cx')).resolve()
+        build = Path(os.environ.get('SPPC_TEST_BUILD', ROOT / 'wine-src-up/build-wow64')).resolve()
         artifacts = {
             'sppc.dll': build / 'dlls/sppc/x86_64-windows/sppc.dll',
             'slc.dll': build / 'dlls/slc/x86_64-windows/slc.dll',

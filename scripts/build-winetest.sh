@@ -11,7 +11,7 @@
 # WINE_CONFIG_MAKEFILE line and autoconf, then any make.
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-B="${WINE_BUILD:-$ROOT/wine-src/build-wow64}"
+B="${WINE_BUILD:-$ROOT/wine-src-up/build-wow64}"
 [ -d "$B" ] || B="$ROOT/build/wine-src/build-wow64"     # the tree scripts/build-from-series.sh makes
 dll=$1; O=$(realpath -m "$2"); mkdir -p "$O"
 cd $B

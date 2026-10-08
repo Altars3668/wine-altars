@@ -66,7 +66,7 @@ def named(blob, name):
 def find_db(arg):
     """The biggest store, counting its -wal: an app that never ran has a .db too."""
     if arg and os.path.isfile(arg): return arg
-    root = arg or os.path.expanduser('~/.wine-altars-office/drive_c')
+    root = arg or os.path.expanduser('~/.wine-c2r-up/drive_c')
     best, best_size = None, -1
     for dirpath, _, files in os.walk(root):
         if os.path.basename(dirpath).lower() != 'otele': continue
